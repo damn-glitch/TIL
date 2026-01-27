@@ -5,11 +5,11 @@
 $ErrorActionPreference = "Stop"
 
 Write-Host ""
-Write-Host "╔════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║              TIL INSTALLER                 ║" -ForegroundColor Cyan
-Write-Host "║     Author: Alisher Beisembekov            ║" -ForegroundColor Cyan
-Write-Host "║  `"Проще Python. Быстрее C. Умнее всех.`"    ║" -ForegroundColor Cyan
-Write-Host "╚════════════════════════════════════════════╝" -ForegroundColor Cyan
+Write-Host "+--------------------------------------------+" -ForegroundColor Cyan
+Write-Host "|              TIL INSTALLER                 |" -ForegroundColor Cyan
+Write-Host "|     Author: Alisher Beisembekov            |" -ForegroundColor Cyan
+Write-Host "|  `"Проще Python. Быстрее C. Умнее всех.`"    |" -ForegroundColor Cyan
+Write-Host "+--------------------------------------------+" -ForegroundColor Cyan
 Write-Host ""
 
 # Check Python
@@ -52,7 +52,7 @@ New-Item -ItemType Directory -Force -Path $TIL_BIN | Out-Null
 
 # Download compiler
 Write-Host "Downloading TIL compiler..." -ForegroundColor Blue
-$compilerUrl = "https://raw.githubusercontent.com/til-lang/til/main/src/til.py"
+$compilerUrl = "https://raw.githubusercontent.com/damn-glitch/TIL/main/src/til.py"
 Invoke-WebRequest -Uri $compilerUrl -OutFile "$TIL_BIN\til.py"
 
 # Create batch wrapper
@@ -78,9 +78,9 @@ $env:Path = "$TIL_BIN;$env:Path"
 
 # Verify
 Write-Host ""
-Write-Host "╔════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "║         TIL INSTALLED SUCCESSFULLY!        ║" -ForegroundColor Green
-Write-Host "╚════════════════════════════════════════════╝" -ForegroundColor Green
+Write-Host "+--------------------------------------------+" -ForegroundColor Green
+Write-Host "|         TIL INSTALLED SUCCESSFULLY!        |" -ForegroundColor Green
+Write-Host "+--------------------------------------------+" -ForegroundColor Green
 Write-Host ""
 
 try {

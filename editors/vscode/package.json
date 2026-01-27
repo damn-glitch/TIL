@@ -1,9 +1,19 @@
 {
   "name": "til-lang",
   "displayName": "TIL Language",
-  "description": "TIL Programming Language support - syntax highlighting, snippets, and build commands",
+  "description": "TIL Programming Language support - syntax highlighting, snippets, and build commands. Simpler than Python. Faster than C.",
   "version": "1.0.0",
   "publisher": "alisher-beisembekov",
+  "icon": "images/til-logo.png",
+  "galleryBanner": {
+    "color": "#1a1a2e",
+    "theme": "dark"
+  },
+  "badges": [],
+  "homepage": "https://til-dev.vercel.app",
+  "bugs": {
+    "url": "https://github.com/damn-glitch/TIL/issues"
+  },
   "author": {
     "name": "Alisher Beisembekov"
   },

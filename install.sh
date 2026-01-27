@@ -50,9 +50,9 @@ mkdir -p "$TIL_BIN"
 # Download compiler
 echo -e "${BLUE}Downloading TIL compiler...${NC}"
 if command -v curl &> /dev/null; then
-    curl -fsSL https://raw.githubusercontent.com/til-lang/til/main/src/til.py -o "$TIL_BIN/til.py"
+    curl -fsSL https://raw.githubusercontent.com/damn-glitch/TIL/main/src/til.py -o "$TIL_BIN/til.py"
 elif command -v wget &> /dev/null; then
-    wget -q https://raw.githubusercontent.com/til-lang/til/main/src/til.py -O "$TIL_BIN/til.py"
+    wget -q https://raw.githubusercontent.com/damn-glitch/TIL/main/src/til.py -O "$TIL_BIN/til.py"
 else
     echo -e "${RED}✗ Neither curl nor wget found${NC}"
     exit 1

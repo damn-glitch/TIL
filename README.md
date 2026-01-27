@@ -14,7 +14,7 @@
 
 **Author: Alisher Beisembekov**
 
-[Website](https://til-dev.vercel.app/) • [Documentation](docs/) • [Examples](examples/) • [Discord](https://discord.gg/til-lang)
+[Website](https://til-dev.vercel.app) • [Documentation](docs/) • [Examples](examples/) • [Discord](https://discord.gg/til-lang)
 
 </div>
 
