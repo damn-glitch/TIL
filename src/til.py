@@ -3052,6 +3052,12 @@ def main():
         print("Multi-Level Programming: Mixed Martial Programming")
         return 0
     
+    # Check for command (run, build, check)
+    command = None
+    if args and args[0] in ('run', 'build', 'check'):
+        command = args[0]
+        args = args[1:]
+    
     compiler = TILCompiler()
     input_file = None
     output_file = None
@@ -3098,6 +3104,15 @@ def main():
         source = f.read()
     
     try:
+        # Check command - just syntax check
+        if command == 'check':
+            lexer = Lexer(source, input_file)
+            tokens = lexer.tokenize()
+            parser = Parser(tokens, input_file)
+            parser.parse()
+            print(f"OK: {input_file}")
+            return 0
+        
         if c_only:
             c_code = compiler.compile(source, input_file)
             if output_file:
@@ -3110,11 +3125,40 @@ def main():
             if not output_file:
                 output_file = os.path.splitext(os.path.basename(input_file))[0]
             
+            # Add .exe on Windows
+            exe_file = output_file
+            if sys.platform == 'win32' and not exe_file.endswith('.exe'):
+                exe_file = output_file + '.exe'
+            
             success = compiler.compile_to_executable(source, output_file, input_file)
             if not success:
                 return 1
             
-            print(f"Compiled: {output_file}")
+            # Run command - compile and execute
+            if command == 'run':
+                # Determine executable path
+                if sys.platform == 'win32':
+                    exe_path = exe_file if os.path.exists(exe_file) else output_file + '.exe'
+                else:
+                    exe_path = './' + output_file if not output_file.startswith('./') else output_file
+                
+                # Run the executable
+                try:
+                    result = subprocess.run([exe_path], capture_output=False)
+                    
+                    # Clean up executable after running
+                    try:
+                        os.remove(exe_path)
+                    except:
+                        pass
+                    
+                    return result.returncode
+                except Exception as e:
+                    print(f"Error running {exe_path}: {e}", file=sys.stderr)
+                    return 1
+            else:
+                # Build command - just compile
+                print(f"Compiled: {output_file}")
     
     except SyntaxError as e:
         print(f"Syntax Error: {e}", file=sys.stderr)
