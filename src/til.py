@@ -899,7 +899,7 @@ class Parser:
                 statements.append(stmt)
             self.skip_newlines()
         
-        return Program(statements)
+        return Program(statements=statements)
     
     def parse_top_level(self) -> Optional[ASTNode]:
         self.skip_newlines()
@@ -1047,7 +1047,7 @@ class Parser:
         self.pending_attributes = []
         self.current_level = 2
         
-        return FuncDef(name, params, ret_type, body, level=level, attributes=attrs)
+        return FuncDef(name=name, params=params, ret_type=ret_type, body=body, level=level, attributes=attrs)
     
     def parse_params(self) -> List[FuncParam]:
         params = []
@@ -1168,7 +1168,7 @@ class Parser:
         if self.match(TokenType.DEDENT):
             self.advance()
         
-        return Block(statements)
+        return Block(statements=statements)
     
     def parse_brace_block(self) -> Block:
         self.consume(TokenType.LBRACE)
@@ -1185,7 +1185,7 @@ class Parser:
             self.skip_newlines()
         
         self.consume(TokenType.RBRACE)
-        return Block(statements)
+        return Block(statements=statements)
     
     def parse_statement(self) -> Optional[ASTNode]:
         self.skip_newlines()
@@ -1227,9 +1227,9 @@ class Parser:
                       TokenType.STAREQ, TokenType.SLASHEQ):
             op = self.advance().value
             value = self.parse_expression()
-            return Assignment(expr, value, op)
+            return Assignment(target=expr, value=value, op=op)
         
-        return ExprStmt(expr)
+        return ExprStmt(expr=expr)
     
     def parse_var_decl(self) -> VarDecl:
         is_const = self.match(TokenType.CONST)
@@ -1248,7 +1248,7 @@ class Parser:
             self.advance()
             value = self.parse_expression()
         
-        return VarDecl(name, type_ann, value, mutable=mutable, is_const=is_const)
+        return VarDecl(name=name, type_ann=type_ann, value=value, mutable=mutable, is_const=is_const)
     
     def parse_if(self) -> If:
         self.consume(TokenType.IF)
@@ -1290,7 +1290,7 @@ class Parser:
             else:
                 else_body = Block([self.parse_statement()])
         
-        return If(condition, then_body, elifs, else_body)
+        return If(condition=condition, then_body=then_body, elifs=elifs, else_body=else_body)
     
     def parse_for(self) -> For:
         self.consume(TokenType.FOR)
@@ -1306,7 +1306,7 @@ class Parser:
         else:
             body = Block([self.parse_statement()])
         
-        return For(var, iter_expr, body)
+        return For(var=var, iter=iter_expr, body=body)
     
     def parse_while(self) -> While:
         self.consume(TokenType.WHILE)
@@ -1320,7 +1320,7 @@ class Parser:
         else:
             body = Block([self.parse_statement()])
         
-        return While(condition, body)
+        return While(condition=condition, body=body)
     
     def parse_loop(self) -> Loop:
         self.consume(TokenType.LOOP)
@@ -1333,7 +1333,7 @@ class Parser:
         else:
             body = Block([self.parse_statement()])
         
-        return Loop(body)
+        return Loop(body=body)
     
     def parse_match(self) -> MatchExpr:
         self.consume(TokenType.MATCH)
@@ -1362,7 +1362,7 @@ class Parser:
         if self.match(TokenType.DEDENT):
             self.advance()
         
-        return MatchExpr(value, arms)
+        return MatchExpr(value=value, arms=arms)
     
     def parse_return(self) -> Return:
         self.consume(TokenType.RETURN)
@@ -1371,7 +1371,7 @@ class Parser:
         if not self.match(TokenType.NEWLINE, TokenType.DEDENT, TokenType.EOF, TokenType.RBRACE):
             value = self.parse_expression()
         
-        return Return(value)
+        return Return(value=value)
     
     def parse_struct(self) -> StructDef:
         self.consume(TokenType.STRUCT)
@@ -1406,7 +1406,7 @@ class Parser:
         if self.match(TokenType.DEDENT):
             self.advance()
         
-        return StructDef(name, fields)
+        return StructDef(name=name, fields=fields)
     
     def parse_enum(self) -> EnumDef:
         self.consume(TokenType.ENUM)
@@ -1440,7 +1440,7 @@ class Parser:
         if self.match(TokenType.DEDENT):
             self.advance()
         
-        return EnumDef(name, variants)
+        return EnumDef(name=name, variants=variants)
     
     def parse_impl(self) -> ImplBlock:
         self.consume(TokenType.IMPL)
@@ -1486,7 +1486,7 @@ class Parser:
         if self.match(TokenType.DEDENT):
             self.advance()
         
-        return ImplBlock(type_name, methods, trait_name)
+        return ImplBlock(type_name=type_name, methods=methods, trait_name=trait_name)
     
     def parse_trait(self) -> TraitDef:
         self.consume(TokenType.TRAIT)
@@ -1571,7 +1571,7 @@ class Parser:
         self.consume(TokenType.EQ)
         value = self.parse_expression()
         
-        return VarDecl(name, type_ann, value, mutable=False, is_const=True)
+        return VarDecl(name=name, type_ann=type_ann, value=value, mutable=False, is_const=True)
     
     # Expression parsing with precedence climbing
     def parse_expression(self) -> ASTNode:
@@ -1585,7 +1585,7 @@ class Parser:
             condition = self.parse_or()
             self.consume(TokenType.ELSE)
             else_expr = self.parse_ternary()
-            return IfExpr(condition, expr, else_expr)
+            return IfExpr(condition=condition, then_expr=expr, else_expr=else_expr)
         
         return expr
     
@@ -1594,7 +1594,7 @@ class Parser:
         while self.match(TokenType.OR):
             self.advance()
             right = self.parse_and()
-            left = BinaryOp("or", left, right)
+            left = BinaryOp(op="or", left=left, right=right)
         return left
     
     def parse_and(self) -> ASTNode:
@@ -1602,13 +1602,13 @@ class Parser:
         while self.match(TokenType.AND):
             self.advance()
             right = self.parse_not()
-            left = BinaryOp("and", left, right)
+            left = BinaryOp(op="and", left=left, right=right)
         return left
     
     def parse_not(self) -> ASTNode:
         if self.match(TokenType.NOT):
             self.advance()
-            return UnaryOp("not", self.parse_not())
+            return UnaryOp(op="not", operand=self.parse_not())
         return self.parse_comparison()
     
     def parse_comparison(self) -> ASTNode:
@@ -1618,7 +1618,7 @@ class Parser:
                         TokenType.GT, TokenType.LTE, TokenType.GTE):
             op = self.advance().value
             right = self.parse_bitwise_or()
-            left = BinaryOp(op, left, right)
+            left = BinaryOp(op=op, left=left, right=right)
         
         return left
     
@@ -1627,7 +1627,7 @@ class Parser:
         while self.match(TokenType.PIPE):
             self.advance()
             right = self.parse_bitwise_xor()
-            left = BinaryOp("|", left, right)
+            left = BinaryOp(op="|", left=left, right=right)
         return left
     
     def parse_bitwise_xor(self) -> ASTNode:
@@ -1635,7 +1635,7 @@ class Parser:
         while self.match(TokenType.CARET):
             self.advance()
             right = self.parse_bitwise_and()
-            left = BinaryOp("^", left, right)
+            left = BinaryOp(op="^", left=left, right=right)
         return left
     
     def parse_bitwise_and(self) -> ASTNode:
@@ -1643,7 +1643,7 @@ class Parser:
         while self.match(TokenType.AMP):
             self.advance()
             right = self.parse_shift()
-            left = BinaryOp("&", left, right)
+            left = BinaryOp(op="&", left=left, right=right)
         return left
     
     def parse_shift(self) -> ASTNode:
@@ -1651,7 +1651,7 @@ class Parser:
         while self.match(TokenType.SHL, TokenType.SHR):
             op = self.advance().value
             right = self.parse_range()
-            left = BinaryOp(op, left, right)
+            left = BinaryOp(op=op, left=left, right=right)
         return left
     
     def parse_range(self) -> ASTNode:
@@ -1661,7 +1661,7 @@ class Parser:
             inclusive = self.current().type == TokenType.RANGE_INCL
             self.advance()
             right = self.parse_additive()
-            return Range(left, right, inclusive)
+            return Range(start=left, end=right, inclusive=inclusive)
         
         return left
     
@@ -1671,7 +1671,7 @@ class Parser:
         while self.match(TokenType.PLUS, TokenType.MINUS):
             op = self.advance().value
             right = self.parse_multiplicative()
-            left = BinaryOp(op, left, right)
+            left = BinaryOp(op=op, left=left, right=right)
         
         return left
     
@@ -1681,7 +1681,7 @@ class Parser:
         while self.match(TokenType.STAR, TokenType.SLASH, TokenType.PERCENT):
             op = self.advance().value
             right = self.parse_power()
-            left = BinaryOp(op, left, right)
+            left = BinaryOp(op=op, left=left, right=right)
         
         return left
     
@@ -1691,27 +1691,27 @@ class Parser:
         if self.match(TokenType.POWER):
             self.advance()
             right = self.parse_power()  # Right associative
-            left = BinaryOp("**", left, right)
+            left = BinaryOp(op="**", left=left, right=right)
         
         return left
     
     def parse_unary(self) -> ASTNode:
         if self.match(TokenType.MINUS):
             self.advance()
-            return UnaryOp("-", self.parse_unary())
+            return UnaryOp(op="-", operand=self.parse_unary())
         if self.match(TokenType.TILDE):
             self.advance()
-            return UnaryOp("~", self.parse_unary())
+            return UnaryOp(op="~", operand=self.parse_unary())
         if self.match(TokenType.AMP):
             self.advance()
             mutable = False
             if self.match(TokenType.MUT):
                 self.advance()
                 mutable = True
-            return UnaryOp("&mut" if mutable else "&", self.parse_unary())
+            return UnaryOp(op="&mut" if mutable else "&", operand=self.parse_unary())
         if self.match(TokenType.STAR):
             self.advance()
-            return UnaryOp("*", self.parse_unary())
+            return UnaryOp(op="*", operand=self.parse_unary())
         
         return self.parse_postfix()
     
@@ -1730,20 +1730,20 @@ class Parser:
                             break
                         self.advance()
                 self.consume(TokenType.RPAREN)
-                expr = Call(expr, args)
+                expr = Call(func=expr, args=args)
             
             elif self.match(TokenType.LBRACKET):
                 # Index
                 self.advance()
                 index = self.parse_expression()
                 self.consume(TokenType.RBRACKET)
-                expr = Index(expr, index)
+                expr = Index(obj=expr, index=index)
             
             elif self.match(TokenType.DOT):
                 # Attribute access
                 self.advance()
                 attr = self.consume(TokenType.IDENT).value
-                expr = Attribute(expr, attr)
+                expr = Attribute(obj=expr, attr=attr)
             
             elif self.match(TokenType.QUESTION):
                 # Null check / unwrap
@@ -1758,23 +1758,23 @@ class Parser:
     def parse_primary(self) -> ASTNode:
         # Literals
         if self.match(TokenType.INT):
-            return IntLit(self.advance().value)
+            return IntLit(value=self.advance().value)
         
         if self.match(TokenType.FLOAT):
-            return FloatLit(self.advance().value)
+            return FloatLit(value=self.advance().value)
         
         if self.match(TokenType.STRING):
-            return StringLit(self.advance().value)
+            return StringLit(value=self.advance().value)
         
         if self.match(TokenType.BOOL):
-            return BoolLit(self.advance().value)
+            return BoolLit(value=self.advance().value)
         
         # Parenthesized expression or tuple
         if self.match(TokenType.LPAREN):
             self.advance()
             if self.match(TokenType.RPAREN):
                 self.advance()
-                return ArrayLit([])  # Empty tuple
+                return ArrayLit(elements=[])  # Empty tuple
             
             expr = self.parse_expression()
             
@@ -1787,7 +1787,7 @@ class Parser:
                         break
                     elements.append(self.parse_expression())
                 self.consume(TokenType.RPAREN)
-                return ArrayLit(elements)
+                return ArrayLit(elements=elements)
             
             self.consume(TokenType.RPAREN)
             return expr
@@ -1814,7 +1814,7 @@ class Parser:
                     
                     self.consume(TokenType.RBRACKET)
                     # Return as special comprehension node (simplified to array for now)
-                    return ArrayLit([first])  # TODO: Implement comprehension
+                    return ArrayLit(elements=[first])  # TODO: Implement comprehension
                 
                 elements.append(first)
                 while self.match(TokenType.COMMA):
@@ -1824,7 +1824,7 @@ class Parser:
                     elements.append(self.parse_expression())
             
             self.consume(TokenType.RBRACKET)
-            return ArrayLit(elements)
+            return ArrayLit(elements=elements)
         
         # Dict literal
         if self.match(TokenType.LBRACE):
@@ -1883,9 +1883,9 @@ class Parser:
                         self.advance()
                 
                 self.consume(TokenType.RBRACE)
-                return StructInit(name, fields)
+                return StructInit(name=name, fields=fields)
             
-            return Identifier(name)
+            return Identifier(name=name)
         
         self.error(f"Unexpected token: {self.current().type.name}")
 
