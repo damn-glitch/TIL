@@ -2873,6 +2873,22 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                 return 'bool'
             if isinstance(node.value, ArrayLit):
                 return self.infer_array_elem_type(node.value) + '*'
+            if isinstance(node.value, StructInit):
+                return node.value.name  # Return struct name as C type
+            if isinstance(node.value, Call):
+                # Check if it's a struct constructor call (Name.new or just Name_new pattern)
+                if isinstance(node.value.func, Attribute):
+                    struct_name = None
+                    if isinstance(node.value.func.obj, Identifier):
+                        struct_name = node.value.func.obj.name
+                    if struct_name and struct_name in self.structs:
+                        return struct_name
+                elif isinstance(node.value.func, Identifier):
+                    # Check for struct method call like Point_new
+                    func_name = node.value.func.name
+                    for struct_name in self.structs:
+                        if func_name == f"{struct_name}_new":
+                            return struct_name
         
         return 'int64_t'
     
