@@ -599,163 +599,163 @@ class ASTNode:
 # Expressions
 @dataclass
 class IntLit(ASTNode):
-    value: int
+    value: int = 0
     type: Type = field(default_factory=lambda: T_INT)
 
 @dataclass
 class FloatLit(ASTNode):
-    value: float
+    value: float = 0.0
     type: Type = field(default_factory=lambda: T_FLOAT)
 
 @dataclass
 class StringLit(ASTNode):
-    value: str
+    value: str = ""
     type: Type = field(default_factory=lambda: T_STR)
 
 @dataclass
 class BoolLit(ASTNode):
-    value: bool
+    value: bool = False
     type: Type = field(default_factory=lambda: T_BOOL)
 
 @dataclass
 class CharLit(ASTNode):
-    value: str
+    value: str = ""
     type: Type = field(default_factory=lambda: T_CHAR)
 
 @dataclass
 class Identifier(ASTNode):
-    name: str
+    name: str = ""
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class BinaryOp(ASTNode):
-    op: str
-    left: ASTNode
-    right: ASTNode
+    op: str = ""
+    left: ASTNode = None
+    right: ASTNode = None
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class UnaryOp(ASTNode):
-    op: str
-    operand: ASTNode
+    op: str = ""
+    operand: ASTNode = None
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class Call(ASTNode):
-    func: ASTNode
-    args: List[ASTNode]
+    func: ASTNode = None
+    args: List[ASTNode] = field(default_factory=list)
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class Index(ASTNode):
-    obj: ASTNode
-    index: ASTNode
+    obj: ASTNode = None
+    index: ASTNode = None
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class Attribute(ASTNode):
-    obj: ASTNode
-    attr: str
+    obj: ASTNode = None
+    attr: str = ""
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class ArrayLit(ASTNode):
-    elements: List[ASTNode]
+    elements: List[ASTNode] = field(default_factory=list)
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class DictLit(ASTNode):
-    pairs: List[Tuple[ASTNode, ASTNode]]
+    pairs: List[Tuple[ASTNode, ASTNode]] = field(default_factory=list)
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class Range(ASTNode):
-    start: ASTNode
-    end: ASTNode
+    start: ASTNode = None
+    end: ASTNode = None
     inclusive: bool = False
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class StructInit(ASTNode):
-    name: str
-    fields: Dict[str, ASTNode]
+    name: str = ""
+    fields: Dict[str, ASTNode] = field(default_factory=dict)
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class Lambda(ASTNode):
-    params: List[Tuple[str, Optional[Type]]]
-    body: ASTNode
+    params: List[Tuple[str, Optional[Type]]] = field(default_factory=list)
+    body: ASTNode = None
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class IfExpr(ASTNode):
-    condition: ASTNode
-    then_expr: ASTNode
-    else_expr: Optional[ASTNode]
+    condition: ASTNode = None
+    then_expr: ASTNode = None
+    else_expr: Optional[ASTNode] = None
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class MatchExpr(ASTNode):
-    value: ASTNode
-    arms: List[Tuple[ASTNode, ASTNode]]  # (pattern, expr)
+    value: ASTNode = None
+    arms: List[Tuple[ASTNode, ASTNode]] = field(default_factory=list)  # (pattern, expr)
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass 
 class Cast(ASTNode):
-    expr: ASTNode
-    target_type: Type
+    expr: ASTNode = None
+    target_type: Type = None
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
 class NullCheck(ASTNode):
     """expr? - unwrap optional or propagate null"""
-    expr: ASTNode
+    expr: ASTNode = None
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 # Statements
 @dataclass
 class Block(ASTNode):
-    statements: List[ASTNode]
+    statements: List[ASTNode] = field(default_factory=list)
 
 @dataclass
 class VarDecl(ASTNode):
-    name: str
-    type_ann: Optional[Type]
-    value: Optional[ASTNode]
+    name: str = ""
+    type_ann: Optional[Type] = None
+    value: Optional[ASTNode] = None
     mutable: bool = True
     is_const: bool = False
 
 @dataclass
 class Assignment(ASTNode):
-    target: ASTNode
-    value: ASTNode
+    target: ASTNode = None
+    value: ASTNode = None
     op: str = "="  # =, +=, -=, etc.
 
 @dataclass
 class If(ASTNode):
-    condition: ASTNode
-    then_body: ASTNode
-    elifs: List[Tuple[ASTNode, ASTNode]]  # [(condition, body), ...]
-    else_body: Optional[ASTNode]
+    condition: ASTNode = None
+    then_body: ASTNode = None
+    elifs: List[Tuple[ASTNode, ASTNode]] = field(default_factory=list)
+    else_body: Optional[ASTNode] = None
 
 @dataclass
 class For(ASTNode):
-    var: str
-    iter: ASTNode
-    body: ASTNode
+    var: str = ""
+    iter: ASTNode = None
+    body: ASTNode = None
 
 @dataclass
 class While(ASTNode):
-    condition: ASTNode
-    body: ASTNode
+    condition: ASTNode = None
+    body: ASTNode = None
 
 @dataclass
 class Loop(ASTNode):
-    body: ASTNode
+    body: ASTNode = None
 
 @dataclass
 class Return(ASTNode):
-    value: Optional[ASTNode]
+    value: Optional[ASTNode] = None
 
 @dataclass
 class Break(ASTNode):
@@ -767,7 +767,7 @@ class Continue(ASTNode):
 
 @dataclass
 class ExprStmt(ASTNode):
-    expr: ASTNode
+    expr: ASTNode = None
 
 # Definitions
 @dataclass
@@ -779,10 +779,10 @@ class FuncParam:
 
 @dataclass
 class FuncDef(ASTNode):
-    name: str
-    params: List[FuncParam]
-    ret_type: Type
-    body: ASTNode
+    name: str = ""
+    params: List[FuncParam] = field(default_factory=list)
+    ret_type: Type = None
+    body: ASTNode = None
     is_pub: bool = False
     level: int = 2  # Default to safe level
     attributes: List[str] = field(default_factory=list)
@@ -798,8 +798,8 @@ class StructField:
 
 @dataclass
 class StructDef(ASTNode):
-    name: str
-    fields: List[StructField]
+    name: str = ""
+    fields: List[StructField] = field(default_factory=list)
     methods: List[FuncDef] = field(default_factory=list)
     is_pub: bool = False
 
@@ -810,36 +810,36 @@ class EnumVariant:
 
 @dataclass
 class EnumDef(ASTNode):
-    name: str
-    variants: List[EnumVariant]
+    name: str = ""
+    variants: List[EnumVariant] = field(default_factory=list)
     is_pub: bool = False
 
 @dataclass
 class ImplBlock(ASTNode):
-    type_name: str
-    methods: List[FuncDef]
+    type_name: str = ""
+    methods: List[FuncDef] = field(default_factory=list)
     trait_name: Optional[str] = None
 
 @dataclass
 class TraitDef(ASTNode):
-    name: str
-    methods: List[FuncDef]
+    name: str = ""
+    methods: List[FuncDef] = field(default_factory=list)
     is_pub: bool = False
 
 @dataclass
 class Import(ASTNode):
-    module: str
+    module: str = ""
     items: Optional[List[str]] = None  # None means import all
     alias: Optional[str] = None
 
 @dataclass
 class TypeAlias(ASTNode):
-    name: str
-    type: Type
+    name: str = ""
+    type: Type = None
 
 @dataclass
 class Program(ASTNode):
-    statements: List[ASTNode]
+    statements: List[ASTNode] = field(default_factory=list)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                                  PARSER
