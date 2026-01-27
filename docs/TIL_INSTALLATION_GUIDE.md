@@ -127,7 +127,7 @@ clang --version
 Open terminal and run:
 
 ```bash
-curl -fsSL https://til-lang.vercel.app/install.sh | sh
+curl -fsSL https://til-dev.vercel.app/install.sh | sh
 ```
 
 This will:
@@ -141,7 +141,7 @@ This will:
 Open PowerShell as Administrator and run:
 
 ```powershell
-irm https://til-lang.vercel.app/install.ps1 | iex
+irm https://til-dev.vercel.app/install.ps1 | iex
 ```
 
 This will:
@@ -350,7 +350,7 @@ til --version
 
 ```bash
 # In WSL terminal, follow Linux instructions
-curl -fsSL https://til-lang.vercel.app/install.sh | sh
+curl -fsSL https://til-dev.vercel.app/install.sh | sh
 ```
 
 ---
@@ -997,7 +997,7 @@ til build program.til -c
 
 ### 11.3 Getting Help
 
-1. **Documentation**: https://til-lang.vercel.app/docs
+1. **Documentation**: https://til-dev.vercel.app/docs
 2. **GitHub Issues**: https://github.com/til-lang/til/issues
 3. **Discord**: https://discord.gg/til-lang
 4. **Stack Overflow**: Tag `til-lang`
@@ -1019,7 +1019,7 @@ Include in bug reports:
 
 ```bash
 # Method 1: Re-run installer
-curl -fsSL https://til-lang.vercel.app/install.sh | sh
+curl -fsSL https://til-dev.vercel.app/install.sh | sh
 
 # Method 2: Manual update
 curl -fsSL https://raw.githubusercontent.com/til-lang/til/main/til.py \
@@ -1033,7 +1033,7 @@ til --version
 
 ```powershell
 # Method 1: Re-run installer
-irm https://til-lang.vercel.app/install.ps1 | iex
+irm https://til-dev.vercel.app/install.ps1 | iex
 
 # Method 2: Manual update
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/til-lang/til/main/til.py" `
@@ -1262,7 +1262,7 @@ til --help                  # Show help
 
 ### Support
 
-- Website: https://til-lang.vercel.app
+- Website: https://til-dev.vercel.app
 - GitHub: https://github.com/til-lang/til
 - Discord: https://discord.gg/til-lang
 - Author: **Alisher Beisembekov**

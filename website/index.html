@@ -12,7 +12,7 @@
     <meta property="og:title" content="TIL - Mixed Martial Programming">
     <meta property="og:description" content="Simpler than Python. Faster than C. Smarter than all.">
     <meta property="og:type" content="website">
-    <meta property="og:url" content="https://til-lang.vercel.app">
+    <meta property="og:url" content="https://til-dev.vercel.app">
     
     <!-- Favicon -->
     <link rel="icon" type="image/svg+xml" href="/logo.svg">
@@ -725,7 +725,7 @@ main()
             </div>
             
             <div class="install-code">
-                <code id="install-cmd">curl -fsSL https://til-lang.vercel.app/install.sh | sh</code>
+                <code id="install-cmd">curl -fsSL https://til-dev.vercel.app/install.sh | sh</code>
             </div>
             
             <p style="text-align: center; margin-top: 2rem; color: var(--text-secondary);">
@@ -813,10 +813,10 @@ main()
             const cmd = document.getElementById('install-cmd');
             switch(os) {
                 case 'linux':
-                    cmd.textContent = 'curl -fsSL https://til-lang.vercel.app/install.sh | sh';
+                    cmd.textContent = 'curl -fsSL https://til-dev.vercel.app/install.sh | sh';
                     break;
                 case 'windows':
-                    cmd.textContent = 'irm https://til-lang.vercel.app/install.ps1 | iex';
+                    cmd.textContent = 'irm https://til-dev.vercel.app/install.ps1 | iex';
                     break;
                 case 'python':
                     cmd.textContent = 'pip install til-compiler && til --version';

@@ -1,6 +1,6 @@
 # TIL Language Installer for Windows
 # Author: Alisher Beisembekov
-# Usage: irm https://til-lang.vercel.app/install.ps1 | iex
+# Usage: irm https://til-dev.vercel.app/install.ps1 | iex
 
 $ErrorActionPreference = "Stop"
 
