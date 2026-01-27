@@ -26,10 +26,10 @@
 
 ```bash
 # Linux / macOS
-curl -fsSL https://til-lang.vercel.app/install.sh | sh
+curl -fsSL https://til-dev.vercel.app/install.sh | sh
 
 # Windows (PowerShell)
-irm https://til-lang.vercel.app/install.ps1 | iex
+irm https://til-dev.vercel.app/install.ps1 | iex
 
 # Or clone and run directly
 git clone https://github.com/til-lang/til.git
@@ -238,7 +238,7 @@ til/
 ├── scripts/
 │   ├── install.sh                # Linux/macOS installer
 │   └── install.ps1               # Windows installer
-├── website/                      # til-lang.vercel.app
+├── website/                      # til-dev.vercel.app
 ├── tests/                        # Test suite
 ├── LICENSE                       # MIT License
 └── README.md                     # This file
