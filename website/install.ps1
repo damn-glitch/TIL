@@ -52,7 +52,7 @@ New-Item -ItemType Directory -Force -Path $TIL_BIN | Out-Null
 
 # Download compiler
 Write-Host "Downloading TIL compiler..." -ForegroundColor Blue
-$compilerUrl = "https://raw.githubusercontent.com/til-lang/til/main/src/til.py"
+$compilerUrl = "https://raw.githubusercontent.com/damn-glitch/TIL/main/src/til.py"
 Invoke-WebRequest -Uri $compilerUrl -OutFile "$TIL_BIN\til.py"
 
 # Create batch wrapper
