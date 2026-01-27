@@ -1,0 +1,43 @@
+# TIL Language .gitignore
+# Author: Alisher Beisembekov
+
+# Compiled
+*.exe
+*.out
+*.o
+*.obj
+build/
+dist/
+
+# Generated C
+*.generated.c
+_til_*.c
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+venv/
+.env/
+
+# VS Code Extension
+node_modules/
+*.vsix
+editors/vscode/out/
+
+# IDEs
+.vscode/
+.idea/
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+*~
+
+# Temp
+*.tmp
+*.log
+*.temp

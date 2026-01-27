@@ -1,0 +1,57 @@
+# 02_variables.til
+# TIL v2.0 - Variables and Types
+# Author: Alisher Beisembekov
+#
+# Run: til run 02_variables.til
+
+main()
+    # Immutable (let)
+    let name = "TIL"
+    let version = 2
+    let pi = 3.14159
+    let active = true
+    
+    print("=== Immutable Variables ===")
+    print(name)
+    print(version)
+    print(pi)
+    print(active)
+    
+    # Mutable (var)
+    var counter = 0
+    print("")
+    print("=== Mutable Variables ===")
+    print(counter)
+    counter = counter + 1
+    print(counter)
+    counter += 10
+    print(counter)
+    
+    # Constants
+    const MAX = 100
+    const APP = "MyApp"
+    print("")
+    print("=== Constants ===")
+    print(MAX)
+    print(APP)
+    
+    # Explicit types
+    let x: int = 42
+    let y: float = 2.5
+    let s: str = "Hello"
+    print("")
+    print("=== Explicit Types ===")
+    print(x)
+    print(y)
+    print(s)
+    
+    # Type casting
+    let a = 10
+    let b = a as float
+    print("")
+    print("=== Type Casting ===")
+    print(b)
+    
+    let c = 3.9
+    let d = c as int
+    print(d)

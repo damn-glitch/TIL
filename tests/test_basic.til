@@ -1,0 +1,63 @@
+# tests/test_basic.til
+# TIL v2.0 - Basic Tests
+# Author: Alisher Beisembekov
+
+# Test 1: Hello World
+test_hello()
+    print("Test 1: Hello World - PASS")
+
+# Test 2: Variables
+test_variables()
+    let x = 42
+    var y = 10
+    y = y + 1
+    if x == 42 and y == 11
+        print("Test 2: Variables - PASS")
+    else
+        print("Test 2: Variables - FAIL")
+
+# Test 3: Functions
+add(a: int, b: int) -> int
+    return a + b
+
+test_functions()
+    let result = add(10, 20)
+    if result == 30
+        print("Test 3: Functions - PASS")
+    else
+        print("Test 3: Functions - FAIL")
+
+# Test 4: Structs
+struct Point
+    x: int
+    y: int
+
+test_structs()
+    let p = Point { x: 3, y: 4 }
+    if p.x == 3 and p.y == 4
+        print("Test 4: Structs - PASS")
+    else
+        print("Test 4: Structs - FAIL")
+
+# Test 5: Control Flow
+test_control_flow()
+    var sum = 0
+    for i in 0..5
+        sum = sum + i
+    if sum == 10
+        print("Test 5: Control Flow - PASS")
+    else
+        print("Test 5: Control Flow - FAIL")
+
+# Run all tests
+main()
+    print("TIL v2.0 - Test Suite")
+    print("Author: Alisher Beisembekov")
+    print("========================")
+    test_hello()
+    test_variables()
+    test_functions()
+    test_structs()
+    test_control_flow()
+    print("========================")
+    print("All tests completed!")

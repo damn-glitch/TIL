@@ -1,0 +1,68 @@
+# variables.til
+# TIL v2.0 - Variables and Types Example
+# Author: Alisher Beisembekov
+#
+# Demonstrates variable declarations, types, and basic operations.
+#
+# Run with: til run variables.til
+
+main()
+    # Immutable variables (cannot be reassigned)
+    let name = "TIL"
+    let version = 2
+    let pi = 3.14159
+    let is_awesome = true
+    
+    print("=== Immutable Variables ===")
+    print(name)
+    print(version)
+    print(pi)
+    print(is_awesome)
+    
+    # Mutable variables (can be reassigned)
+    var counter = 0
+    print("")
+    print("=== Mutable Variables ===")
+    print("Initial counter:")
+    print(counter)
+    
+    counter = counter + 1
+    print("After increment:")
+    print(counter)
+    
+    counter += 10
+    print("After += 10:")
+    print(counter)
+    
+    # Constants (compile-time)
+    const MAX_SIZE = 100
+    const APP_NAME = "My TIL App"
+    
+    print("")
+    print("=== Constants ===")
+    print(MAX_SIZE)
+    print(APP_NAME)
+    
+    # Type annotations
+    let explicit_int: int = 42
+    let explicit_float: float = 2.718
+    let explicit_str: str = "Hello"
+    
+    print("")
+    print("=== Explicit Types ===")
+    print(explicit_int)
+    print(explicit_float)
+    print(explicit_str)
+    
+    # Type casting
+    let a = 10
+    let b = a as float
+    print("")
+    print("=== Type Casting ===")
+    print("int to float:")
+    print(b)
+    
+    let c = 3.7
+    let d = c as int
+    print("float to int (truncates):")
+    print(d)

@@ -1,0 +1,99 @@
+# functions.til
+# TIL v2.0 - Functions Example
+# Author: Alisher Beisembekov
+#
+# Demonstrates function definitions, parameters, return values, and recursion.
+#
+# Run with: til run functions.til
+
+# Simple function with return value
+add(a: int, b: int) -> int
+    return a + b
+
+# Function without return value
+greet(name: str)
+    print("Hello, " + name + "!")
+
+# Function with default parameters
+power(base: int, exp: int = 2) -> int
+    var result = 1
+    for i in 0..exp
+        result = result * base
+    return result
+
+# Recursive function - Factorial
+factorial(n: int) -> int
+    if n <= 1
+        return 1
+    return n * factorial(n - 1)
+
+# Recursive function - Fibonacci
+fibonacci(n: int) -> int
+    if n <= 1
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+# Function with multiple calculations
+calculate_stats(a: int, b: int, c: int)
+    let sum = a + b + c
+    let product = a * b * c
+    let average = sum / 3
+    
+    print("Sum:")
+    print(sum)
+    print("Product:")
+    print(product)
+    print("Average:")
+    print(average)
+
+# Higher-order style (passing values)
+apply_twice(x: int) -> int
+    return x * 2 * 2
+
+# Early return example
+is_positive(n: int) -> bool
+    if n > 0
+        return true
+    return false
+
+main()
+    print("=== Basic Functions ===")
+    let sum = add(10, 20)
+    print("10 + 20 =")
+    print(sum)
+    
+    print("")
+    print("=== Greeting ===")
+    greet("World")
+    greet("TIL")
+    
+    print("")
+    print("=== Default Parameters ===")
+    print("power(3) = 3^2 =")
+    print(power(3))
+    print("power(2, 10) = 2^10 =")
+    print(power(2, 10))
+    
+    print("")
+    print("=== Factorial (Recursive) ===")
+    print("5! =")
+    print(factorial(5))
+    print("10! =")
+    print(factorial(10))
+    
+    print("")
+    print("=== Fibonacci (Recursive) ===")
+    print("First 10 Fibonacci numbers:")
+    for i in 0..10
+        print(fibonacci(i))
+    
+    print("")
+    print("=== Statistics ===")
+    calculate_stats(10, 20, 30)
+    
+    print("")
+    print("=== Boolean Return ===")
+    print("is_positive(5):")
+    print(is_positive(5))
+    print("is_positive(-3):")
+    print(is_positive(-3))

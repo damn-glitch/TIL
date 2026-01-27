@@ -1,0 +1,115 @@
+{
+  "name": "til-lang",
+  "displayName": "TIL Language",
+  "description": "TIL Programming Language support - syntax highlighting, snippets, and build commands",
+  "version": "1.0.0",
+  "publisher": "alisher-beisembekov",
+  "author": {
+    "name": "Alisher Beisembekov"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/til-lang/til"
+  },
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Snippets"
+  ],
+  "keywords": [
+    "til",
+    "programming language",
+    "compiler",
+    "multi-level"
+  ],
+  "icon": "images/til-logo.png",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:til"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "til",
+        "aliases": ["TIL", "til"],
+        "extensions": [".til"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "til",
+        "scopeName": "source.til",
+        "path": "./syntaxes/til.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "til",
+        "path": "./snippets/til.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "til.run",
+        "title": "TIL: Run Current File"
+      },
+      {
+        "command": "til.build",
+        "title": "TIL: Build Current File"
+      },
+      {
+        "command": "til.buildAndRun",
+        "title": "TIL: Build and Run"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "til.run",
+        "key": "f5",
+        "when": "editorLangId == til"
+      },
+      {
+        "command": "til.build",
+        "key": "f6",
+        "when": "editorLangId == til"
+      },
+      {
+        "command": "til.buildAndRun",
+        "key": "f7",
+        "when": "editorLangId == til"
+      }
+    ],
+    "configuration": {
+      "title": "TIL",
+      "properties": {
+        "til.compilerPath": {
+          "type": "string",
+          "default": "til",
+          "description": "Path to the TIL compiler"
+        },
+        "til.optimization": {
+          "type": "string",
+          "default": "-O2",
+          "enum": ["-O0", "-O1", "-O2", "-O3"],
+          "description": "Optimization level"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.74.0",
+    "typescript": "^5.0.0",
+    "vsce": "^2.15.0"
+  }
+}

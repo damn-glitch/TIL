@@ -1,0 +1,56 @@
+# 03_functions.til
+# TIL v2.0 - Functions
+# Author: Alisher Beisembekov
+#
+# Run: til run 03_functions.til
+
+# Basic function
+add(a: int, b: int) -> int
+    return a + b
+
+# No return value
+greet(name: str)
+    print("Hello, " + name + "!")
+
+# Default parameters
+power(base: int, exp: int = 2) -> int
+    var result = 1
+    for i in 0..exp
+        result = result * base
+    return result
+
+# Recursive
+factorial(n: int) -> int
+    if n <= 1
+        return 1
+    return n * factorial(n - 1)
+
+# Recursive Fibonacci
+fib(n: int) -> int
+    if n <= 1
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+main()
+    print("=== Basic Function ===")
+    print(add(10, 20))
+    
+    print("")
+    print("=== Greeting ===")
+    greet("World")
+    greet("TIL")
+    
+    print("")
+    print("=== Default Parameters ===")
+    print(power(3))
+    print(power(2, 10))
+    
+    print("")
+    print("=== Factorial ===")
+    print(factorial(5))
+    print(factorial(10))
+    
+    print("")
+    print("=== Fibonacci ===")
+    for i in 0..10
+        print(fib(i))

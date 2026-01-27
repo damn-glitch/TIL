@@ -1,0 +1,281 @@
+# multilevel.til
+# TIL v2.0 - Multi-Level Programming Example
+# Author: Alisher Beisembekov
+#
+# Demonstrates TIL's unique multi-level system:
+# - Level 0: Hardware (maximum performance)
+# - Level 1: Systems (C-like control)
+# - Level 2: Safe (default, balanced)
+# - Level 3: Script (maximum productivity)
+#
+# Run with: til run multilevel.til
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 0: HARDWARE
+# Maximum performance, always inlined, no safety checks
+# Use for: inner loops, SIMD, math kernels
+# ═══════════════════════════════════════════════════════════
+
+#[level: 0]
+#[inline]
+fast_add(a: float, b: float) -> float
+    return a + b
+
+#[level: 0]
+#[inline]
+fast_multiply(a: float, b: float) -> float
+    return a * b
+
+#[level: 0]
+fast_dot_product(x1: float, y1: float, x2: float, y2: float) -> float
+    return fast_add(fast_multiply(x1, x2), fast_multiply(y1, y2))
+
+#[level: 0]
+fast_distance(x1: float, y1: float, x2: float, y2: float) -> float
+    let dx = x2 - x1
+    let dy = y2 - y1
+    return sqrt(fast_add(fast_multiply(dx, dx), fast_multiply(dy, dy)))
+
+#[level: 0]
+fast_array_sum(arr: float[], n: int) -> float
+    var sum = 0.0
+    for i in 0..n
+        sum = fast_add(sum, arr[i])
+    return sum
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 1: SYSTEMS
+# C-like control, inline hints, manual optimization
+# Use for: performance-critical algorithms
+# ═══════════════════════════════════════════════════════════
+
+#[level: 1]
+factorial_iterative(n: int) -> int
+    var result = 1
+    for i in 2..=n
+        result = result * i
+    return result
+
+#[level: 1]
+fibonacci_iterative(n: int) -> int
+    if n <= 1
+        return n
+    
+    var a = 0
+    var b = 1
+    
+    for i in 2..=n
+        let temp = a + b
+        a = b
+        b = temp
+    
+    return b
+
+#[level: 1]
+binary_search(arr: int[], target: int, n: int) -> int
+    var low = 0
+    var high = n - 1
+    
+    while low <= high
+        let mid = (low + high) / 2
+        
+        if arr[mid] == target
+            return mid
+        elif arr[mid] < target
+            low = mid + 1
+        else
+            high = mid - 1
+    
+    return -1
+
+#[level: 1]
+is_prime(n: int) -> bool
+    if n <= 1
+        return false
+    if n <= 3
+        return true
+    if n % 2 == 0 or n % 3 == 0
+        return false
+    
+    var i = 5
+    while i * i <= n
+        if n % i == 0 or n % (i + 2) == 0
+            return false
+        i = i + 6
+    
+    return true
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 2: SAFE (DEFAULT)
+# Balanced performance and safety, bounds checking
+# Use for: most application code
+# ═══════════════════════════════════════════════════════════
+
+struct Vector2D
+    x: float
+    y: float
+
+impl Vector2D
+    new(x: float, y: float) -> Vector2D
+        return Vector2D { x: x, y: y }
+    
+    zero() -> Vector2D
+        return Vector2D { x: 0.0, y: 0.0 }
+    
+    # Uses Level 0 functions for performance
+    magnitude(self) -> float
+        return fast_distance(0.0, 0.0, self.x, self.y)
+    
+    dot(self, other: Vector2D) -> float
+        return fast_dot_product(self.x, self.y, other.x, other.y)
+    
+    add(self, other: Vector2D) -> Vector2D
+        return Vector2D.new(
+            fast_add(self.x, other.x),
+            fast_add(self.y, other.y)
+        )
+    
+    scale(self, factor: float) -> Vector2D
+        return Vector2D.new(
+            fast_multiply(self.x, factor),
+            fast_multiply(self.y, factor)
+        )
+    
+    normalize(self) -> Vector2D
+        let mag = self.magnitude()
+        if mag == 0.0
+            return Vector2D.zero()
+        return self.scale(1.0 / mag)
+
+struct Particle
+    position: Vector2D
+    velocity: Vector2D
+    mass: float
+
+impl Particle
+    new(x: float, y: float) -> Particle
+        return Particle {
+            position: Vector2D.new(x, y),
+            velocity: Vector2D.zero(),
+            mass: 1.0
+        }
+    
+    update(self, dt: float)
+        let movement = self.velocity.scale(dt)
+        self.position = self.position.add(movement)
+    
+    apply_force(self, fx: float, fy: float)
+        let acceleration = Vector2D.new(fx / self.mass, fy / self.mass)
+        self.velocity = self.velocity.add(acceleration)
+    
+    kinetic_energy(self) -> float
+        let v_squared = self.velocity.dot(self.velocity)
+        return fast_multiply(0.5, fast_multiply(self.mass, v_squared))
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 3: SCRIPT
+# Maximum productivity, minimal boilerplate
+# Use for: prototyping, scripts, glue code
+# ═══════════════════════════════════════════════════════════
+
+#[level: 3]
+print_header(title: str)
+    print("════════════════════════════════════════")
+    print(title)
+    print("════════════════════════════════════════")
+
+#[level: 3]
+demo_level_0()
+    print_header("LEVEL 0: Hardware Operations")
+    
+    let a = 3.0
+    let b = 4.0
+    
+    print("fast_add(3, 4) =")
+    print(fast_add(a, b))
+    
+    print("fast_multiply(3, 4) =")
+    print(fast_multiply(a, b))
+    
+    print("fast_dot_product(1,2, 3,4) =")
+    print(fast_dot_product(1.0, 2.0, 3.0, 4.0))
+    
+    print("fast_distance(0,0, 3,4) =")
+    print(fast_distance(0.0, 0.0, 3.0, 4.0))
+
+#[level: 3]
+demo_level_1()
+    print_header("LEVEL 1: Systems Operations")
+    
+    print("factorial(10) =")
+    print(factorial_iterative(10))
+    
+    print("fibonacci(20) =")
+    print(fibonacci_iterative(20))
+    
+    print("Primes up to 30:")
+    for n in 2..=30
+        if is_prime(n)
+            print(n)
+
+#[level: 3]
+demo_level_2()
+    print_header("LEVEL 2: Safe Structs & Methods")
+    
+    let v1 = Vector2D.new(3.0, 4.0)
+    let v2 = Vector2D.new(1.0, 2.0)
+    
+    print("v1 magnitude:")
+    print(v1.magnitude())
+    
+    print("v1 dot v2:")
+    print(v1.dot(v2))
+    
+    let v3 = v1.add(v2)
+    print("v1 + v2 = ")
+    print(v3.x)
+    print(v3.y)
+    
+    let normalized = v1.normalize()
+    print("v1 normalized:")
+    print(normalized.x)
+    print(normalized.y)
+    
+    print("")
+    print("Particle simulation:")
+    var particle = Particle.new(0.0, 0.0)
+    particle.apply_force(10.0, 5.0)
+    
+    for step in 0..5
+        particle.update(0.1)
+        print("Position:")
+        print(particle.position.x)
+        print(particle.position.y)
+
+#[level: 3]
+run_all_demos()
+    print("TIL v2.0 - Multi-Level Programming Demo")
+    print("Author: Alisher Beisembekov")
+    print("")
+    print("This demo shows all 4 levels working together!")
+    print("")
+    
+    demo_level_0()
+    print("")
+    
+    demo_level_1()
+    print("")
+    
+    demo_level_2()
+    print("")
+    
+    print_header("DEMO COMPLETE")
+    print("All levels work seamlessly together!")
+    print("Level 0 for speed, Level 2 for safety, Level 3 for ease.")
+
+# ═══════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════
+
+main()
+    run_all_demos()

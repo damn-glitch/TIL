@@ -1,0 +1,10 @@
+# 01_hello.til
+# TIL v2.0 - Hello World
+# Author: Alisher Beisembekov
+#
+# Run: til run 01_hello.til
+
+main()
+    print("Hello, World!")
+    print("Welcome to TIL!")
+    print("Проще Python. Быстрее C. Умнее всех.")

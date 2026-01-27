@@ -1,0 +1,10 @@
+# hello.til
+# TIL v2.0 - Hello World Example
+# Author: Alisher Beisembekov
+#
+# The simplest TIL program - prints "Hello, World!" to the console.
+#
+# Run with: til run hello.til
+
+main()
+    print("Hello, World!")

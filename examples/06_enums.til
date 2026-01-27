@@ -1,0 +1,55 @@
+# 06_enums.til
+# TIL v2.0 - Enumerations
+# Author: Alisher Beisembekov
+#
+# Run: til run 06_enums.til
+
+enum Color
+    Red
+    Green
+    Blue
+
+enum Direction
+    North = 0
+    East = 1
+    South = 2
+    West = 3
+
+enum HttpStatus
+    OK = 200
+    NotFound = 404
+    ServerError = 500
+
+get_status_text(status: HttpStatus) -> str
+    if status == HttpStatus.OK
+        return "Success"
+    elif status == HttpStatus.NotFound
+        return "Not Found"
+    else
+        return "Error"
+
+main()
+    print("=== Basic Enum ===")
+    let color = Color.Red
+    if color == Color.Red
+        print("It's red!")
+    
+    print("")
+    print("=== Enum with Values ===")
+    print("Direction North:")
+    print(Direction.North)
+    print("Direction East:")
+    print(Direction.East)
+    
+    print("")
+    print("=== HTTP Status ===")
+    print("OK status code:")
+    print(HttpStatus.OK)
+    print("NotFound status code:")
+    print(HttpStatus.NotFound)
+    
+    print("")
+    print("=== Status Text ===")
+    print(get_status_text(HttpStatus.OK))
+    print(get_status_text(HttpStatus.NotFound))
+    print(get_status_text(HttpStatus.ServerError))

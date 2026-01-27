@@ -1,0 +1,81 @@
+# 04_structs.til
+# TIL v2.0 - Structs and Methods
+# Author: Alisher Beisembekov
+#
+# Run: til run 04_structs.til
+
+struct Point
+    x: float
+    y: float
+
+impl Point
+    new(x: float, y: float) -> Point
+        return Point { x: x, y: y }
+    
+    origin() -> Point
+        return Point { x: 0.0, y: 0.0 }
+    
+    distance(self) -> float
+        return sqrt(self.x ** 2 + self.y ** 2)
+    
+    add(self, other: Point) -> Point
+        return Point.new(self.x + other.x, self.y + other.y)
+    
+    scale(self, factor: float) -> Point
+        return Point.new(self.x * factor, self.y * factor)
+
+struct Rectangle
+    width: float
+    height: float
+
+impl Rectangle
+    new(w: float, h: float) -> Rectangle
+        return Rectangle { width: w, height: h }
+    
+    area(self) -> float
+        return self.width * self.height
+    
+    perimeter(self) -> float
+        return 2.0 * (self.width + self.height)
+
+struct Person
+    name: str
+    age: int
+
+impl Person
+    new(name: str, age: int) -> Person
+        return Person { name: name, age: age }
+    
+    greet(self)
+        print("Hi, I'm " + self.name)
+    
+    is_adult(self) -> bool
+        return self.age >= 18
+
+main()
+    print("=== Point ===")
+    let p1 = Point.new(3.0, 4.0)
+    let p2 = Point.new(1.0, 2.0)
+    
+    print("P1 distance:")
+    print(p1.distance())
+    
+    let p3 = p1.add(p2)
+    print("P1 + P2:")
+    print(p3.x)
+    print(p3.y)
+    
+    print("")
+    print("=== Rectangle ===")
+    let rect = Rectangle.new(10.0, 5.0)
+    print("Area:")
+    print(rect.area())
+    print("Perimeter:")
+    print(rect.perimeter())
+    
+    print("")
+    print("=== Person ===")
+    let alice = Person.new("Alice", 25)
+    alice.greet()
+    print("Is adult:")
+    print(alice.is_adult())

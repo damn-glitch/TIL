@@ -1,0 +1,87 @@
+%YAML 1.2
+---
+# TIL Syntax for Sublime Text
+# Author: Alisher Beisembekov
+name: TIL
+file_extensions: [til]
+scope: source.til
+
+contexts:
+  main:
+    # Comments
+    - match: '#(?!\[).*$'
+      scope: comment.line.til
+
+    # Attributes
+    - match: '#\[[^\]]*\]'
+      scope: entity.other.attribute-name.til
+
+    # Strings
+    - match: '"'
+      push: double_string
+    - match: "'"
+      push: single_string
+
+    # Numbers
+    - match: '\b0[xX][0-9a-fA-F_]+\b'
+      scope: constant.numeric.hex.til
+    - match: '\b0[bB][01_]+\b'
+      scope: constant.numeric.binary.til
+    - match: '\b[0-9][0-9_]*\.[0-9_]+([eE][+-]?[0-9_]+)?\b'
+      scope: constant.numeric.float.til
+    - match: '\b[0-9][0-9_]*\b'
+      scope: constant.numeric.integer.til
+
+    # Keywords
+    - match: '\b(if|else|elif|for|while|loop|match|in|return|break|continue)\b'
+      scope: keyword.control.til
+    - match: '\b(fn|let|var|const|mut|struct|enum|impl|trait|type|pub)\b'
+      scope: keyword.declaration.til
+    - match: '\b(and|or|not)\b'
+      scope: keyword.operator.logical.til
+    - match: '\b(as|import|from)\b'
+      scope: keyword.other.til
+    - match: '\b(self)\b'
+      scope: variable.language.til
+
+    # Types
+    - match: '\b(int|float|str|bool|char|void|i8|i16|i32|i64|u8|u16|u32|u64|f32|f64)\b'
+      scope: storage.type.til
+
+    # Constants
+    - match: '\b(true|false|True|False)\b'
+      scope: constant.language.boolean.til
+    - match: '\b(None)\b'
+      scope: constant.language.null.til
+
+    # Built-ins
+    - match: '\b(print|input|sqrt|abs|pow|sin|cos|tan|log|exp|floor|ceil|round|min|max|len)\b'
+      scope: support.function.builtin.til
+
+    # Type names (PascalCase)
+    - match: '\b[A-Z][a-zA-Z0-9_]*\b'
+      scope: entity.name.type.til
+
+    # Operators
+    - match: '->|=>'
+      scope: keyword.operator.arrow.til
+    - match: '==|!=|<=|>=|<|>'
+      scope: keyword.operator.comparison.til
+    - match: '\.\.\.'
+      scope: keyword.operator.range.til
+    - match: '\.\.'
+      scope: keyword.operator.range.til
+
+  double_string:
+    - meta_scope: string.quoted.double.til
+    - match: '\\.'
+      scope: constant.character.escape.til
+    - match: '"'
+      pop: true
+
+  single_string:
+    - meta_scope: string.quoted.single.til
+    - match: '\\.'
+      scope: constant.character.escape.til
+    - match: "'"
+      pop: true

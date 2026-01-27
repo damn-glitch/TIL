@@ -1,0 +1,60 @@
+# TIL Language CI/CD
+# Author: Alisher Beisembekov
+
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install GCC
+        run: sudo apt-get update && sudo apt-get install -y gcc
+      
+      - name: Run tests
+        run: |
+          python src/til.py --version
+          python src/til.py run examples/01_hello.til
+          python src/til.py run tests/test_basic.til
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Run tests
+        run: |
+          python src/til.py --version
+          python src/til.py run examples/01_hello.til
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Run tests
+        run: |
+          python src/til.py --version
+          python src/til.py run examples/01_hello.til
