@@ -1,8 +1,8 @@
 {
   "name": "til-lang",
   "displayName": "TIL Language",
-  "description": "TIL Programming Language support - syntax highlighting and snippets. Simpler than Python. Faster than C.",
-  "version": "1.0.0",
+  "description": "TIL Programming Language - syntax highlighting, run, build, and check support. Simpler than Python. Faster than C.",
+  "version": "1.1.0",
   "publisher": "alisher-beisembekov",
   "icon": "images/til-logo.png",
   "galleryBanner": {
@@ -14,21 +14,39 @@
     "type": "git",
     "url": "https://github.com/damn-glitch/TIL"
   },
+  "bugs": {
+    "url": "https://github.com/damn-glitch/TIL/issues"
+  },
   "engines": {
     "vscode": "^1.74.0"
   },
   "categories": [
     "Programming Languages",
-    "Snippets"
+    "Snippets",
+    "Other"
   ],
-  "keywords": ["til", "programming language"],
+  "keywords": [
+    "til",
+    "programming language",
+    "compiler",
+    "multi-level",
+    "systems programming"
+  ],
+  "activationEvents": [
+    "onLanguage:til"
+  ],
+  "main": "./src/extension.js",
   "contributes": {
     "languages": [
       {
         "id": "til",
         "aliases": ["TIL", "til"],
         "extensions": [".til"],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./images/til-logo.png",
+          "dark": "./images/til-logo.png"
+        }
       }
     ],
     "grammars": [
@@ -43,6 +61,105 @@
         "language": "til",
         "path": "./snippets/til.json"
       }
-    ]
+    ],
+    "commands": [
+      {
+        "command": "til.run",
+        "title": "TIL: Run File",
+        "icon": "$(play)"
+      },
+      {
+        "command": "til.build",
+        "title": "TIL: Build File",
+        "icon": "$(tools)"
+      },
+      {
+        "command": "til.check",
+        "title": "TIL: Check Syntax",
+        "icon": "$(check)"
+      },
+      {
+        "command": "til.runInTerminal",
+        "title": "TIL: Run in Terminal",
+        "icon": "$(terminal)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "til.run",
+        "key": "f5",
+        "when": "editorLangId == til && !inDebugMode"
+      },
+      {
+        "command": "til.build",
+        "key": "f6",
+        "when": "editorLangId == til"
+      },
+      {
+        "command": "til.check",
+        "key": "f7",
+        "when": "editorLangId == til"
+      },
+      {
+        "command": "til.runInTerminal",
+        "key": "ctrl+f5",
+        "when": "editorLangId == til"
+      }
+    ],
+    "menus": {
+      "editor/title/run": [
+        {
+          "command": "til.run",
+          "when": "editorLangId == til",
+          "group": "navigation@1"
+        },
+        {
+          "command": "til.runInTerminal",
+          "when": "editorLangId == til",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "til.run",
+          "when": "editorLangId == til",
+          "group": "til@1"
+        },
+        {
+          "command": "til.build",
+          "when": "editorLangId == til",
+          "group": "til@2"
+        },
+        {
+          "command": "til.check",
+          "when": "editorLangId == til",
+          "group": "til@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "TIL",
+      "properties": {
+        "til.compilerPath": {
+          "type": "string",
+          "default": "til",
+          "description": "Path to the TIL compiler"
+        },
+        "til.optimization": {
+          "type": "string",
+          "default": "-O2",
+          "enum": ["-O0", "-O1", "-O2", "-O3"],
+          "description": "Optimization level for builds"
+        },
+        "til.runInTerminal": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run TIL files in integrated terminal instead of output panel"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "vsce package"
   }
 }

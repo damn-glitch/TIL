@@ -7,28 +7,12 @@
 ## Features
 
 - 🎨 **Syntax Highlighting** - Full support for TIL syntax
+- ▶️ **Run (F5)** - Run TIL files directly
+- 🔨 **Build (F6)** - Compile to executable
+- ✓ **Check (F7)** - Syntax checking
 - ⚡ **Code Snippets** - Quick templates for common patterns
-- 🔨 **Build Commands** - Compile and run with keyboard shortcuts
+- 🔴 **Error Highlighting** - Inline error diagnostics
 - 📝 **Language Configuration** - Auto-closing brackets, comments, indentation
-
-## Installation
-
-1. Install from VS Code Marketplace (search "TIL Language")
-2. Or download `.vsix` from [GitHub Releases](https://github.com/damn-glitch/TIL/releases)
-
-## Requirements
-
-- **Python 3.8+** - For the TIL compiler
-- **GCC/Clang** - For C compilation
-
-Install TIL compiler:
-```bash
-# Linux/macOS
-curl -fsSL https://til-dev.vercel.app/install.sh | sh
-
-# Windows (PowerShell)
-irm https://til-dev.vercel.app/install.ps1 | iex
-```
 
 ## Keyboard Shortcuts
 
@@ -36,7 +20,34 @@ irm https://til-dev.vercel.app/install.ps1 | iex
 |----------|---------|
 | `F5` | Run current file |
 | `F6` | Build current file |
-| `F7` | Build and run |
+| `F7` | Check syntax |
+| `Ctrl+F5` | Run in terminal |
+
+## Right-Click Menu
+
+Right-click in a `.til` file to see:
+- TIL: Run File
+- TIL: Build File
+- TIL: Check Syntax
+
+## Requirements
+
+- **TIL Compiler** - Install from https://til-dev.vercel.app
+
+```bash
+# Windows (PowerShell)
+irm https://til-dev.vercel.app/install.ps1 | iex
+
+# Linux/macOS
+curl -fsSL https://til-dev.vercel.app/install.sh | sh
+```
+
+## Settings
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `til.compilerPath` | Path to TIL compiler | `til` |
+| `til.optimization` | Optimization level | `-O2` |
 
 ## Snippets
 
@@ -65,6 +76,8 @@ main()
     let p = Point { x: 3.0, y: 4.0 }
     print(p.distance())  # 5.0
 ```
+
+Press **F5** to run!
 
 ## Links
 
