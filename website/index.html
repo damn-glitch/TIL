@@ -332,6 +332,34 @@
             font-size: 0.9rem;
         }
         
+        /* Patent */
+        .patent {
+            padding: 6rem 2rem;
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        
+        .patent-container {
+            text-align: center;
+        }
+        
+        .patent-viewer {
+            margin: 2rem 0;
+            background: var(--bg-secondary);
+            border-radius: 16px;
+            padding: 1rem;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        
+        .patent-viewer object,
+        .patent-viewer iframe {
+            border-radius: 12px;
+        }
+        
+        .patent-download {
+            margin-top: 1.5rem;
+        }
+        
         /* Playground */
         .playground {
             padding: 6rem 2rem;
@@ -549,9 +577,10 @@
         <ul class="nav-links">
             <li><a href="#features">Features</a></li>
             <li><a href="#levels">Levels</a></li>
+            <li><a href="#patent">Patent</a></li>
             <li><a href="#playground">Playground</a></li>
             <li><a href="#install">Install</a></li>
-            <li><a href="https://github.com/til-lang/til" target="_blank">GitHub</a></li>
+            <li><a href="https://github.com/damn-glitch/TIL" target="_blank">GitHub</a></li>
         </ul>
         
         <a href="#install" class="nav-cta">Get Started</a>
@@ -573,7 +602,7 @@
                 <a href="#install" class="btn btn-secondary">
                     ↓ Download
                 </a>
-                <a href="https://github.com/til-lang/til" class="btn btn-secondary" target="_blank">
+                <a href="https://github.com/damn-glitch/TIL" class="btn btn-secondary" target="_blank">
                     ★ GitHub
                 </a>
             </div>
@@ -617,9 +646,9 @@
             </div>
             
             <div class="feature-card">
-                <div class="feature-icon">🔧</div>
-                <h3>C Interop</h3>
-                <p>View generated C code, integrate with existing C libraries, understand what happens.</p>
+                <div class="feature-icon">🌍</div>
+                <h3>Multilingual Syntax</h3>
+                <p>Code in English, Russian, or Kazakh. Programming without language barriers.</p>
             </div>
         </div>
     </section>
@@ -654,6 +683,39 @@
                     <h3>Script</h3>
                     <p>Python-like productivity. Dynamic features, minimal boilerplate. For rapid prototyping.</p>
                 </div>
+            </div>
+        </div>
+    </section>
+    
+    <!-- Patent -->
+    <section class="patent" id="patent">
+        <div class="patent-container">
+            <h2 class="section-title">Patented Technology</h2>
+            <p class="section-subtitle">Patent № 66853 — Republic of Kazakhstan</p>
+            
+            <div class="patent-viewer">
+                <object
+                    data="https://raw.githubusercontent.com/damn-glitch/TIL/main/TIL%20patent.pdf"
+                    type="application/pdf"
+                    width="100%"
+                    height="600px"
+                >
+                    <!-- Fallback if native doesn't work -->
+                    <iframe
+                        src="https://docs.google.com/viewer?url=https://raw.githubusercontent.com/damn-glitch/TIL/main/TIL%20patent.pdf&embedded=true"
+                        width="100%"
+                        height="600px"
+                        style="border: none;"
+                    ></iframe>
+                </object>
+            </div>
+            
+            <div class="patent-download">
+                <a href="https://raw.githubusercontent.com/damn-glitch/TIL/main/TIL%20patent.pdf" 
+                   target="_blank" 
+                   class="btn btn-secondary">
+                    📥 Download Patent (PDF)
+                </a>
             </div>
         </div>
     </section>
@@ -735,7 +797,7 @@ main()
             </div>
             
             <p style="text-align: center; margin-top: 2rem; color: var(--text-secondary);">
-                Or download directly from <a href="https://github.com/til-lang/til/releases" style="color: var(--accent);">GitHub Releases</a>
+                Or download directly from <a href="https://github.com/damn-glitch/TIL/releases" style="color: var(--accent);">GitHub Releases</a>
             </p>
         </div>
     </section>
@@ -743,14 +805,13 @@ main()
     <!-- Footer -->
     <footer>
         <div class="footer-links">
-            <a href="https://github.com/til-lang/til">GitHub</a>
-            <a href="https://github.com/til-lang/til/blob/main/docs/README.md">Documentation</a>
-            <a href="https://discord.gg/til-lang">Discord</a>
-            <a href="https://twitter.com/til_lang">Twitter</a>
+            <a href="https://github.com/damn-glitch/TIL">GitHub</a>
+            <a href="https://github.com/damn-glitch/TIL/blob/main/docs/README.md">Documentation</a>
+            <a href="https://marketplace.visualstudio.com/items?itemName=alisher-beisembekov.til-lang">VS Code Extension</a>
         </div>
         <p class="copyright">
             Created by <strong>Alisher Beisembekov</strong><br>
-            © 2025 TIL Language. MIT License.
+            © 2026 TIL Language. BSL 1.1 License. Patent № 66853.
         </p>
     </footer>
     
