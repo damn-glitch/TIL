@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-TIL v2.0 - The Intelligent Language
+TIL v1.5 - The Intelligent Language
 ====================================
 Complete Multi-Level Programming Language
 
 Author: Alisher Beisembekov
-Version: 2.0.0
+Version: 1.5.0
 
 "Проще Python. Быстрее C. Умнее всех."
 (Simpler than Python. Faster than C. Smarter than all.)
@@ -2601,7 +2601,7 @@ class CCodeGenerator:
         return '\n'.join(self.output)
     
     def emit_header(self):
-        self.emit_raw("// TIL v2.0 - Generated C Code")
+        self.emit_raw("// TIL v1.5 - Generated C Code")
         self.emit_raw("// Author: Alisher Beisembekov")
         self.emit_raw("// Multi-Level Programming: Mixed Martial Programming")
         self.emit_raw("")
@@ -4252,7 +4252,7 @@ class TILCompiler:
 
 def print_help():
     print("""
-TIL v2.0 Compiler - The Intelligent Language
+TIL v1.5 Compiler - The Intelligent Language
 Author: Alisher Beisembekov
 
 Usage: til [options] <input.til>
@@ -4290,7 +4290,7 @@ def main():
         return 0
     
     if '--version' in args:
-        print("TIL Compiler v2.0.0")
+        print("TIL Compiler v1.5.0")
         print("Author: Alisher Beisembekov")
         print("Multi-Level Programming: Mixed Martial Programming")
         return 0
