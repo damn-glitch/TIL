@@ -32,6 +32,112 @@ from enum import Enum, auto
 from abc import ABC, abstractmethod
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#                              ERROR REPORTING
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ErrorReporter:
+    """Beautiful error messages with source context and hints."""
+
+    # ANSI colors (used when output is a tty)
+    RESET = "\033[0m"
+    RED = "\033[31m"
+    YELLOW = "\033[33m"
+    CYAN = "\033[36m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+
+    def __init__(self, source: str = "", filename: str = "<stdin>", use_color: bool = True):
+        self.source = source
+        self.filename = filename
+        self.lines = source.split('\n') if source else []
+        self.use_color = use_color and sys.stderr.isatty()
+
+    def _c(self, code: str, text: str) -> str:
+        """Wrap text in ANSI color if color is enabled."""
+        if self.use_color:
+            return f"{code}{text}{self.RESET}"
+        return text
+
+    def format_error(self, line: int, col: int, msg: str,
+                     error_code: str = "", hint: str = "") -> str:
+        """Format a beautiful error message with source context."""
+        parts = []
+
+        # Error header
+        code_str = f"[{error_code}] " if error_code else ""
+        parts.append(self._c(self.BOLD + self.RED, f"error{code_str}: {msg}"))
+
+        # Location
+        parts.append(self._c(self.CYAN, f" --> {self.filename}:{line}:{col}"))
+
+        # Source context
+        if 1 <= line <= len(self.lines):
+            line_num_width = len(str(line + 1))
+            pad = " " * line_num_width
+
+            # Line before (context)
+            if line >= 2:
+                prev = self.lines[line - 2]
+                parts.append(self._c(self.DIM, f"  {line-1:>{line_num_width}} | {prev}"))
+
+            # Error line
+            error_line = self.lines[line - 1]
+            parts.append(f"  {self._c(self.CYAN, f'{line:>{line_num_width}}')} | {error_line}")
+
+            # Pointer
+            pointer = " " * max(0, col - 1) + "^"
+            parts.append(f"  {pad} | {self._c(self.RED, pointer)}")
+
+            # Line after (context)
+            if line < len(self.lines):
+                nxt = self.lines[line]
+                parts.append(self._c(self.DIM, f"  {line+1:>{line_num_width}} | {nxt}"))
+
+        # Hint
+        if hint:
+            parts.append(self._c(self.YELLOW, f"  = hint: {hint}"))
+
+        return "\n".join(parts)
+
+    def format_warning(self, line: int, col: int, msg: str, hint: str = "") -> str:
+        """Format a warning message."""
+        parts = []
+        parts.append(self._c(self.BOLD + self.YELLOW, f"warning: {msg}"))
+        parts.append(self._c(self.CYAN, f" --> {self.filename}:{line}:{col}"))
+
+        if 1 <= line <= len(self.lines):
+            error_line = self.lines[line - 1]
+            line_num_width = len(str(line))
+            parts.append(f"  {self._c(self.CYAN, f'{line:>{line_num_width}}')} | {error_line}")
+            pointer = " " * max(0, col - 1) + "^"
+            parts.append(f"  {' ' * line_num_width} | {self._c(self.YELLOW, pointer)}")
+
+        if hint:
+            parts.append(self._c(self.YELLOW, f"  = hint: {hint}"))
+
+        return "\n".join(parts)
+
+
+# Common error hints
+ERROR_HINTS = {
+    "Expected IDENT": "Variable or function name expected here",
+    "Expected RPAREN": "Missing closing parenthesis ')'",
+    "Expected RBRACKET": "Missing closing bracket ']'",
+    "Expected RBRACE": "Missing closing brace '}'",
+    "Expected INDENT": "Expected an indented block (use 4 spaces)",
+    "Unexpected token: NEWLINE": "Unexpected end of line. Check for missing operators or parentheses",
+    "Unexpected character": "This character is not valid in TIL",
+}
+
+def get_hint_for_error(msg: str) -> str:
+    """Get a helpful hint for a given error message."""
+    for pattern, hint in ERROR_HINTS.items():
+        if pattern in msg:
+            return hint
+    return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #                                  TOKENS
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -176,9 +282,12 @@ class Lexer:
         self.indent_stack = [0]
         self.at_line_start = True
         self.paren_depth = 0  # Track () [] {} depth to suppress NEWLINE inside
-        
+        self.error_reporter = ErrorReporter(source, filename)
+
     def error(self, msg: str):
-        raise SyntaxError(f"{self.filename}:{self.line}:{self.col}: {msg}")
+        hint = get_hint_for_error(msg)
+        formatted = self.error_reporter.format_error(self.line, self.col, msg, hint=hint)
+        raise SyntaxError(formatted)
     
     def current(self) -> str:
         return self.source[self.pos] if self.pos < len(self.source) else '\0'
@@ -724,6 +833,15 @@ class NullCheck(ASTNode):
     expr: ASTNode = None
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
+@dataclass
+class ListComprehension(ASTNode):
+    """[expr for var in iter if condition]"""
+    expr: ASTNode = None
+    var: str = ""
+    iter: ASTNode = None
+    condition: Optional[ASTNode] = None
+    type: Type = field(default_factory=lambda: T_UNKNOWN)
+
 # Statements
 @dataclass
 class Block(ASTNode):
@@ -859,16 +977,19 @@ class Program(ASTNode):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Parser:
-    def __init__(self, tokens: List[Token], filename: str = "<stdin>"):
+    def __init__(self, tokens: List[Token], filename: str = "<stdin>", source: str = ""):
         self.tokens = tokens
         self.filename = filename
         self.pos = 0
         self.current_level = 2  # Default level
         self.pending_attributes: List[str] = []
-    
+        self.error_reporter = ErrorReporter(source, filename)
+
     def error(self, msg: str):
         tok = self.current()
-        raise SyntaxError(f"{self.filename}:{tok.line}:{tok.col}: {msg}")
+        hint = get_hint_for_error(msg)
+        formatted = self.error_reporter.format_error(tok.line, tok.col, msg, hint=hint)
+        raise SyntaxError(formatted)
     
     def current(self) -> Token:
         if self.pos < len(self.tokens):
@@ -1833,21 +1954,21 @@ class Parser:
             if not self.match(TokenType.RBRACKET):
                 first = self.parse_expression()
                 
-                # Check for list comprehension: [expr for x in iter]
+                # Check for list comprehension: [expr for x in iter if cond]
                 if self.match(TokenType.FOR):
                     self.advance()
                     var = self.consume(TokenType.IDENT).value
                     self.consume(TokenType.IN)
-                    iter_expr = self.parse_expression()
-                    
+                    # Parse only non-ternary expression for iter to avoid consuming 'if'
+                    iter_expr = self.parse_or()
+
                     condition = None
                     if self.match(TokenType.IF):
                         self.advance()
-                        condition = self.parse_expression()
-                    
+                        condition = self.parse_or()
+
                     self.consume(TokenType.RBRACKET)
-                    # Return as special comprehension node (simplified to array for now)
-                    return ArrayLit(elements=[first])  # TODO: Implement comprehension
+                    return ListComprehension(expr=first, var=var, iter=iter_expr, condition=condition)
                 
                 elements.append(first)
                 while self.match(TokenType.COMMA):
@@ -1894,7 +2015,7 @@ class Parser:
                     self.advance()
             self.consume(TokenType.PIPE)
             body = self.parse_expression()
-            return Lambda(params, body)
+            return Lambda(params=params, body=body)
         
         # Self keyword (used in method bodies)
         if self.match(TokenType.SELF):
@@ -2284,14 +2405,24 @@ class CCodeGenerator:
             for method in methods:
                 self._func_ret_types[f"{type_name}_{method.name}"] = self.type_to_c(method.ret_type)
 
+        # Initialize lambda storage
+        self._lambda_defs = []
+        self._lambda_counter = 0
+
         # Generate code
         self.emit_header()
         self.emit_types()
         self.emit_enums()
         self.emit_forward_declarations()
         self.emit_helpers()
+        self.emit_lambdas()  # emit lambda defs collected from first pass (may be empty)
         self.emit_structs()
         self.emit_functions(program)
+        # Emit any lambdas created during code generation
+        if self._lambda_defs:
+            # Lambdas need to be before the functions that use them
+            # Re-insert them before the functions section
+            self._fixup_lambdas()
         self.emit_main_wrapper()
         
         return '\n'.join(self.output)
@@ -2330,6 +2461,24 @@ class CCodeGenerator:
                     self.emit_raw(f"    {name}_{variant.name} = {i}{suffix}")
             self.emit_raw(f"}} {name};")
             self.emit_raw("")
+
+    def emit_lambdas(self):
+        """Emit lambda function definitions (placeholder, filled during codegen)."""
+        pass
+
+    def _fixup_lambdas(self):
+        """Insert lambda definitions before the TIL Functions section."""
+        if not self._lambda_defs:
+            return
+        # Find the "// TIL Functions" marker and insert lambdas before it
+        marker = "// TIL Functions"
+        for i, line in enumerate(self.output):
+            if line.strip() == marker:
+                insert_lines = ["// Lambda Functions"]
+                insert_lines.extend(self._lambda_defs)
+                insert_lines.append("")
+                self.output[i:i] = insert_lines
+                break
 
     def emit_forward_declarations(self):
         self.emit_raw("// Forward Declarations")
@@ -2407,6 +2556,87 @@ static char* til_str_concat(const char* a, const char* b) {
 
 static bool til_str_eq(const char* a, const char* b) {
     return strcmp(a, b) == 0;
+}
+
+// String methods
+static bool til_str_contains(const char* s, const char* sub) {
+    return strstr(s, sub) != NULL;
+}
+
+static bool til_str_starts_with(const char* s, const char* prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+static bool til_str_ends_with(const char* s, const char* suffix) {
+    size_t slen = strlen(s), suflen = strlen(suffix);
+    if (suflen > slen) return false;
+    return strcmp(s + slen - suflen, suffix) == 0;
+}
+
+static char* til_str_trim(const char* s) {
+    while (*s == ' ' || *s == '\\t' || *s == '\\n' || *s == '\\r') s++;
+    size_t len = strlen(s);
+    while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\\t' || s[len-1] == '\\n' || s[len-1] == '\\r')) len--;
+    char* result = (char*)malloc(len + 1);
+    strncpy(result, s, len);
+    result[len] = '\\0';
+    return result;
+}
+
+static char* til_str_to_upper(const char* s) {
+    size_t len = strlen(s);
+    char* result = (char*)malloc(len + 1);
+    for (size_t i = 0; i < len; i++)
+        result[i] = (s[i] >= 'a' && s[i] <= 'z') ? s[i] - 32 : s[i];
+    result[len] = '\\0';
+    return result;
+}
+
+static char* til_str_to_lower(const char* s) {
+    size_t len = strlen(s);
+    char* result = (char*)malloc(len + 1);
+    for (size_t i = 0; i < len; i++)
+        result[i] = (s[i] >= 'A' && s[i] <= 'Z') ? s[i] + 32 : s[i];
+    result[len] = '\\0';
+    return result;
+}
+
+static char* til_str_replace(const char* s, const char* old, const char* new_s) {
+    size_t slen = strlen(s), olen = strlen(old), nlen = strlen(new_s);
+    size_t count = 0;
+    const char* p = s;
+    while ((p = strstr(p, old)) != NULL) { count++; p += olen; }
+    char* result = (char*)malloc(slen + count * (nlen - olen) + 1);
+    char* w = result;
+    p = s;
+    while (*p) {
+        if (strncmp(p, old, olen) == 0) {
+            memcpy(w, new_s, nlen);
+            w += nlen;
+            p += olen;
+        } else {
+            *w++ = *p++;
+        }
+    }
+    *w = '\\0';
+    return result;
+}
+
+static char* til_str_slice(const char* s, int64_t start, int64_t end) {
+    size_t len = strlen(s);
+    if (start < 0) start = 0;
+    if (end > (int64_t)len) end = len;
+    if (start >= end) { char* r = (char*)malloc(1); r[0] = '\\0'; return r; }
+    size_t n = end - start;
+    char* result = (char*)malloc(n + 1);
+    strncpy(result, s + start, n);
+    result[n] = '\\0';
+    return result;
+}
+
+static int64_t til_str_find(const char* s, const char* sub) {
+    const char* p = strstr(s, sub);
+    return p ? (int64_t)(p - s) : -1;
 }
 
 // Memory (Level 1+)
@@ -2627,6 +2857,9 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
             if isinstance(node.value, ArrayLit):
                 self.array_vars[node.name] = len(node.value.elements)
 
+            if isinstance(node.value, ListComprehension):
+                self.array_vars[node.name] = 0  # dynamic
+
             if node.value:
                 val = self.generate_node(node.value)
 
@@ -2636,6 +2869,10 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                     n = len(node.value.elements)
                     self.emit(f"{elem_type} {node.name}[{n}] = {val};")
                     self.emit(f"size_t {node.name}_len = {n};")
+                elif isinstance(node.value, ListComprehension):
+                    # Comprehension already emitted the array; just assign the pointer and len
+                    self.emit(f"{c_type} {node.name} = {val};")
+                    self.emit(f"size_t {node.name}_len = {val}_len;")
                 else:
                     self.emit(f"{c_type} {node.name} = {val};")
             else:
@@ -2723,11 +2960,37 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
             else:
                 self.emit(f"int64_t {node.var} = {arr_name}[_i_{node.var}];")
             self.indent -= 1
-        else:
-            # Generic iterable
+        elif isinstance(node.iter, ArrayLit):
+            # Iterate over array literal: for x in [1, 2, 3]
+            n = len(node.iter.elements)
+            elem_type = self.infer_array_elem_type(node.iter)
+            arr_name = f"_arr_{node.var}"
+            arr_val = self.generate_node(node.iter)
+            self.emit(f"{elem_type} {arr_name}[{n}] = {arr_val};")
+            self.emit(f"for (size_t _i_{node.var} = 0; _i_{node.var} < {n}; _i_{node.var}++) {{")
+            self.indent += 1
+            self.emit(f"{elem_type} {node.var} = {arr_name}[_i_{node.var}];")
+            self.indent -= 1
+        elif isinstance(node.iter, Attribute):
+            # Iterate over field: for x in obj.items
             iter_expr = self.generate_node(node.iter)
-            self.emit(f"// TODO: Generic iteration over {iter_expr}")
-            self.emit(f"for (size_t _i = 0; _i < 0; _i++) {{")
+            len_expr = f"{iter_expr}_len"
+            self.emit(f"for (size_t _i_{node.var} = 0; _i_{node.var} < {len_expr}; _i_{node.var}++) {{")
+            self.indent += 1
+            self.emit(f"int64_t {node.var} = {iter_expr}[_i_{node.var}];")
+            self.indent -= 1
+        elif isinstance(node.iter, Call):
+            # Iterate over function result
+            iter_expr = self.generate_node(node.iter)
+            self.emit(f"// Iteration over call result")
+            self.emit(f"for (size_t _i_{node.var} = 0; _i_{node.var} < 0; _i_{node.var}++) {{")
+        else:
+            # Generic iterable — try to iterate
+            iter_expr = self.generate_node(node.iter)
+            self.emit(f"for (size_t _i_{node.var} = 0; _i_{node.var} < {iter_expr}_len; _i_{node.var}++) {{")
+            self.indent += 1
+            self.emit(f"int64_t {node.var} = {iter_expr}[_i_{node.var}];")
+            self.indent -= 1
         
         self.indent += 1
         self.declared_vars.add(node.var)
@@ -2870,10 +3133,24 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
             if key in self._func_ret_types:
                 return self._func_ret_types[key]
         if isinstance(node.func, Attribute):
+            method_name = node.func.attr
+
+            # String method return types
+            if self._is_string_expr(node.func.obj):
+                str_bool_methods = {'contains', 'starts_with', 'ends_with', 'eq'}
+                str_str_methods = {'trim', 'to_upper', 'to_lower', 'replace', 'slice'}
+                str_int_methods = {'len', 'find'}
+                if method_name in str_bool_methods:
+                    return "bool"
+                if method_name in str_str_methods:
+                    return "const char*"
+                if method_name in str_int_methods:
+                    return "int64_t"
+
             # obj.method() — resolve struct type of obj, then look up method return type
             stype = self._resolve_expr_struct_type(node.func.obj)
             if stype:
-                key = f"{stype}_{node.func.attr}"
+                key = f"{stype}_{method_name}"
                 if key in self._func_ret_types:
                     return self._func_ret_types[key]
         return "int64_t"
@@ -2895,6 +3172,12 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     def gen_Call(self, node: Call) -> str:
         if isinstance(node.func, Identifier):
             name = node.func.name
+
+            # Handle print/println as special case (they're not regular C functions)
+            if name in ("print", "println"):
+                self.gen_print_call(node)
+                return ""
+
             args = [self.generate_node(a) for a in node.args]
             args_str = ", ".join(args)
             
@@ -2935,6 +3218,25 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
             obj = self.generate_node(node.func.obj)
             method_name = node.func.attr
             args = [self.generate_node(a) for a in node.args]
+
+            # String method calls
+            if self._is_string_expr(node.func.obj):
+                str_methods = {
+                    'len': ('til_len_str', [obj]),
+                    'contains': ('til_str_contains', [obj] + args),
+                    'starts_with': ('til_str_starts_with', [obj] + args),
+                    'ends_with': ('til_str_ends_with', [obj] + args),
+                    'trim': ('til_str_trim', [obj]),
+                    'to_upper': ('til_str_to_upper', [obj]),
+                    'to_lower': ('til_str_to_lower', [obj]),
+                    'replace': ('til_str_replace', [obj] + args),
+                    'slice': ('til_str_slice', [obj] + args),
+                    'find': ('til_str_find', [obj] + args),
+                    'eq': ('til_str_eq', [obj] + args),
+                }
+                if method_name in str_methods:
+                    func_name, func_args = str_methods[method_name]
+                    return f"{func_name}({', '.join(func_args)})"
 
             # Resolve the struct type of the object
             resolved_type = self._resolve_expr_struct_type(node.func.obj)
@@ -3069,15 +3371,16 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     def gen_Index(self, node: Index) -> str:
         obj = self.generate_node(node.obj)
         index = self.generate_node(node.index)
-        
-        # Add bounds checking for Level 2+
+
+        # Add bounds checking for Level 2+ (Safe level and above)
         if self.current_level >= 2:
             if isinstance(node.obj, Identifier):
                 arr_name = node.obj.name
                 if arr_name in self.array_vars:
-                    # Static array - we know the length
-                    pass  # Could add static check
-        
+                    self.emit(f'til_bounds_check({index}, {arr_name}_len, "{arr_name}");')
+                elif arr_name in self.string_vars:
+                    self.emit(f'til_bounds_check({index}, til_len_str({arr_name}), "{arr_name}");')
+
         return f"{obj}[{index}]"
     
     def gen_Attribute(self, node: Attribute) -> str:
@@ -3090,6 +3393,96 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
             return f"{node.obj.name}_{node.attr}"
         return f"{obj}.{node.attr}"
     
+    def gen_ListComprehension(self, node: ListComprehension) -> str:
+        """Generate C code for [expr for var in iter if condition].
+        Returns the array variable name; also emits _len variable."""
+        if not hasattr(self, '_comp_counter'):
+            self._comp_counter = 0
+        self._comp_counter += 1
+        arr = f"_comp_{self._comp_counter}"
+
+        if isinstance(node.iter, Range):
+            start = self.generate_node(node.iter.start)
+            end = self.generate_node(node.iter.end)
+            op = "<=" if node.iter.inclusive else "<"
+            # Calculate max size
+            size_expr = f"({end} - {start}" + (" + 1" if node.iter.inclusive else "") + ")"
+            self.emit(f"size_t {arr}_cap = {size_expr};")
+            self.emit(f"int64_t* {arr} = (int64_t*)malloc(sizeof(int64_t) * {arr}_cap);")
+            self.emit(f"size_t {arr}_len = 0;")
+            self.emit(f"for (int64_t {node.var} = {start}; {node.var} {op} {end}; {node.var}++) {{")
+            self.indent += 1
+            if node.condition:
+                cond = self.generate_node(node.condition)
+                self.emit(f"if ({cond}) {{")
+                self.indent += 1
+            expr_val = self.generate_node(node.expr)
+            self.emit(f"{arr}[{arr}_len++] = {expr_val};")
+            if node.condition:
+                self.indent -= 1
+                self.emit("}")
+            self.indent -= 1
+            self.emit("}")
+        else:
+            # Array iteration
+            iter_expr = self.generate_node(node.iter)
+            len_name = f"{iter_expr}_len" if isinstance(node.iter, Identifier) else "0"
+            self.emit(f"size_t {arr}_cap = {len_name};")
+            self.emit(f"int64_t* {arr} = (int64_t*)malloc(sizeof(int64_t) * ({arr}_cap > 0 ? {arr}_cap : 16));")
+            self.emit(f"size_t {arr}_len = 0;")
+            self.emit(f"for (size_t _ci = 0; _ci < {len_name}; _ci++) {{")
+            self.indent += 1
+            self.emit(f"int64_t {node.var} = {iter_expr}[_ci];")
+            if node.condition:
+                cond = self.generate_node(node.condition)
+                self.emit(f"if ({cond}) {{")
+                self.indent += 1
+            expr_val = self.generate_node(node.expr)
+            self.emit(f"{arr}[{arr}_len++] = {expr_val};")
+            if node.condition:
+                self.indent -= 1
+                self.emit("}")
+            self.indent -= 1
+            self.emit("}")
+
+        # Track as array var
+        self.array_vars[arr] = 0  # dynamic size
+
+        return arr
+
+    def gen_Lambda(self, node: Lambda) -> str:
+        # Generate a unique static function for the lambda
+        if not hasattr(self, '_lambda_counter'):
+            self._lambda_counter = 0
+        self._lambda_counter += 1
+        name = f"_til_lambda_{self._lambda_counter}"
+
+        # Infer parameter and return types from the body
+        params = []
+        for pname, ptype in node.params:
+            if ptype:
+                c_type = self.type_to_c(ptype)
+            else:
+                c_type = "int64_t"  # default
+            params.append(f"{c_type} {pname}")
+        params_str = ", ".join(params) if params else "void"
+
+        # Store the lambda function to be emitted at top level
+        if not hasattr(self, '_lambda_defs'):
+            self._lambda_defs = []
+
+        # Generate the body expression
+        body_code = self.generate_node(node.body)
+        self._lambda_defs.append(f"static int64_t {name}({params_str}) {{ return {body_code}; }}")
+
+        return name
+
+    def gen_IfExpr(self, node: IfExpr) -> str:
+        cond = self.generate_node(node.condition)
+        then_val = self.generate_node(node.then_expr)
+        else_val = self.generate_node(node.else_expr) if node.else_expr else "0"
+        return f"({cond} ? {then_val} : {else_val})"
+
     def gen_Cast(self, node: Cast) -> str:
         expr = self.generate_node(node.expr)
         c_type = self.type_to_c(node.target_type)
@@ -3115,6 +3508,15 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         elements = [self.generate_node(e) for e in node.elements]
         return "{" + ", ".join(elements) + "}"
     
+    def gen_NullCheck(self, node: NullCheck) -> str:
+        expr = self.generate_node(node.expr)
+        return f"({expr} != NULL ? {expr} : (fprintf(stderr, \"Null unwrap failed\\n\"), exit(1), (void*)0))"
+
+    def gen_DictLit(self, node: DictLit) -> str:
+        # Basic dict literal - generate as comment for now (needs hash table impl)
+        self.emit("// TODO: Dict literal requires hash table implementation")
+        return "NULL"
+
     def gen_Range(self, node: Range) -> str:
         # Ranges are handled in for loops
         start = self.generate_node(node.start)
@@ -3236,6 +3638,21 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                 ret = self._infer_call_ret_type(node.value)
                 if ret and ret != 'void':
                     return ret
+            if isinstance(node.value, ListComprehension):
+                return 'int64_t*'
+            if isinstance(node.value, UnaryOp):
+                if node.value.op == 'not':
+                    return 'bool'
+                return self.infer_c_type(VarDecl(value=node.value.operand))
+            if isinstance(node.value, BinaryOp):
+                if node.value.op in ('==', '!=', '<', '>', '<=', '>=', 'and', 'or'):
+                    return 'bool'
+                # If either side is float, result is float
+                lt = self._infer_expr_print_type(node.value.left)
+                if lt == "float":
+                    return 'double'
+            if isinstance(node.value, IfExpr):
+                return self.infer_c_type(VarDecl(value=node.value.then_expr))
 
         return 'int64_t'
     
@@ -3278,9 +3695,9 @@ class TILCompiler:
         if self.verbose:
             print(f"[TIL] Parsing...")
         
-        parser = Parser(tokens, filename)
+        parser = Parser(tokens, filename, source=source)
         ast = parser.parse()
-        
+
         if self.check_types:
             if self.verbose:
                 print(f"[TIL] Type checking...")
@@ -3455,7 +3872,7 @@ def main():
         if command == 'check':
             lexer = Lexer(source, input_file)
             tokens = lexer.tokenize()
-            parser = Parser(tokens, input_file)
+            parser = Parser(tokens, input_file, source=source)
             parser.parse()
             print(f"OK: {input_file}")
             return 0
