@@ -16,10 +16,12 @@ from til import (
     IntLit, FloatLit, StringLit, BoolLit, Identifier, BinaryOp, UnaryOp,
     Call, Attribute, Cast, ArrayLit, Range, StructInit, MatchExpr,
     Block, VarDecl, Assignment, If, For, While, Loop, Return, Break, Continue,
-    ExprStmt, FuncDef, StructDef, EnumDef, ImplBlock, Program,
+    ExprStmt, FuncDef, StructDef, EnumDef, ImplBlock, Import, Program,
     Lambda, IfExpr, ListComprehension, NullCheck, DictLit,
-    ErrorReporter, get_hint_for_error,
-    PrimitiveType, ArrayType, StructType, T_INT, T_FLOAT, T_STR, T_BOOL, T_VOID, T_UNKNOWN,
+    ErrorReporter, get_hint_for_error, ModuleResolver, resolve_imports,
+    PrimitiveType, ArrayType, StructType, OptionType, ResultType,
+    T_INT, T_FLOAT, T_STR, T_BOOL, T_VOID, T_UNKNOWN,
+    KAZAKH_KEYWORDS,
 )
 
 
@@ -909,6 +911,139 @@ class TestTypeChecker:
     def test_function_return_type(self):
         errors = self._check('add(a: int, b: int) -> int\n    return a + b\nmain()\n    let x = add(1, 2)\n')
         assert len(errors) == 0
+
+
+# ═══════════════════════════════════════════════════════════════
+# PHASE 3: KAZAKH LANGUAGE TESTS
+# ═══════════════════════════════════════════════════════════════
+
+class TestKazakh:
+    def test_kazakh_keywords_exist(self):
+        assert 'егер' in KAZAKH_KEYWORDS  # if
+        assert 'қайтару' in KAZAKH_KEYWORDS  # return
+        assert 'құрылым' in KAZAKH_KEYWORDS  # struct
+        assert 'функция' in KAZAKH_KEYWORDS  # fn
+
+    def test_kazakh_if_keyword(self):
+        """Kazakh 'егер' should work as 'if'."""
+        tokens = lex('егер true\n    print("ok")\n')
+        types = [t.type for t in tokens if t.type not in (TokenType.NEWLINE, TokenType.EOF, TokenType.INDENT, TokenType.DEDENT)]
+        assert TokenType.IF in types
+
+    def test_kazakh_for_loop(self):
+        """Kazakh 'үшін ... ішінде' should work as 'for ... in'."""
+        tokens = lex('үшін и ішінде 1..5\n    print(и)\n')
+        types = [t.type for t in tokens if t.type not in (TokenType.NEWLINE, TokenType.EOF, TokenType.INDENT, TokenType.DEDENT)]
+        assert TokenType.FOR in types
+        assert TokenType.IN in types
+
+    def test_kazakh_let_var(self):
+        """Kazakh 'тұрақты'/'айнымалы' should work as 'let'/'var'."""
+        tokens = lex('тұрақты x = 10\nайнымалы y = 20\n')
+        types = [t.type for t in tokens if t.type not in (TokenType.NEWLINE, TokenType.EOF)]
+        assert TokenType.LET in types
+        assert TokenType.VAR in types
+
+    def test_kazakh_example_compiles(self):
+        """The Kazakh salam.til example should compile and run."""
+        root = os.path.join(os.path.dirname(__file__), '..')
+        path = os.path.join(root, 'examples', 'kazakh', 'salam.til')
+        result = subprocess.run(
+            [sys.executable, os.path.join(root, 'src', 'til.py'), 'run', path],
+            capture_output=True, text=True, timeout=30
+        )
+        assert result.returncode == 0, f"Kazakh example failed:\n{result.stderr}"
+        assert "7" in result.stdout
+        assert "15" in result.stdout
+        assert "120" in result.stdout
+
+    def test_kazakh_hello_compile_and_run(self):
+        """Simple Kazakh program should compile and run."""
+        src = 'main()\n    тұрақты x = 42\n    print(x)\n'
+        out = compile_and_run(src)
+        assert out == "42"
+
+    def test_unicode_var_name_mangling(self):
+        """Unicode variable names should be mangled to valid C."""
+        c = compile_to_c('main()\n    тұрақты нәтиже = 10\n    print(нәтиже)\n')
+        assert '_u' in c  # mangled names contain _uXXXX
+        assert 'int64_t' in c
+
+    def test_unicode_function_name_mangling(self):
+        """Unicode function names should be mangled to valid C."""
+        c = compile_to_c('қосу(а: int, б: int) -> int\n    return а + б\nmain()\n    print(қосу(1, 2))\n')
+        assert 'til__u' in c  # mangled function name
+
+
+# ═══════════════════════════════════════════════════════════════
+# PHASE 3: MODULE/IMPORT TESTS
+# ═══════════════════════════════════════════════════════════════
+
+class TestModuleSystem:
+    def test_import_parses(self):
+        """import statement should parse correctly."""
+        prog = parse('import math_utils\nmain()\n    print(1)\n')
+        assert any(isinstance(s, Import) for s in prog.statements)
+
+    def test_from_import_parses(self):
+        """from module import name should parse."""
+        prog = parse('from utils import helper\nmain()\n    print(1)\n')
+        imp = [s for s in prog.statements if isinstance(s, Import)][0]
+        assert imp.module == "utils"
+        assert imp.items == ["helper"]
+
+    def test_module_resolver(self):
+        """ModuleResolver should find .til files."""
+        root = os.path.join(os.path.dirname(__file__), '..')
+        resolver = ModuleResolver(os.path.join(root, 'examples'))
+        path = resolver.resolve('math_utils', os.path.join(root, 'examples', '08_imports.til'))
+        assert path is not None
+        assert path.endswith('math_utils.til')
+
+    def test_import_example_runs(self):
+        """08_imports.til example should compile and run."""
+        root = os.path.join(os.path.dirname(__file__), '..')
+        path = os.path.join(root, 'examples', '08_imports.til')
+        result = subprocess.run(
+            [sys.executable, os.path.join(root, 'src', 'til.py'), 'run', path],
+            capture_output=True, text=True, timeout=30
+        )
+        assert result.returncode == 0, f"Import example failed:\n{result.stderr}"
+        assert "25" in result.stdout  # square(5)
+        assert "27" in result.stdout  # cube(3)
+        assert "10" in result.stdout  # clamp(15, 0, 10)
+
+
+# ═══════════════════════════════════════════════════════════════
+# PHASE 3: OPTION/RESULT TYPE TESTS
+# ═══════════════════════════════════════════════════════════════
+
+class TestOptionResult:
+    def test_option_type_to_c(self):
+        """Option<int> should generate TIL_Option_int."""
+        gen = CCodeGenerator()
+        c = gen.type_to_c(OptionType(T_INT))
+        assert c == "TIL_Option_int"
+
+    def test_option_float_type(self):
+        gen = CCodeGenerator()
+        c = gen.type_to_c(OptionType(T_FLOAT))
+        assert c == "TIL_Option_float"
+
+    def test_result_type_to_c(self):
+        """Result<int, str> should generate TIL_Result_int."""
+        gen = CCodeGenerator()
+        c = gen.type_to_c(ResultType(T_INT, T_STR))
+        assert c == "TIL_Result_int"
+
+    def test_some_codegen(self):
+        c = compile_to_c('main()\n    let x = Some(42)\n')
+        assert 'til_Some_int(42)' in c
+
+    def test_option_in_helpers(self):
+        c = compile_to_c('main()\n    print(1)\n')
+        assert 'TIL_Option_int' in c
+        assert 'TIL_Result_int' in c
 
 
 if __name__ == '__main__':

@@ -1,0 +1,15 @@
+# TIL Math Utilities Module
+# Can be imported with: import math_utils
+
+square(x: int) -> int
+    return x * x
+
+cube(x: int) -> int
+    return x * x * x
+
+clamp(x: int, lo: int, hi: int) -> int
+    if x < lo
+        return lo
+    if x > hi
+        return hi
+    return x

@@ -271,6 +271,45 @@ KEYWORDS = {
     'True': TokenType.BOOL, 'False': TokenType.BOOL,
 }
 
+# Казахские ключевые слова (Kazakh language keywords)
+# TIL supports writing code in Kazakh — Patent № 66853
+KAZAKH_KEYWORDS = {
+    'егер': TokenType.IF,         # if
+    'әйтпесе': TokenType.ELSE,   # else
+    'немесе': TokenType.ELIF,     # elif
+    'үшін': TokenType.FOR,        # for
+    'кезінде': TokenType.WHILE,   # while
+    'цикл': TokenType.LOOP,       # loop
+    'ішінде': TokenType.IN,       # in
+    'қайтару': TokenType.RETURN,  # return
+    'тоқтату': TokenType.BREAK,   # break
+    'жалғастыру': TokenType.CONTINUE,  # continue
+    'функция': TokenType.FN,      # fn
+    'тұрақты': TokenType.LET,     # let (immutable)
+    'айнымалы': TokenType.VAR,    # var (mutable)
+    'тұрақтама': TokenType.CONST, # const
+    'өзгермелі': TokenType.MUT,   # mut
+    'ашық': TokenType.PUB,        # pub
+    'құрылым': TokenType.STRUCT,  # struct
+    'санақ': TokenType.ENUM,      # enum
+    'іске': TokenType.IMPL,       # impl
+    'қасиет': TokenType.TRAIT,    # trait
+    'сәйкестік': TokenType.MATCH, # match
+    'импорт': TokenType.IMPORT,   # import
+    'бастап': TokenType.FROM,     # from
+    'ретінде': TokenType.AS,      # as
+    'тип': TokenType.TYPE,        # type
+    'өзін': TokenType.SELF,       # self
+    'және': TokenType.AND,        # and
+    'немесе': TokenType.OR,       # or (also elif, last definition wins)
+    'емес': TokenType.NOT,        # not
+    'ақиқат': TokenType.BOOL,     # true
+    'жалған': TokenType.BOOL,     # false
+}
+
+# Merge Kazakh keywords into the main keyword map
+KEYWORDS.update(KAZAKH_KEYWORDS)
+
 class Lexer:
     def __init__(self, source: str, filename: str = "<stdin>"):
         self.source = source
@@ -1685,20 +1724,20 @@ class Parser:
                         break
                     self.advance()
             
-            return Import(module, items)
+            return Import(module=module, items=items)
         else:
             self.consume(TokenType.IMPORT)
             module = self.consume(TokenType.IDENT).value
             while self.match(TokenType.DOT):
                 self.advance()
                 module += "." + self.consume(TokenType.IDENT).value
-            
+
             alias = None
             if self.match(TokenType.AS):
                 self.advance()
                 alias = self.consume(TokenType.IDENT).value
-            
-            return Import(module, alias=alias)
+
+            return Import(module=module, alias=alias)
     
     def parse_type_alias(self) -> TypeAlias:
         self.consume(TokenType.TYPE)
@@ -2375,9 +2414,27 @@ class CCodeGenerator:
         self.in_method: bool = False
         self.current_struct: Optional[str] = None
     
+    @staticmethod
+    def mangle_name(name: str) -> str:
+        """Mangle a Unicode identifier to a valid C identifier."""
+        if name.isascii() and name.replace('_', 'a').isalnum():
+            return name  # Already a valid C identifier
+        # Convert non-ASCII chars to _uXXXX hex encoding
+        result = []
+        for ch in name:
+            if ch.isascii() and (ch.isalnum() or ch == '_'):
+                result.append(ch)
+            else:
+                result.append(f"_u{ord(ch):04x}")
+        mangled = ''.join(result)
+        # Ensure it starts with a letter or underscore
+        if mangled and mangled[0].isdigit():
+            mangled = '_' + mangled
+        return mangled
+
     def emit(self, line: str):
         self.output.append("    " * self.indent + line)
-    
+
     def emit_raw(self, line: str):
         self.output.append(line)
     
@@ -2485,15 +2542,17 @@ class CCodeGenerator:
 
         # Forward declare structs (so methods can reference them)
         for name in self.structs:
-            self.emit_raw(f"typedef struct {name} {name};")
+            c_name = self.mangle_name(name)
+            self.emit_raw(f"typedef struct {c_name} {c_name};")
 
         # Forward declare functions
         for name, func in self.functions.items():
+            c_name = self.mangle_name(name)
             ret = self.type_to_c(func.ret_type)
             params = self.params_to_c(func.params)
             level = func.level
             level_names = {0: "Hardware", 1: "Systems", 2: "Safe", 3: "Script", 4: "Formal"}
-            self.emit_raw(f"{ret} til_{name}({params});  // Level {level}: {level_names.get(level, '?')}")
+            self.emit_raw(f"{ret} til_{c_name}({params});  // Level {level}: {level_names.get(level, '?')}")
 
         # Forward declare all impl methods
         for type_name, methods in self.impl_methods.items():
@@ -2638,6 +2697,46 @@ static int64_t til_str_find(const char* s, const char* sub) {
     const char* p = strstr(s, sub);
     return p ? (int64_t)(p - s) : -1;
 }
+
+// Option<T> - tagged union for optional values
+typedef struct TIL_Option_int { bool has_value; int64_t value; } TIL_Option_int;
+typedef struct TIL_Option_float { bool has_value; double value; } TIL_Option_float;
+typedef struct TIL_Option_str { bool has_value; const char* value; } TIL_Option_str;
+typedef struct TIL_Option_bool { bool has_value; bool value; } TIL_Option_bool;
+
+static TIL_Option_int til_Some_int(int64_t v) { return (TIL_Option_int){true, v}; }
+static TIL_Option_float til_Some_float(double v) { return (TIL_Option_float){true, v}; }
+static TIL_Option_str til_Some_str(const char* v) { return (TIL_Option_str){true, v}; }
+static TIL_Option_bool til_Some_bool(bool v) { return (TIL_Option_bool){true, v}; }
+static TIL_Option_int til_None_int(void) { return (TIL_Option_int){false, 0}; }
+static TIL_Option_float til_None_float(void) { return (TIL_Option_float){false, 0.0}; }
+static TIL_Option_str til_None_str(void) { return (TIL_Option_str){false, NULL}; }
+static TIL_Option_bool til_None_bool(void) { return (TIL_Option_bool){false, false}; }
+
+static int64_t til_unwrap_int(TIL_Option_int opt, const char* msg) {
+    if (!opt.has_value) { fprintf(stderr, "Unwrap failed: %s\\n", msg); exit(1); }
+    return opt.value;
+}
+static double til_unwrap_float(TIL_Option_float opt, const char* msg) {
+    if (!opt.has_value) { fprintf(stderr, "Unwrap failed: %s\\n", msg); exit(1); }
+    return opt.value;
+}
+static const char* til_unwrap_str(TIL_Option_str opt, const char* msg) {
+    if (!opt.has_value) { fprintf(stderr, "Unwrap failed: %s\\n", msg); exit(1); }
+    return opt.value;
+}
+
+// Result<T, E> - tagged union for error handling
+typedef struct TIL_Result_int { bool is_ok; int64_t value; const char* error; } TIL_Result_int;
+typedef struct TIL_Result_float { bool is_ok; double value; const char* error; } TIL_Result_float;
+typedef struct TIL_Result_str { bool is_ok; const char* value; const char* error; } TIL_Result_str;
+
+static TIL_Result_int til_Ok_int(int64_t v) { return (TIL_Result_int){true, v, NULL}; }
+static TIL_Result_float til_Ok_float(double v) { return (TIL_Result_float){true, v, NULL}; }
+static TIL_Result_str til_Ok_str(const char* v) { return (TIL_Result_str){true, v, NULL}; }
+static TIL_Result_int til_Err_int(const char* e) { return (TIL_Result_int){false, 0, e}; }
+static TIL_Result_float til_Err_float(const char* e) { return (TIL_Result_float){false, 0.0, e}; }
+static TIL_Result_str til_Err_str(const char* e) { return (TIL_Result_str){false, NULL, e}; }
 
 // Memory (Level 1+)
 static void* til_alloc(size_t size) { return malloc(size); }
@@ -2799,8 +2898,9 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         if attr_str:
             attr_str += ' '
         
+        c_name = self.mangle_name(func.name)
         self.emit_raw(f"// Level {func.level}: {level_names.get(func.level, 'Unknown')}")
-        self.emit_raw(f"{attr_str}{ret} til_{func.name}({params}) {{")
+        self.emit_raw(f"{attr_str}{ret} til_{c_name}({params}) {{")
         self.indent += 1
         
         self.generate_node(func.body)
@@ -2842,6 +2942,7 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     
     def gen_VarDecl(self, node: VarDecl) -> str:
         c_type = self.infer_c_type(node)
+        c_name = self.mangle_name(node.name)
 
         # Track variable types for print/method inference
         self._track_var_type(node, c_type)
@@ -2850,7 +2951,7 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
             # Just assign
             if node.value:
                 val = self.generate_node(node.value)
-                self.emit(f"{node.name} = {val};")
+                self.emit(f"{c_name} = {val};")
         else:
             self.declared_vars.add(node.name)
 
@@ -2867,16 +2968,16 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                 if isinstance(node.value, ArrayLit):
                     elem_type = self.infer_array_elem_type(node.value)
                     n = len(node.value.elements)
-                    self.emit(f"{elem_type} {node.name}[{n}] = {val};")
-                    self.emit(f"size_t {node.name}_len = {n};")
+                    self.emit(f"{elem_type} {c_name}[{n}] = {val};")
+                    self.emit(f"size_t {c_name}_len = {n};")
                 elif isinstance(node.value, ListComprehension):
                     # Comprehension already emitted the array; just assign the pointer and len
-                    self.emit(f"{c_type} {node.name} = {val};")
-                    self.emit(f"size_t {node.name}_len = {val}_len;")
+                    self.emit(f"{c_type} {c_name} = {val};")
+                    self.emit(f"size_t {c_name}_len = {val}_len;")
                 else:
-                    self.emit(f"{c_type} {node.name} = {val};")
+                    self.emit(f"{c_type} {c_name} = {val};")
             else:
-                self.emit(f"{c_type} {node.name};")
+                self.emit(f"{c_type} {c_name};")
         
         return ""
     
@@ -2944,32 +3045,28 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         return ""
     
     def gen_For(self, node: For) -> str:
+        c_var = self.mangle_name(node.var)
         if isinstance(node.iter, Range):
             start = self.generate_node(node.iter.start)
             end = self.generate_node(node.iter.end)
             op = "<=" if node.iter.inclusive else "<"
-            self.emit(f"for (int64_t {node.var} = {start}; {node.var} {op} {end}; {node.var}++) {{")
+            self.emit(f"for (int64_t {c_var} = {start}; {c_var} {op} {end}; {c_var}++) {{")
         elif isinstance(node.iter, Identifier):
-            arr_name = node.iter.name
-            len_var = f"{arr_name}_len"
-            self.emit(f"for (size_t _i_{node.var} = 0; _i_{node.var} < {len_var}; _i_{node.var}++) {{")
+            c_arr = self.mangle_name(node.iter.name)
+            len_var = f"{c_arr}_len"
+            self.emit(f"for (size_t _i_{c_var} = 0; _i_{c_var} < {len_var}; _i_{c_var}++) {{")
             self.indent += 1
-            # Get element type
-            if arr_name in self.array_vars:
-                self.emit(f"int64_t {node.var} = {arr_name}[_i_{node.var}];")
-            else:
-                self.emit(f"int64_t {node.var} = {arr_name}[_i_{node.var}];")
+            self.emit(f"int64_t {c_var} = {c_arr}[_i_{c_var}];")
             self.indent -= 1
         elif isinstance(node.iter, ArrayLit):
-            # Iterate over array literal: for x in [1, 2, 3]
             n = len(node.iter.elements)
             elem_type = self.infer_array_elem_type(node.iter)
-            arr_name = f"_arr_{node.var}"
+            arr_name = f"_arr_{c_var}"
             arr_val = self.generate_node(node.iter)
             self.emit(f"{elem_type} {arr_name}[{n}] = {arr_val};")
-            self.emit(f"for (size_t _i_{node.var} = 0; _i_{node.var} < {n}; _i_{node.var}++) {{")
+            self.emit(f"for (size_t _i_{c_var} = 0; _i_{c_var} < {n}; _i_{c_var}++) {{")
             self.indent += 1
-            self.emit(f"{elem_type} {node.var} = {arr_name}[_i_{node.var}];")
+            self.emit(f"{elem_type} {c_var} = {arr_name}[_i_{c_var}];")
             self.indent -= 1
         elif isinstance(node.iter, Attribute):
             # Iterate over field: for x in obj.items
@@ -3197,10 +3294,23 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                 return f"til_min_int({args_str})"
             if name == 'max':
                 return f"til_max_int({args_str})"
+
+            # Option/Result constructors
+            if name == 'Some':
+                inner_type = self._infer_expr_print_type(node.args[0]) if node.args else "int"
+                type_map = {"int": "int", "float": "float", "str": "str", "bool": "bool"}
+                return f"til_Some_{type_map.get(inner_type, 'int')}({args_str})"
+            if name == 'Ok':
+                inner_type = self._infer_expr_print_type(node.args[0]) if node.args else "int"
+                type_map = {"int": "int", "float": "float", "str": "str", "bool": "bool"}
+                return f"til_Ok_{type_map.get(inner_type, 'int')}({args_str})"
+            if name == 'Err':
+                return f'til_Err_int({args_str})'
             
             # Struct constructor
             if name in self.structs:
-                return f"{name}_create({args_str})"
+                c_sname = self.mangle_name(name)
+                return f"{c_sname}_create({args_str})"
 
             # Fill in default parameters if fewer args provided
             if name in self.functions:
@@ -3212,7 +3322,8 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                             args.append(self.generate_node(p.default))
                     args_str = ", ".join(args)
 
-            return f"til_{name}({args_str})"
+            c_fname = self.mangle_name(name)
+            return f"til_{c_fname}({args_str})"
         
         if isinstance(node.func, Attribute):
             obj = self.generate_node(node.func.obj)
@@ -3489,7 +3600,9 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         return f"(({c_type}){expr})"
 
     def gen_Identifier(self, node: Identifier) -> str:
-        return node.name
+        if node.name == "self":
+            return "self"
+        return self.mangle_name(node.name)
     
     def gen_IntLit(self, node: IntLit) -> str:
         return str(node.value)
@@ -3595,23 +3708,36 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         
         if isinstance(t, StructType):
             return t.name
-        
+
+        if isinstance(t, OptionType):
+            inner_c = self.type_to_c(t.inner)
+            type_map = {'int64_t': 'int', 'double': 'float', 'const char*': 'str', 'bool': 'bool'}
+            suffix = type_map.get(inner_c, 'int')
+            return f'TIL_Option_{suffix}'
+
+        if isinstance(t, ResultType):
+            ok_c = self.type_to_c(t.ok)
+            type_map = {'int64_t': 'int', 'double': 'float', 'const char*': 'str', 'bool': 'bool'}
+            suffix = type_map.get(ok_c, 'int')
+            return f'TIL_Result_{suffix}'
+
         if isinstance(t, UnknownType):
             return 'int64_t'
-        
+
         return 'int64_t'
     
     def params_to_c(self, params: List[FuncParam]) -> str:
         if not params:
             return 'void'
-        
+
         parts = []
         for p in params:
             c_type = self.type_to_c(p.type)
             if isinstance(p.type, UnknownType):
                 c_type = 'int64_t'
-            parts.append(f"{c_type} {p.name}")
-        
+            c_pname = self.mangle_name(p.name)
+            parts.append(f"{c_type} {c_pname}")
+
         return ", ".join(parts)
     
     def infer_c_type(self, node: VarDecl) -> str:
@@ -3676,27 +3802,115 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
 #                                COMPILER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+class ModuleResolver:
+    """Resolves and loads TIL module files."""
+
+    def __init__(self, base_path: str = "."):
+        self.base_path = base_path
+        self.loaded: Dict[str, Program] = {}  # module_name -> parsed AST
+
+    def resolve(self, module_name: str, from_file: str = "") -> Optional[str]:
+        """Resolve a module name to a file path."""
+        # Convert module.path to file path
+        parts = module_name.replace(".", os.sep)
+
+        # Search paths: relative to importing file, then base path
+        search_dirs = []
+        if from_file and from_file != "<stdin>":
+            search_dirs.append(os.path.dirname(os.path.abspath(from_file)))
+        search_dirs.append(self.base_path)
+
+        for d in search_dirs:
+            # Try module_name.til
+            candidate = os.path.join(d, parts + ".til")
+            if os.path.exists(candidate):
+                return candidate
+            # Try module_name/mod.til (package)
+            candidate = os.path.join(d, parts, "mod.til")
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
+    def load_module(self, module_name: str, from_file: str = "") -> Optional[Program]:
+        """Load and parse a module, returning its AST."""
+        if module_name in self.loaded:
+            return self.loaded[module_name]
+
+        path = self.resolve(module_name, from_file)
+        if not path:
+            return None
+
+        with open(path, 'r', encoding='utf-8') as f:
+            source = f.read()
+
+        lexer = Lexer(source, path)
+        tokens = lexer.tokenize()
+        parser = Parser(tokens, path, source=source)
+        ast = parser.parse()
+
+        self.loaded[module_name] = ast
+        return ast
+
+
+def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
+    """Process import statements: load modules and merge their definitions."""
+    resolver = ModuleResolver()
+    new_statements = []
+
+    for stmt in program.statements:
+        if isinstance(stmt, Import):
+            mod_ast = resolver.load_module(stmt.module, filename)
+            if mod_ast is None:
+                print(f"Warning: Could not find module '{stmt.module}'", file=sys.stderr)
+                continue
+
+            # Collect exported definitions from the module
+            for mod_stmt in mod_ast.statements:
+                if isinstance(mod_stmt, (FuncDef, StructDef, EnumDef, ImplBlock)):
+                    if stmt.items is None:
+                        # import all
+                        new_statements.append(mod_stmt)
+                    elif isinstance(mod_stmt, FuncDef) and mod_stmt.name in stmt.items:
+                        new_statements.append(mod_stmt)
+                    elif isinstance(mod_stmt, StructDef) and mod_stmt.name in stmt.items:
+                        new_statements.append(mod_stmt)
+                    elif isinstance(mod_stmt, EnumDef) and mod_stmt.name in stmt.items:
+                        new_statements.append(mod_stmt)
+                    elif isinstance(mod_stmt, ImplBlock) and mod_stmt.type_name in stmt.items:
+                        new_statements.append(mod_stmt)
+        else:
+            new_statements.append(stmt)
+
+    program.statements = new_statements
+    return program
+
+
 class TILCompiler:
     def __init__(self):
         self.verbose = False
         self.optimize = 2
         self.keep_c = False
         self.check_types = True
-    
+
     def compile(self, source: str, filename: str = "<stdin>") -> str:
         """Compile TIL source to C code"""
-        
+
         if self.verbose:
             print(f"[TIL] Lexing {filename}...")
-        
+
         lexer = Lexer(source, filename)
         tokens = lexer.tokenize()
-        
+
         if self.verbose:
             print(f"[TIL] Parsing...")
         
         parser = Parser(tokens, filename, source=source)
         ast = parser.parse()
+
+        # Resolve imports
+        if self.verbose:
+            print(f"[TIL] Resolving imports...")
+        ast = resolve_imports(ast, filename)
 
         if self.check_types:
             if self.verbose:
@@ -3727,9 +3941,9 @@ class TILCompiler:
             print("Error: No C compiler found (tried gcc, clang, cc)", file=sys.stderr)
             return False
         
-        # Write C code to temp file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False, 
-                                         encoding='ascii', errors='replace', newline='\n') as f:
+        # Write C code to temp file (UTF-8 for string literals with Kazakh/Unicode)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False,
+                                         encoding='utf-8', newline='\n') as f:
             f.write(c_code)
             c_file = f.name
         
@@ -3880,7 +4094,7 @@ def main():
         if c_only:
             c_code = compiler.compile(source, input_file)
             if output_file:
-                with open(output_file, 'w', encoding='ascii', errors='replace', newline='\n') as f:
+                with open(output_file, 'w', encoding='utf-8', newline='\n') as f:
                     f.write(c_code)
                 print(f"Generated: {output_file}")
             else:
