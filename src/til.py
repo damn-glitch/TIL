@@ -175,6 +175,7 @@ class Lexer:
         self.tokens: List[Token] = []
         self.indent_stack = [0]
         self.at_line_start = True
+        self.paren_depth = 0  # Track () [] {} depth to suppress NEWLINE inside
         
     def error(self, msg: str):
         raise SyntaxError(f"{self.filename}:{self.line}:{self.col}: {msg}")
@@ -198,8 +199,13 @@ class Lexer:
     
     def tokenize(self) -> List[Token]:
         while self.pos < len(self.source):
-            if self.at_line_start:
+            if self.at_line_start and self.paren_depth == 0:
                 self.handle_indentation()
+            elif self.at_line_start and self.paren_depth > 0:
+                # Inside parens: skip whitespace but don't emit INDENT/DEDENT
+                self.at_line_start = False
+                while self.pos < len(self.source) and self.current() in ' \t':
+                    self.advance()
                 if self.pos >= len(self.source):
                     break
             
@@ -220,11 +226,12 @@ class Lexer:
             
             # Newline
             if ch == '\n':
-                self.add_token(TokenType.NEWLINE, '\n')
+                if self.paren_depth == 0:
+                    self.add_token(TokenType.NEWLINE, '\n')
+                    self.at_line_start = True
                 self.advance()
                 self.line += 1
                 self.col = 1
-                self.at_line_start = True
                 continue
             
             # String
@@ -463,6 +470,11 @@ class Lexer:
         }
         
         if ch in one_char_ops:
+            # Track paren depth for multi-line expression support
+            if ch in '([{':
+                self.paren_depth += 1
+            elif ch in ')]}':
+                self.paren_depth = max(0, self.paren_depth - 1)
             self.advance()
             self.add_token(one_char_ops[ch], ch)
             return True
@@ -807,6 +819,7 @@ class StructDef(ASTNode):
 class EnumVariant:
     name: str
     fields: List[Type] = field(default_factory=list)
+    value: Optional[ASTNode] = None
 
 @dataclass
 class EnumDef(ASTNode):
@@ -1146,10 +1159,18 @@ class Parser:
             return GenericType(name, params)
         
         # Primitive or struct
-        if name in TYPE_MAP:
-            return TYPE_MAP[name]
-        
-        return StructType(name)
+        base_type = TYPE_MAP.get(name, StructType(name))
+
+        # Support type[] syntax for arrays (e.g., float[], int[])
+        if self.match(TokenType.LBRACKET):
+            self.advance()
+            size = None
+            if self.match(TokenType.INT):
+                size = self.advance().value
+            self.consume(TokenType.RBRACKET)
+            return ArrayType(base_type, size)
+
+        return base_type
     
     def parse_block(self) -> Block:
         self.consume(TokenType.INDENT)
@@ -1422,7 +1443,13 @@ class Parser:
                 break
             
             var_name = self.consume(TokenType.IDENT).value
-            
+
+            # Handle enum variant value: Name = value
+            value = None
+            if self.match(TokenType.EQ):
+                self.advance()
+                value = self.parse_expression()
+
             fields = []
             if self.match(TokenType.LPAREN):
                 self.advance()
@@ -1433,8 +1460,8 @@ class Parser:
                             break
                         self.advance()
                 self.consume(TokenType.RPAREN)
-            
-            variants.append(EnumVariant(var_name, fields))
+
+            variants.append(EnumVariant(var_name, fields, value))
             self.skip_newlines()
         
         if self.match(TokenType.DEDENT):
@@ -1745,14 +1772,20 @@ class Parser:
                 attr = self.consume(TokenType.IDENT).value
                 expr = Attribute(obj=expr, attr=attr)
             
+            elif self.match(TokenType.AS):
+                # Type cast: expr as Type
+                self.advance()
+                target_type = self.parse_type()
+                expr = Cast(expr=expr, target_type=target_type, type=target_type)
+
             elif self.match(TokenType.QUESTION):
                 # Null check / unwrap
                 self.advance()
                 expr = NullCheck(expr)
-            
+
             else:
                 break
-        
+
         return expr
     
     def parse_primary(self) -> ASTNode:
@@ -1863,6 +1896,16 @@ class Parser:
             body = self.parse_expression()
             return Lambda(params, body)
         
+        # Self keyword (used in method bodies)
+        if self.match(TokenType.SELF):
+            self.advance()
+            return Identifier(name="self")
+
+        # None literal
+        if self.match(TokenType.IDENT) and self.current().value == "None":
+            self.advance()
+            return Identifier(name="NULL")
+
         # Identifier or struct init
         if self.match(TokenType.IDENT):
             name = self.advance().value
@@ -2198,12 +2241,18 @@ class CCodeGenerator:
         self.output: List[str] = []
         self.indent = 0
         self.structs: Dict[str, StructDef] = {}
+        self.enums: Dict[str, EnumDef] = {}
         self.functions: Dict[str, FuncDef] = {}
         self.impl_methods: Dict[str, List[FuncDef]] = {}
         self.declared_vars: Set[str] = set()
         self.string_vars: Set[str] = set()
+        self.float_vars: Set[str] = set()
+        self.bool_vars: Set[str] = set()
+        self.struct_vars: Dict[str, str] = {}  # var_name -> struct_type_name
         self.array_vars: Dict[str, int] = {}  # name -> length
         self.current_level = 2
+        self.in_method: bool = False
+        self.current_struct: Optional[str] = None
     
     def emit(self, line: str):
         self.output.append("    " * self.indent + line)
@@ -2220,14 +2269,25 @@ class CCodeGenerator:
                 self.structs[stmt.name] = stmt
             elif isinstance(stmt, FuncDef):
                 self.functions[stmt.name] = stmt
+            elif isinstance(stmt, EnumDef):
+                self.enums[stmt.name] = stmt
             elif isinstance(stmt, ImplBlock):
                 if stmt.type_name not in self.impl_methods:
                     self.impl_methods[stmt.type_name] = []
                 self.impl_methods[stmt.type_name].extend(stmt.methods)
-        
+
+        # Build function return type map for print inference
+        self._func_ret_types: Dict[str, str] = {}
+        for name, func in self.functions.items():
+            self._func_ret_types[name] = self.type_to_c(func.ret_type)
+        for type_name, methods in self.impl_methods.items():
+            for method in methods:
+                self._func_ret_types[f"{type_name}_{method.name}"] = self.type_to_c(method.ret_type)
+
         # Generate code
         self.emit_header()
         self.emit_types()
+        self.emit_enums()
         self.emit_forward_declarations()
         self.emit_helpers()
         self.emit_structs()
@@ -2255,16 +2315,51 @@ class CCodeGenerator:
         self.emit_raw("typedef struct TIL_Array { void* data; size_t len; size_t cap; size_t elem_size; } TIL_Array;")
         self.emit_raw("")
     
+    def emit_enums(self):
+        if not self.enums:
+            return
+        self.emit_raw("// Enum Definitions")
+        for name, enum_def in self.enums.items():
+            self.emit_raw(f"typedef enum {{")
+            for i, variant in enumerate(enum_def.variants):
+                suffix = "," if i < len(enum_def.variants) - 1 else ""
+                if variant.value is not None:
+                    val = self.generate_node(variant.value)
+                    self.emit_raw(f"    {name}_{variant.name} = {val}{suffix}")
+                else:
+                    self.emit_raw(f"    {name}_{variant.name} = {i}{suffix}")
+            self.emit_raw(f"}} {name};")
+            self.emit_raw("")
+
     def emit_forward_declarations(self):
         self.emit_raw("// Forward Declarations")
-        
+
+        # Forward declare structs (so methods can reference them)
+        for name in self.structs:
+            self.emit_raw(f"typedef struct {name} {name};")
+
+        # Forward declare functions
         for name, func in self.functions.items():
             ret = self.type_to_c(func.ret_type)
             params = self.params_to_c(func.params)
             level = func.level
             level_names = {0: "Hardware", 1: "Systems", 2: "Safe", 3: "Script", 4: "Formal"}
             self.emit_raw(f"{ret} til_{name}({params});  // Level {level}: {level_names.get(level, '?')}")
-        
+
+        # Forward declare all impl methods
+        for type_name, methods in self.impl_methods.items():
+            for method in methods:
+                ret = self.type_to_c(method.ret_type)
+                has_self = any(p.name == "self" for p in method.params)
+                params = []
+                if has_self:
+                    params.append(f"{type_name}* self")
+                for p in method.params:
+                    if p.name != "self":
+                        params.append(f"{self.type_to_c(p.type)} {p.name}")
+                params_str = ", ".join(params) if params else "void"
+                self.emit_raw(f"static {ret} {type_name}_{method.name}({params_str});")
+
         self.emit_raw("")
     
     def emit_helpers(self):
@@ -2336,20 +2431,20 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         self.emit_raw("// Struct Definitions")
         
         for name, struct in self.structs.items():
-            self.emit_raw(f"typedef struct {name} {{")
-            for field in struct.fields:
-                c_type = self.type_to_c(field.type)
-                self.emit_raw(f"    {c_type} {field.name};")
-            self.emit_raw(f"}} {name};")
+            self.emit_raw(f"struct {name} {{")
+            for fld in struct.fields:
+                c_type = self.type_to_c(fld.type)
+                self.emit_raw(f"    {c_type} {fld.name};")
+            self.emit_raw(f"}};")
             self.emit_raw("")
-            
+
             # Constructor
-            params = ", ".join(f"{self.type_to_c(f.type)} {f.name}" for f in struct.fields)
-            self.emit_raw(f"static {name} {name}_new({params}) {{")
-            self.emit_raw(f"    {name} self;")
-            for field in struct.fields:
-                self.emit_raw(f"    self.{field.name} = {field.name};")
-            self.emit_raw(f"    return self;")
+            params = ", ".join(f"{self.type_to_c(f.type)} _{f.name}" for f in struct.fields)
+            self.emit_raw(f"static {name} {name}_create({params}) {{")
+            self.emit_raw(f"    {name} _self;")
+            for fld in struct.fields:
+                self.emit_raw(f"    _self.{fld.name} = _{fld.name};")
+            self.emit_raw(f"    return _self;")
             self.emit_raw(f"}}")
             self.emit_raw("")
         
@@ -2360,24 +2455,70 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     
     def emit_method(self, type_name: str, method: FuncDef):
         ret = self.type_to_c(method.ret_type)
-        
-        # Add self parameter
-        params = [f"{type_name}* self"]
+        has_self = any(p.name == "self" for p in method.params)
+
+        # Build parameter list
+        params = []
+        if has_self:
+            params.append(f"{type_name}* self")
         for p in method.params:
             if p.name != "self":
                 params.append(f"{self.type_to_c(p.type)} {p.name}")
-        
-        params_str = ", ".join(params)
-        
+
+        params_str = ", ".join(params) if params else "void"
+
         self.emit_raw(f"static {ret} {type_name}_{method.name}({params_str}) {{")
         self.indent += 1
-        self.declared_vars = {"self"}
-        
+
+        # Save and set context
+        old_declared = self.declared_vars
+        old_string = self.string_vars
+        old_float = self.float_vars
+        old_bool = self.bool_vars
+        old_struct = self.struct_vars
+        old_in_method = self.in_method
+        old_current_struct = self.current_struct
+
+        self.declared_vars = {"self"} if has_self else set()
+        self.string_vars = set()
+        self.float_vars = set()
+        self.bool_vars = set()
+        self.struct_vars = {}
+        self.in_method = has_self
+        self.current_struct = type_name if has_self else None
+
+        # Track parameter types
+        for p in method.params:
+            if p.name != "self":
+                self.declared_vars.add(p.name)
+                self._track_param_type(p)
+
         self.generate_node(method.body)
-        
+
+        # Restore context
+        self.declared_vars = old_declared
+        self.string_vars = old_string
+        self.float_vars = old_float
+        self.bool_vars = old_bool
+        self.struct_vars = old_struct
+        self.in_method = old_in_method
+        self.current_struct = old_current_struct
+
         self.indent -= 1
         self.emit_raw("}")
         self.emit_raw("")
+
+    def _track_param_type(self, p):
+        """Track parameter type for print/string inference."""
+        if isinstance(p.type, PrimitiveType):
+            if p.type.name == "str":
+                self.string_vars.add(p.name)
+            elif p.type.name in ("float", "f32", "f64"):
+                self.float_vars.add(p.name)
+            elif p.type.name == "bool":
+                self.bool_vars.add(p.name)
+        elif isinstance(p.type, StructType):
+            self.struct_vars[p.name] = p.type.name
     
     def emit_functions(self, program: Program):
         self.emit_raw("// TIL Functions")
@@ -2390,13 +2531,17 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         self.current_level = func.level
         self.declared_vars = set()
         self.string_vars = set()
+        self.float_vars = set()
+        self.bool_vars = set()
+        self.struct_vars = {}
         self.array_vars = {}
-        
-        # Add parameters to declared vars
+        self.in_method = False
+        self.current_struct = None
+
+        # Add parameters to declared vars and track types
         for p in func.params:
             self.declared_vars.add(p.name)
-            if isinstance(p.type, PrimitiveType) and p.type.name == "str":
-                self.string_vars.add(p.name)
+            self._track_param_type(p)
         
         ret = self.type_to_c(func.ret_type)
         params = self.params_to_c(func.params)
@@ -2467,7 +2612,10 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     
     def gen_VarDecl(self, node: VarDecl) -> str:
         c_type = self.infer_c_type(node)
-        
+
+        # Track variable types for print/method inference
+        self._track_var_type(node, c_type)
+
         if node.name in self.declared_vars:
             # Just assign
             if node.value:
@@ -2475,15 +2623,13 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                 self.emit(f"{node.name} = {val};")
         else:
             self.declared_vars.add(node.name)
-            
-            if isinstance(node.value, StringLit):
-                self.string_vars.add(node.name)
-            elif isinstance(node.value, ArrayLit):
+
+            if isinstance(node.value, ArrayLit):
                 self.array_vars[node.name] = len(node.value.elements)
-            
+
             if node.value:
                 val = self.generate_node(node.value)
-                
+
                 # Handle array initialization
                 if isinstance(node.value, ArrayLit):
                     elem_type = self.infer_array_elem_type(node.value)
@@ -2497,6 +2643,35 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         
         return ""
     
+    def _track_var_type(self, node: VarDecl, c_type: str):
+        """Track variable type for print/method call inference."""
+        if c_type == "const char*":
+            self.string_vars.add(node.name)
+        elif c_type in ("double", "float"):
+            self.float_vars.add(node.name)
+        elif c_type == "bool":
+            self.bool_vars.add(node.name)
+        # Track struct type from struct init, constructor call, or type annotation
+        if isinstance(node.value, StructInit):
+            self.struct_vars[node.name] = node.value.name
+        elif isinstance(node.value, Call):
+            # Check for Type.method() calls like Point.new(...)
+            if isinstance(node.value.func, Attribute) and isinstance(node.value.func.obj, Identifier):
+                sname = node.value.func.obj.name
+                if sname in self.structs:
+                    self.struct_vars[node.name] = sname
+            # Check struct constructor call like Point(...)
+            elif isinstance(node.value.func, Identifier) and node.value.func.name in self.structs:
+                self.struct_vars[node.name] = node.value.func.name
+        elif node.type_ann and isinstance(node.type_ann, StructType):
+            self.struct_vars[node.name] = node.type_ann.name
+        # Check c_type against known struct names
+        if c_type in self.structs:
+            self.struct_vars[node.name] = c_type
+        # Track enum types
+        if c_type in self.enums:
+            pass  # enums are int-like in C
+
     def gen_Assignment(self, node: Assignment) -> str:
         target = self.generate_node(node.target)
         value = self.generate_node(node.value)
@@ -2606,29 +2781,114 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
             self.emit(f"{expr};")
         return ""
     
+    def _infer_expr_print_type(self, arg) -> str:
+        """Infer the C print type for an expression: 'str', 'float', 'bool', or 'int'."""
+        if isinstance(arg, StringLit):
+            return "str"
+        if isinstance(arg, IntLit):
+            return "int"
+        if isinstance(arg, FloatLit):
+            return "float"
+        if isinstance(arg, BoolLit):
+            return "bool"
+        if isinstance(arg, Cast):
+            c = self.type_to_c(arg.target_type) if arg.target_type else ""
+            if c in ("double", "float"):
+                return "float"
+            if c == "const char*":
+                return "str"
+            if c == "bool":
+                return "bool"
+            return "int"
+        if isinstance(arg, Identifier):
+            if arg.name in self.string_vars:
+                return "str"
+            if arg.name in self.float_vars:
+                return "float"
+            if arg.name in self.bool_vars:
+                return "bool"
+            return "int"
+        if isinstance(arg, Attribute):
+            # self.x in method context — check struct field type
+            if isinstance(arg.obj, Identifier):
+                obj_name = arg.obj.name
+                stype = None
+                if obj_name == "self" and self.current_struct:
+                    stype = self.current_struct
+                elif obj_name in self.struct_vars:
+                    stype = self.struct_vars[obj_name]
+                if stype and stype in self.structs:
+                    for fld in self.structs[stype].fields:
+                        if fld.name == arg.attr:
+                            ct = self.type_to_c(fld.type)
+                            if ct in ("double", "float"):
+                                return "float"
+                            if ct == "const char*":
+                                return "str"
+                            if ct == "bool":
+                                return "bool"
+                            return "int"
+            return "int"
+        if isinstance(arg, Call):
+            # Check function return types
+            ret_c = self._infer_call_ret_type(arg)
+            if ret_c in ("double", "float"):
+                return "float"
+            if ret_c == "const char*":
+                return "str"
+            if ret_c == "bool":
+                return "bool"
+            return "int"
+        if isinstance(arg, BinaryOp):
+            if arg.op in ("==", "!=", "<", ">", "<=", ">=", "and", "or"):
+                return "bool"
+            # If either side is float, result is float
+            lt = self._infer_expr_print_type(arg.left)
+            rt = self._infer_expr_print_type(arg.right)
+            if lt == "str" or rt == "str":
+                return "str"
+            if lt == "float" or rt == "float":
+                return "float"
+            return "int"
+        if isinstance(arg, UnaryOp):
+            if arg.op == "not":
+                return "bool"
+            return self._infer_expr_print_type(arg.operand)
+        return "int"
+
+    def _infer_call_ret_type(self, node: Call) -> str:
+        """Infer C return type of a function/method call."""
+        if isinstance(node.func, Identifier):
+            name = node.func.name
+            # Built-in math functions return double
+            if name in ('sqrt', 'abs', 'pow', 'sin', 'cos', 'tan', 'log', 'exp', 'floor', 'ceil', 'round',
+                        'min', 'max'):
+                return "double"
+            if name in ('len',):
+                return "int64_t"
+            key = name
+            if key in self._func_ret_types:
+                return self._func_ret_types[key]
+        if isinstance(node.func, Attribute):
+            # obj.method() — resolve struct type of obj, then look up method return type
+            stype = self._resolve_expr_struct_type(node.func.obj)
+            if stype:
+                key = f"{stype}_{node.func.attr}"
+                if key in self._func_ret_types:
+                    return self._func_ret_types[key]
+        return "int64_t"
+
     def gen_print_call(self, node: Call):
         for arg in node.args:
             val = self.generate_node(arg)
-            
-            if isinstance(arg, StringLit):
+            ptype = self._infer_expr_print_type(arg)
+
+            if ptype == "str":
                 self.emit(f'til_print_str({val});')
-            elif isinstance(arg, IntLit):
-                self.emit(f'til_print_int({val});')
-            elif isinstance(arg, FloatLit):
+            elif ptype == "float":
                 self.emit(f'til_print_float({val});')
-            elif isinstance(arg, BoolLit):
+            elif ptype == "bool":
                 self.emit(f'til_print_bool({val});')
-            elif isinstance(arg, Identifier):
-                if arg.name in self.string_vars:
-                    self.emit(f'til_print_str({val});')
-                else:
-                    # Try to infer type
-                    self.emit(f'til_print_int((int64_t){val});')
-            elif isinstance(arg, Call):
-                # Function call result
-                self.emit(f'til_print_int((int64_t){val});')
-            elif isinstance(arg, BinaryOp):
-                self.emit(f'til_print_int((int64_t)({val}));')
             else:
                 self.emit(f'til_print_int((int64_t){val});')
     
@@ -2657,25 +2917,52 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
             
             # Struct constructor
             if name in self.structs:
-                return f"{name}_new({args_str})"
-            
+                return f"{name}_create({args_str})"
+
+            # Fill in default parameters if fewer args provided
+            if name in self.functions:
+                func_def = self.functions[name]
+                if len(node.args) < len(func_def.params):
+                    for i in range(len(node.args), len(func_def.params)):
+                        p = func_def.params[i]
+                        if p.default:
+                            args.append(self.generate_node(p.default))
+                    args_str = ", ".join(args)
+
             return f"til_{name}({args_str})"
         
         if isinstance(node.func, Attribute):
             obj = self.generate_node(node.func.obj)
-            method = node.func.attr
+            method_name = node.func.attr
             args = [self.generate_node(a) for a in node.args]
-            
-            # Get type name
-            if isinstance(node.func.obj, Identifier):
-                # Try to find the type
-                type_name = node.func.obj.name
-                if type_name in self.structs:
-                    args_str = ", ".join([f"&{obj}"] + args)
-                    return f"{type_name}_{method}({args_str})"
-            
+
+            # Resolve the struct type of the object
+            resolved_type = self._resolve_expr_struct_type(node.func.obj)
+
+            if resolved_type:
+                if resolved_type in self.enums:
+                    # Enum member access: Color.Red -> Color_Red
+                    return f"{resolved_type}_{method_name}"
+                # Check if method has self parameter (instance method vs static)
+                is_instance = False
+                if resolved_type in self.impl_methods:
+                    for m in self.impl_methods[resolved_type]:
+                        if m.name == method_name:
+                            is_instance = any(p.name == "self" for p in m.params)
+                            break
+                if is_instance:
+                    # If obj is already a pointer (self in method), don't add &
+                    if isinstance(node.func.obj, Identifier) and node.func.obj.name == "self" and self.in_method:
+                        self_arg = "self"  # already a pointer
+                    else:
+                        self_arg = f"&{obj}"
+                    args_str = ", ".join([self_arg] + args)
+                else:
+                    args_str = ", ".join(args)
+                return f"{resolved_type}_{method_name}({args_str})"
+
             args_str = ", ".join(args)
-            return f"{obj}.{method}({args_str})"
+            return f"{obj}.{method_name}({args_str})"
         
         func = self.generate_node(node.func)
         args = [self.generate_node(a) for a in node.args]
@@ -2698,13 +2985,69 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
             return f"pow({left}, {right})"
         
         if node.op == '+':
-            # Check for string concat
-            if isinstance(node.left, StringLit) or isinstance(node.right, StringLit):
+            # Check for string concat — works with literals AND variables
+            if self._is_string_expr(node.left) or self._is_string_expr(node.right):
                 return f'til_str_concat({left}, {right})'
         
         c_op = op_map.get(node.op, node.op)
         return f"({left} {c_op} {right})"
     
+    def _resolve_expr_struct_type(self, node) -> Optional[str]:
+        """Resolve the struct type name of an expression, or None."""
+        if isinstance(node, Identifier):
+            name = node.name
+            if name == "self" and self.current_struct:
+                return self.current_struct
+            if name in self.struct_vars:
+                return self.struct_vars[name]
+            if name in self.structs:
+                return name  # static call: Point.new(...)
+            if name in self.enums:
+                return name  # enum access
+            return None
+        if isinstance(node, Attribute):
+            # Chained access: e.g., self.center -> look up field type
+            parent_type = self._resolve_expr_struct_type(node.obj)
+            if parent_type and parent_type in self.structs:
+                for fld in self.structs[parent_type].fields:
+                    if fld.name == node.attr:
+                        if isinstance(fld.type, StructType):
+                            return fld.type.name
+                        ct = self.type_to_c(fld.type)
+                        if ct in self.structs:
+                            return ct
+            return None
+        if isinstance(node, Call):
+            # Method call result: e.g., v1.add(v2) -> Vector2D
+            ret = self._infer_call_ret_type(node)
+            if ret in self.structs:
+                return ret
+            return None
+        return None
+
+    def _is_string_expr(self, node) -> bool:
+        """Check if an expression produces a string value."""
+        if isinstance(node, StringLit):
+            return True
+        if isinstance(node, Identifier):
+            return node.name in self.string_vars
+        if isinstance(node, BinaryOp) and node.op == '+':
+            return self._is_string_expr(node.left) or self._is_string_expr(node.right)
+        if isinstance(node, Call):
+            return self._infer_call_ret_type(node) == "const char*"
+        if isinstance(node, Attribute):
+            if isinstance(node.obj, Identifier):
+                stype = None
+                if node.obj.name == "self" and self.current_struct:
+                    stype = self.current_struct
+                elif node.obj.name in self.struct_vars:
+                    stype = self.struct_vars[node.obj.name]
+                if stype and stype in self.structs:
+                    for fld in self.structs[stype].fields:
+                        if fld.name == node.attr:
+                            return self.type_to_c(fld.type) == "const char*"
+        return False
+
     def gen_UnaryOp(self, node: UnaryOp) -> str:
         operand = self.generate_node(node.operand)
         
@@ -2739,8 +3082,19 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     
     def gen_Attribute(self, node: Attribute) -> str:
         obj = self.generate_node(node.obj)
+        # Use -> for pointer access (self in methods)
+        if isinstance(node.obj, Identifier) and node.obj.name == "self" and self.in_method:
+            return f"self->{node.attr}"
+        # Check if it's an enum member access: Color.Red -> Color_Red
+        if isinstance(node.obj, Identifier) and node.obj.name in self.enums:
+            return f"{node.obj.name}_{node.attr}"
         return f"{obj}.{node.attr}"
     
+    def gen_Cast(self, node: Cast) -> str:
+        expr = self.generate_node(node.expr)
+        c_type = self.type_to_c(node.target_type)
+        return f"(({c_type}){expr})"
+
     def gen_Identifier(self, node: Identifier) -> str:
         return node.name
     
@@ -2770,17 +3124,17 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     def gen_StructInit(self, node: StructInit) -> str:
         args = []
         if node.name in self.structs:
-            for field in self.structs[node.name].fields:
-                if field.name in node.fields:
-                    args.append(self.generate_node(node.fields[field.name]))
-                elif field.default:
-                    args.append(self.generate_node(field.default))
+            for fld in self.structs[node.name].fields:
+                if fld.name in node.fields:
+                    args.append(self.generate_node(node.fields[fld.name]))
+                elif fld.default:
+                    args.append(self.generate_node(fld.default))
                 else:
                     args.append("0")
         else:
             args = [self.generate_node(v) for v in node.fields.values()]
-        
-        return f"{node.name}_new({', '.join(args)})"
+
+        return f"{node.name}_create({', '.join(args)})"
     
     def gen_MatchExpr(self, node: MatchExpr) -> str:
         # Generate as switch or if-else chain
@@ -2875,21 +3229,14 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                 return self.infer_array_elem_type(node.value) + '*'
             if isinstance(node.value, StructInit):
                 return node.value.name  # Return struct name as C type
+            if isinstance(node.value, Cast):
+                return self.type_to_c(node.value.target_type)
             if isinstance(node.value, Call):
-                # Check if it's a struct constructor call (Name.new or just Name_new pattern)
-                if isinstance(node.value.func, Attribute):
-                    struct_name = None
-                    if isinstance(node.value.func.obj, Identifier):
-                        struct_name = node.value.func.obj.name
-                    if struct_name and struct_name in self.structs:
-                        return struct_name
-                elif isinstance(node.value.func, Identifier):
-                    # Check for struct method call like Point_new
-                    func_name = node.value.func.name
-                    for struct_name in self.structs:
-                        if func_name == f"{struct_name}_new":
-                            return struct_name
-        
+                # Use unified call return type inference
+                ret = self._infer_call_ret_type(node.value)
+                if ret and ret != 'void':
+                    return ret
+
         return 'int64_t'
     
     def infer_array_elem_type(self, node: ArrayLit) -> str:
