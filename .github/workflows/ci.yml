@@ -10,51 +10,78 @@ on:
     branches: [ main ]
 
 jobs:
-  test-linux:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
-      - name: Install GCC
-        run: sudo apt-get update && sudo apt-get install -y gcc
-      
-      - name: Run tests
+      - name: Syntax check compiler
+        run: python -m py_compile src/til.py
+      - name: Check version
+        run: python src/til.py --version
+
+  test-linux:
+    runs-on: ubuntu-latest
+    needs: lint
+    strategy:
+      matrix:
+        python-version: ['3.9', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
         run: |
-          python src/til.py --version
-          python src/til.py run examples/01_hello.til
-          python src/til.py run tests/test_basic.til
+          sudo apt-get update && sudo apt-get install -y gcc
+          pip install pytest
+      - name: Run unit tests
+        run: python -m pytest tests/test_compiler.py -v --tb=short
+      - name: Compile all examples
+        run: |
+          for f in examples/*.til examples/basic/*.til examples/advanced/*.til examples/multilevel/*.til; do
+            echo "Testing: $f"
+            python src/til.py run "$f"
+          done
+      - name: Test Kazakh example
+        run: python src/til.py run examples/kazakh/salam.til
 
   test-macos:
     runs-on: macos-latest
+    needs: lint
     steps:
       - uses: actions/checkout@v4
-      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
-      - name: Run tests
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run unit tests
+        run: python -m pytest tests/test_compiler.py -v --tb=short
+      - name: Compile examples
         run: |
-          python src/til.py --version
-          python src/til.py run examples/01_hello.til
+          for f in examples/*.til examples/basic/*.til examples/advanced/*.til examples/multilevel/*.til; do
+            echo "Testing: $f"
+            python src/til.py run "$f"
+          done
 
   test-windows:
     runs-on: windows-latest
+    needs: lint
     steps:
       - uses: actions/checkout@v4
-      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
-      - name: Run tests
-        run: |
-          python src/til.py --version
-          python src/til.py run examples/01_hello.til
+      - name: Install pytest
+        run: pip install pytest
+      - name: Run unit tests
+        run: python -m pytest tests/test_compiler.py -v --tb=short
+      - name: Compile hello example
+        run: python src/til.py run examples/01_hello.til

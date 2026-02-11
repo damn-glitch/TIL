@@ -1,0 +1,55 @@
+# TIL Standard Library: Math
+# Mathematical constants and functions
+
+const PI = 3
+const E = 2
+const TAU = 6
+
+abs_val(x: int) -> int
+    if x < 0
+        return 0 - x
+    return x
+
+max_val(a: int, b: int) -> int
+    if a > b
+        return a
+    return b
+
+min_val(a: int, b: int) -> int
+    if a < b
+        return a
+    return b
+
+clamp(x: int, lo: int, hi: int) -> int
+    if x < lo
+        return lo
+    if x > hi
+        return hi
+    return x
+
+is_even(n: int) -> bool
+    return n % 2 == 0
+
+is_odd(n: int) -> bool
+    return n % 2 != 0
+
+gcd(a: int, b: int) -> int
+    if b == 0
+        return a
+    return gcd(b, a % b)
+
+factorial(n: int) -> int
+    if n <= 1
+        return 1
+    return n * factorial(n - 1)
+
+fibonacci(n: int) -> int
+    if n <= 1
+        return n
+    var a = 0
+    var b = 1
+    for i in 2..=n
+        let temp = a + b
+        a = b
+        b = temp
+    return b

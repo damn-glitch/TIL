@@ -1,0 +1,9 @@
+# Example 08: Module imports
+# Demonstrates TIL's module system
+
+import math_utils
+
+main()
+    print(square(5))
+    print(cube(3))
+    print(clamp(15, 0, 10))
