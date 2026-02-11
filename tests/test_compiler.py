@@ -13,10 +13,11 @@ import tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 from til import (
     Lexer, TokenType, Parser, TypeChecker, CCodeGenerator, TILCompiler,
-    IntLit, FloatLit, StringLit, BoolLit, Identifier, BinaryOp, UnaryOp,
+    IntLit, FloatLit, StringLit, BoolLit, CharLit, FStringLit, Identifier,
+    BinaryOp, UnaryOp, TupleLit,
     Call, Attribute, Cast, ArrayLit, Range, StructInit, MatchExpr,
     Block, VarDecl, Assignment, If, For, While, Loop, Return, Break, Continue,
-    ExprStmt, FuncDef, StructDef, EnumDef, ImplBlock, Import, Program,
+    ExprStmt, FuncDef, StructDef, EnumDef, ImplBlock, TraitDef, Import, TypeAlias, Program,
     Lambda, IfExpr, ListComprehension, NullCheck, DictLit,
     ErrorReporter, get_hint_for_error, ModuleResolver, resolve_imports,
     PrimitiveType, ArrayType, StructType, OptionType, ResultType,
@@ -1044,6 +1045,305 @@ class TestOptionResult:
         c = compile_to_c('main()\n    print(1)\n')
         assert 'TIL_Option_int' in c
         assert 'TIL_Result_int' in c
+
+
+# ═══════════════════════════════════════════════════════════════
+# PHASE 4: GLOBALS, CHAR, TYPE ALIASES, TRAITS, F-STRINGS
+# ═══════════════════════════════════════════════════════════════
+
+class TestGlobals:
+    def test_global_const_codegen(self):
+        c = compile_to_c('const MAX = 100\nmain()\n    print(MAX)\n')
+        assert 'static' in c
+        assert 'MAX' in c
+        assert '100' in c
+
+    def test_global_const_compile_and_run(self):
+        out = compile_and_run('const ANSWER = 42\nmain()\n    print(ANSWER)\n')
+        assert out == "42"
+
+    def test_global_variable_compile_and_run(self):
+        out = compile_and_run('const X = 10\nconst Y = 20\nmain()\n    print(X + Y)\n')
+        assert out == "30"
+
+    def test_global_string_const(self):
+        out = compile_and_run('const GREETING = "Hello"\nmain()\n    print(GREETING)\n')
+        assert out == "Hello"
+
+    def test_global_array_const(self):
+        c = compile_to_c('const PRIMES = [2, 3, 5]\nmain()\n    print(1)\n')
+        assert 'static' in c
+        assert 'PRIMES' in c
+
+
+class TestCharLit:
+    def test_char_token(self):
+        tokens = lex("'x'")
+        chars = [t for t in tokens if t.type == TokenType.CHAR]
+        assert len(chars) == 1
+        assert chars[0].value == 'x'
+
+    def test_char_vs_string(self):
+        """Single char in single quotes = CharLit; multi-char = StringLit."""
+        tokens = lex("'x' 'ab'")
+        chars = [t for t in tokens if t.type == TokenType.CHAR]
+        strings = [t for t in tokens if t.type == TokenType.STRING]
+        assert len(chars) == 1
+        assert len(strings) == 1
+
+    def test_char_parse(self):
+        prog = parse("main()\n    let c = 'a'\n")
+        decl = prog.statements[0].body.statements[0]
+        assert isinstance(decl.value, CharLit)
+        assert decl.value.value == 'a'
+
+    def test_char_codegen(self):
+        c = compile_to_c("main()\n    let c = 'x'\n")
+        assert "'x'" in c
+
+    def test_char_compile_and_run(self):
+        out = compile_and_run("main()\n    let c = 'A'\n    print(c)\n")
+        # char printed as int (ASCII code)
+        assert out == "65"
+
+    def test_escape_char(self):
+        tokens = lex("'\\n'")
+        chars = [t for t in tokens if t.type == TokenType.CHAR]
+        assert len(chars) == 1
+        assert chars[0].value == '\n'
+
+
+class TestTypeAlias:
+    def test_type_alias_parse(self):
+        prog = parse('type MyInt = int\nmain()\n    print(1)\n')
+        assert any(isinstance(s, TypeAlias) for s in prog.statements)
+
+    def test_type_alias_codegen(self):
+        c = compile_to_c('type MyInt = int\nmain()\n    print(1)\n')
+        assert 'typedef' in c
+        assert 'MyInt' in c
+
+
+class TestFString:
+    def test_fstring_token(self):
+        tokens = lex('f"hello {name}"')
+        fstrings = [t for t in tokens if t.type == TokenType.FSTRING]
+        assert len(fstrings) == 1
+
+    def test_fstring_parse(self):
+        prog = parse('main()\n    let name = "World"\n    let s = f"Hello {name}"\n')
+        decl = prog.statements[0].body.statements[1]
+        assert isinstance(decl.value, FStringLit)
+        assert len(decl.value.parts) == 2
+
+    def test_fstring_codegen(self):
+        c = compile_to_c('main()\n    let name = "World"\n    let s = f"Hello {name}"\n')
+        assert 'til_str_concat' in c
+
+    def test_fstring_compile_and_run(self):
+        src = 'main()\n    let name = "World"\n    print(f"Hello {name}!")\n'
+        out = compile_and_run(src)
+        assert out == "Hello World!"
+
+    def test_fstring_with_int(self):
+        src = 'main()\n    let x = 42\n    print(f"Answer: {x}")\n'
+        out = compile_and_run(src)
+        assert out == "Answer: 42"
+
+    def test_fstring_multiple_exprs(self):
+        src = 'main()\n    let a = "hello"\n    let b = "world"\n    print(f"{a} {b}")\n'
+        out = compile_and_run(src)
+        assert out == "hello world"
+
+
+class TestTraits:
+    def test_trait_parse(self):
+        prog = parse('trait Printable\n    fn to_string(self) -> str\n        return ""\n')
+        assert any(isinstance(s, TraitDef) for s in prog.statements)
+        trait = [s for s in prog.statements if isinstance(s, TraitDef)][0]
+        assert trait.name == "Printable"
+        assert len(trait.methods) == 1
+
+
+# ═══════════════════════════════════════════════════════════════
+# PHASE 5: TUPLES, STDLIB, ADVANCED FEATURES
+# ═══════════════════════════════════════════════════════════════
+
+class TestTuples:
+    def test_tuple_parse(self):
+        prog = parse('main()\n    let t = (1, 2, 3)\n')
+        decl = prog.statements[0].body.statements[0]
+        assert isinstance(decl.value, TupleLit)
+        assert len(decl.value.elements) == 3
+
+    def test_tuple_two_elements(self):
+        prog = parse('main()\n    let p = (10, 20)\n')
+        decl = prog.statements[0].body.statements[0]
+        assert isinstance(decl.value, TupleLit)
+        assert len(decl.value.elements) == 2
+
+
+class TestStdlib:
+    def test_stdlib_math_resolves(self):
+        root = os.path.join(os.path.dirname(__file__), '..')
+        resolver = ModuleResolver()
+        stdlib_dir = os.path.join(root, 'stdlib')
+        # Check file exists
+        assert os.path.exists(os.path.join(stdlib_dir, 'math.til'))
+
+    def test_stdlib_strings_resolves(self):
+        root = os.path.join(os.path.dirname(__file__), '..')
+        stdlib_dir = os.path.join(root, 'stdlib')
+        assert os.path.exists(os.path.join(stdlib_dir, 'strings.til'))
+
+    def test_import_stdlib_math(self):
+        """Importing stdlib/math.til should compile."""
+        root = os.path.join(os.path.dirname(__file__), '..')
+        src = 'import math\nmain()\n    print(factorial(5))\n'
+        # Write temp file next to stdlib
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.til', dir=root, delete=False) as f:
+            f.write(src)
+            tmp = f.name
+        try:
+            result = subprocess.run(
+                [sys.executable, os.path.join(root, 'src', 'til.py'), 'run', tmp],
+                capture_output=True, text=True, timeout=30
+            )
+            assert result.returncode == 0, f"Stdlib math import failed:\n{result.stderr}"
+            assert "120" in result.stdout
+        finally:
+            os.unlink(tmp)
+
+
+class TestAdvancedIntegration:
+    """Advanced integration tests combining multiple features."""
+
+    def test_struct_with_string_fields(self):
+        src = """struct Person
+    name: str
+    age: int
+impl Person
+    greet(self) -> str
+        return self.name
+main()
+    let p = Person { name: "Alice", age: 30 }
+    print(p.greet())
+"""
+        out = compile_and_run(src)
+        assert out == "Alice"
+
+    def test_nested_loops(self):
+        src = """main()
+    var count = 0
+    for i in 0..3
+        for j in 0..3
+            count += 1
+    print(count)
+"""
+        out = compile_and_run(src)
+        assert out == "9"
+
+    def test_multiple_enums(self):
+        src = """enum Color
+    Red = 1
+    Green = 2
+    Blue = 3
+enum Direction
+    North = 0
+    South = 1
+main()
+    print(Color.Blue)
+    print(Direction.South)
+"""
+        out = compile_and_run(src)
+        assert out == "3\n1"
+
+    def test_recursive_fibonacci(self):
+        src = """fib(n: int) -> int
+    if n <= 1
+        return n
+    return fib(n - 1) + fib(n - 2)
+main()
+    print(fib(10))
+"""
+        out = compile_and_run(src)
+        assert out == "55"
+
+    def test_string_operations_chained(self):
+        out = compile_and_run('main()\n    let s = "Hello World"\n    print(s.to_upper())\n    print(s.to_lower())\n')
+        lines = out.split('\n')
+        assert lines[0] == "HELLO WORLD"
+        assert lines[1] == "hello world"
+
+    def test_complex_if_chains(self):
+        src = """classify(n: int) -> str
+    if n < 0
+        return "negative"
+    elif n == 0
+        return "zero"
+    elif n < 10
+        return "small"
+    elif n < 100
+        return "medium"
+    else
+        return "large"
+main()
+    print(classify(0))
+    print(classify(5))
+    print(classify(50))
+    print(classify(500))
+"""
+        out = compile_and_run(src)
+        lines = out.split('\n')
+        assert lines[0] == "zero"
+        assert lines[1] == "small"
+        assert lines[2] == "medium"
+        assert lines[3] == "large"
+
+    def test_boolean_logic(self):
+        out = compile_and_run('main()\n    print(true and false)\n    print(true or false)\n    print(not true)\n')
+        lines = out.split('\n')
+        assert lines[0] == "false"
+        assert lines[1] == "true"
+        assert lines[2] == "false"
+
+    def test_modulo_operations(self):
+        out = compile_and_run('main()\n    print(17 % 5)\n    print(100 % 3)\n')
+        lines = out.split('\n')
+        assert lines[0] == "2"
+        assert lines[1] == "1"
+
+    def test_comparison_chain(self):
+        src = """main()
+    let a = 5
+    let b = 10
+    let c = 15
+    print(a < b)
+    print(b < c)
+    print(a == b)
+    print(a != c)
+"""
+        out = compile_and_run(src)
+        lines = out.split('\n')
+        assert lines[0] == "true"
+        assert lines[1] == "true"
+        assert lines[2] == "false"
+        assert lines[3] == "true"
+
+    def test_mixed_types_print(self):
+        src = """main()
+    print(42)
+    print(3.14)
+    print("hello")
+    print(true)
+"""
+        out = compile_and_run(src)
+        lines = out.split('\n')
+        assert lines[0] == "42"
+        assert "3.14" in lines[1]
+        assert lines[2] == "hello"
+        assert lines[3] == "true"
 
 
 if __name__ == '__main__':

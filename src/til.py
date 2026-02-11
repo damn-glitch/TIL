@@ -146,6 +146,7 @@ class TokenType(Enum):
     INT = auto()
     FLOAT = auto()
     STRING = auto()
+    FSTRING = auto()  # f-string interpolation
     CHAR = auto()
     BOOL = auto()
     
@@ -382,7 +383,11 @@ class Lexer:
                 self.col = 1
                 continue
             
-            # String
+            # String / f-string
+            if ch == 'f' and self.peek() in '"\'':
+                self.advance()  # skip 'f'
+                self.read_fstring(self.current())
+                continue
             if ch in '"\'':
                 self.read_string(ch)
                 continue
@@ -486,7 +491,12 @@ class Lexer:
             ch = self.current()
             if ch == quote:
                 self.advance()
-                self.add_token(TokenType.STRING, ''.join(result))
+                value = ''.join(result)
+                # Single-quoted single char = CharLit
+                if quote == "'" and len(value) == 1:
+                    self.add_token(TokenType.CHAR, value)
+                else:
+                    self.add_token(TokenType.STRING, value)
                 return
             elif ch == '\\':
                 self.advance()
@@ -503,6 +513,52 @@ class Lexer:
         
         self.error("Unterminated string")
     
+    def read_fstring(self, quote: str):
+        """Parse f"text {expr} text" into STRING_INTERP token with parts list."""
+        self.advance()  # opening quote
+        parts = []  # list of (type, value): ('str', text) or ('expr', text)
+        current_str = []
+
+        while self.pos < len(self.source):
+            ch = self.current()
+            if ch == quote:
+                self.advance()
+                if current_str:
+                    parts.append(('str', ''.join(current_str)))
+                self.add_token(TokenType.FSTRING, parts)
+                return
+            elif ch == '{':
+                if current_str:
+                    parts.append(('str', ''.join(current_str)))
+                    current_str = []
+                self.advance()  # skip {
+                expr_chars = []
+                depth = 1
+                while self.pos < len(self.source) and depth > 0:
+                    c = self.current()
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                        if depth == 0:
+                            self.advance()
+                            break
+                    expr_chars.append(c)
+                    self.advance()
+                parts.append(('expr', ''.join(expr_chars)))
+            elif ch == '\\':
+                self.advance()
+                esc = self.current()
+                escapes = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '"': '"', "'": "'"}
+                current_str.append(escapes.get(esc, esc))
+                self.advance()
+            elif ch == '\n':
+                self.error("Unterminated f-string")
+            else:
+                current_str.append(ch)
+                self.advance()
+        self.error("Unterminated f-string")
+
     def read_number(self):
         start = self.pos
         is_float = False
@@ -773,6 +829,12 @@ class StringLit(ASTNode):
     type: Type = field(default_factory=lambda: T_STR)
 
 @dataclass
+class FStringLit(ASTNode):
+    """f"text {expr} text" - interpolated string"""
+    parts: List = field(default_factory=list)  # list of (type, ASTNode_or_str)
+    type: Type = field(default_factory=lambda: T_STR)
+
+@dataclass
 class BoolLit(ASTNode):
     value: bool = False
     type: Type = field(default_factory=lambda: T_BOOL)
@@ -870,6 +932,12 @@ class Cast(ASTNode):
 class NullCheck(ASTNode):
     """expr? - unwrap optional or propagate null"""
     expr: ASTNode = None
+    type: Type = field(default_factory=lambda: T_UNKNOWN)
+
+@dataclass
+class TupleLit(ASTNode):
+    """(a, b, c) - tuple literal"""
+    elements: List[ASTNode] = field(default_factory=list)
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
@@ -1701,7 +1769,7 @@ class Parser:
         if self.match(TokenType.DEDENT):
             self.advance()
         
-        return TraitDef(name, methods)
+        return TraitDef(name=name, methods=methods)
     
     def parse_import(self) -> Import:
         if self.match(TokenType.FROM):
@@ -1744,7 +1812,7 @@ class Parser:
         name = self.consume(TokenType.IDENT).value
         self.consume(TokenType.EQ)
         type_val = self.parse_type()
-        return TypeAlias(name, type_val)
+        return TypeAlias(name=name, type=type_val)
     
     def parse_const(self) -> VarDecl:
         self.consume(TokenType.CONST)
@@ -1958,7 +2026,26 @@ class Parser:
         
         if self.match(TokenType.STRING):
             return StringLit(value=self.advance().value)
-        
+
+        if self.match(TokenType.CHAR):
+            return CharLit(value=self.advance().value)
+
+        if self.match(TokenType.FSTRING):
+            token = self.advance()
+            # Parse expression parts within the f-string
+            parts = []
+            for kind, text in token.value:
+                if kind == 'str':
+                    parts.append(('str', StringLit(value=text)))
+                else:
+                    # Parse the expression text
+                    from til import Lexer as SubLexer, Parser as SubParser
+                    sub_tokens = SubLexer(text, "<fstring>").tokenize()
+                    sub_parser = SubParser(sub_tokens, "<fstring>")
+                    expr = sub_parser.parse_expression()
+                    parts.append(('expr', expr))
+            return FStringLit(parts=parts)
+
         if self.match(TokenType.BOOL):
             return BoolLit(value=self.advance().value)
         
@@ -1972,7 +2059,7 @@ class Parser:
             expr = self.parse_expression()
             
             if self.match(TokenType.COMMA):
-                # Tuple
+                # Tuple: (a, b, c)
                 elements = [expr]
                 while self.match(TokenType.COMMA):
                     self.advance()
@@ -1980,7 +2067,7 @@ class Parser:
                         break
                     elements.append(self.parse_expression())
                 self.consume(TokenType.RPAREN)
-                return ArrayLit(elements=elements)
+                return TupleLit(elements=elements)
             
             self.consume(TokenType.RPAREN)
             return expr
@@ -2156,6 +2243,12 @@ class TypeChecker:
         return T_UNKNOWN
     
     def check_Program(self, node: Program) -> Type:
+        # First pass: collect trait definitions
+        self._trait_defs: Dict[str, TraitDef] = {}
+        for stmt in node.statements:
+            if isinstance(stmt, TraitDef):
+                self._trait_defs[stmt.name] = stmt
+
         for stmt in node.statements:
             self.check_node(stmt)
         return T_VOID
@@ -2378,6 +2471,15 @@ class TypeChecker:
         return T_VOID
     
     def check_ImplBlock(self, node: ImplBlock) -> Type:
+        # Check if this impl is for a trait
+        if node.trait_name and hasattr(self, '_trait_defs') and node.trait_name in self._trait_defs:
+            trait = self._trait_defs[node.trait_name]
+            impl_method_names = {m.name for m in node.methods}
+            for trait_method in trait.methods:
+                if trait_method.name not in impl_method_names:
+                    self.errors.append(
+                        f"Missing trait method '{trait_method.name}' in impl {node.trait_name} for {node.type_name}")
+
         for method in node.methods:
             self.check_node(method)
         return T_VOID
@@ -2410,6 +2512,9 @@ class CCodeGenerator:
         self.bool_vars: Set[str] = set()
         self.struct_vars: Dict[str, str] = {}  # var_name -> struct_type_name
         self.array_vars: Dict[str, int] = {}  # name -> length
+        self._global_string_vars: Set[str] = set()
+        self._global_float_vars: Set[str] = set()
+        self._global_bool_vars: Set[str] = set()
         self.current_level = 2
         self.in_method: bool = False
         self.current_struct: Optional[str] = None
@@ -2442,6 +2547,9 @@ class CCodeGenerator:
         self.output = []
         
         # First pass: collect definitions
+        self._globals: List[VarDecl] = []
+        self._type_aliases: Dict[str, TypeAlias] = {}
+        self._trait_defs: Dict[str, 'TraitDef'] = {}
         for stmt in program.statements:
             if isinstance(stmt, StructDef):
                 self.structs[stmt.name] = stmt
@@ -2453,6 +2561,12 @@ class CCodeGenerator:
                 if stmt.type_name not in self.impl_methods:
                     self.impl_methods[stmt.type_name] = []
                 self.impl_methods[stmt.type_name].extend(stmt.methods)
+            elif isinstance(stmt, VarDecl):
+                self._globals.append(stmt)
+            elif isinstance(stmt, TypeAlias):
+                self._type_aliases[stmt.name] = stmt
+            elif isinstance(stmt, TraitDef):
+                self._trait_defs[stmt.name] = stmt
 
         # Build function return type map for print inference
         self._func_ret_types: Dict[str, str] = {}
@@ -2470,10 +2584,12 @@ class CCodeGenerator:
         self.emit_header()
         self.emit_types()
         self.emit_enums()
+        self.emit_type_aliases()
         self.emit_forward_declarations()
         self.emit_helpers()
-        self.emit_lambdas()  # emit lambda defs collected from first pass (may be empty)
+        self.emit_lambdas()
         self.emit_structs()
+        self.emit_globals()
         self.emit_functions(program)
         # Emit any lambdas created during code generation
         if self._lambda_defs:
@@ -2698,6 +2814,28 @@ static int64_t til_str_find(const char* s, const char* sub) {
     return p ? (int64_t)(p - s) : -1;
 }
 
+// Dynamic array helpers
+typedef struct TIL_IntArray { int64_t* data; size_t len; size_t cap; } TIL_IntArray;
+typedef struct TIL_FloatArray { double* data; size_t len; size_t cap; } TIL_FloatArray;
+typedef struct TIL_StrArray { const char** data; size_t len; size_t cap; } TIL_StrArray;
+
+static TIL_IntArray til_int_array_new(size_t cap) {
+    TIL_IntArray a; a.data = (int64_t*)malloc(sizeof(int64_t) * (cap > 0 ? cap : 8));
+    a.len = 0; a.cap = cap > 0 ? cap : 8; return a;
+}
+static void til_int_array_push(TIL_IntArray* a, int64_t val) {
+    if (a->len >= a->cap) { a->cap *= 2; a->data = (int64_t*)realloc(a->data, sizeof(int64_t) * a->cap); }
+    a->data[a->len++] = val;
+}
+static int64_t til_int_array_pop(TIL_IntArray* a) {
+    if (a->len == 0) { fprintf(stderr, "Pop from empty array\\n"); exit(1); }
+    return a->data[--a->len];
+}
+static int64_t til_int_array_get(TIL_IntArray* a, size_t i) {
+    if (i >= a->len) { fprintf(stderr, "Array index out of bounds\\n"); exit(1); }
+    return a->data[i];
+}
+
 // Option<T> - tagged union for optional values
 typedef struct TIL_Option_int { bool has_value; int64_t value; } TIL_Option_int;
 typedef struct TIL_Option_float { bool has_value; double value; } TIL_Option_float;
@@ -2753,6 +2891,48 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
 """)
         self.emit_raw("")
     
+    def emit_type_aliases(self):
+        """Emit C typedef for type aliases."""
+        if not self._type_aliases:
+            return
+        self.emit_raw("// Type Aliases")
+        for name, alias in self._type_aliases.items():
+            c_name = self.mangle_name(name)
+            c_type = self.type_to_c(alias.type) if alias.type else "int64_t"
+            self.emit_raw(f"typedef {c_type} {c_name};")
+        self.emit_raw("")
+
+    def emit_globals(self):
+        """Emit module-level variables and constants as C static variables."""
+        if not self._globals:
+            return
+        self.emit_raw("// Global Variables")
+        for var in self._globals:
+            c_type = self.infer_c_type(var)
+            c_name = self.mangle_name(var.name)
+            self._track_var_type(var, c_type)
+            self.declared_vars.add(var.name)
+            # Track global type info for print inference across functions
+            if isinstance(var.value, StringLit):
+                self._global_string_vars.add(var.name)
+            elif isinstance(var.value, FloatLit):
+                self._global_float_vars.add(var.name)
+            elif isinstance(var.value, BoolLit):
+                self._global_bool_vars.add(var.name)
+            if var.value:
+                val = self.generate_node(var.value)
+                if isinstance(var.value, ArrayLit):
+                    elem_type = self.infer_array_elem_type(var.value)
+                    n = len(var.value.elements)
+                    self.emit_raw(f"static {elem_type} {c_name}[{n}] = {val};")
+                    self.emit_raw(f"static size_t {c_name}_len = {n};")
+                    self.array_vars[var.name] = n
+                else:
+                    self.emit_raw(f"static {c_type} {c_name} = {val};")
+            else:
+                self.emit_raw(f"static {c_type} {c_name};")
+        self.emit_raw("")
+
     def emit_structs(self):
         if not self.structs:
             return
@@ -2809,9 +2989,9 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         old_current_struct = self.current_struct
 
         self.declared_vars = {"self"} if has_self else set()
-        self.string_vars = set()
-        self.float_vars = set()
-        self.bool_vars = set()
+        self.string_vars = set(self._global_string_vars)
+        self.float_vars = set(self._global_float_vars)
+        self.bool_vars = set(self._global_bool_vars)
         self.struct_vars = {}
         self.in_method = has_self
         self.current_struct = type_name if has_self else None
@@ -2859,9 +3039,9 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     def generate_function(self, func: FuncDef):
         self.current_level = func.level
         self.declared_vars = set()
-        self.string_vars = set()
-        self.float_vars = set()
-        self.bool_vars = set()
+        self.string_vars = set(self._global_string_vars)
+        self.float_vars = set(self._global_float_vars)
+        self.bool_vars = set(self._global_bool_vars)
         self.struct_vars = {}
         self.array_vars = {}
         self.in_method = False
@@ -3144,6 +3324,8 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     def _infer_expr_print_type(self, arg) -> str:
         """Infer the C print type for an expression: 'str', 'float', 'bool', or 'int'."""
         if isinstance(arg, StringLit):
+            return "str"
+        if isinstance(arg, FStringLit):
             return "str"
         if isinstance(arg, IntLit):
             return "int"
@@ -3616,7 +3798,85 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     
     def gen_BoolLit(self, node: BoolLit) -> str:
         return "true" if node.value else "false"
+
+    def gen_CharLit(self, node: CharLit) -> str:
+        ch = node.value
+        if ch == "'":
+            return "'\\''"
+        elif ch == '\\':
+            return "'\\\\'"
+        elif ch == '\n':
+            return "'\\n'"
+        elif ch == '\t':
+            return "'\\t'"
+        return f"'{ch}'"
     
+    def gen_TupleLit(self, node: TupleLit) -> str:
+        """Generate tuple as a C struct literal."""
+        if not hasattr(self, '_tuple_types'):
+            self._tuple_types = {}
+        n = len(node.elements)
+        # Get element types
+        types = []
+        vals = []
+        for elem in node.elements:
+            t = self._infer_expr_print_type(elem)
+            type_map = {"int": "int64_t", "float": "double", "str": "const char*", "bool": "bool"}
+            types.append(type_map.get(t, "int64_t"))
+            vals.append(self.generate_node(elem))
+
+        # Create a unique tuple type name
+        key = "_".join(types)
+        if key not in self._tuple_types:
+            tuple_name = f"TIL_Tuple_{len(self._tuple_types)}"
+            self._tuple_types[key] = tuple_name
+            # Will be emitted in _fixup_tuples
+
+        tuple_name = self._tuple_types[key]
+        fields = ", ".join(vals)
+        return f"({tuple_name}){{{fields}}}"
+
+    def gen_FStringLit(self, node: FStringLit) -> str:
+        """Generate f-string as a series of til_str_concat calls."""
+        if not node.parts:
+            return '""'
+
+        result = None
+        for kind, part in node.parts:
+            if kind == 'str':
+                val = self.gen_StringLit(part)
+            else:
+                # Expression — convert to string based on type
+                ptype = self._infer_expr_print_type(part)
+                expr_val = self.generate_node(part)
+                if ptype == "str":
+                    val = expr_val
+                elif ptype == "int":
+                    if not hasattr(self, '_fstr_counter'):
+                        self._fstr_counter = 0
+                    self._fstr_counter += 1
+                    buf = f"_fstr_buf_{self._fstr_counter}"
+                    self.emit(f"char {buf}[32]; snprintf({buf}, 32, \"%lld\", (long long){expr_val});")
+                    val = buf
+                elif ptype == "float":
+                    if not hasattr(self, '_fstr_counter'):
+                        self._fstr_counter = 0
+                    self._fstr_counter += 1
+                    buf = f"_fstr_buf_{self._fstr_counter}"
+                    self.emit(f"char {buf}[32]; snprintf({buf}, 32, \"%g\", {expr_val});")
+                    val = buf
+                elif ptype == "bool":
+                    val = f"({expr_val} ? \"true\" : \"false\")"
+                else:
+                    val = expr_val
+
+            if result is None:
+                result = val
+            else:
+                result = f"til_str_concat({result}, {val})"
+
+        return result
+
     def gen_ArrayLit(self, node: ArrayLit) -> str:
         elements = [self.generate_node(e) for e in node.elements]
         return "{" + ", ".join(elements) + "}"
@@ -3814,11 +4074,16 @@ class ModuleResolver:
         # Convert module.path to file path
         parts = module_name.replace(".", os.sep)
 
-        # Search paths: relative to importing file, then base path
+        # Search paths: relative to importing file, then base path, then stdlib
         search_dirs = []
         if from_file and from_file != "<stdin>":
             search_dirs.append(os.path.dirname(os.path.abspath(from_file)))
         search_dirs.append(self.base_path)
+        # Add stdlib directory (relative to compiler location)
+        compiler_dir = os.path.dirname(os.path.abspath(__file__))
+        stdlib_dir = os.path.join(os.path.dirname(compiler_dir), 'stdlib')
+        if os.path.isdir(stdlib_dir):
+            search_dirs.append(stdlib_dir)
 
         for d in search_dirs:
             # Try module_name.til
