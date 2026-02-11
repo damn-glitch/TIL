@@ -43,7 +43,7 @@ jobs:
         run: python -m pytest tests/test_compiler.py -v --tb=short
       - name: Compile all examples
         run: |
-          for f in examples/*.til examples/basic/*.til examples/advanced/*.til examples/multilevel/*.til; do
+          for f in examples/[0-9]*.til; do
             echo "Testing: $f"
             python src/til.py run "$f"
           done
@@ -65,7 +65,7 @@ jobs:
         run: python -m pytest tests/test_compiler.py -v --tb=short
       - name: Compile examples
         run: |
-          for f in examples/*.til examples/basic/*.til examples/advanced/*.til examples/multilevel/*.til; do
+          for f in examples/[0-9]*.til; do
             echo "Testing: $f"
             python src/til.py run "$f"
           done
