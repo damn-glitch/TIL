@@ -1346,6 +1346,926 @@ main()
         assert lines[3] == "true"
 
 
+# ═══════════════════════════════════════════════════════════════
+# V2.0 FEATURE TESTS
+# ═══════════════════════════════════════════════════════════════
+
+class TestClosures:
+    """Tests for closure / lambda variable capture"""
+
+    def test_basic_closure(self):
+        src = """
+main()
+    let x = 10
+    let add_x = |y: int| -> int { y + x }
+    print(add_x(5))
+"""
+        assert compile_and_run(src) == "15"
+
+    def test_closure_capture_multiple(self):
+        src = """
+main()
+    let a = 3
+    let b = 7
+    let sum_ab = |c: int| -> int { a + b + c }
+    print(sum_ab(10))
+"""
+        assert compile_and_run(src) == "20"
+
+    def test_closure_string_capture(self):
+        src = """
+main()
+    let greeting = "Hello"
+    let greet = |name: str| -> str { greeting }
+    print(greet("World"))
+"""
+        assert compile_and_run(src) == "Hello"
+
+    def test_lambda_no_capture(self):
+        src = """
+main()
+    let double = |x: int| -> int { x * 2 }
+    print(double(7))
+"""
+        assert compile_and_run(src) == "14"
+
+    def test_lambda_arithmetic(self):
+        src = """
+main()
+    let square = |x: int| -> int { x * x }
+    print(square(5))
+    print(square(3))
+"""
+        out = compile_and_run(src)
+        assert out == "25\n9"
+
+    def test_lambda_with_function(self):
+        src = """
+apply(f: int, x: int) -> int
+    return f + x
+
+main()
+    let offset = 100
+    let add_offset = |v: int| -> int { v + offset }
+    print(add_offset(42))
+"""
+        assert compile_and_run(src) == "142"
+
+
+class TestDynamicArrays:
+    """Tests for Vec<T> dynamic arrays"""
+
+    def test_vec_int_basic(self):
+        src = """
+main()
+    let v = Vec<int>.new()
+    v.push(10)
+    v.push(20)
+    v.push(30)
+    print(v.len())
+    print(v.get(0))
+    print(v.get(1))
+    print(v.get(2))
+"""
+        assert compile_and_run(src) == "3\n10\n20\n30"
+
+    def test_vec_int_push_pop(self):
+        src = """
+main()
+    let v = Vec<int>.new()
+    v.push(1)
+    v.push(2)
+    v.push(3)
+    let x = v.pop()
+    print(x)
+    print(v.len())
+"""
+        assert compile_and_run(src) == "3\n2"
+
+    def test_vec_float(self):
+        src = """
+main()
+    let v = Vec<float>.new()
+    v.push(1.5)
+    v.push(2.5)
+    print(v.len())
+    print(v.get(0))
+"""
+        out = compile_and_run(src)
+        lines = out.split('\n')
+        assert lines[0] == "2"
+        assert "1.5" in lines[1]
+
+    def test_vec_str(self):
+        src = """
+main()
+    let v = Vec<str>.new()
+    v.push("hello")
+    v.push("world")
+    print(v.len())
+    print(v.get(0))
+    print(v.get(1))
+"""
+        assert compile_and_run(src) == "2\nhello\nworld"
+
+    def test_vec_multiple_pops(self):
+        src = """
+main()
+    let v = Vec<int>.new()
+    v.push(10)
+    v.push(20)
+    v.push(30)
+    v.pop()
+    v.pop()
+    print(v.len())
+    print(v.get(0))
+"""
+        assert compile_and_run(src) == "1\n10"
+
+    def test_vec_empty_len(self):
+        src = """
+main()
+    let v = Vec<int>.new()
+    print(v.len())
+"""
+        assert compile_and_run(src) == "0"
+
+
+class TestHashMaps:
+    """Tests for HashMap<K,V>"""
+
+    def test_hashmap_str_int_basic(self):
+        src = """
+main()
+    let m = HashMap<str, int>.new()
+    m.set("a", 1)
+    m.set("b", 2)
+    print(m.get("a"))
+    print(m.get("b"))
+    print(m.len())
+"""
+        assert compile_and_run(src) == "1\n2\n2"
+
+    def test_hashmap_has(self):
+        src = """
+main()
+    let m = HashMap<str, int>.new()
+    m.set("key", 42)
+    print(m.has("key"))
+    print(m.has("missing"))
+"""
+        assert compile_and_run(src) == "true\nfalse"
+
+    def test_hashmap_overwrite(self):
+        src = """
+main()
+    let m = HashMap<str, int>.new()
+    m.set("x", 10)
+    m.set("x", 20)
+    print(m.get("x"))
+    print(m.len())
+"""
+        assert compile_and_run(src) == "20\n1"
+
+    def test_hashmap_str_str(self):
+        src = """
+main()
+    let m = HashMap<str, str>.new()
+    m.set("name", "Alice")
+    m.set("city", "Almaty")
+    print(m.get("name"))
+    print(m.get("city"))
+"""
+        assert compile_and_run(src) == "Alice\nAlmaty"
+
+    def test_hashmap_multiple_entries(self):
+        src = """
+main()
+    let m = HashMap<str, int>.new()
+    m.set("a", 1)
+    m.set("b", 2)
+    m.set("c", 3)
+    m.set("d", 4)
+    m.set("e", 5)
+    print(m.len())
+    print(m.get("c"))
+    print(m.get("e"))
+"""
+        assert compile_and_run(src) == "5\n3\n5"
+
+
+class TestPatternMatchingV2:
+    """Tests for pattern matching with wildcards and guards"""
+
+    def test_wildcard_pattern(self):
+        src = """
+main()
+    let x = 42
+    let r = match x
+        1 => "one"
+        2 => "two"
+        _ => "other"
+    print(r)
+"""
+        assert compile_and_run(src) == "other"
+
+    def test_match_guard(self):
+        src = """
+main()
+    let n = 15
+    let r = match n
+        n if n > 10 => "big"
+        n if n > 5 => "medium"
+        _ => "small"
+    print(r)
+"""
+        assert compile_and_run(src) == "big"
+
+    def test_match_guard_medium(self):
+        src = """
+main()
+    let n = 7
+    let r = match n
+        n if n > 10 => "big"
+        n if n > 5 => "medium"
+        _ => "small"
+    print(r)
+"""
+        assert compile_and_run(src) == "medium"
+
+    def test_match_guard_small(self):
+        src = """
+main()
+    let n = 3
+    let r = match n
+        n if n > 10 => "big"
+        n if n > 5 => "medium"
+        _ => "small"
+    print(r)
+"""
+        assert compile_and_run(src) == "small"
+
+    def test_wildcard_only(self):
+        src = """
+main()
+    let x = 99
+    let r = match x
+        _ => "catch all"
+    print(r)
+"""
+        assert compile_and_run(src) == "catch all"
+
+    def test_match_exact_and_wildcard(self):
+        src = """
+main()
+    let x = 2
+    let r = match x
+        1 => "one"
+        2 => "two"
+        3 => "three"
+        _ => "many"
+    print(r)
+"""
+        assert compile_and_run(src) == "two"
+
+
+class TestEffectsAndContracts:
+    """Tests for effect annotations and contracts"""
+
+    def test_pure_annotation(self):
+        src = """
+#[pure]
+add(a: int, b: int) -> int
+    return a + b
+
+main()
+    print(add(3, 4))
+"""
+        assert compile_and_run(src) == "7"
+
+    def test_requires_contract(self):
+        src = """
+#[requires: n > 0]
+factorial(n: int) -> int
+    if n == 1
+        return 1
+    return n * factorial(n - 1)
+
+main()
+    print(factorial(5))
+"""
+        assert compile_and_run(src) == "120"
+
+    def test_ensures_contract(self):
+        src = """
+#[ensures: result >= 0]
+abs_val(x: int) -> int
+    if x < 0
+        return 0 - x
+    return x
+
+main()
+    print(abs_val(-5))
+    print(abs_val(3))
+"""
+        assert compile_and_run(src) == "5\n3"
+
+    def test_effects_io_annotation(self):
+        src = """
+#[effects: io]
+greet(name: str)
+    print(name)
+
+main()
+    greet("Hello")
+"""
+        assert compile_and_run(src) == "Hello"
+
+    def test_pure_function_no_side_effects(self):
+        src = """
+#[pure]
+multiply(a: int, b: int) -> int
+    return a * b
+
+main()
+    let r = multiply(6, 7)
+    print(r)
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_requires_boundary(self):
+        src = """
+#[requires: x >= 0]
+#[ensures: result >= 0]
+double_positive(x: int) -> int
+    return x * 2
+
+main()
+    print(double_positive(5))
+"""
+        assert compile_and_run(src) == "10"
+
+    def test_multiple_requires(self):
+        src = """
+#[requires: a >= 0]
+#[requires: b >= 0]
+safe_add(a: int, b: int) -> int
+    return a + b
+
+main()
+    print(safe_add(10, 20))
+"""
+        assert compile_and_run(src) == "30"
+
+
+class TestREPL:
+    """Tests for REPL infrastructure"""
+
+    def test_version_output(self):
+        import subprocess
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        result = subprocess.run(
+            [sys.executable, os.path.join('src', 'til.py'), '--version'],
+            capture_output=True, text=True, cwd=project_root
+        )
+        assert "TIL Compiler v2.0.0" in result.stdout
+
+    def test_help_mentions_repl(self):
+        import subprocess
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        result = subprocess.run(
+            [sys.executable, os.path.join('src', 'til.py'), '--help'],
+            capture_output=True, text=True, cwd=project_root
+        )
+        assert "repl" in result.stdout.lower()
+
+
+class TestV2Integration:
+    """Integration tests combining v2.0 features"""
+
+    def test_vec_in_function(self):
+        src = """
+sum_vec(v: int) -> int
+    return v
+
+main()
+    let v = Vec<int>.new()
+    v.push(10)
+    v.push(20)
+    print(v.get(0) + v.get(1))
+"""
+        assert compile_and_run(src) == "30"
+
+    def test_hashmap_with_conditional(self):
+        src = """
+main()
+    let m = HashMap<str, int>.new()
+    m.set("score", 95)
+    let s = m.get("score")
+    if s > 90
+        print("A")
+    else
+        print("B")
+"""
+        assert compile_and_run(src) == "A"
+
+    def test_match_with_computation(self):
+        src = """
+classify(n: int) -> str
+    let r = match n
+        0 => "zero"
+        1 => "one"
+        _ => "many"
+    return r
+
+main()
+    print(classify(0))
+    print(classify(1))
+    print(classify(42))
+"""
+        assert compile_and_run(src) == "zero\none\nmany"
+
+    def test_pure_math_chain(self):
+        src = """
+#[pure]
+square(x: int) -> int
+    return x * x
+
+#[pure]
+add(a: int, b: int) -> int
+    return a + b
+
+main()
+    let r = add(square(3), square(4))
+    print(r)
+"""
+        assert compile_and_run(src) == "25"
+
+    def test_vec_str_accumulate(self):
+        src = """
+main()
+    let names = Vec<str>.new()
+    names.push("Alice")
+    names.push("Bob")
+    names.push("Charlie")
+    print(names.get(0))
+    print(names.get(1))
+    print(names.get(2))
+    print(names.len())
+"""
+        assert compile_and_run(src) == "Alice\nBob\nCharlie\n3"
+
+    def test_hashmap_str_str_lookup(self):
+        src = """
+main()
+    let dict = HashMap<str, str>.new()
+    dict.set("hello", "world")
+    dict.set("foo", "bar")
+    print(dict.get("hello"))
+    print(dict.has("foo"))
+    print(dict.has("baz"))
+"""
+        assert compile_and_run(src) == "world\ntrue\nfalse"
+
+    def test_lambda_with_match(self):
+        src = """
+main()
+    let x = 5
+    let r = match x
+        1 => "one"
+        5 => "five"
+        _ => "other"
+    print(r)
+    let double = |n: int| -> int { n * 2 }
+    print(double(x))
+"""
+        assert compile_and_run(src) == "five\n10"
+
+
+# ═══════════════════════════════════════════════════════════════
+# V2.0 REVOLUTIONARY FEATURES TESTS
+# ═══════════════════════════════════════════════════════════════
+
+class TestGenerics:
+    """Tests for generic function annotations"""
+
+    def test_generic_identity(self):
+        src = """
+#[generic: T]
+identity(x: int) -> int
+    return x
+
+main()
+    print(identity(42))
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_generic_annotated_function(self):
+        src = """
+#[generic: T, U]
+first(a: int, b: int) -> int
+    return a
+
+main()
+    print(first(10, 20))
+"""
+        assert compile_and_run(src) == "10"
+
+
+class TestAlgebraicEffects:
+    """Tests for algebraic effect system"""
+
+    def test_pure_effect(self):
+        src = """
+#[pure]
+add(a: int, b: int) -> int
+    return a + b
+
+main()
+    print(add(3, 4))
+"""
+        assert compile_and_run(src) == "7"
+
+    def test_io_effect(self):
+        src = """
+#[effects: io]
+greet(name: str)
+    print(name)
+
+main()
+    greet("hello")
+"""
+        assert compile_and_run(src) == "hello"
+
+    def test_multiple_effects(self):
+        src = """
+#[effects: io, fs]
+process(x: int) -> int
+    return x * 2
+
+main()
+    print(process(21))
+"""
+        assert compile_and_run(src) == "42"
+
+
+class TestCapabilitySecurity:
+    """Tests for capability-based security"""
+
+    def test_cap_declaration(self):
+        src = """
+cap FileAccess { read, write }
+
+main()
+    print(42)
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_cap_function_annotation(self):
+        src = """
+#[cap: FileRead]
+read_data(path: str) -> str
+    return path
+
+main()
+    print(read_data("hello.txt"))
+"""
+        assert compile_and_run(src) == "hello.txt"
+
+    def test_cap_with_effects(self):
+        src = """
+#[cap: NetAccess]
+#[effects: io]
+fetch(url: str) -> str
+    return url
+
+main()
+    print(fetch("example.com"))
+"""
+        assert compile_and_run(src) == "example.com"
+
+
+class TestTemporalTypes:
+    """Tests for temporal types and timeout"""
+
+    def test_timeout_basic(self):
+        src = """
+main()
+    let r = timeout(1000)
+        42
+    print(r)
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_timeout_computation(self):
+        src = """
+main()
+    let r = timeout(5000)
+        10 + 20 + 30
+    print(r)
+"""
+        assert compile_and_run(src) == "60"
+
+
+class TestGradualVerification:
+    """Tests for assert and invariant"""
+
+    def test_assert_pass(self):
+        src = """
+main()
+    let x = 10
+    assert x > 5, "x must be > 5"
+    print(x)
+"""
+        assert compile_and_run(src) == "10"
+
+    def test_assert_with_expression(self):
+        src = """
+main()
+    let a = 3
+    let b = 4
+    assert a + b == 7, "sum should be 7"
+    print(a + b)
+"""
+        assert compile_and_run(src) == "7"
+
+    def test_invariant_pass(self):
+        src = """
+main()
+    let x = 42
+    invariant x > 0, "x must be positive"
+    print(x)
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_assert_failure(self):
+        src = """
+main()
+    let x = 3
+    assert x > 10, "x must be > 10"
+    print(x)
+"""
+        compiler = TILCompiler()
+        compiler.check_types = False
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.out', delete=False) as f:
+            exe = f.name
+        try:
+            ok = compiler.compile_to_executable(src, exe, "<test>")
+            assert ok
+            result = subprocess.run([exe], capture_output=True, text=True, timeout=10)
+            assert result.returncode != 0
+            assert "Assertion failed" in result.stderr
+        finally:
+            try:
+                os.unlink(exe)
+            except:
+                pass
+
+    def test_multiple_asserts(self):
+        src = """
+main()
+    let x = 10
+    let y = 20
+    assert x > 0, "x positive"
+    assert y > 0, "y positive"
+    assert x < y, "x less than y"
+    print(x + y)
+"""
+        assert compile_and_run(src) == "30"
+
+
+class TestAdaptiveErrorHandling:
+    """Tests for retry and fallback"""
+
+    def test_retry_basic(self):
+        src = """
+main()
+    let r = retry(3)
+        42
+    print(r)
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_retry_expression(self):
+        src = """
+main()
+    let r = retry(5)
+        10 + 20
+    print(r)
+"""
+        assert compile_and_run(src) == "30"
+
+
+class TestEnergyAware:
+    """Tests for energy-aware compilation"""
+
+    def test_energy_low(self):
+        src = """
+#[energy: low]
+eco_add(a: int, b: int) -> int
+    return a + b
+
+main()
+    print(eco_add(1, 2))
+"""
+        assert compile_and_run(src) == "3"
+
+    def test_energy_high(self):
+        src = """
+#[energy: high]
+fast_multiply(a: int, b: int) -> int
+    return a * b
+
+main()
+    print(fast_multiply(6, 7))
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_energy_mixed(self):
+        src = """
+#[energy: low]
+slow_fn(x: int) -> int
+    return x + 1
+
+#[energy: high]
+fast_fn(x: int) -> int
+    return x * 2
+
+main()
+    print(slow_fn(10))
+    print(fast_fn(10))
+"""
+        assert compile_and_run(src) == "11\n20"
+
+
+class TestCrossLevelContracts:
+    """Tests for cross-level contracts"""
+
+    def test_cross_level_annotation(self):
+        src = """
+#[level: 1]
+#[cross_level: 1 -> 2]
+fast_op(x: int) -> int
+    return x * 3
+
+main()
+    print(fast_op(14))
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_level_with_requires(self):
+        src = """
+#[level: 1]
+#[requires: x > 0]
+system_fn(x: int) -> int
+    return x * 10
+
+main()
+    print(system_fn(5))
+"""
+        assert compile_and_run(src) == "50"
+
+
+class TestDistributedTypes:
+    """Tests for channel-like communication using Vec"""
+
+    def test_channel_simulation(self):
+        src = """
+main()
+    let ch = Vec<int>.new()
+    ch.push(10)
+    ch.push(20)
+    ch.push(30)
+    print(ch.get(0))
+    print(ch.get(1))
+    print(ch.get(2))
+"""
+        assert compile_and_run(src) == "10\n20\n30"
+
+    def test_message_queue(self):
+        src = """
+main()
+    let msgs = Vec<str>.new()
+    msgs.push("hello")
+    msgs.push("world")
+    print(msgs.get(0))
+    print(msgs.get(1))
+    print(msgs.len())
+"""
+        assert compile_and_run(src) == "hello\nworld\n2"
+
+
+class TestIntentBasedProgramming:
+    """Tests for intent blocks"""
+
+    def test_intent_basic(self):
+        src = """
+main()
+    intent "compute sum"
+        let s = 1 + 2 + 3
+        print(s)
+"""
+        assert compile_and_run(src) == "6"
+
+    def test_intent_with_logic(self):
+        src = """
+main()
+    intent "find maximum"
+        let a = 10
+        let b = 20
+        if a > b
+            print(a)
+        else
+            print(b)
+"""
+        assert compile_and_run(src) == "20"
+
+    def test_intent_with_loop(self):
+        src = """
+main()
+    intent "count to 5"
+        for i in 1..6
+            print(i)
+"""
+        assert compile_and_run(src) == "1\n2\n3\n4\n5"
+
+
+class TestRevolutionaryIntegration:
+    """Integration tests combining multiple revolutionary features"""
+
+    def test_pure_with_assert(self):
+        src = """
+#[pure]
+#[requires: a >= 0]
+#[requires: b >= 0]
+safe_add(a: int, b: int) -> int
+    return a + b
+
+main()
+    let r = safe_add(10, 20)
+    assert r == 30, "result should be 30"
+    print(r)
+"""
+        assert compile_and_run(src) == "30"
+
+    def test_energy_with_contract(self):
+        src = """
+#[energy: high]
+#[ensures: result > 0]
+positive_square(x: int) -> int
+    return x * x
+
+main()
+    print(positive_square(5))
+"""
+        assert compile_and_run(src) == "25"
+
+    def test_cap_with_contract(self):
+        src = """
+#[cap: FileRead]
+#[requires: path != 0]
+safe_read(path: int) -> int
+    return path
+
+main()
+    print(safe_read(42))
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_intent_with_vec(self):
+        src = """
+main()
+    intent "build a list of squares"
+        let squares = Vec<int>.new()
+        squares.push(1)
+        squares.push(4)
+        squares.push(9)
+        squares.push(16)
+        print(squares.len())
+        print(squares.get(2))
+"""
+        assert compile_and_run(src) == "4\n9"
+
+    def test_all_annotations_combined(self):
+        src = """
+#[level: 1]
+#[pure]
+#[energy: high]
+#[generic: T]
+#[requires: x > 0]
+#[ensures: result >= x]
+double(x: int) -> int
+    return x * 2
+
+main()
+    let r = double(21)
+    assert r == 42, "should be 42"
+    print(r)
+"""
+        assert compile_and_run(src) == "42"
+
+
 if __name__ == '__main__':
     import pytest
     pytest.main([__file__, '-v'])

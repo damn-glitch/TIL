@@ -1,5 +1,5 @@
 # 07_multilevel.til
-# TIL v1.5 - Multi-Level Programming
+# TIL v2.0 - Multi-Level Programming
 # Author: Alisher Beisembekov
 #
 # This example demonstrates TIL's unique multi-level system.
@@ -132,7 +132,7 @@ demo_level_2()
 # ═══════════════════════════════════════════════════════════
 
 main()
-    print("TIL v1.5 - Multi-Level Demo")
+    print("TIL v2.0 - Multi-Level Demo")
     print("Author: Alisher Beisembekov")
     print("")
     

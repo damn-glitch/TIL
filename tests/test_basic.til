@@ -1,5 +1,5 @@
 # tests/test_basic.til
-# TIL v1.5 - Basic Tests
+# TIL v2.0 - Basic Tests
 # Author: Alisher Beisembekov
 
 # Test 1: Hello World
@@ -51,7 +51,7 @@ test_control_flow()
 
 # Run all tests
 main()
-    print("TIL v1.5 - Test Suite")
+    print("TIL v2.0 - Test Suite")
     print("Author: Alisher Beisembekov")
     print("========================")
     test_hello()
