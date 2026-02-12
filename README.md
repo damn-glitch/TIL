@@ -10,9 +10,9 @@
 
 [![CI](https://github.com/damn-glitch/TIL/actions/workflows/ci.yml/badge.svg)](https://github.com/damn-glitch/TIL/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.5.0-green.svg)](https://github.com/damn-glitch/TIL/releases)
+[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](https://github.com/damn-glitch/TIL/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/damn-glitch/TIL)
-[![Tests](https://img.shields.io/badge/tests-184%20passing-brightgreen.svg)](tests/test_compiler.py)
+[![Tests](https://img.shields.io/badge/tests-223%20passing-brightgreen.svg)](tests/test_compiler.py)
 
 **Author: Alisher Beisembekov | Patent No 66853**
 
@@ -63,6 +63,7 @@ Commands:
   run <file>              Compile and run immediately
   build <file>            Compile to executable
   check <file>            Type-check only (no compilation)
+  repl                    Interactive REPL
 
 Options:
   -o <file>               Output file name
@@ -396,6 +397,91 @@ negizgi()
 
 Unicode identifiers are automatically mangled to valid C via `_uXXXX` encoding.
 
+### Closures (v2.0)
+
+```python
+main()
+    let x = 10
+    let add_x = |y: int| -> int { y + x }   # captures x
+    print(add_x(5))                           # 15
+    print(add_x(20))                          # 30
+```
+
+### Dynamic Arrays (v2.0)
+
+```python
+main()
+    let v = Vec<int>.new()
+    v.push(10)
+    v.push(20)
+    v.push(30)
+    print(v.len())      # 3
+    print(v.get(1))     # 20
+    v.pop()
+    print(v.len())      # 2
+```
+
+### Hash Maps (v2.0)
+
+```python
+main()
+    let m = HashMap<str, int>.new()
+    m.set("alice", 95)
+    m.set("bob", 87)
+    print(m.get("alice"))    # 95
+    print(m.has("bob"))      # true
+    print(m.len())           # 2
+```
+
+### Pattern Matching with Guards (v2.0)
+
+```python
+classify(n: int) -> str
+    let r = match n
+        0 => "zero"
+        n if n > 100 => "huge"
+        n if n > 0 => "positive"
+        _ => "negative"
+    return r
+
+main()
+    print(classify(42))     # positive
+    print(classify(-5))     # negative
+    print(classify(200))    # huge
+```
+
+### Design by Contract (v2.0)
+
+```python
+#[requires: n > 0]
+#[ensures: result >= 1]
+factorial(n: int) -> int
+    if n == 1
+        return 1
+    return n * factorial(n - 1)
+
+#[pure]
+square(x: int) -> int
+    return x * x
+
+main()
+    print(factorial(5))    # 120
+    print(square(7))       # 49
+```
+
+### Interactive REPL (v2.0)
+
+```bash
+$ python src/til.py repl
+TIL v2.0 REPL - The Intelligent Language
+til> 2 + 3
+5
+til> "hello"
+hello
+til> exit
+Bye!
+```
+
 ---
 
 ## Standard Library
@@ -443,7 +529,7 @@ Unicode identifiers are automatically mangled to valid C via `_uXXXX` encoding.
 TIL Source --> Lexer --> Parser --> TypeChecker --> CCodeGenerator --> GCC --> Binary
 ```
 
-The entire compiler is a single Python file: `src/til.py` (~4300 lines).
+The entire compiler is a single Python file: `src/til.py` (~5000 lines).
 
 | Stage | What it does |
 |-------|-------------|
@@ -494,7 +580,7 @@ python src/til.py run examples/01_hello.til
 
 ## Testing
 
-**184 tests** covering the full compiler pipeline:
+**223 tests** covering the full compiler pipeline:
 
 ```bash
 pip install pytest
@@ -517,6 +603,13 @@ python -m pytest tests/test_compiler.py -v
 | Traits & Tuples | 3 | Trait definitions, tuple literals |
 | Stdlib | 3 | Math and string module resolution |
 | Advanced | 10 | Nested loops, recursion, enums, struct methods |
+| **Closures** | 6 | Variable capture, string closures, multi-capture |
+| **Dynamic Arrays** | 6 | Vec\<int/float/str\>, push/pop/get/len |
+| **Hash Maps** | 5 | HashMap\<str,int/str\>, set/get/has/overwrite |
+| **Pattern Matching v2** | 6 | Wildcards, guards, match-as-expression |
+| **Effects & Contracts** | 7 | #[pure], #[effects], #[requires], #[ensures] |
+| **REPL** | 2 | Version output, help text |
+| **v2.0 Integration** | 7 | Cross-feature combinations |
 
 ### CI/CD
 
@@ -533,7 +626,7 @@ Automated testing on every push via GitHub Actions:
 ```
 TIL/
 ├── src/
-│   └── til.py               # The compiler (single file, ~4300 lines)
+│   └── til.py               # The compiler (single file, ~5000 lines)
 ├── examples/
 │   ├── 01_hello.til          # Progressive tutorials (01-08)
 │   ├── 02_variables.til
@@ -550,7 +643,7 @@ TIL/
 │   ├── math.til              # Math standard library
 │   └── strings.til           # String standard library
 ├── tests/
-│   └── test_compiler.py      # 184 tests
+│   └── test_compiler.py      # 223 tests
 ├── .github/
 │   └── workflows/
 │       └── ci.yml            # CI for Linux, macOS, Windows
@@ -590,15 +683,22 @@ TIL/
 - Type checker with immutability and annotation validation
 - CI/CD across Linux, macOS, Windows
 
-### Roadmap to v2.0
+### New in v2.0
 
-- [ ] Closures with variable capture
+- [x] **Closures** with variable capture (`|x: int| -> int { x + captured_var }`)
+- [x] **Dynamic Arrays** — `Vec<int>`, `Vec<float>`, `Vec<str>` with `.push()`, `.pop()`, `.get()`, `.len()`
+- [x] **Hash Maps** — `HashMap<str, int>`, `HashMap<str, str>` with `.set()`, `.get()`, `.has()`, `.len()`
+- [x] **Pattern Matching** with wildcards (`_`) and guards (`pattern if cond => expr`)
+- [x] **Match expressions** as values (`let r = match x ...`)
+- [x] **Effect System** — `#[pure]`, `#[effects: io]` annotations
+- [x] **Design by Contract** — `#[requires: expr]`, `#[ensures: expr]` with runtime verification
+- [x] **Interactive REPL** — `til repl` for live expression evaluation
+
+### Roadmap to v3.0
+
 - [ ] Generics (`fn max<T>(a: T, b: T) -> T`)
 - [ ] Full pattern matching with destructuring
-- [ ] Dynamic array methods from TIL code (`arr.push()`, `arr.pop()`)
-- [ ] Hash maps / dictionaries
 - [ ] Full trait dispatch (dynamic method resolution)
-- [ ] REPL mode
 - [ ] LSP server for editor integration
 - [ ] Package manager
 - [ ] Expanded standard library

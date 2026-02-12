@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-TIL v1.5 - The Intelligent Language
+TIL v2.0 - The Intelligent Language
 ====================================
 Complete Multi-Level Programming Language
 
 Author: Alisher Beisembekov
-Version: 1.5.0
+Version: 2.0.0
 
 "Проще Python. Быстрее C. Умнее всех."
 (Simpler than Python. Faster than C. Smarter than all.)
@@ -907,6 +907,7 @@ class StructInit(ASTNode):
 class Lambda(ASTNode):
     params: List[Tuple[str, Optional[Type]]] = field(default_factory=list)
     body: ASTNode = None
+    ret_type: Optional[Type] = None
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass
@@ -919,7 +920,7 @@ class IfExpr(ASTNode):
 @dataclass
 class MatchExpr(ASTNode):
     value: ASTNode = None
-    arms: List[Tuple[ASTNode, ASTNode]] = field(default_factory=list)  # (pattern, expr)
+    arms: List = field(default_factory=list)  # list of (pattern, guard_or_None, expr)
     type: Type = field(default_factory=lambda: T_UNKNOWN)
 
 @dataclass 
@@ -1025,6 +1026,9 @@ class FuncDef(ASTNode):
     attributes: List[str] = field(default_factory=list)
     is_method: bool = False
     self_type: Optional[str] = None
+    effects: Optional[List[str]] = None
+    requires: List[ASTNode] = field(default_factory=list)
+    ensures: List[ASTNode] = field(default_factory=list)
 
 @dataclass
 class StructField:
@@ -1261,15 +1265,15 @@ class Parser:
         self.consume(TokenType.LPAREN)
         params = self.parse_params()
         self.consume(TokenType.RPAREN)
-        
+
         # Return type
         ret_type = T_VOID
         if self.match(TokenType.ARROW):
             self.advance()
             ret_type = self.parse_type()
-        
+
         self.skip_newlines()
-        
+
         # Body
         if self.match(TokenType.INDENT):
             body = self.parse_block()
@@ -1281,14 +1285,41 @@ class Parser:
             body = Block([Return(expr)])
         else:
             self.error("Expected function body")
-        
+
         # Apply pending attributes
         attrs = self.pending_attributes
         level = self.current_level
         self.pending_attributes = []
         self.current_level = 2
-        
-        return FuncDef(name=name, params=params, ret_type=ret_type, body=body, level=level, attributes=attrs)
+
+        # Parse effects and contracts from attributes
+        effects = []
+        requires_list = []
+        ensures_list = []
+        remaining_attrs = []
+        for attr in attrs:
+            if attr == "pure":
+                effects.append("pure")
+            elif attr.startswith("effects:"):
+                for e in attr[len("effects:"):].strip().split(","):
+                    effects.append(e.strip())
+            elif attr.startswith("requires:"):
+                expr_text = attr[len("requires:"):].strip()
+                sub_tokens = Lexer(expr_text, "<attr>").tokenize()
+                sub_parser = Parser(sub_tokens, "<attr>")
+                requires_list.append(sub_parser.parse_expression())
+            elif attr.startswith("ensures:"):
+                expr_text = attr[len("ensures:"):].strip()
+                sub_tokens = Lexer(expr_text, "<attr>").tokenize()
+                sub_parser = Parser(sub_tokens, "<attr>")
+                ensures_list.append(sub_parser.parse_expression())
+            else:
+                remaining_attrs.append(attr)
+
+        return FuncDef(name=name, params=params, ret_type=ret_type, body=body,
+                       level=level, attributes=remaining_attrs,
+                       effects=effects if effects else None,
+                       requires=requires_list, ensures=ensures_list)
     
     def parse_params(self) -> List[FuncParam]:
         params = []
@@ -1587,30 +1618,38 @@ class Parser:
     def parse_match(self) -> MatchExpr:
         self.consume(TokenType.MATCH)
         value = self.parse_expression()
-        
+
         self.skip_newlines()
         self.consume(TokenType.INDENT)
-        
+
         arms = []
         while not self.match(TokenType.DEDENT, TokenType.EOF):
             self.skip_newlines()
             if self.match(TokenType.DEDENT, TokenType.EOF):
                 break
-            
-            pattern = self.parse_expression()
+
+            # Use parse_or to avoid ternary consuming 'if' (needed for guard syntax)
+            pattern = self.parse_or()
+
+            # Parse optional guard: pattern if condition =>
+            guard = None
+            if self.match(TokenType.IF):
+                self.advance()
+                guard = self.parse_or()
+
             self.consume(TokenType.FAT_ARROW)
-            
+
             if self.match(TokenType.INDENT):
                 expr = self.parse_block()
             else:
                 expr = self.parse_expression()
-            
-            arms.append((pattern, expr))
+
+            arms.append((pattern, guard, expr))
             self.skip_newlines()
-        
+
         if self.match(TokenType.DEDENT):
             self.advance()
-        
+
         return MatchExpr(value=value, arms=arms)
     
     def parse_return(self) -> Return:
@@ -2124,7 +2163,7 @@ class Parser:
             self.consume(TokenType.RBRACE)
             return DictLit(pairs)
         
-        # Lambda: |x, y| x + y
+        # Lambda: |x, y| x + y  OR  |x: int| -> int { x + 1 }
         if self.match(TokenType.PIPE):
             self.advance()
             params = []
@@ -2140,8 +2179,21 @@ class Parser:
                         break
                     self.advance()
             self.consume(TokenType.PIPE)
-            body = self.parse_expression()
-            return Lambda(params=params, body=body)
+            # Optional return type annotation
+            ret_type = None
+            if self.match(TokenType.ARROW):
+                self.advance()
+                ret_type = self.parse_type()
+            # Body: either { expr } or just expr
+            if self.match(TokenType.LBRACE):
+                self.advance()
+                self.skip_newlines()
+                body = self.parse_expression()
+                self.skip_newlines()
+                self.consume(TokenType.RBRACE)
+            else:
+                body = self.parse_expression()
+            return Lambda(params=params, body=body, ret_type=ret_type)
         
         # Self keyword (used in method bodies)
         if self.match(TokenType.SELF):
@@ -2156,7 +2208,20 @@ class Parser:
         # Identifier or struct init
         if self.match(TokenType.IDENT):
             name = self.advance().value
-            
+
+            # Vec<T> or HashMap<K,V> generic constructors
+            if name in ("Vec", "HashMap") and self.match(TokenType.LT):
+                self.advance()  # <
+                type_args = []
+                while True:
+                    type_args.append(self.consume(TokenType.IDENT).value)
+                    if not self.match(TokenType.COMMA):
+                        break
+                    self.advance()
+                self.consume(TokenType.GT)
+                encoded = f"__{name}__{'_'.join(type_args)}"
+                return Identifier(name=encoded)
+
             # Struct initialization: Name { field: value }
             if self.match(TokenType.LBRACE):
                 self.advance()
@@ -2176,7 +2241,11 @@ class Parser:
                 return StructInit(name=name, fields=fields)
             
             return Identifier(name=name)
-        
+
+        # Match expression (can appear as expression: let r = match x ...)
+        if self.match(TokenType.MATCH):
+            return self.parse_match()
+
         self.error(f"Unexpected token: {self.current().type.name}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2518,6 +2587,17 @@ class CCodeGenerator:
         self.current_level = 2
         self.in_method: bool = False
         self.current_struct: Optional[str] = None
+        # V2: container tracking
+        self.dynarray_vars: Dict[str, str] = {}  # var_name -> elem_type
+        self.hashmap_vars: Dict[str, tuple] = {}  # var_name -> (key_type, val_type)
+        # V2: lambda/closure tracking
+        self._lambda_var_map: Dict[str, str] = {}  # var_name -> lambda_c_name
+        self._lambda_captures: Dict[str, list] = {}  # lambda_name -> [capture_names]
+        self._lambda_ret_types: Dict[str, str] = {}  # lambda_c_name -> C return type
+        # V2: contract tracking
+        self._current_ensures: list = []
+        self._current_ensures_ret_type: str = "int64_t"
+        self._in_ensures: bool = False
     
     @staticmethod
     def mangle_name(name: str) -> str:
@@ -2601,7 +2681,7 @@ class CCodeGenerator:
         return '\n'.join(self.output)
     
     def emit_header(self):
-        self.emit_raw("// TIL v1.5 - Generated C Code")
+        self.emit_raw("// TIL v2.0 - Generated C Code")
         self.emit_raw("// Author: Alisher Beisembekov")
         self.emit_raw("// Multi-Level Programming: Mixed Martial Programming")
         self.emit_raw("")
@@ -2888,6 +2968,154 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         exit(1);
     }
 }
+
+// ═══ Vec<T> - Dynamic Arrays ═══
+typedef struct TIL_DynArray_int { int64_t* data; size_t len; size_t cap; } TIL_DynArray_int;
+static TIL_DynArray_int til_dynarray_int_new() {
+    TIL_DynArray_int a; a.data = (int64_t*)malloc(sizeof(int64_t) * 8);
+    a.len = 0; a.cap = 8; return a;
+}
+static void til_dynarray_int_push(TIL_DynArray_int* a, int64_t val) {
+    if (a->len >= a->cap) { a->cap *= 2; a->data = (int64_t*)realloc(a->data, sizeof(int64_t) * a->cap); }
+    a->data[a->len++] = val;
+}
+static int64_t til_dynarray_int_pop(TIL_DynArray_int* a) {
+    if (a->len == 0) { fprintf(stderr, "Pop from empty Vec\\n"); exit(1); }
+    return a->data[--a->len];
+}
+static int64_t til_dynarray_int_get(TIL_DynArray_int* a, size_t i) {
+    if (i >= a->len) { fprintf(stderr, "Vec index out of bounds\\n"); exit(1); }
+    return a->data[i];
+}
+
+typedef struct TIL_DynArray_float { double* data; size_t len; size_t cap; } TIL_DynArray_float;
+static TIL_DynArray_float til_dynarray_float_new() {
+    TIL_DynArray_float a; a.data = (double*)malloc(sizeof(double) * 8);
+    a.len = 0; a.cap = 8; return a;
+}
+static void til_dynarray_float_push(TIL_DynArray_float* a, double val) {
+    if (a->len >= a->cap) { a->cap *= 2; a->data = (double*)realloc(a->data, sizeof(double) * a->cap); }
+    a->data[a->len++] = val;
+}
+static double til_dynarray_float_pop(TIL_DynArray_float* a) {
+    if (a->len == 0) { fprintf(stderr, "Pop from empty Vec\\n"); exit(1); }
+    return a->data[--a->len];
+}
+static double til_dynarray_float_get(TIL_DynArray_float* a, size_t i) {
+    if (i >= a->len) { fprintf(stderr, "Vec index out of bounds\\n"); exit(1); }
+    return a->data[i];
+}
+
+typedef struct TIL_DynArray_str { const char** data; size_t len; size_t cap; } TIL_DynArray_str;
+static TIL_DynArray_str til_dynarray_str_new() {
+    TIL_DynArray_str a; a.data = (const char**)malloc(sizeof(const char*) * 8);
+    a.len = 0; a.cap = 8; return a;
+}
+static void til_dynarray_str_push(TIL_DynArray_str* a, const char* val) {
+    if (a->len >= a->cap) { a->cap *= 2; a->data = (const char**)realloc(a->data, sizeof(const char*) * a->cap); }
+    a->data[a->len++] = val;
+}
+static const char* til_dynarray_str_pop(TIL_DynArray_str* a) {
+    if (a->len == 0) { fprintf(stderr, "Pop from empty Vec\\n"); exit(1); }
+    return a->data[--a->len];
+}
+static const char* til_dynarray_str_get(TIL_DynArray_str* a, size_t i) {
+    if (i >= a->len) { fprintf(stderr, "Vec index out of bounds\\n"); exit(1); }
+    return a->data[i];
+}
+
+// ═══ HashMap<str, int/str> ═══
+static size_t _til_hash_str(const char* s) {
+    size_t h = 5381;
+    while (*s) { h = ((h << 5) + h) + (unsigned char)*s++; }
+    return h;
+}
+
+typedef struct TIL_HM_si_Entry { const char* key; int64_t value; bool occupied; } TIL_HM_si_Entry;
+typedef struct TIL_HashMap_str_int { TIL_HM_si_Entry* entries; size_t cap; size_t len; } TIL_HashMap_str_int;
+
+static TIL_HashMap_str_int til_hashmap_str_int_new() {
+    TIL_HashMap_str_int m;
+    m.cap = 64; m.len = 0;
+    m.entries = (TIL_HM_si_Entry*)calloc(m.cap, sizeof(TIL_HM_si_Entry));
+    return m;
+}
+static void til_hashmap_str_int_set(TIL_HashMap_str_int* m, const char* key, int64_t val) {
+    size_t idx = _til_hash_str(key) % m->cap;
+    for (size_t i = 0; i < m->cap; i++) {
+        size_t j = (idx + i) % m->cap;
+        if (!m->entries[j].occupied || (m->entries[j].key && strcmp(m->entries[j].key, key) == 0)) {
+            if (!m->entries[j].occupied) m->len++;
+            m->entries[j].key = key; m->entries[j].value = val; m->entries[j].occupied = true;
+            return;
+        }
+    }
+}
+static int64_t til_hashmap_str_int_get(TIL_HashMap_str_int* m, const char* key) {
+    size_t idx = _til_hash_str(key) % m->cap;
+    for (size_t i = 0; i < m->cap; i++) {
+        size_t j = (idx + i) % m->cap;
+        if (!m->entries[j].occupied) break;
+        if (strcmp(m->entries[j].key, key) == 0) return m->entries[j].value;
+    }
+    fprintf(stderr, "Key not found: %s\\n", key); exit(1); return 0;
+}
+static bool til_hashmap_str_int_has(TIL_HashMap_str_int* m, const char* key) {
+    size_t idx = _til_hash_str(key) % m->cap;
+    for (size_t i = 0; i < m->cap; i++) {
+        size_t j = (idx + i) % m->cap;
+        if (!m->entries[j].occupied) return false;
+        if (strcmp(m->entries[j].key, key) == 0) return true;
+    }
+    return false;
+}
+static void til_hashmap_str_int_delete(TIL_HashMap_str_int* m, const char* key) {
+    size_t idx = _til_hash_str(key) % m->cap;
+    for (size_t i = 0; i < m->cap; i++) {
+        size_t j = (idx + i) % m->cap;
+        if (!m->entries[j].occupied) return;
+        if (strcmp(m->entries[j].key, key) == 0) { m->entries[j].occupied = false; m->len--; return; }
+    }
+}
+
+typedef struct TIL_HM_ss_Entry { const char* key; const char* value; bool occupied; } TIL_HM_ss_Entry;
+typedef struct TIL_HashMap_str_str { TIL_HM_ss_Entry* entries; size_t cap; size_t len; } TIL_HashMap_str_str;
+
+static TIL_HashMap_str_str til_hashmap_str_str_new() {
+    TIL_HashMap_str_str m;
+    m.cap = 64; m.len = 0;
+    m.entries = (TIL_HM_ss_Entry*)calloc(m.cap, sizeof(TIL_HM_ss_Entry));
+    return m;
+}
+static void til_hashmap_str_str_set(TIL_HashMap_str_str* m, const char* key, const char* val) {
+    size_t idx = _til_hash_str(key) % m->cap;
+    for (size_t i = 0; i < m->cap; i++) {
+        size_t j = (idx + i) % m->cap;
+        if (!m->entries[j].occupied || (m->entries[j].key && strcmp(m->entries[j].key, key) == 0)) {
+            if (!m->entries[j].occupied) m->len++;
+            m->entries[j].key = key; m->entries[j].value = val; m->entries[j].occupied = true;
+            return;
+        }
+    }
+}
+static const char* til_hashmap_str_str_get(TIL_HashMap_str_str* m, const char* key) {
+    size_t idx = _til_hash_str(key) % m->cap;
+    for (size_t i = 0; i < m->cap; i++) {
+        size_t j = (idx + i) % m->cap;
+        if (!m->entries[j].occupied) break;
+        if (strcmp(m->entries[j].key, key) == 0) return m->entries[j].value;
+    }
+    fprintf(stderr, "Key not found: %s\\n", key); exit(1); return NULL;
+}
+static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
+    size_t idx = _til_hash_str(key) % m->cap;
+    for (size_t i = 0; i < m->cap; i++) {
+        size_t j = (idx + i) % m->cap;
+        if (!m->entries[j].occupied) return false;
+        if (strcmp(m->entries[j].key, key) == 0) return true;
+    }
+    return false;
+}
 """)
         self.emit_raw("")
     
@@ -3044,6 +3272,9 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         self.bool_vars = set(self._global_bool_vars)
         self.struct_vars = {}
         self.array_vars = {}
+        self.dynarray_vars = {}
+        self.hashmap_vars = {}
+        self._lambda_var_map = {}
         self.in_method = False
         self.current_struct = None
 
@@ -3051,19 +3282,23 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         for p in func.params:
             self.declared_vars.add(p.name)
             self._track_param_type(p)
-        
+
         ret = self.type_to_c(func.ret_type)
         params = self.params_to_c(func.params)
-        
+
         # Level-specific attributes
         attrs = []
         level_names = {0: "Hardware/SIMD", 1: "Systems", 2: "Safe", 3: "Script", 4: "Formal"}
-        
+
         if func.level == 0:
             attrs.append("__attribute__((always_inline)) inline")
         elif func.level == 1:
             attrs.append("inline")
-        
+
+        # Effect system: #[pure] adds __attribute__((pure))
+        if func.effects and 'pure' in func.effects:
+            attrs.append("__attribute__((pure))")
+
         for attr in func.attributes:
             if attr == "inline" and "inline" not in ' '.join(attrs):
                 attrs.append("inline")
@@ -3073,17 +3308,33 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                 attrs.append("__attribute__((hot))")
             elif attr == "cold":
                 attrs.append("__attribute__((cold))")
-        
+
         attr_str = ' '.join(attrs)
         if attr_str:
             attr_str += ' '
-        
+
         c_name = self.mangle_name(func.name)
         self.emit_raw(f"// Level {func.level}: {level_names.get(func.level, 'Unknown')}")
         self.emit_raw(f"{attr_str}{ret} til_{c_name}({params}) {{")
         self.indent += 1
-        
+
+        # Emit requires contract checks at function entry
+        if func.requires:
+            for req_expr in func.requires:
+                req_code = self.generate_node(req_expr)
+                self.emit(f'if (!({req_code})) {{ fprintf(stderr, "Contract violation: requires failed\\n"); exit(1); }}')
+
+        # Set up ensures for gen_Return to use
+        old_ensures = self._current_ensures
+        old_ensures_ret = self._current_ensures_ret_type
+        self._current_ensures = func.ensures if func.ensures else []
+        self._current_ensures_ret_type = ret
+
         self.generate_node(func.body)
+
+        # Restore ensures state
+        self._current_ensures = old_ensures
+        self._current_ensures_ret_type = old_ensures_ret
         
         # Add default return if needed
         if isinstance(func.ret_type, VoidType) or (isinstance(func.ret_type, PrimitiveType) and func.ret_type.name == "void"):
@@ -3127,6 +3378,13 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         # Track variable types for print/method inference
         self._track_var_type(node, c_type)
 
+        # Handle lambda assignment: don't emit a C variable, just track mapping
+        if isinstance(node.value, Lambda):
+            lambda_name = self.generate_node(node.value)
+            self._lambda_var_map[node.name] = lambda_name
+            self.declared_vars.add(node.name)
+            return ""
+
         if node.name in self.declared_vars:
             # Just assign
             if node.value:
@@ -3158,7 +3416,7 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                     self.emit(f"{c_type} {c_name} = {val};")
             else:
                 self.emit(f"{c_type} {c_name};")
-        
+
         return ""
     
     def _track_var_type(self, node: VarDecl, c_type: str):
@@ -3189,6 +3447,15 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         # Track enum types
         if c_type in self.enums:
             pass  # enums are int-like in C
+        # Track Vec<T> dynamic array variables
+        if c_type.startswith("TIL_DynArray_"):
+            elem_type = c_type[len("TIL_DynArray_"):]
+            self.dynarray_vars[node.name] = elem_type
+        # Track HashMap<K,V> variables
+        elif c_type.startswith("TIL_HashMap_"):
+            parts = c_type[len("TIL_HashMap_"):].split("_", 1)
+            if len(parts) == 2:
+                self.hashmap_vars[node.name] = (parts[0], parts[1])
 
     def gen_Assignment(self, node: Assignment) -> str:
         target = self.generate_node(node.target)
@@ -3296,7 +3563,19 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     def gen_Return(self, node: Return) -> str:
         if node.value:
             val = self.generate_node(node.value)
-            self.emit(f"return {val};")
+            # Check if current function has ensures contracts
+            if self._current_ensures:
+                ret_type = self._current_ensures_ret_type
+                self.emit(f"{{ {ret_type} _result = {val};")
+                old_in_ensures = self._in_ensures
+                self._in_ensures = True
+                for ens_expr in self._current_ensures:
+                    ens_code = self.generate_node(ens_expr)
+                    self.emit(f'  if (!({ens_code})) {{ fprintf(stderr, "Contract violation: ensures\\n"); exit(1); }}')
+                self._in_ensures = old_in_ensures
+                self.emit(f"  return _result; }}")
+            else:
+                self.emit(f"return {val};")
         else:
             self.emit("return;")
         return ""
@@ -3408,11 +3687,36 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                 return "double"
             if name in ('len',):
                 return "int64_t"
+            # Check lambda return types
+            if name in self._lambda_var_map:
+                lambda_name = self._lambda_var_map[name]
+                if lambda_name in self._lambda_ret_types:
+                    return self._lambda_ret_types[lambda_name]
             key = name
             if key in self._func_ret_types:
                 return self._func_ret_types[key]
         if isinstance(node.func, Attribute):
             method_name = node.func.attr
+
+            # DynArray/HashMap method return types
+            if isinstance(node.func.obj, Identifier):
+                obj_name = node.func.obj.name
+                if obj_name in self.dynarray_vars:
+                    elem = self.dynarray_vars[obj_name]
+                    type_map = {"int": "int64_t", "float": "double", "str": "const char*"}
+                    if method_name in ("len",):
+                        return "int64_t"
+                    if method_name in ("get", "pop"):
+                        return type_map.get(elem, "int64_t")
+                if obj_name in self.hashmap_vars:
+                    key_t, val_t = self.hashmap_vars[obj_name]
+                    type_map = {"int": "int64_t", "float": "double", "str": "const char*"}
+                    if method_name == "get":
+                        return type_map.get(val_t, "int64_t")
+                    if method_name == "has":
+                        return "bool"
+                    if method_name == "len":
+                        return "int64_t"
 
             # String method return types
             if self._is_string_expr(node.func.obj):
@@ -3459,7 +3763,17 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
 
             args = [self.generate_node(a) for a in node.args]
             args_str = ", ".join(args)
-            
+
+            # Check if this is a lambda variable with captures
+            if name in self._lambda_var_map:
+                lambda_name = self._lambda_var_map[name]
+                captures = self._lambda_captures.get(lambda_name, [])
+                if captures:
+                    cap_args = [self.mangle_name(c) for c in captures]
+                    all_args = args + cap_args
+                    return f"{lambda_name}({', '.join(all_args)})"
+                return f"{lambda_name}({args_str})"
+
             # Built-in functions
             builtins = {
                 'sqrt': 'til_sqrt', 'abs': 'til_abs', 'pow': 'til_pow',
@@ -3468,10 +3782,10 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                 'floor': 'til_floor', 'ceil': 'til_ceil', 'round': 'til_round',
                 'len': 'til_len_str',
             }
-            
+
             if name in builtins:
                 return f"{builtins[name]}({args_str})"
-            
+
             if name == 'min':
                 return f"til_min_int({args_str})"
             if name == 'max':
@@ -3488,7 +3802,7 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                 return f"til_Ok_{type_map.get(inner_type, 'int')}({args_str})"
             if name == 'Err':
                 return f'til_Err_int({args_str})'
-            
+
             # Struct constructor
             if name in self.structs:
                 c_sname = self.mangle_name(name)
@@ -3511,6 +3825,50 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
             obj = self.generate_node(node.func.obj)
             method_name = node.func.attr
             args = [self.generate_node(a) for a in node.args]
+
+            # Vec<T>.new() and HashMap<K,V>.new() constructors
+            if isinstance(node.func.obj, Identifier):
+                obj_name = node.func.obj.name
+                if obj_name.startswith("__Vec__"):
+                    elem_type = obj_name[7:]
+                    if method_name == "new":
+                        return f"til_dynarray_{elem_type}_new()"
+                if obj_name.startswith("__HashMap__"):
+                    type_parts = obj_name[11:]  # "str_int" or "str_str"
+                    if method_name == "new":
+                        return f"til_hashmap_{type_parts}_new()"
+
+                # Dynamic array method calls
+                if obj_name in self.dynarray_vars:
+                    elem_type = self.dynarray_vars[obj_name]
+                    c_obj = self.mangle_name(obj_name)
+                    if method_name == "push":
+                        self.emit(f"til_dynarray_{elem_type}_push(&{c_obj}, {args[0]});")
+                        return ""
+                    elif method_name == "pop":
+                        return f"til_dynarray_{elem_type}_pop(&{c_obj})"
+                    elif method_name == "get":
+                        return f"til_dynarray_{elem_type}_get(&{c_obj}, {args[0]})"
+                    elif method_name == "len":
+                        return f"(int64_t){c_obj}.len"
+
+                # HashMap method calls
+                if obj_name in self.hashmap_vars:
+                    key_type, val_type = self.hashmap_vars[obj_name]
+                    c_obj = self.mangle_name(obj_name)
+                    hm_prefix = f"til_hashmap_{key_type}_{val_type}"
+                    if method_name == "set":
+                        self.emit(f"{hm_prefix}_set(&{c_obj}, {args[0]}, {args[1]});")
+                        return ""
+                    elif method_name == "get":
+                        return f"{hm_prefix}_get(&{c_obj}, {args[0]})"
+                    elif method_name == "has":
+                        return f"{hm_prefix}_has(&{c_obj}, {args[0]})"
+                    elif method_name == "delete":
+                        self.emit(f"{hm_prefix}_delete(&{c_obj}, {args[0]});")
+                        return ""
+                    elif method_name == "len":
+                        return f"(int64_t){c_obj}.len"
 
             # String method calls
             if self._is_string_expr(node.func.obj):
@@ -3744,31 +4102,129 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         return arr
 
     def gen_Lambda(self, node: Lambda) -> str:
-        # Generate a unique static function for the lambda
+        """Generate a lambda with closure support (captured outer variables)."""
         if not hasattr(self, '_lambda_counter'):
             self._lambda_counter = 0
         self._lambda_counter += 1
         name = f"_til_lambda_{self._lambda_counter}"
 
-        # Infer parameter and return types from the body
-        params = []
-        for pname, ptype in node.params:
-            if ptype:
-                c_type = self.type_to_c(ptype)
-            else:
-                c_type = "int64_t"  # default
-            params.append(f"{c_type} {pname}")
-        params_str = ", ".join(params) if params else "void"
-
-        # Store the lambda function to be emitted at top level
         if not hasattr(self, '_lambda_defs'):
             self._lambda_defs = []
 
-        # Generate the body expression
+        # Collect parameter names
+        param_names = {pname for pname, _ in node.params}
+
+        # Save and set up tracking for lambda scope
+        old_string_vars = set(self.string_vars)
+        old_float_vars = set(self.float_vars)
+        old_bool_vars = set(self.bool_vars)
+        old_declared = set(self.declared_vars)
+
+        for pname, ptype in node.params:
+            self.declared_vars.add(pname)
+            if ptype:
+                c_type = self.type_to_c(ptype)
+                if c_type == "const char*":
+                    self.string_vars.add(pname)
+                elif c_type in ("double", "float"):
+                    self.float_vars.add(pname)
+                elif c_type == "bool":
+                    self.bool_vars.add(pname)
+
+        # Detect captured outer variables
+        captures = []
+        self._collect_captures(node.body, param_names, captures)
+
+        # Build C parameter list (params + captures)
+        params = []
+        for pname, ptype in node.params:
+            c_type = self.type_to_c(ptype) if ptype else "int64_t"
+            params.append(f"{c_type} {pname}")
+
+        for cap_name in captures:
+            c_type = self._infer_var_c_type(cap_name)
+            params.append(f"{c_type} {cap_name}")
+
+        params_str = ", ".join(params) if params else "void"
+
+        # Determine return type
+        if node.ret_type:
+            ret_type = self.type_to_c(node.ret_type)
+        else:
+            ret_type = "int64_t"
+
+        # Generate body expression
         body_code = self.generate_node(node.body)
-        self._lambda_defs.append(f"static int64_t {name}({params_str}) {{ return {body_code}; }}")
+
+        # Restore tracking state
+        self.string_vars = old_string_vars
+        self.float_vars = old_float_vars
+        self.bool_vars = old_bool_vars
+        self.declared_vars = old_declared
+
+        self._lambda_defs.append(f"static {ret_type} {name}({params_str}) {{ return {body_code}; }}")
+        self._lambda_captures[name] = captures
+        self._lambda_ret_types[name] = ret_type
 
         return name
+
+    def _collect_captures(self, node, param_names, captures):
+        """Walk AST to find identifiers referencing outer scope variables (captures)."""
+        if node is None:
+            return
+        if isinstance(node, Identifier):
+            if (node.name not in param_names and node.name in self.declared_vars
+                    and node.name not in captures
+                    and node.name not in self.functions
+                    and node.name != "self"):
+                captures.append(node.name)
+        elif isinstance(node, BinaryOp):
+            self._collect_captures(node.left, param_names, captures)
+            self._collect_captures(node.right, param_names, captures)
+        elif isinstance(node, UnaryOp):
+            self._collect_captures(node.operand, param_names, captures)
+        elif isinstance(node, Call):
+            if isinstance(node.func, Attribute):
+                self._collect_captures(node.func.obj, param_names, captures)
+            elif isinstance(node.func, Identifier):
+                pass  # Don't capture function names
+            else:
+                self._collect_captures(node.func, param_names, captures)
+            for arg in node.args:
+                self._collect_captures(arg, param_names, captures)
+        elif isinstance(node, Attribute):
+            self._collect_captures(node.obj, param_names, captures)
+        elif isinstance(node, Block):
+            for stmt in node.statements:
+                self._collect_captures(stmt, param_names, captures)
+        elif isinstance(node, ExprStmt):
+            self._collect_captures(node.expr, param_names, captures)
+        elif isinstance(node, Return):
+            if node.value:
+                self._collect_captures(node.value, param_names, captures)
+        elif isinstance(node, IfExpr):
+            self._collect_captures(node.condition, param_names, captures)
+            self._collect_captures(node.then_expr, param_names, captures)
+            if node.else_expr:
+                self._collect_captures(node.else_expr, param_names, captures)
+        elif isinstance(node, If):
+            self._collect_captures(node.condition, param_names, captures)
+            self._collect_captures(node.then_body, param_names, captures)
+            if node.else_body:
+                self._collect_captures(node.else_body, param_names, captures)
+        elif isinstance(node, Index):
+            self._collect_captures(node.obj, param_names, captures)
+            self._collect_captures(node.index, param_names, captures)
+
+    def _infer_var_c_type(self, name: str) -> str:
+        """Infer the C type of a variable from tracking info."""
+        if name in self.string_vars:
+            return "const char*"
+        if name in self.float_vars:
+            return "double"
+        if name in self.bool_vars:
+            return "bool"
+        return "int64_t"
 
     def gen_IfExpr(self, node: IfExpr) -> str:
         cond = self.generate_node(node.condition)
@@ -3784,6 +4240,8 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     def gen_Identifier(self, node: Identifier) -> str:
         if node.name == "self":
             return "self"
+        if node.name == "result" and self._in_ensures:
+            return "_result"
         return self.mangle_name(node.name)
     
     def gen_IntLit(self, node: IntLit) -> str:
@@ -3912,31 +4370,151 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
         return f"{node.name}_create({', '.join(args)})"
     
     def gen_MatchExpr(self, node: MatchExpr) -> str:
-        # Generate as switch or if-else chain
         val = self.generate_node(node.value)
-        
-        self.emit(f"switch ({val}) {{")
+
+        # Normalize arms to 3-tuples (pattern, guard, body)
+        arms = []
+        for arm in node.arms:
+            if len(arm) == 2:
+                arms.append((arm[0], None, arm[1]))
+            else:
+                arms.append(arm)
+
+        # Determine if this match produces a value (expression context)
+        # Heuristic: if any arm body is a non-Block expression, it's a value match
+        is_expr = any(not isinstance(body, Block) for _, _, body in arms)
+
+        # Infer result type from first arm body
+        result_c_type = "int64_t"
+        if is_expr:
+            first_body = arms[0][2] if arms else None
+            if first_body:
+                if isinstance(first_body, StringLit):
+                    result_c_type = "const char*"
+                elif isinstance(first_body, FloatLit):
+                    result_c_type = "double"
+                elif isinstance(first_body, BoolLit):
+                    result_c_type = "bool"
+
+        # Check if we need if-else chain (guards, wildcards, or variable bindings)
+        has_guards = any(guard is not None for _, guard, _ in arms)
+        has_wildcard = any(isinstance(p, Identifier) and p.name == "_" for p, _, _ in arms)
+        has_var_bind = any(isinstance(p, Identifier) and p.name != "_"
+                          and not isinstance(p, (IntLit, FloatLit, BoolLit, StringLit))
+                          for p, _, _ in arms)
+
+        if has_guards or has_wildcard or has_var_bind:
+            return self._gen_match_complex(arms, val, is_expr, result_c_type)
+        else:
+            return self._gen_match_switch(arms, val, is_expr, result_c_type)
+
+    def _gen_match_arm_body(self, body, result_var=None):
+        """Generate the body of a match arm. If result_var set, assign expression to it."""
+        if isinstance(body, Block):
+            self.generate_node(body)
+        elif result_var:
+            result = self.generate_node(body)
+            if result:
+                self.emit(f"{result_var} = {result};")
+        else:
+            # Could be a Call to print — generate_node handles it
+            result = self.generate_node(body)
+            if result:
+                self.emit(f"{result};")
+
+    def _gen_match_complex(self, arms, val, is_expr=False, result_c_type="int64_t"):
+        """Generate match as cascading if-else with guards/variable bindings."""
+        self._match_counter = getattr(self, '_match_counter', 0) + 1
+        result_var = f"_match_result_{self._match_counter}" if is_expr else None
+
+        # Declare result var BEFORE the block so it's visible after
+        if result_var:
+            if result_c_type == "const char*":
+                self.emit(f'{result_c_type} {result_var} = "";')
+            else:
+                self.emit(f"{result_c_type} {result_var} = 0;")
+
+        self.emit("{")
         self.indent += 1
-        
-        for pattern, expr in node.arms:
-            if isinstance(pattern, Identifier) and pattern.name == "_":
-                self.emit("default:")
+        self.emit(f"int64_t _match_val = {val};")
+        self.emit("bool _matched = false;")
+
+        for pat, guard, body in arms:
+            is_wildcard = isinstance(pat, Identifier) and pat.name == "_"
+            is_var_bind = (isinstance(pat, Identifier) and pat.name != "_"
+                          and not isinstance(pat, (IntLit, FloatLit, BoolLit, StringLit)))
+
+            if is_wildcard:
+                self.emit("if (!_matched) {")
+                self.indent += 1
+                self._gen_match_arm_body(body, result_var)
+                self.indent -= 1
+                self.emit("}")
+            elif is_var_bind and guard:
+                var_name = self.mangle_name(pat.name)
+                self.declared_vars.add(pat.name)
+                self.emit("if (!_matched) {")
+                self.indent += 1
+                self.emit(f"int64_t {var_name} = _match_val;")
+                guard_code = self.generate_node(guard)
+                self.emit(f"if ({guard_code}) {{")
+                self.indent += 1
+                self._gen_match_arm_body(body, result_var)
+                self.emit("_matched = true;")
+                self.indent -= 1
+                self.emit("}")
+                self.indent -= 1
+                self.emit("}")
             else:
-                pat = self.generate_node(pattern)
-                self.emit(f"case {pat}:")
-            
-            self.indent += 1
-            if isinstance(expr, Block):
-                self.generate_node(expr)
-            else:
-                result = self.generate_node(expr)
-                if result:
-                    self.emit(f"{result};")
-            self.emit("break;")
-            self.indent -= 1
-        
+                # Literal pattern (possibly with guard)
+                pat_val = self.generate_node(pat)
+                cond = f"_match_val == {pat_val}"
+                if guard:
+                    guard_code = self.generate_node(guard)
+                    cond = f"({cond}) && ({guard_code})"
+                self.emit(f"if (!_matched && ({cond})) {{")
+                self.indent += 1
+                self._gen_match_arm_body(body, result_var)
+                self.emit("_matched = true;")
+                self.indent -= 1
+                self.emit("}")
+
         self.indent -= 1
         self.emit("}")
+        if result_var:
+            return result_var
+        return ""
+
+    def _gen_match_switch(self, arms, val, is_expr=False, result_c_type="int64_t"):
+        """Generate match as switch statement."""
+        self._match_counter = getattr(self, '_match_counter', 0) + 1
+        result_var = f"_match_result_{self._match_counter}" if is_expr else None
+
+        if result_var:
+            if result_c_type == "const char*":
+                self.emit(f'{result_c_type} {result_var} = "";')
+            else:
+                self.emit(f"{result_c_type} {result_var} = 0;")
+
+        self.emit(f"switch ({val}) {{")
+        self.indent += 1
+
+        for pat, guard, body in arms:
+            if isinstance(pat, Identifier) and pat.name == "_":
+                self.emit("default:")
+            else:
+                pat_val = self.generate_node(pat)
+                self.emit(f"case {pat_val}:")
+
+            self.indent += 1
+            self._gen_match_arm_body(body, result_var)
+            self.emit("break;")
+            self.indent -= 1
+
+        self.indent -= 1
+        self.emit("}")
+        if result_var:
+            return result_var
         return ""
     
     # Helper methods
@@ -4003,7 +4581,7 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
     def infer_c_type(self, node: VarDecl) -> str:
         if node.type_ann:
             return self.type_to_c(node.type_ann)
-        
+
         if node.value:
             if isinstance(node.value, IntLit):
                 return 'int64_t'
@@ -4020,6 +4598,15 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
             if isinstance(node.value, Cast):
                 return self.type_to_c(node.value.target_type)
             if isinstance(node.value, Call):
+                # Check for Vec<T>.new() and HashMap<K,V>.new() constructors
+                if isinstance(node.value.func, Attribute) and isinstance(node.value.func.obj, Identifier):
+                    cname = node.value.func.obj.name
+                    if cname.startswith("__Vec__"):
+                        elem_type = cname[7:]
+                        return f"TIL_DynArray_{elem_type}"
+                    if cname.startswith("__HashMap__"):
+                        type_parts = cname[11:]
+                        return f"TIL_HashMap_{type_parts}"
                 # Use unified call return type inference
                 ret = self._infer_call_ret_type(node.value)
                 if ret and ret != 'void':
@@ -4039,6 +4626,12 @@ static void til_bounds_check(size_t index, size_t len, const char* msg) {
                     return 'double'
             if isinstance(node.value, IfExpr):
                 return self.infer_c_type(VarDecl(value=node.value.then_expr))
+            if isinstance(node.value, MatchExpr):
+                # Infer from first arm body
+                if node.value.arms:
+                    first_arm = node.value.arms[0]
+                    body = first_arm[2] if len(first_arm) == 3 else first_arm[1]
+                    return self.infer_c_type(VarDecl(value=body))
 
         return 'int64_t'
     
@@ -4252,7 +4845,7 @@ class TILCompiler:
 
 def print_help():
     print("""
-TIL v1.5 Compiler - The Intelligent Language
+TIL v2.0 Compiler - The Intelligent Language
 Author: Alisher Beisembekov
 
 Usage: til [options] <input.til>
@@ -4280,26 +4873,137 @@ Examples:
   til -o myapp program.til     # Compile to ./myapp
   til -c program.til           # Output C code to stdout
   til -O3 program.til          # Compile with max optimization
+
+Commands:
+  run <file>        Compile and run
+  build <file>      Compile to executable
+  check <file>      Syntax check only
+  repl              Interactive REPL
 """)
+
+def run_repl():
+    """Interactive REPL for TIL"""
+    print("TIL v2.0 REPL - The Intelligent Language")
+    print("Author: Alisher Beisembekov")
+    print('Type expressions or statements. Use "exit" or Ctrl+D to quit.')
+    print()
+
+    compiler = TILCompiler()
+    compiler.check_types = False  # Less strict for REPL
+    history_funcs = []  # Accumulated function definitions
+    history_vars = []   # Accumulated variable assignments
+
+    while True:
+        try:
+            line = input("til> ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            return 0
+
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line in ('exit', 'quit', 'exit()', 'quit()'):
+            print("Bye!")
+            return 0
+
+        # Build a program from accumulated state + current input
+        parts = []
+        for func_def in history_funcs:
+            parts.append(func_def)
+
+        # Check if this looks like a function definition
+        if ('(' in line and line.endswith(':') and not line.startswith(' ') and
+                not line.startswith('if') and not line.startswith('while') and
+                not line.startswith('for')):
+            # Multi-line function definition
+            func_lines = [line]
+            while True:
+                try:
+                    cont = input("...  ")
+                except (EOFError, KeyboardInterrupt):
+                    print("\nBye!")
+                    return 0
+                if cont.strip() == '':
+                    break
+                func_lines.append(cont)
+            func_def = '\n'.join(func_lines)
+            history_funcs.append(func_def)
+            print("OK")
+            continue
+
+        # Build main function with accumulated vars + current line
+        main_lines = ["main()"]
+        for var_line in history_vars:
+            main_lines.append(f"    {var_line}")
+
+        # Determine if this is a print, assignment, or expression
+        is_assignment = False
+        if '=' in line and not line.startswith('print') and not '==' in line.split('=')[0]:
+            # Likely an assignment like "let x = 5" or "x = 5"
+            is_assignment = True
+            main_lines.append(f"    {line}")
+            # Also print result for let statements
+            if line.startswith('let '):
+                var_name = line.split('=')[0].replace('let ', '').strip()
+                if ':' in var_name:
+                    var_name = var_name.split(':')[0].strip()
+                main_lines.append(f"    print({var_name})")
+        elif line.startswith('print'):
+            main_lines.append(f"    {line}")
+        else:
+            # Treat as expression - wrap in print
+            main_lines.append(f"    print({line})")
+
+        source = '\n'.join(parts + main_lines) + '\n'
+
+        try:
+            success = compiler.compile_to_executable(source, '/tmp/til_repl', '<repl>')
+            if success:
+                result = subprocess.run(['/tmp/til_repl'], capture_output=True, text=True,
+                                       encoding='utf-8', errors='replace')
+                if result.stdout:
+                    print(result.stdout, end='')
+                if result.stderr:
+                    print(result.stderr, end='', file=sys.stderr)
+                if result.returncode != 0 and not result.stdout and not result.stderr:
+                    print(f"[exit code: {result.returncode}]")
+
+                # If assignment succeeded, remember it
+                if is_assignment:
+                    history_vars.append(line)
+
+                try:
+                    os.remove('/tmp/til_repl')
+                except:
+                    pass
+        except Exception as e:
+            print(f"Error: {e}")
+
+    return 0
+
 
 def main():
     args = sys.argv[1:]
-    
+
     if not args or '-h' in args or '--help' in args:
         print_help()
         return 0
-    
+
     if '--version' in args:
-        print("TIL Compiler v1.5.0")
+        print("TIL Compiler v2.0.0")
         print("Author: Alisher Beisembekov")
         print("Multi-Level Programming: Mixed Martial Programming")
         return 0
-    
-    # Check for command (run, build, check)
+
+    # Check for command (run, build, check, repl)
     command = None
-    if args and args[0] in ('run', 'build', 'check'):
+    if args and args[0] in ('run', 'build', 'check', 'repl'):
         command = args[0]
         args = args[1:]
+
+    if command == 'repl':
+        return run_repl()
     
     compiler = TILCompiler()
     input_file = None
