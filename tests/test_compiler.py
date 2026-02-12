@@ -1840,6 +1840,430 @@ main()
         assert compile_and_run(src) == "five\n10"
 
 
+# ═══════════════════════════════════════════════════════════════
+# V2.0 REVOLUTIONARY FEATURES TESTS
+# ═══════════════════════════════════════════════════════════════
+
+class TestGenerics:
+    """Tests for generic function annotations"""
+
+    def test_generic_identity(self):
+        src = """
+#[generic: T]
+identity(x: int) -> int
+    return x
+
+main()
+    print(identity(42))
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_generic_annotated_function(self):
+        src = """
+#[generic: T, U]
+first(a: int, b: int) -> int
+    return a
+
+main()
+    print(first(10, 20))
+"""
+        assert compile_and_run(src) == "10"
+
+
+class TestAlgebraicEffects:
+    """Tests for algebraic effect system"""
+
+    def test_pure_effect(self):
+        src = """
+#[pure]
+add(a: int, b: int) -> int
+    return a + b
+
+main()
+    print(add(3, 4))
+"""
+        assert compile_and_run(src) == "7"
+
+    def test_io_effect(self):
+        src = """
+#[effects: io]
+greet(name: str)
+    print(name)
+
+main()
+    greet("hello")
+"""
+        assert compile_and_run(src) == "hello"
+
+    def test_multiple_effects(self):
+        src = """
+#[effects: io, fs]
+process(x: int) -> int
+    return x * 2
+
+main()
+    print(process(21))
+"""
+        assert compile_and_run(src) == "42"
+
+
+class TestCapabilitySecurity:
+    """Tests for capability-based security"""
+
+    def test_cap_declaration(self):
+        src = """
+cap FileAccess { read, write }
+
+main()
+    print(42)
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_cap_function_annotation(self):
+        src = """
+#[cap: FileRead]
+read_data(path: str) -> str
+    return path
+
+main()
+    print(read_data("hello.txt"))
+"""
+        assert compile_and_run(src) == "hello.txt"
+
+    def test_cap_with_effects(self):
+        src = """
+#[cap: NetAccess]
+#[effects: io]
+fetch(url: str) -> str
+    return url
+
+main()
+    print(fetch("example.com"))
+"""
+        assert compile_and_run(src) == "example.com"
+
+
+class TestTemporalTypes:
+    """Tests for temporal types and timeout"""
+
+    def test_timeout_basic(self):
+        src = """
+main()
+    let r = timeout(1000)
+        42
+    print(r)
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_timeout_computation(self):
+        src = """
+main()
+    let r = timeout(5000)
+        10 + 20 + 30
+    print(r)
+"""
+        assert compile_and_run(src) == "60"
+
+
+class TestGradualVerification:
+    """Tests for assert and invariant"""
+
+    def test_assert_pass(self):
+        src = """
+main()
+    let x = 10
+    assert x > 5, "x must be > 5"
+    print(x)
+"""
+        assert compile_and_run(src) == "10"
+
+    def test_assert_with_expression(self):
+        src = """
+main()
+    let a = 3
+    let b = 4
+    assert a + b == 7, "sum should be 7"
+    print(a + b)
+"""
+        assert compile_and_run(src) == "7"
+
+    def test_invariant_pass(self):
+        src = """
+main()
+    let x = 42
+    invariant x > 0, "x must be positive"
+    print(x)
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_assert_failure(self):
+        src = """
+main()
+    let x = 3
+    assert x > 10, "x must be > 10"
+    print(x)
+"""
+        compiler = TILCompiler()
+        compiler.check_types = False
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.out', delete=False) as f:
+            exe = f.name
+        try:
+            ok = compiler.compile_to_executable(src, exe, "<test>")
+            assert ok
+            result = subprocess.run([exe], capture_output=True, text=True, timeout=10)
+            assert result.returncode != 0
+            assert "Assertion failed" in result.stderr
+        finally:
+            try:
+                os.unlink(exe)
+            except:
+                pass
+
+    def test_multiple_asserts(self):
+        src = """
+main()
+    let x = 10
+    let y = 20
+    assert x > 0, "x positive"
+    assert y > 0, "y positive"
+    assert x < y, "x less than y"
+    print(x + y)
+"""
+        assert compile_and_run(src) == "30"
+
+
+class TestAdaptiveErrorHandling:
+    """Tests for retry and fallback"""
+
+    def test_retry_basic(self):
+        src = """
+main()
+    let r = retry(3)
+        42
+    print(r)
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_retry_expression(self):
+        src = """
+main()
+    let r = retry(5)
+        10 + 20
+    print(r)
+"""
+        assert compile_and_run(src) == "30"
+
+
+class TestEnergyAware:
+    """Tests for energy-aware compilation"""
+
+    def test_energy_low(self):
+        src = """
+#[energy: low]
+eco_add(a: int, b: int) -> int
+    return a + b
+
+main()
+    print(eco_add(1, 2))
+"""
+        assert compile_and_run(src) == "3"
+
+    def test_energy_high(self):
+        src = """
+#[energy: high]
+fast_multiply(a: int, b: int) -> int
+    return a * b
+
+main()
+    print(fast_multiply(6, 7))
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_energy_mixed(self):
+        src = """
+#[energy: low]
+slow_fn(x: int) -> int
+    return x + 1
+
+#[energy: high]
+fast_fn(x: int) -> int
+    return x * 2
+
+main()
+    print(slow_fn(10))
+    print(fast_fn(10))
+"""
+        assert compile_and_run(src) == "11\n20"
+
+
+class TestCrossLevelContracts:
+    """Tests for cross-level contracts"""
+
+    def test_cross_level_annotation(self):
+        src = """
+#[level: 1]
+#[cross_level: 1 -> 2]
+fast_op(x: int) -> int
+    return x * 3
+
+main()
+    print(fast_op(14))
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_level_with_requires(self):
+        src = """
+#[level: 1]
+#[requires: x > 0]
+system_fn(x: int) -> int
+    return x * 10
+
+main()
+    print(system_fn(5))
+"""
+        assert compile_and_run(src) == "50"
+
+
+class TestDistributedTypes:
+    """Tests for channel-like communication using Vec"""
+
+    def test_channel_simulation(self):
+        src = """
+main()
+    let ch = Vec<int>.new()
+    ch.push(10)
+    ch.push(20)
+    ch.push(30)
+    print(ch.get(0))
+    print(ch.get(1))
+    print(ch.get(2))
+"""
+        assert compile_and_run(src) == "10\n20\n30"
+
+    def test_message_queue(self):
+        src = """
+main()
+    let msgs = Vec<str>.new()
+    msgs.push("hello")
+    msgs.push("world")
+    print(msgs.get(0))
+    print(msgs.get(1))
+    print(msgs.len())
+"""
+        assert compile_and_run(src) == "hello\nworld\n2"
+
+
+class TestIntentBasedProgramming:
+    """Tests for intent blocks"""
+
+    def test_intent_basic(self):
+        src = """
+main()
+    intent "compute sum"
+        let s = 1 + 2 + 3
+        print(s)
+"""
+        assert compile_and_run(src) == "6"
+
+    def test_intent_with_logic(self):
+        src = """
+main()
+    intent "find maximum"
+        let a = 10
+        let b = 20
+        if a > b
+            print(a)
+        else
+            print(b)
+"""
+        assert compile_and_run(src) == "20"
+
+    def test_intent_with_loop(self):
+        src = """
+main()
+    intent "count to 5"
+        for i in 1..6
+            print(i)
+"""
+        assert compile_and_run(src) == "1\n2\n3\n4\n5"
+
+
+class TestRevolutionaryIntegration:
+    """Integration tests combining multiple revolutionary features"""
+
+    def test_pure_with_assert(self):
+        src = """
+#[pure]
+#[requires: a >= 0]
+#[requires: b >= 0]
+safe_add(a: int, b: int) -> int
+    return a + b
+
+main()
+    let r = safe_add(10, 20)
+    assert r == 30, "result should be 30"
+    print(r)
+"""
+        assert compile_and_run(src) == "30"
+
+    def test_energy_with_contract(self):
+        src = """
+#[energy: high]
+#[ensures: result > 0]
+positive_square(x: int) -> int
+    return x * x
+
+main()
+    print(positive_square(5))
+"""
+        assert compile_and_run(src) == "25"
+
+    def test_cap_with_contract(self):
+        src = """
+#[cap: FileRead]
+#[requires: path != 0]
+safe_read(path: int) -> int
+    return path
+
+main()
+    print(safe_read(42))
+"""
+        assert compile_and_run(src) == "42"
+
+    def test_intent_with_vec(self):
+        src = """
+main()
+    intent "build a list of squares"
+        let squares = Vec<int>.new()
+        squares.push(1)
+        squares.push(4)
+        squares.push(9)
+        squares.push(16)
+        print(squares.len())
+        print(squares.get(2))
+"""
+        assert compile_and_run(src) == "4\n9"
+
+    def test_all_annotations_combined(self):
+        src = """
+#[level: 1]
+#[pure]
+#[energy: high]
+#[generic: T]
+#[requires: x > 0]
+#[ensures: result >= x]
+double(x: int) -> int
+    return x * 2
+
+main()
+    let r = double(21)
+    assert r == 42, "should be 42"
+    print(r)
+"""
+        assert compile_and_run(src) == "42"
+
+
 if __name__ == '__main__':
     import pytest
     pytest.main([__file__, '-v'])

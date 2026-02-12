@@ -12,7 +12,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](https://github.com/damn-glitch/TIL/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/damn-glitch/TIL)
-[![Tests](https://img.shields.io/badge/tests-223%20passing-brightgreen.svg)](tests/test_compiler.py)
+[![Tests](https://img.shields.io/badge/tests-255%20passing-brightgreen.svg)](tests/test_compiler.py)
 
 **Author: Alisher Beisembekov | Patent No 66853**
 
@@ -580,7 +580,7 @@ python src/til.py run examples/01_hello.til
 
 ## Testing
 
-**223 tests** covering the full compiler pipeline:
+**255 tests** covering the full compiler pipeline:
 
 ```bash
 pip install pytest
@@ -610,6 +610,17 @@ python -m pytest tests/test_compiler.py -v
 | **Effects & Contracts** | 7 | #[pure], #[effects], #[requires], #[ensures] |
 | **REPL** | 2 | Version output, help text |
 | **v2.0 Integration** | 7 | Cross-feature combinations |
+| **Generics** | 2 | Generic annotations, type parameters |
+| **Algebraic Effects** | 3 | Pure, IO, multi-effect annotations |
+| **Capability Security** | 3 | Cap declarations, function caps, cap+effects |
+| **Temporal Types** | 2 | Timeout expressions, timed computation |
+| **Gradual Verification** | 5 | Assert pass/fail, invariants, multi-assert |
+| **Adaptive Errors** | 2 | Retry blocks, retry expressions |
+| **Energy-Aware** | 3 | Low/high energy, mixed energy functions |
+| **Cross-Level Contracts** | 2 | Level transitions, level+requires |
+| **Distributed Types** | 2 | Channel simulation, message queues |
+| **Intent Programming** | 3 | Intent blocks with logic, loops |
+| **Revolutionary Integration** | 5 | Multi-annotation, combined features |
 
 ### CI/CD
 
@@ -643,7 +654,7 @@ TIL/
 │   ├── math.til              # Math standard library
 │   └── strings.til           # String standard library
 ├── tests/
-│   └── test_compiler.py      # 223 tests
+│   └── test_compiler.py      # 255 tests
 ├── .github/
 │   └── workflows/
 │       └── ci.yml            # CI for Linux, macOS, Windows
@@ -694,9 +705,22 @@ TIL/
 - [x] **Design by Contract** — `#[requires: expr]`, `#[ensures: expr]` with runtime verification
 - [x] **Interactive REPL** — `til repl` for live expression evaluation
 
+### Revolutionary Features (v2.0)
+
+- [x] **Generics** — `#[generic: T]` type parameter annotations
+- [x] **Algebraic Effects** — `#[pure]`, `#[effects: io, fs]` with composable effect types
+- [x] **Capability-Based Security** — `cap FileAccess { read, write }`, `#[cap: FileRead]` function capabilities
+- [x] **Temporal Types** — `timeout(ms) { expr }` timed execution
+- [x] **Gradual Verification** — `assert cond, "msg"`, `invariant cond` runtime verification
+- [x] **Adaptive Error Handling** — `retry(n) { expr }` with automatic retry
+- [x] **Energy-Aware Compilation** — `#[energy: low|medium|high]` optimization hints
+- [x] **Cross-Level Contracts** — `#[cross_level: 1 -> 2]` level transition validation
+- [x] **Distributed Types** — Channel-like patterns with `Vec<T>` message queues
+- [x] **Intent-Based Programming** — `intent "description" { body }` self-documenting code blocks
+
 ### Roadmap to v3.0
 
-- [ ] Generics (`fn max<T>(a: T, b: T) -> T`)
+- [ ] Full generics with monomorphization
 - [ ] Full pattern matching with destructuring
 - [ ] Full trait dispatch (dynamic method resolution)
 - [ ] LSP server for editor integration

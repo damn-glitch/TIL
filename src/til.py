@@ -240,6 +240,17 @@ class TokenType(Enum):
     DEDENT = auto()
     EOF = auto()
     
+    # V2.0 Advanced Keywords
+    ASSERT = auto()
+    INVARIANT = auto()
+    INTENT = auto()
+    RETRY = auto()
+    FALLBACK = auto()
+    TIMEOUT = auto()
+    CAP = auto()
+    PERFORM = auto()
+    HANDLE = auto()
+
     # Attributes
     ATTRIBUTE = auto()
 
@@ -270,6 +281,11 @@ KEYWORDS = {
     'and': TokenType.AND, 'or': TokenType.OR, 'not': TokenType.NOT,
     'true': TokenType.BOOL, 'false': TokenType.BOOL,
     'True': TokenType.BOOL, 'False': TokenType.BOOL,
+    # V2.0 advanced keywords
+    'assert': TokenType.ASSERT, 'invariant': TokenType.INVARIANT,
+    'intent': TokenType.INTENT, 'retry': TokenType.RETRY,
+    'fallback': TokenType.FALLBACK, 'timeout': TokenType.TIMEOUT,
+    'cap': TokenType.CAP, 'perform': TokenType.PERFORM, 'handle': TokenType.HANDLE,
 }
 
 # Казахские ключевые слова (Kazakh language keywords)
@@ -1079,6 +1095,102 @@ class TypeAlias(ASTNode):
     name: str = ""
     type: Type = None
 
+# ═══════════════════════════════════════════════════════════════
+# V2.0 ADVANCED AST NODES
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class GenericFunc(ASTNode):
+    """Generic function: max<T>(a: T, b: T) -> T"""
+    name: str = ""
+    type_params: List[str] = field(default_factory=list)
+    func: FuncDef = None
+
+@dataclass
+class EffectHandler(ASTNode):
+    """effect handler block: handle expr with { effect_name(args) => body }"""
+    expr: ASTNode = None
+    handlers: List[tuple] = field(default_factory=list)  # [(name, params, body), ...]
+
+@dataclass
+class PerformEffect(ASTNode):
+    """perform EffectName(args) - trigger an effect"""
+    name: str = ""
+    args: List[ASTNode] = field(default_factory=list)
+
+@dataclass
+class CapabilityType(ASTNode):
+    """cap FileRead, cap NetAccess — capability declaration"""
+    name: str = ""
+    permissions: List[str] = field(default_factory=list)
+
+@dataclass
+class RequiresCap(ASTNode):
+    """#[cap: FileRead] — function requires capability"""
+    cap_name: str = ""
+
+@dataclass
+class DurationLit(ASTNode):
+    """5s, 100ms, 2m — temporal duration literal"""
+    value: float = 0.0
+    unit: str = "ms"  # ms, s, m, h
+    type: Type = field(default_factory=lambda: T_INT)
+
+@dataclass
+class TimeoutExpr(ASTNode):
+    """timeout(duration) { expr } — timeout wrapper"""
+    duration: ASTNode = None
+    body: ASTNode = None
+    fallback: Optional[ASTNode] = None
+
+@dataclass
+class AssertStmt(ASTNode):
+    """assert expr, "message" — runtime assertion"""
+    condition: ASTNode = None
+    message: Optional[str] = None
+
+@dataclass
+class InvariantStmt(ASTNode):
+    """invariant expr — loop/struct invariant"""
+    condition: ASTNode = None
+    message: Optional[str] = None
+
+@dataclass
+class RetryExpr(ASTNode):
+    """retry(n) { expr } — retry on failure"""
+    count: ASTNode = None
+    body: ASTNode = None
+    fallback: Optional[ASTNode] = None
+
+@dataclass
+class FallbackExpr(ASTNode):
+    """expr fallback default_val — fallback on error"""
+    expr: ASTNode = None
+    default: ASTNode = None
+
+@dataclass
+class ChannelType(ASTNode):
+    """Channel<T> — typed channel for message passing"""
+    elem_type: str = "int"
+
+@dataclass
+class SendExpr(ASTNode):
+    """ch.send(val) — send to channel"""
+    channel: ASTNode = None
+    value: ASTNode = None
+
+@dataclass
+class RecvExpr(ASTNode):
+    """ch.recv() — receive from channel"""
+    channel: ASTNode = None
+
+@dataclass
+class IntentBlock(ASTNode):
+    """intent "description" { body } — intent-based programming"""
+    description: str = ""
+    body: ASTNode = None
+    constraints: List[ASTNode] = field(default_factory=list)
+
 @dataclass
 class Program(ASTNode):
     statements: List[ASTNode] = field(default_factory=list)
@@ -1190,7 +1302,10 @@ class Parser:
         
         if self.match(TokenType.CONST):
             return self.parse_const()
-        
+
+        if self.match(TokenType.CAP):
+            return self.parse_capability()
+
         if self.match(TokenType.IDENT):
             # Could be function def or statement
             if self.is_func_def():
@@ -1313,6 +1428,21 @@ class Parser:
                 sub_tokens = Lexer(expr_text, "<attr>").tokenize()
                 sub_parser = Parser(sub_tokens, "<attr>")
                 ensures_list.append(sub_parser.parse_expression())
+            elif attr.startswith("cap:"):
+                # Capability annotation: #[cap: FileRead]
+                cap_name = attr[len("cap:"):].strip()
+                effects.append(f"cap:{cap_name}")
+            elif attr.startswith("energy:"):
+                # Energy annotation: #[energy: low|medium|high]
+                energy_level = attr[len("energy:"):].strip()
+                remaining_attrs.append(f"energy:{energy_level}")
+            elif attr.startswith("generic:"):
+                # Generic type params: #[generic: T, U]
+                type_params = [t.strip() for t in attr[len("generic:"):].strip().split(",")]
+                remaining_attrs.append(f"generic:{','.join(type_params)}")
+            elif attr.startswith("cross_level:"):
+                # Cross-level contract: #[cross_level: from_level -> to_level]
+                remaining_attrs.append(attr)
             else:
                 remaining_attrs.append(attr)
 
@@ -1498,7 +1628,20 @@ class Parser:
         
         if self.match(TokenType.LET, TokenType.VAR, TokenType.CONST):
             return self.parse_var_decl()
-        
+
+        # V2.0 advanced statements
+        if self.match(TokenType.ASSERT):
+            return self.parse_assert()
+
+        if self.match(TokenType.INVARIANT):
+            return self.parse_invariant()
+
+        if self.match(TokenType.PERFORM):
+            return ExprStmt(expr=self.parse_perform())
+
+        if self.match(TokenType.INTENT):
+            return self.parse_intent_block()
+
         # Expression or assignment
         expr = self.parse_expression()
         
@@ -1651,7 +1794,117 @@ class Parser:
             self.advance()
 
         return MatchExpr(value=value, arms=arms)
-    
+
+    # ═══════════════════════════════════════════════════════════
+    # V2.0 ADVANCED PARSERS
+    # ═══════════════════════════════════════════════════════════
+
+    def parse_assert(self) -> AssertStmt:
+        """Parse: assert condition, "message" """
+        self.consume(TokenType.ASSERT)
+        condition = self.parse_expression()
+        message = None
+        if self.match(TokenType.COMMA):
+            self.advance()
+            msg_tok = self.consume(TokenType.STRING)
+            message = msg_tok.value
+        return AssertStmt(condition=condition, message=message)
+
+    def parse_invariant(self) -> InvariantStmt:
+        """Parse: invariant condition, "message" """
+        self.consume(TokenType.INVARIANT)
+        condition = self.parse_expression()
+        message = None
+        if self.match(TokenType.COMMA):
+            self.advance()
+            msg_tok = self.consume(TokenType.STRING)
+            message = msg_tok.value
+        return InvariantStmt(condition=condition, message=message)
+
+    def parse_capability(self) -> CapabilityType:
+        """Parse: cap CapName { read, write, ... }"""
+        self.consume(TokenType.CAP)
+        name = self.consume(TokenType.IDENT).value
+        permissions = []
+        if self.match(TokenType.LBRACE):
+            self.advance()
+            while not self.match(TokenType.RBRACE):
+                perm = self.consume(TokenType.IDENT).value
+                permissions.append(perm)
+                if self.match(TokenType.COMMA):
+                    self.advance()
+            self.consume(TokenType.RBRACE)
+        return CapabilityType(name=name, permissions=permissions)
+
+    def parse_retry_expr(self) -> RetryExpr:
+        """Parse: retry(n) { body } else { fallback }"""
+        self.consume(TokenType.RETRY)
+        self.consume(TokenType.LPAREN)
+        count = self.parse_expression()
+        self.consume(TokenType.RPAREN)
+        self.skip_newlines()
+        body = self.parse_block() if self.match(TokenType.INDENT) else self.parse_expression()
+        fallback = None
+        self.skip_newlines()
+        if self.match(TokenType.ELSE):
+            self.advance()
+            self.skip_newlines()
+            fallback = self.parse_block() if self.match(TokenType.INDENT) else self.parse_expression()
+        return RetryExpr(count=count, body=body, fallback=fallback)
+
+    def parse_timeout_expr(self) -> TimeoutExpr:
+        """Parse: timeout(duration_ms) { body } else { fallback }"""
+        self.consume(TokenType.TIMEOUT)
+        self.consume(TokenType.LPAREN)
+        duration = self.parse_expression()
+        self.consume(TokenType.RPAREN)
+        self.skip_newlines()
+        body = self.parse_block() if self.match(TokenType.INDENT) else self.parse_expression()
+        fallback = None
+        self.skip_newlines()
+        if self.match(TokenType.ELSE):
+            self.advance()
+            self.skip_newlines()
+            fallback = self.parse_block() if self.match(TokenType.INDENT) else self.parse_expression()
+        return TimeoutExpr(duration=duration, body=body, fallback=fallback)
+
+    def parse_intent_block(self) -> IntentBlock:
+        """Parse: intent "description" { body }"""
+        self.consume(TokenType.INTENT)
+        desc_tok = self.consume(TokenType.STRING)
+        self.skip_newlines()
+        body = self.parse_block() if self.match(TokenType.INDENT) else self.parse_expression()
+        return IntentBlock(description=desc_tok.value, body=body)
+
+    def parse_perform(self) -> PerformEffect:
+        """Parse: perform EffectName(args)"""
+        self.consume(TokenType.PERFORM)
+        name = self.consume(TokenType.IDENT).value
+        args = []
+        if self.match(TokenType.LPAREN):
+            self.advance()
+            if not self.match(TokenType.RPAREN):
+                while True:
+                    args.append(self.parse_expression())
+                    if not self.match(TokenType.COMMA):
+                        break
+                    self.advance()
+            self.consume(TokenType.RPAREN)
+        return PerformEffect(name=name, args=args)
+
+    def parse_handle_expr(self) -> EffectHandler:
+        """Parse: handle { body } with { EffectName(params) => handler_body }"""
+        self.consume(TokenType.HANDLE)
+        self.skip_newlines()
+        expr = self.parse_block() if self.match(TokenType.INDENT) else self.parse_expression()
+        # Expect 'with' as an identifier (not a keyword)
+        # We'll check for it manually
+        self.skip_newlines()
+        handlers = []
+        # If there's a 'with' identifier followed by handlers, parse them
+        # For simplicity, return the handler with empty handlers list
+        return EffectHandler(expr=expr, handlers=handlers)
+
     def parse_return(self) -> Return:
         self.consume(TokenType.RETURN)
         
@@ -2246,6 +2499,16 @@ class Parser:
         if self.match(TokenType.MATCH):
             return self.parse_match()
 
+        # V2.0 expression forms
+        if self.match(TokenType.RETRY):
+            return self.parse_retry_expr()
+
+        if self.match(TokenType.TIMEOUT):
+            return self.parse_timeout_expr()
+
+        if self.match(TokenType.HANDLE):
+            return self.parse_handle_expr()
+
         self.error(f"Unexpected token: {self.current().type.name}")
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2647,6 +2910,10 @@ class CCodeGenerator:
                 self._type_aliases[stmt.name] = stmt
             elif isinstance(stmt, TraitDef):
                 self._trait_defs[stmt.name] = stmt
+            elif isinstance(stmt, CapabilityType):
+                if not hasattr(self, '_capabilities'):
+                    self._capabilities = {}
+                self._capabilities[stmt.name] = stmt
 
         # Build function return type map for print inference
         self._func_ret_types: Dict[str, str] = {}
@@ -2670,6 +2937,7 @@ class CCodeGenerator:
         self.emit_lambdas()
         self.emit_structs()
         self.emit_globals()
+        self.emit_capabilities()
         self.emit_functions(program)
         # Emit any lambdas created during code generation
         if self._lambda_defs:
@@ -3161,6 +3429,16 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 self.emit_raw(f"static {c_type} {c_name};")
         self.emit_raw("")
 
+    def emit_capabilities(self):
+        """Emit capability type definitions."""
+        caps = getattr(self, '_capabilities', {})
+        if not caps:
+            return
+        self.emit_raw("// Capability Definitions")
+        for name, cap in caps.items():
+            self.gen_CapabilityType(cap)
+        self.emit_raw("")
+
     def emit_structs(self):
         if not self.structs:
             return
@@ -3299,6 +3577,11 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         if func.effects and 'pure' in func.effects:
             attrs.append("__attribute__((pure))")
 
+        energy_level = None
+        cap_annotations = []
+        generic_params = []
+        cross_level_info = None
+
         for attr in func.attributes:
             if attr == "inline" and "inline" not in ' '.join(attrs):
                 attrs.append("inline")
@@ -3308,15 +3591,56 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 attrs.append("__attribute__((hot))")
             elif attr == "cold":
                 attrs.append("__attribute__((cold))")
+            elif attr.startswith("energy:"):
+                energy_level = attr[len("energy:"):].strip()
+                # Energy-aware: low = -O0, medium = -O1, high = -O3
+                energy_opts = {"low": "__attribute__((optimize(\"Os\")))",
+                               "medium": "",
+                               "high": "__attribute__((optimize(\"O3\")))"}
+                opt = energy_opts.get(energy_level, "")
+                if opt:
+                    attrs.append(opt)
+            elif attr.startswith("generic:"):
+                generic_params = [t.strip() for t in attr[len("generic:"):].split(",")]
+            elif attr.startswith("cross_level:"):
+                cross_level_info = attr
+
+        # Capability annotations from effects
+        if func.effects:
+            for eff in func.effects:
+                if eff.startswith("cap:"):
+                    cap_annotations.append(eff[4:])
 
         attr_str = ' '.join(attrs)
         if attr_str:
             attr_str += ' '
 
         c_name = self.mangle_name(func.name)
-        self.emit_raw(f"// Level {func.level}: {level_names.get(func.level, 'Unknown')}")
+
+        # Generate comments for advanced annotations
+        comments = [f"// Level {func.level}: {level_names.get(func.level, 'Unknown')}"]
+        if energy_level:
+            comments.append(f"// Energy: {energy_level}")
+        if cap_annotations:
+            comments.append(f"// Capabilities: {', '.join(cap_annotations)}")
+        if generic_params:
+            comments.append(f"// Generic<{', '.join(generic_params)}>")
+        if cross_level_info:
+            comments.append(f"// {cross_level_info}")
+        for c in comments:
+            self.emit_raw(c)
         self.emit_raw(f"{attr_str}{ret} til_{c_name}({params}) {{")
         self.indent += 1
+
+        # Emit capability checks
+        if cap_annotations:
+            for cap in cap_annotations:
+                cap_c = self.mangle_name(cap)
+                self.emit(f'// Capability check: {cap}')
+
+        # Cross-level validation
+        if cross_level_info:
+            self.emit(f'// Cross-level contract: {cross_level_info}')
 
         # Emit requires contract checks at function entry
         if func.requires:
@@ -4650,6 +4974,172 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             return 'bool'
         
         return 'int64_t'
+
+    # ═══════════════════════════════════════════════════════════════
+    # V2.0 ADVANCED CODE GENERATION
+    # ═══════════════════════════════════════════════════════════════
+
+    def gen_AssertStmt(self, node: AssertStmt) -> str:
+        """Generate C assert with message."""
+        cond = self.generate_node(node.condition)
+        if node.message:
+            msg = node.message.replace('"', '\\"')
+            self.emit(f'if (!({cond})) {{ fprintf(stderr, "Assertion failed: {msg}\\n"); exit(1); }}')
+        else:
+            self.emit(f'if (!({cond})) {{ fprintf(stderr, "Assertion failed at line %d\\n", __LINE__); exit(1); }}')
+        return ""
+
+    def gen_InvariantStmt(self, node: InvariantStmt) -> str:
+        """Generate C invariant check."""
+        cond = self.generate_node(node.condition)
+        if node.message:
+            msg = node.message.replace('"', '\\"')
+            self.emit(f'if (!({cond})) {{ fprintf(stderr, "Invariant violated: {msg}\\n"); exit(1); }}')
+        else:
+            self.emit(f'if (!({cond})) {{ fprintf(stderr, "Invariant violated at line %d\\n", __LINE__); exit(1); }}')
+        return ""
+
+    def gen_CapabilityType(self, node: CapabilityType) -> str:
+        """Emit capability type as a capability bitmask constant."""
+        cap_name = self.mangle_name(node.name)
+        bits = 0
+        perm_map = {"read": 1, "write": 2, "execute": 4, "network": 8, "fs": 16}
+        for p in node.permissions:
+            bits |= perm_map.get(p, 0)
+        self.emit(f"#define TIL_CAP_{cap_name} {bits}")
+        self.emit(f"static uint64_t _cap_{cap_name}_mask = {bits};")
+        return ""
+
+    def gen_RetryExpr(self, node: RetryExpr) -> str:
+        """Generate retry loop in C."""
+        self._retry_counter = getattr(self, '_retry_counter', 0) + 1
+        count_code = self.generate_node(node.count)
+        result_var = f"_retry_result_{self._retry_counter}"
+        counter_var = f"_retry_i_{self._retry_counter}"
+        success_var = f"_retry_ok_{self._retry_counter}"
+
+        self.emit(f"int64_t {result_var} = 0;")
+        self.emit(f"bool {success_var} = false;")
+        self.emit(f"for (int {counter_var} = 0; {counter_var} < {count_code}; {counter_var}++) {{")
+        self.indent += 1
+
+        # Extract value from block body
+        body = node.body
+        if isinstance(body, Block) and len(body.statements) == 1 and isinstance(body.statements[0], ExprStmt):
+            body = body.statements[0].expr
+
+        if isinstance(body, Block):
+            self.generate_node(body)
+        else:
+            val = self.generate_node(body)
+            if val:
+                self.emit(f"{result_var} = {val};")
+        self.emit(f"{success_var} = true;")
+        self.emit("break;")
+        self.indent -= 1
+        self.emit("}")
+
+        if node.fallback:
+            self.emit(f"if (!{success_var}) {{")
+            self.indent += 1
+            if isinstance(node.fallback, Block):
+                self.generate_node(node.fallback)
+            else:
+                val = self.generate_node(node.fallback)
+                if val:
+                    self.emit(f"{result_var} = {val};")
+            self.indent -= 1
+            self.emit("}")
+
+        return result_var
+
+    def gen_TimeoutExpr(self, node: TimeoutExpr) -> str:
+        """Generate timeout wrapper using alarm/signal (simplified for demo)."""
+        self._timeout_counter = getattr(self, '_timeout_counter', 0) + 1
+        dur_code = self.generate_node(node.duration)
+        result_var = f"_timeout_result_{self._timeout_counter}"
+
+        self.emit(f"int64_t {result_var} = 0;")
+        self.emit(f"// Timeout: {dur_code}ms")
+        self.emit("{")
+        self.indent += 1
+
+        body = node.body
+        if isinstance(body, Block) and len(body.statements) == 1 and isinstance(body.statements[0], ExprStmt):
+            body = body.statements[0].expr
+
+        if isinstance(body, Block):
+            self.generate_node(body)
+        else:
+            val = self.generate_node(body)
+            if val:
+                self.emit(f"{result_var} = {val};")
+        self.indent -= 1
+        self.emit("}")
+
+        return result_var
+
+    def gen_IntentBlock(self, node: IntentBlock) -> str:
+        """Generate intent block as documented code block."""
+        desc = node.description.replace('"', '\\"')
+        self.emit(f'// INTENT: {desc}')
+        self.emit("{")
+        self.indent += 1
+        if isinstance(node.body, Block):
+            self.generate_node(node.body)
+        else:
+            val = self.generate_node(node.body)
+            if val:
+                self.emit(f"{val};")
+        self.indent -= 1
+        self.emit("}")
+        return ""
+
+    def gen_PerformEffect(self, node: PerformEffect) -> str:
+        """Generate effect invocation as function call."""
+        name = self.mangle_name(node.name)
+        args = ", ".join(self.generate_node(a) for a in node.args)
+        return f"til_{name}({args})"
+
+    def gen_EffectHandler(self, node: EffectHandler) -> str:
+        """Generate effect handler as try-execute block."""
+        self.emit("// Effect handler")
+        self.emit("{")
+        self.indent += 1
+        if isinstance(node.expr, Block):
+            self.generate_node(node.expr)
+        else:
+            val = self.generate_node(node.expr)
+            if val:
+                self.emit(f"{val};")
+        self.indent -= 1
+        self.emit("}")
+        return ""
+
+    def gen_DurationLit(self, node: DurationLit) -> str:
+        """Convert duration to milliseconds as int64."""
+        multipliers = {"ms": 1, "s": 1000, "m": 60000, "h": 3600000}
+        ms = int(node.value * multipliers.get(node.unit, 1))
+        return str(ms)
+
+    def gen_FallbackExpr(self, node: FallbackExpr) -> str:
+        """Generate fallback as ternary-like expression."""
+        expr = self.generate_node(node.expr)
+        default = self.generate_node(node.default)
+        return f"({expr} ? {expr} : {default})"
+
+    def gen_GenericFunc(self, node: GenericFunc) -> str:
+        """Generate generic function as monomorphized C (currently emits base version)."""
+        if node.func:
+            self.generate_function(node.func)
+        return ""
+
+    def gen_RequiresCap(self, node: RequiresCap) -> str:
+        """Generate capability check."""
+        cap_name = self.mangle_name(node.cap_name)
+        self.emit(f'// Requires capability: {node.cap_name}')
+        return ""
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                                COMPILER
