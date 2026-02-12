@@ -1723,17 +1723,19 @@ class TestREPL:
 
     def test_version_output(self):
         import subprocess
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         result = subprocess.run(
-            ['python', 'src/til.py', '--version'],
-            capture_output=True, text=True, cwd='/home/user/TIL'
+            [sys.executable, os.path.join('src', 'til.py'), '--version'],
+            capture_output=True, text=True, cwd=project_root
         )
         assert "TIL Compiler v2.0.0" in result.stdout
 
     def test_help_mentions_repl(self):
         import subprocess
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         result = subprocess.run(
-            ['python', 'src/til.py', '--help'],
-            capture_output=True, text=True, cwd='/home/user/TIL'
+            [sys.executable, os.path.join('src', 'til.py'), '--help'],
+            capture_output=True, text=True, cwd=project_root
         )
         assert "repl" in result.stdout.lower()
 
