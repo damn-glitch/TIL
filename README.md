@@ -9,7 +9,7 @@
 *"Proще Python. Быстрее C. Умнее всех."*
 
 [![CI](https://github.com/damn-glitch/TIL/actions/workflows/ci.yml/badge.svg)](https://github.com/damn-glitch/TIL/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-orange.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](https://github.com/damn-glitch/TIL/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/damn-glitch/TIL)
 [![Tests](https://img.shields.io/badge/tests-255%20passing-brightgreen.svg)](tests/test_compiler.py)
