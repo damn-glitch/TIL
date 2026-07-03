@@ -2872,6 +2872,7 @@ class CCodeGenerator:
         # V2: container tracking
         self.dynarray_vars: Dict[str, str] = {}  # var_name -> elem_type
         self.hashmap_vars: Dict[str, tuple] = {}  # var_name -> (key_type, val_type)
+        self.optresult_vars: Dict[str, str] = {}  # var_name -> TIL_Option_x / TIL_Result_x
         # V2: lambda/closure tracking
         self._lambda_var_map: Dict[str, str] = {}  # var_name -> lambda_c_name
         self._lambda_captures: Dict[str, list] = {}  # lambda_name -> [capture_names]
@@ -2880,6 +2881,8 @@ class CCodeGenerator:
         self._current_ensures: list = []
         self._current_ensures_ret_type: str = "int64_t"
         self._in_ensures: bool = False
+        # Current function's TIL return Type (for typed None / ? propagation).
+        self._current_ret_type: Optional[Type] = None
     
     @staticmethod
     def mangle_name(name: str) -> str:
@@ -2951,8 +2954,11 @@ class CCodeGenerator:
         self.emit_types()
         self.emit_enums()
         self.emit_type_aliases()
-        self.emit_forward_declarations()
+        # Helpers define the Option/Result/Vec/HashMap typedefs, so they MUST
+        # precede forward declarations — user function prototypes may return
+        # those types (e.g. `f() -> Result<int,str>` -> `TIL_Result_int til_f();`).
         self.emit_helpers()
+        self.emit_forward_declarations()
         self.emit_lambdas()
         self.emit_structs()
         self.emit_globals()
@@ -3571,6 +3577,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         self.array_vars = {}
         self.dynarray_vars = {}
         self.hashmap_vars = {}
+        self.optresult_vars = {}
         self._lambda_var_map = {}
         self.in_method = False
         self.current_struct = None
@@ -3672,14 +3679,17 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         # Set up ensures for gen_Return to use
         old_ensures = self._current_ensures
         old_ensures_ret = self._current_ensures_ret_type
+        old_ret_type = self._current_ret_type
         self._current_ensures = func.ensures if func.ensures else []
         self._current_ensures_ret_type = ret
+        self._current_ret_type = func.ret_type
 
         self.generate_node(func.body)
 
         # Restore ensures state
         self._current_ensures = old_ensures
         self._current_ensures_ret_type = old_ensures_ret
+        self._current_ret_type = old_ret_type
         
         # Add default return if needed
         if isinstance(func.ret_type, VoidType) or (isinstance(func.ret_type, PrimitiveType) and func.ret_type.name == "void"):
@@ -3801,6 +3811,9 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             parts = c_type[len("TIL_HashMap_"):].split("_", 1)
             if len(parts) == 2:
                 self.hashmap_vars[node.name] = (parts[0], parts[1])
+        # Track Option/Result variables (for the `?` operator).
+        if c_type.startswith("TIL_Option_") or c_type.startswith("TIL_Result_"):
+            self.optresult_vars[node.name] = c_type
 
     def gen_Assignment(self, node: Assignment) -> str:
         target = self.generate_node(node.target)
@@ -3913,6 +3926,12 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
     
     def gen_Return(self, node: Return) -> str:
         if node.value:
+            # `return None` in an Option-returning function -> typed None ctor.
+            if (isinstance(node.value, Identifier) and node.value.name == "NULL"
+                    and isinstance(self._current_ret_type, OptionType)):
+                suffix = self.type_to_c(self._current_ret_type)[len("TIL_Option_"):]
+                self.emit(f"return til_None_{suffix}();")
+                return ""
             val = self.generate_node(node.value)
             # Check if current function has ensures contracts
             if self._current_ensures:
@@ -3981,6 +4000,16 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 return "bool"
             return "int"
         if isinstance(arg, Attribute):
+            # Option/Result fields: .value (inner), .error (str), .has_value/.is_ok (bool)
+            if isinstance(arg.obj, Identifier) and arg.obj.name in self.optresult_vars:
+                ct = self.optresult_vars[arg.obj.name]
+                if arg.attr == "error":
+                    return "str"
+                if arg.attr in ("has_value", "is_ok"):
+                    return "bool"
+                if arg.attr == "value":
+                    suffix = ct.split("_")[-1]
+                    return {"int": "int", "float": "float", "str": "str", "bool": "bool"}.get(suffix, "int")
             # self.x in method context — check struct field type
             if isinstance(arg.obj, Identifier):
                 obj_name = arg.obj.name
@@ -4748,7 +4777,41 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         elements = [self.generate_node(e) for e in node.elements]
         return "{" + ", ".join(elements) + "}"
     
+    def _infer_optresult_ctype(self, node) -> Optional[str]:
+        """Return the C type (TIL_Option_x / TIL_Result_x) of an Option/Result
+        expression, or None."""
+        if isinstance(node, Call):
+            ct = self._infer_call_ret_type(node)
+            if ct.startswith("TIL_Option_") or ct.startswith("TIL_Result_"):
+                return ct
+        if isinstance(node, Identifier) and node.name in self.optresult_vars:
+            return self.optresult_vars[node.name]
+        return None
+
     def gen_NullCheck(self, node: NullCheck) -> str:
+        """`expr?` — real error propagation. If expr is None/Err, early-return it
+        from the enclosing function (when that function also returns Option/Result);
+        otherwise unwrap-or-abort. Evaluates to the contained value."""
+        opt_ctype = self._infer_optresult_ctype(node.expr)
+        if opt_ctype:
+            self._q_counter = getattr(self, '_q_counter', 0) + 1
+            q = f"_q_{self._q_counter}"
+            val = self.generate_node(node.expr)
+            self.emit(f"{opt_ctype} {q} = {val};")
+            if opt_ctype.startswith("TIL_Option_"):
+                if isinstance(self._current_ret_type, OptionType):
+                    rsuffix = self.type_to_c(self._current_ret_type)[len("TIL_Option_"):]
+                    self.emit(f"if (!{q}.has_value) return til_None_{rsuffix}();")
+                else:
+                    self.emit(f'if (!{q}.has_value) {{ fprintf(stderr, "? on None value\\n"); exit(1); }}')
+            else:  # TIL_Result_
+                if isinstance(self._current_ret_type, ResultType):
+                    self.emit(f"if (!{q}.is_ok) return {q};")
+                else:
+                    self.emit(f'if (!{q}.is_ok) {{ fprintf(stderr, "? on Err: %s\\n", {q}.error); exit(1); }}')
+            return f"{q}.value"
+
+        # Fallback: legacy pointer null-check.
         expr = self.generate_node(node.expr)
         return f"({expr} != NULL ? {expr} : (fprintf(stderr, \"Null unwrap failed\\n\"), exit(1), (void*)0))"
 
@@ -5030,6 +5093,13 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 ret = self._infer_call_ret_type(node.value)
                 if ret and ret != 'void':
                     return ret
+            if isinstance(node.value, NullCheck):
+                # `let x = expr?` — type is the contained value's type.
+                ct = self._infer_optresult_ctype(node.value.expr)
+                if ct:
+                    suffix = ct.split("_")[-1]  # int / float / str / bool
+                    return {"int": "int64_t", "float": "double",
+                            "str": "const char*", "bool": "bool"}.get(suffix, "int64_t")
             if isinstance(node.value, ListComprehension):
                 return 'int64_t*'
             if isinstance(node.value, UnaryOp):
@@ -5356,6 +5426,135 @@ def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
     return program
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#          COMPILE-TIME CONTRACT VERIFICATION (v3 "proof-level" slice)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class CompileError(Exception):
+    """A fatal, compile-time error that must abort compilation."""
+    pass
+
+
+def _eval_const_expr(node, env):
+    """Best-effort compile-time evaluation of a constant expression against
+    `env` (param name -> python value). Returns (True, value) if it folds to a
+    constant, else (False, None) meaning 'not statically known'."""
+    if isinstance(node, IntLit):
+        return True, node.value
+    if isinstance(node, FloatLit):
+        return True, node.value
+    if isinstance(node, BoolLit):
+        return True, node.value
+    if isinstance(node, Identifier):
+        if node.name in env:
+            return True, env[node.name]
+        return False, None
+    if isinstance(node, UnaryOp):
+        ok, v = _eval_const_expr(node.operand, env)
+        if not ok:
+            return False, None
+        if node.op == '-':
+            return True, -v
+        if node.op == 'not':
+            return True, (not v)
+        return False, None
+    if isinstance(node, BinaryOp):
+        ok1, l = _eval_const_expr(node.left, env)
+        ok2, r = _eval_const_expr(node.right, env)
+        if not (ok1 and ok2):
+            return False, None
+        op = node.op
+        try:
+            if op == '+': return True, l + r
+            if op == '-': return True, l - r
+            if op == '*': return True, l * r
+            if op == '%':
+                return (True, l % r) if r != 0 else (False, None)
+            if op == '/':
+                if r == 0:
+                    return False, None
+                return (True, l / r) if isinstance(l, float) or isinstance(r, float) else (True, l // r)
+            if op == '**': return True, l ** r
+            if op == '==': return True, l == r
+            if op == '!=': return True, l != r
+            if op == '<': return True, l < r
+            if op == '>': return True, l > r
+            if op == '<=': return True, l <= r
+            if op == '>=': return True, l >= r
+            if op == 'and': return True, (bool(l) and bool(r))
+            if op == 'or': return True, (bool(l) or bool(r))
+        except Exception:
+            return False, None
+    return False, None
+
+
+def _render_expr(node) -> str:
+    """Render an expression AST back to readable source (for diagnostics)."""
+    if isinstance(node, IntLit): return str(node.value)
+    if isinstance(node, FloatLit): return str(node.value)
+    if isinstance(node, BoolLit): return "true" if node.value else "false"
+    if isinstance(node, StringLit): return f'"{node.value}"'
+    if isinstance(node, Identifier): return node.name
+    if isinstance(node, UnaryOp): return f"{node.op}{_render_expr(node.operand)}"
+    if isinstance(node, BinaryOp): return f"{_render_expr(node.left)} {node.op} {_render_expr(node.right)}"
+    return "<expr>"
+
+
+def check_static_contracts(program: Program) -> List[str]:
+    """Compile-time #[requires] verification. For any call whose arguments are
+    compile-time constants, substitute them into the callee's `requires` clauses
+    and evaluate: a clause that is provably false is a fatal compile error — a
+    taste of proof-level checking, no SMT solver required."""
+    funcs: Dict[str, FuncDef] = {}
+    for stmt in program.statements:
+        if isinstance(stmt, FuncDef):
+            funcs[stmt.name] = stmt
+
+    violations: List[str] = []
+
+    def check_call(call: Call):
+        if not (isinstance(call.func, Identifier) and call.func.name in funcs):
+            return
+        fd = funcs[call.func.name]
+        if not fd.requires:
+            return
+        env = {}
+        for i, param in enumerate(fd.params):
+            if i < len(call.args):
+                ok, v = _eval_const_expr(call.args[i], {})
+                if ok:
+                    env[param.name] = v
+        for req in fd.requires:
+            ok, val = _eval_const_expr(req, env)
+            if ok and val is False:
+                argstr = ", ".join(_render_expr(a) for a in call.args)
+                violations.append(
+                    f"Line {call.line}: compile-time contract violation — "
+                    f"call `{fd.name}({argstr})` fails requires `{_render_expr(req)}`")
+
+    def walk(node):
+        if node is None:
+            return
+        if isinstance(node, Call):
+            check_call(node)
+        children = list(vars(node).values()) if hasattr(node, '__dict__') else []
+        for val in children:
+            if isinstance(val, ASTNode):
+                walk(val)
+            elif isinstance(val, (list, tuple)):
+                for item in val:
+                    if isinstance(item, ASTNode):
+                        walk(item)
+                    elif isinstance(item, (list, tuple)):
+                        for sub in item:
+                            if isinstance(sub, ASTNode):
+                                walk(sub)
+
+    for stmt in program.statements:
+        walk(stmt)
+    return violations
+
+
 class TILCompiler:
     def __init__(self):
         self.verbose = False
@@ -5382,6 +5581,14 @@ class TILCompiler:
         if self.verbose:
             print(f"[TIL] Resolving imports...")
         ast = resolve_imports(ast, filename)
+
+        # Compile-time contract verification (proof-level slice): reject calls
+        # that provably violate a callee's #[requires] with constant arguments.
+        contract_violations = check_static_contracts(ast)
+        if contract_violations:
+            for v in contract_violations:
+                print(f"error: {v}", file=sys.stderr)
+            raise CompileError(f"{len(contract_violations)} compile-time contract violation(s)")
 
         if self.check_types:
             if self.verbose:
@@ -5671,12 +5878,14 @@ def main():
             parser = Parser(tokens, input_file, source=source)
             ast = parser.parse()
             ast = resolve_imports(ast, input_file)
+            contract_violations = check_static_contracts(ast)
             checker = TypeChecker()
             errors = checker.check(ast)
-            if errors:
-                for err in errors:
+            all_errors = contract_violations + errors
+            if all_errors:
+                for err in all_errors:
                     print(f"error: {err}", file=sys.stderr)
-                print(f"FAILED: {input_file} ({len(errors)} type error(s))", file=sys.stderr)
+                print(f"FAILED: {input_file} ({len(all_errors)} error(s))", file=sys.stderr)
                 return 1
             print(f"OK: {input_file}")
             return 0
