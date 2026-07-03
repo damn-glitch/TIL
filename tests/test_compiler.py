@@ -2266,6 +2266,57 @@ main()
         assert compile_and_run(src) == "42"
 
 
+class TestRepairFixes:
+    """Behavioral regression tests for the honest-repair (Track A/B) fixes."""
+
+    def test_string_equality_is_value_not_pointer(self):
+        # A runtime-built string must compare equal by content, not pointer.
+        src = 'main()\n    let a = "he" + "llo"\n    print(a == "hello")\n    print(a == "nope")\n'
+        assert compile_and_run(src) == "true\nfalse"
+
+    def test_string_not_equal(self):
+        src = 'main()\n    let a = "ab" + "c"\n    print(a != "abc")\n'
+        assert compile_and_run(src) == "false"
+
+    def test_string_compound_concat(self):
+        src = 'main()\n    var s = "a"\n    s += "b"\n    s += "c"\n    print(s)\n'
+        assert compile_and_run(src) == "abc"
+
+    def test_pure_attribute_suppressed_when_io(self):
+        src = '#[pure]\nnoisy(x: int) -> int\n    print(999)\n    return x\nmain()\n    noisy(5)\n'
+        assert "__attribute__((pure))" not in compile_to_c(src)
+
+    def test_pure_attribute_kept_when_no_io(self):
+        src = '#[pure]\nsq(x: int) -> int\n    return x * x\nmain()\n    print(sq(5))\n'
+        assert "__attribute__((pure))" in compile_to_c(src)
+
+    def test_bad_hex_literal_raises_positioned_error(self):
+        import pytest as _pt
+        with _pt.raises(SyntaxError):
+            lex("main()\n    let x = 0x\n")
+
+    def test_bad_float_literal_raises_positioned_error(self):
+        import pytest as _pt
+        with _pt.raises(SyntaxError):
+            lex("main()\n    let x = 1e\n")
+
+    def test_uniform_string_match_infers_str(self):
+        src = ('classify(n: int) -> str\n    let r = match n\n        1 => "one"\n'
+               '        _ => "many"\n    return r\nmain()\n    print(classify(1))\n')
+        assert compile_and_run(src) == "one"
+
+    def test_side_effecting_index_evaluated_once(self):
+        # arr[ctr()] must call ctr() exactly once (bounds check + access share it).
+        src = ('ctr() -> int\n    print(7)\n    return 1\n'
+               'main()\n    let arr = [10, 20, 30]\n    print(arr[ctr()])\n')
+        assert compile_and_run(src) == "7\n20"
+
+    def test_typechecker_flags_str_assigned_to_int(self):
+        prog = parse('main()\n    let x: int = "hello"\n')
+        errors = TypeChecker().check(prog)
+        assert any("mismatch" in e.lower() for e in errors)
+
+
 if __name__ == '__main__':
     import pytest
     pytest.main([__file__, '-v'])

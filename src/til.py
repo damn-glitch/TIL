@@ -585,7 +585,11 @@ class Lexer:
             self.advance()
             while self.current() in '0123456789abcdefABCDEF_':
                 self.advance()
-            self.add_token(TokenType.INT, int(self.source[start:self.pos].replace('_', ''), 16))
+            hex_text = self.source[start:self.pos].replace('_', '')
+            try:
+                self.add_token(TokenType.INT, int(hex_text, 16))
+            except ValueError:
+                self.error(f"Invalid hexadecimal literal: '{hex_text}'")
             return
         
         # Binary
@@ -594,7 +598,11 @@ class Lexer:
             self.advance()
             while self.current() in '01_':
                 self.advance()
-            self.add_token(TokenType.INT, int(self.source[start:self.pos].replace('_', ''), 2))
+            bin_text = self.source[start:self.pos].replace('_', '')
+            try:
+                self.add_token(TokenType.INT, int(bin_text, 2))
+            except ValueError:
+                self.error(f"Invalid binary literal: '{bin_text}'")
             return
         
         # Decimal
@@ -616,10 +624,13 @@ class Lexer:
                 self.advance()
         
         text = self.source[start:self.pos].replace('_', '')
-        if is_float:
-            self.add_token(TokenType.FLOAT, float(text))
-        else:
-            self.add_token(TokenType.INT, int(text))
+        try:
+            if is_float:
+                self.add_token(TokenType.FLOAT, float(text))
+            else:
+                self.add_token(TokenType.INT, int(text))
+        except ValueError:
+            self.error(f"Invalid numeric literal: '{text}'")
     
     def read_identifier(self):
         start = self.pos
@@ -2553,7 +2564,9 @@ class TypeChecker:
         return None
     
     def check(self, program: Program) -> List[str]:
-        # First pass: collect all type definitions
+        # First pass: collect all type definitions (incl. traits, so the
+        # trait-implementation completeness check in check_ImplBlock is live).
+        self._trait_defs: Dict[str, TraitDef] = {}
         for stmt in program.statements:
             if isinstance(stmt, StructDef):
                 fields = {f.name: f.type for f in stmt.fields}
@@ -2561,6 +2574,8 @@ class TypeChecker:
             elif isinstance(stmt, FuncDef):
                 param_types = [p.type for p in stmt.params]
                 self.functions[stmt.name] = FunctionType(param_types, stmt.ret_type)
+            elif isinstance(stmt, TraitDef):
+                self._trait_defs[stmt.name] = stmt
         
         # Second pass: type check
         for stmt in program.statements:
@@ -3573,8 +3588,10 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         elif func.level == 1:
             attrs.append("inline")
 
-        # Effect system: #[pure] adds __attribute__((pure))
-        if func.effects and 'pure' in func.effects:
+        # Effect system: #[pure] adds __attribute__((pure)) — but ONLY when the
+        # body performs no IO. Otherwise GCC is free to delete/merge observable
+        # calls (e.g. print), silently miscompiling the program.
+        if func.effects and 'pure' in func.effects and not self._body_has_io(func.body):
             attrs.append("__attribute__((pure))")
 
         energy_level = None
@@ -3784,12 +3801,18 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
     def gen_Assignment(self, node: Assignment) -> str:
         target = self.generate_node(node.target)
         value = self.generate_node(node.value)
-        
+
+        # String compound concat: `s += x` on a string target lowers to
+        # `s = til_str_concat(s, x)` (C has no `+=` for char*).
+        if node.op == "+=" and (self._is_string_expr(node.target) or self._is_string_expr(node.value)):
+            self.emit(f"{target} = til_str_concat({target}, {value});")
+            return ""
+
         if node.op == "=":
             self.emit(f"{target} = {value};")
         else:
             self.emit(f"{target} {node.op} {value};")
-        
+
         return ""
     
     def gen_If(self, node: If) -> str:
@@ -4238,6 +4261,25 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                     args_str = ", ".join(args)
                 return f"{resolved_type}_{method_name}({args_str})"
 
+            # Module-qualified call: `mod.func(args)`. Imports are flattened, so
+            # `mod` is not a value; if the method resolves to a known top-level
+            # function, emit the plain `til_func(args)` call.
+            if (isinstance(node.func.obj, Identifier)
+                    and node.func.obj.name not in self.struct_vars
+                    and node.func.obj.name not in self.dynarray_vars
+                    and node.func.obj.name not in self.hashmap_vars
+                    and node.func.obj.name not in self.structs
+                    and node.func.obj.name not in self.enums
+                    and method_name in self.functions):
+                func_def = self.functions[method_name]
+                if len(node.args) < len(func_def.params):
+                    for i in range(len(node.args), len(func_def.params)):
+                        p = func_def.params[i]
+                        if p.default:
+                            args.append(self.generate_node(p.default))
+                c_fname = self.mangle_name(method_name)
+                return f"til_{c_fname}({', '.join(args)})"
+
             args_str = ", ".join(args)
             return f"{obj}.{method_name}({args_str})"
         
@@ -4353,13 +4395,23 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         index = self.generate_node(node.index)
 
         # Add bounds checking for Level 2+ (Safe level and above)
-        if self.current_level >= 2:
-            if isinstance(node.obj, Identifier):
-                arr_name = node.obj.name
-                if arr_name in self.array_vars:
-                    self.emit(f'til_bounds_check({index}, {arr_name}_len, "{arr_name}");')
-                elif arr_name in self.string_vars:
-                    self.emit(f'til_bounds_check({index}, til_len_str({arr_name}), "{arr_name}");')
+        if self.current_level >= 2 and isinstance(node.obj, Identifier):
+            arr_name = node.obj.name
+            len_expr = None
+            if arr_name in self.array_vars:
+                len_expr = f"{arr_name}_len"
+            elif arr_name in self.string_vars:
+                len_expr = f"til_len_str({arr_name})"
+            if len_expr is not None:
+                # Hoist a non-trivial index into a temp so a side-effecting index
+                # (e.g. arr[v.pop()]) is evaluated exactly once and the value that
+                # is bounds-checked is the same value that is used to index.
+                if not isinstance(node.index, (IntLit, Identifier)):
+                    self._idx_counter = getattr(self, '_idx_counter', 0) + 1
+                    idx_var = f"_idx_{self._idx_counter}"
+                    self.emit(f"int64_t {idx_var} = {index};")
+                    index = idx_var
+                self.emit(f'til_bounds_check({index}, {len_expr}, "{arr_name}");')
 
         return f"{obj}[{index}]"
     
@@ -4545,6 +4597,30 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             self._collect_captures(node.obj, param_names, captures)
             self._collect_captures(node.index, param_names, captures)
 
+    def _body_has_io(self, node) -> bool:
+        """Detect IO (print/println/input/perform) anywhere in a subtree.
+        Used to suppress an unsound __attribute__((pure))."""
+        if node is None:
+            return False
+        if isinstance(node, Call) and isinstance(node.func, Identifier) \
+                and node.func.name in ("print", "println", "input"):
+            return True
+        if isinstance(node, PerformEffect):
+            return True
+        children = list(vars(node).values()) if hasattr(node, '__dict__') else []
+        for val in children:
+            if isinstance(val, ASTNode) and self._body_has_io(val):
+                return True
+            if isinstance(val, (list, tuple)):
+                for item in val:
+                    if isinstance(item, ASTNode) and self._body_has_io(item):
+                        return True
+                    if isinstance(item, (list, tuple)):
+                        for sub in item:
+                            if isinstance(sub, ASTNode) and self._body_has_io(sub):
+                                return True
+        return False
+
     def _infer_var_c_type(self, name: str) -> str:
         """Infer the C type of a variable from tracking info."""
         if name in self.string_vars:
@@ -4713,17 +4789,22 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         # Heuristic: if any arm body is a non-Block expression, it's a value match
         is_expr = any(not isinstance(body, Block) for _, _, body in arms)
 
-        # Infer result type from first arm body
+        # Infer result type by scanning ALL arm bodies (not just the first).
+        # A char* result holding an int later segfaults on print, so when the
+        # arms disagree we fall back to int64_t and warn instead of trusting arm 0.
         result_c_type = "int64_t"
         if is_expr:
-            first_body = arms[0][2] if arms else None
-            if first_body:
-                if isinstance(first_body, StringLit):
-                    result_c_type = "const char*"
-                elif isinstance(first_body, FloatLit):
-                    result_c_type = "double"
-                elif isinstance(first_body, BoolLit):
-                    result_c_type = "bool"
+            ptype_to_c = {"str": "const char*", "float": "double", "bool": "bool", "int": "int64_t"}
+            seen_types = set()
+            for _, _, body in arms:
+                if isinstance(body, Block):
+                    continue
+                seen_types.add(ptype_to_c.get(self._infer_expr_print_type(body), "int64_t"))
+            if len(seen_types) == 1:
+                result_c_type = next(iter(seen_types))
+            elif len(seen_types) > 1:
+                result_c_type = "int64_t"
+                self.emit("// warning: match arms have differing result types; using int64_t")
 
         # Check if we need if-else chain (guards, wildcards, or variable bindings)
         has_guards = any(guard is not None for _, guard, _ in arms)
@@ -4956,11 +5037,18 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             if isinstance(node.value, IfExpr):
                 return self.infer_c_type(VarDecl(value=node.value.then_expr))
             if isinstance(node.value, MatchExpr):
-                # Infer from first arm body
-                if node.value.arms:
-                    first_arm = node.value.arms[0]
-                    body = first_arm[2] if len(first_arm) == 3 else first_arm[1]
-                    return self.infer_c_type(VarDecl(value=body))
+                # Scan ALL arm bodies (consistent with gen_MatchExpr) so a
+                # `let r = match ...` binding matches the match's own result type.
+                ptype_to_c = {"str": "const char*", "float": "double", "bool": "bool", "int": "int64_t"}
+                seen = set()
+                for arm in node.value.arms:
+                    body = arm[2] if len(arm) == 3 else arm[1]
+                    if isinstance(body, Block):
+                        continue
+                    seen.add(ptype_to_c.get(self._infer_expr_print_type(body), "int64_t"))
+                if len(seen) == 1:
+                    return next(iter(seen))
+                return "int64_t"
 
         return 'int64_t'
     
@@ -5562,12 +5650,20 @@ def main():
         source = f.read()
     
     try:
-        # Check command - just syntax check
+        # Check command - syntax + type check
         if command == 'check':
             lexer = Lexer(source, input_file)
             tokens = lexer.tokenize()
             parser = Parser(tokens, input_file, source=source)
-            parser.parse()
+            ast = parser.parse()
+            ast = resolve_imports(ast, input_file)
+            checker = TypeChecker()
+            errors = checker.check(ast)
+            if errors:
+                for err in errors:
+                    print(f"error: {err}", file=sys.stderr)
+                print(f"FAILED: {input_file} ({len(errors)} type error(s))", file=sys.stderr)
+                return 1
             print(f"OK: {input_file}")
             return 0
         
