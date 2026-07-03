@@ -1,9 +1,9 @@
 # TIL Standard Library: Math
 # Mathematical constants and functions
 
-const PI = 3
-const E = 2
-const TAU = 6
+const PI = 3.14159265358979
+const E = 2.71828182845905
+const TAU = 6.28318530717959
 
 abs_val(x: int) -> int
     if x < 0

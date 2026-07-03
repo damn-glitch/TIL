@@ -2301,7 +2301,7 @@ class Parser:
             elif self.match(TokenType.QUESTION):
                 # Null check / unwrap
                 self.advance()
-                expr = NullCheck(expr)
+                expr = NullCheck(expr=expr)
 
             else:
                 break
@@ -4265,7 +4265,12 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             # Check for string concat — works with literals AND variables
             if self._is_string_expr(node.left) or self._is_string_expr(node.right):
                 return f'til_str_concat({left}, {right})'
-        
+
+        # String value equality: compare contents, not pointers.
+        if node.op in ('==', '!=') and (self._is_string_expr(node.left) or self._is_string_expr(node.right)):
+            eq = f'til_str_eq({left}, {right})'
+            return eq if node.op == '==' else f'(!{eq})'
+
         c_op = op_map.get(node.op, node.op)
         return f"({left} {c_op} {right})"
     
@@ -4983,17 +4988,28 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         """Generate C assert with message."""
         cond = self.generate_node(node.condition)
         if node.message:
-            msg = node.message.replace('"', '\\"')
+            msg = self._escape_c_message(node.message)
             self.emit(f'if (!({cond})) {{ fprintf(stderr, "Assertion failed: {msg}\\n"); exit(1); }}')
         else:
             self.emit(f'if (!({cond})) {{ fprintf(stderr, "Assertion failed at line %d\\n", __LINE__); exit(1); }}')
         return ""
 
+    @staticmethod
+    def _escape_c_message(text: str) -> str:
+        """Escape a message for safe embedding in a C string literal (prevents
+        break-out / injection: backslash FIRST, then quote, then control bytes)."""
+        return (text.replace('\\', '\\\\')
+                    .replace('"', '\\"')
+                    .replace('\n', '\\n')
+                    .replace('\r', '\\r')
+                    .replace('\t', '\\t')
+                    .replace('\0', ''))
+
     def gen_InvariantStmt(self, node: InvariantStmt) -> str:
         """Generate C invariant check."""
         cond = self.generate_node(node.condition)
         if node.message:
-            msg = node.message.replace('"', '\\"')
+            msg = self._escape_c_message(node.message)
             self.emit(f'if (!({cond})) {{ fprintf(stderr, "Invariant violated: {msg}\\n"); exit(1); }}')
         else:
             self.emit(f'if (!({cond})) {{ fprintf(stderr, "Invariant violated at line %d\\n", __LINE__); exit(1); }}')
@@ -5081,7 +5097,9 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
 
     def gen_IntentBlock(self, node: IntentBlock) -> str:
         """Generate intent block as documented code block."""
-        desc = node.description.replace('"', '\\"')
+        # Single-line // comment: strip newlines/CR to prevent breaking out of
+        # the comment and injecting C statements into the function body.
+        desc = node.description.replace('\n', ' ').replace('\r', ' ')
         self.emit(f'// INTENT: {desc}')
         self.emit("{")
         self.indent += 1
@@ -5214,7 +5232,7 @@ def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
 
             # Collect exported definitions from the module
             for mod_stmt in mod_ast.statements:
-                if isinstance(mod_stmt, (FuncDef, StructDef, EnumDef, ImplBlock)):
+                if isinstance(mod_stmt, (FuncDef, StructDef, EnumDef, ImplBlock, VarDecl)):
                     if stmt.items is None:
                         # import all
                         new_statements.append(mod_stmt)
@@ -5225,6 +5243,9 @@ def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
                     elif isinstance(mod_stmt, EnumDef) and mod_stmt.name in stmt.items:
                         new_statements.append(mod_stmt)
                     elif isinstance(mod_stmt, ImplBlock) and mod_stmt.type_name in stmt.items:
+                        new_statements.append(mod_stmt)
+                    elif isinstance(mod_stmt, VarDecl) and mod_stmt.name in stmt.items:
+                        # module-level const / global
                         new_statements.append(mod_stmt)
         else:
             new_statements.append(stmt)
