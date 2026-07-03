@@ -1,0 +1,45 @@
+# TIL v3 preview — "Verified Gradient" features (implemented & working)
+#   * typed Option<T> / Result<T, E>
+#   * the ? operator with REAL error propagation (early-return of Err/None)
+#   * #[requires] contracts verified at COMPILE TIME for constant arguments
+#
+# Run:  python src/til.py run examples/09_verified.til
+
+#[requires: b != 0]
+safe_div(a: int, b: int) -> int
+    return a / b
+
+parse_positive(n: int) -> Result<int, str>
+    if n < 0
+        return Err("negative not allowed")
+    return Ok(n * 2)
+
+# `?` propagates the Err upward automatically — no manual if-check needed.
+double_then_inc(n: int) -> Result<int, str>
+    let doubled = parse_positive(n)?
+    return Ok(doubled + 1)
+
+find_even(n: int) -> Option<int>
+    if n % 2 == 0
+        return Some(n)
+    return None
+
+main()
+    # The contract b != 0 holds for this constant call, so it compiles.
+    print(safe_div(10, 2))            # 5
+    # print(safe_div(10, 0))          # uncomment -> COMPILE-TIME error: requires b != 0
+
+    let ok = double_then_inc(5)
+    print(ok.is_ok)                   # true
+    print(ok.value)                   # 11
+
+    let bad = double_then_inc(-3)     # parse_positive returns Err -> ? propagates it
+    print(bad.is_ok)                  # false
+    print(bad.error)                  # negative not allowed
+
+    let e = find_even(4)
+    print(e.has_value)                # true
+    print(e.value)                    # 4
+
+    let o = find_even(3)
+    print(o.has_value)                # false

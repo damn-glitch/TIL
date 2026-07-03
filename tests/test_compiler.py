@@ -23,6 +23,7 @@ from til import (
     PrimitiveType, ArrayType, StructType, OptionType, ResultType,
     T_INT, T_FLOAT, T_STR, T_BOOL, T_VOID, T_UNKNOWN,
     KAZAKH_KEYWORDS,
+    CompileError, check_static_contracts, _eval_const_expr,
 )
 
 
@@ -2264,6 +2265,134 @@ main()
     print(r)
 """
         assert compile_and_run(src) == "42"
+
+
+class TestRepairFixes:
+    """Behavioral regression tests for the honest-repair (Track A/B) fixes."""
+
+    def test_string_equality_is_value_not_pointer(self):
+        # A runtime-built string must compare equal by content, not pointer.
+        src = 'main()\n    let a = "he" + "llo"\n    print(a == "hello")\n    print(a == "nope")\n'
+        assert compile_and_run(src) == "true\nfalse"
+
+    def test_string_not_equal(self):
+        src = 'main()\n    let a = "ab" + "c"\n    print(a != "abc")\n'
+        assert compile_and_run(src) == "false"
+
+    def test_string_compound_concat(self):
+        src = 'main()\n    var s = "a"\n    s += "b"\n    s += "c"\n    print(s)\n'
+        assert compile_and_run(src) == "abc"
+
+    def test_pure_attribute_suppressed_when_io(self):
+        src = '#[pure]\nnoisy(x: int) -> int\n    print(999)\n    return x\nmain()\n    noisy(5)\n'
+        assert "__attribute__((pure))" not in compile_to_c(src)
+
+    def test_pure_attribute_kept_when_no_io(self):
+        src = '#[pure]\nsq(x: int) -> int\n    return x * x\nmain()\n    print(sq(5))\n'
+        assert "__attribute__((pure))" in compile_to_c(src)
+
+    def test_bad_hex_literal_raises_positioned_error(self):
+        import pytest as _pt
+        with _pt.raises(SyntaxError):
+            lex("main()\n    let x = 0x\n")
+
+    def test_bad_float_literal_raises_positioned_error(self):
+        import pytest as _pt
+        with _pt.raises(SyntaxError):
+            lex("main()\n    let x = 1e\n")
+
+    def test_uniform_string_match_infers_str(self):
+        src = ('classify(n: int) -> str\n    let r = match n\n        1 => "one"\n'
+               '        _ => "many"\n    return r\nmain()\n    print(classify(1))\n')
+        assert compile_and_run(src) == "one"
+
+    def test_side_effecting_index_evaluated_once(self):
+        # arr[ctr()] must call ctr() exactly once (bounds check + access share it).
+        src = ('ctr() -> int\n    print(7)\n    return 1\n'
+               'main()\n    let arr = [10, 20, 30]\n    print(arr[ctr()])\n')
+        assert compile_and_run(src) == "7\n20"
+
+    def test_typechecker_flags_str_assigned_to_int(self):
+        prog = parse('main()\n    let x: int = "hello"\n')
+        errors = TypeChecker().check(prog)
+        assert any("mismatch" in e.lower() for e in errors)
+
+    # ── Track B: type propagation ──
+
+    def test_fstring_string_interpolation(self):
+        src = 'main()\n    let name = "World"\n    print(f"Hello {name}!")\n'
+        assert compile_and_run(src) == "Hello World!"
+
+    def test_fstring_float_and_bool_interpolation(self):
+        src = ('main()\n    let pi = 3.5\n    let flag = true\n'
+               '    print(f"pi={pi}")\n    print(f"flag={flag}")\n')
+        assert compile_and_run(src) == "pi=3.5\nflag=true"
+
+    def test_let_string_concat_prints_as_string(self):
+        # Previously `let a = "he"+"llo"` was typed int64_t and printed a pointer.
+        src = 'main()\n    let a = "he" + "llo"\n    print(a)\n'
+        assert compile_and_run(src) == "hello"
+
+    def test_let_string_concat_then_equality(self):
+        src = 'main()\n    let a = "ab" + "c"\n    let b = a\n    print(b == "abc")\n'
+        assert compile_and_run(src) == "true"
+
+    def test_some_infers_option_type(self):
+        c = compile_to_c('main()\n    let o = Some(5)\n    print(o.value)\n')
+        assert "TIL_Option_int o" in c
+
+    # ── Track C: v3 Verified Gradient prototype ──
+
+    def test_option_returning_function_compiles_and_runs(self):
+        src = ('find(id: int) -> Option<int>\n    if id == 1\n        return Some(100)\n'
+               '    return None\n'
+               'main()\n    let r = find(1)\n    print(r.value)\n'
+               '    let m = find(2)\n    print(m.has_value)\n')
+        assert compile_and_run(src) == "100\nfalse"
+
+    def test_question_mark_propagates_err(self):
+        src = ('parse_pos(n: int) -> Result<int, str>\n    if n < 0\n        return Err("neg")\n'
+               '    return Ok(n * 2)\n'
+               'use_it(n: int) -> Result<int, str>\n    let d = parse_pos(n)?\n    return Ok(d + 1)\n'
+               'main()\n    let a = use_it(5)\n    print(a.value)\n'
+               '    let b = use_it(-3)\n    print(b.is_ok)\n    print(b.error)\n')
+        assert compile_and_run(src) == "11\nfalse\nneg"
+
+    def test_question_mark_propagates_none(self):
+        src = ('fp(a: int) -> Option<int>\n    if a > 0\n        return Some(a)\n    return None\n'
+               'chain(a: int) -> Option<int>\n    let v = fp(a)?\n    return Some(v + 100)\n'
+               'main()\n    let r = chain(5)\n    print(r.value)\n'
+               '    let n = chain(-1)\n    print(n.has_value)\n')
+        assert compile_and_run(src) == "105\nfalse"
+
+    def test_compile_time_contract_violation_is_fatal(self):
+        import pytest as _pt
+        src = ('#[requires: b != 0]\ndivide(a: int, b: int) -> int\n    return a / b\n'
+               'main()\n    print(divide(10, 0))\n')
+        with _pt.raises(CompileError):
+            compile_to_c(src)
+
+    def test_compile_time_contract_satisfied_compiles(self):
+        src = ('#[requires: n > 0]\nident(n: int) -> int\n    return n\n'
+               'main()\n    print(ident(5))\n')
+        assert compile_and_run(src) == "5"
+
+    def test_compile_time_contract_skips_non_constant_args(self):
+        # A variable argument is not statically known -> no false positive.
+        src = ('#[requires: b != 0]\ndivide(a: int, b: int) -> int\n    return a / b\n'
+               'main()\n    var d = 5\n    print(divide(10, d))\n')
+        assert compile_and_run(src) == "2"
+
+    def test_static_contract_checker_direct(self):
+        prog = parse('#[requires: x > 0]\nf(x: int) -> int\n    return x\n'
+                     'main()\n    print(f(-3))\n')
+        violations = check_static_contracts(prog)
+        assert len(violations) == 1 and "requires" in violations[0]
+
+    def test_const_evaluator(self):
+        # sanity for the compile-time constant folder
+        ok, val = _eval_const_expr(parse('main()\n    let z = 2 + 3 * 4\n').statements[0].body.statements[0].value, {})
+        assert ok and val == 14
 
 
 if __name__ == '__main__':
