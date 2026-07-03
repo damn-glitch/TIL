@@ -2316,6 +2316,30 @@ class TestRepairFixes:
         errors = TypeChecker().check(prog)
         assert any("mismatch" in e.lower() for e in errors)
 
+    # ── Track B: type propagation ──
+
+    def test_fstring_string_interpolation(self):
+        src = 'main()\n    let name = "World"\n    print(f"Hello {name}!")\n'
+        assert compile_and_run(src) == "Hello World!"
+
+    def test_fstring_float_and_bool_interpolation(self):
+        src = ('main()\n    let pi = 3.5\n    let flag = true\n'
+               '    print(f"pi={pi}")\n    print(f"flag={flag}")\n')
+        assert compile_and_run(src) == "pi=3.5\nflag=true"
+
+    def test_let_string_concat_prints_as_string(self):
+        # Previously `let a = "he"+"llo"` was typed int64_t and printed a pointer.
+        src = 'main()\n    let a = "he" + "llo"\n    print(a)\n'
+        assert compile_and_run(src) == "hello"
+
+    def test_let_string_concat_then_equality(self):
+        src = 'main()\n    let a = "ab" + "c"\n    let b = a\n    print(b == "abc")\n'
+        assert compile_and_run(src) == "true"
+
+    def test_some_infers_option_type(self):
+        c = compile_to_c('main()\n    let o = Some(5)\n    print(o.value)\n')
+        assert "TIL_Option_int o" in c
+
 
 if __name__ == '__main__':
     import pytest

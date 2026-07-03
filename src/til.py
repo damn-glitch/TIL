@@ -2341,10 +2341,14 @@ class Parser:
                 if kind == 'str':
                     parts.append(('str', StringLit(value=text)))
                 else:
-                    # Parse the expression text
-                    from til import Lexer as SubLexer, Parser as SubParser
-                    sub_tokens = SubLexer(text, "<fstring>").tokenize()
-                    sub_parser = SubParser(sub_tokens, "<fstring>")
+                    # Parse the expression text using THIS module's Lexer/Parser.
+                    # (A `from til import ...` here would load a second module copy
+                    # when the compiler runs as __main__, so the sub-parser would
+                    # produce AST nodes of a different class object and every
+                    # isinstance() check in codegen would fail — breaking f-string
+                    # type inference for all non-int values.)
+                    sub_tokens = Lexer(text, "<fstring>").tokenize()
+                    sub_parser = Parser(sub_tokens, "<fstring>")
                     expr = sub_parser.parse_expression()
                     parts.append(('expr', expr))
             return FStringLit(parts=parts)
@@ -5017,6 +5021,11 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                     if cname.startswith("__HashMap__"):
                         type_parts = cname[11:]
                         return f"TIL_HashMap_{type_parts}"
+                # Option constructor: `let o = Some(5)` -> TIL_Option_int, not int.
+                if isinstance(node.value.func, Identifier) and node.value.func.name == 'Some':
+                    inner = self._infer_expr_print_type(node.value.args[0]) if node.value.args else "int"
+                    suffix = {"int": "int", "float": "float", "str": "str", "bool": "bool"}.get(inner, "int")
+                    return f"TIL_Option_{suffix}"
                 # Use unified call return type inference
                 ret = self._infer_call_ret_type(node.value)
                 if ret and ret != 'void':
@@ -5030,9 +5039,14 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             if isinstance(node.value, BinaryOp):
                 if node.value.op in ('==', '!=', '<', '>', '<=', '>=', 'and', 'or'):
                     return 'bool'
+                # String concatenation produces a string, not an int.
+                if node.value.op == '+' and (self._is_string_expr(node.value.left)
+                                             or self._is_string_expr(node.value.right)):
+                    return 'const char*'
                 # If either side is float, result is float
                 lt = self._infer_expr_print_type(node.value.left)
-                if lt == "float":
+                rt = self._infer_expr_print_type(node.value.right)
+                if lt == "float" or rt == "float":
                     return 'double'
             if isinstance(node.value, IfExpr):
                 return self.infer_c_type(VarDecl(value=node.value.then_expr))
