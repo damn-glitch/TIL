@@ -2333,6 +2333,253 @@ static int recover(tilvm *vm, int target) {
     return 1;
 }
 
+/* push constant k (int / float / string kept in ROM) */
+static void push_const(tilvm *vm, uint16_t k) {
+    const uint8_t *p = vm->bc + vm->const_off[k];
+    uint8_t tag = p[-1];
+    tv_val *dst = &STK[SP];
+    if (tag == 3) { dst->t = TV_STRK; dst->u.i = 0; dst->u.k = k; }
+    else if (tag == 1) {
+#if TILVM_INT_BITS == 64
+        set_int(dst, (tv_int)((uint64_t)RD32(p) | ((uint64_t)RD32(p + 4) << 32)));
+#else
+        set_int(dst, (tv_int)(int32_t)RD32(p));
+#endif
+    } else {
+#if TILVM_FLOAT == 2 && !defined(__SDCC)
+        uint64_t bits = (uint64_t)RD32(p) | ((uint64_t)RD32(p + 4) << 32);
+        double d;
+        memcpy(&d, &bits, sizeof d);
+        set_float(dst, (tv_float)d);
+#elif TILVM_FLOAT
+        /* single precision (or SDCC, where double is 32-bit): decode IEEE754 */
+        uint32_t hi = RD32(p + 4), lo = RD32(p);
+        int e = (int)((hi >> 20) & 0x7FF) - 1023;
+        tv_float m = (tv_float)1 + (tv_float)(hi & 0xFFFFF) / (tv_float)1048576.0
+                     + (tv_float)lo / (tv_float)4503599627370496.0;
+        if (((hi >> 20) & 0x7FF) == 0) m = 0;
+        if (e > 200) m = (tv_float)1e30 * (tv_float)1e30;   /* inf in float */
+        else if (e < -200) m = 0;
+        else {
+            while (e > 0) { m *= 2; e--; }
+            while (e < 0) { m /= 2; e++; }
+        }
+        set_float(dst, (hi >> 31) ? -m : m);
+#else
+        set_nil(dst);
+#endif
+    }
+    SP++;
+}
+
+static int no_method_error(tilvm *vm, uint16_t name_c, const tv_val *recv) {
+    char nm[64], tn[64];
+    uint32_t len;
+    tv_val nv;
+    const char *np;
+    nv.t = TV_STRK;
+    nv.u.k = name_c;
+    np = str_data(vm, &nv, &len);
+    if (len > 63) len = 63;
+    memcpy(nm, np, len);
+    nm[len] = 0;
+    if (recv->t == TV_STRUCT) {
+        nv.u.k = type_name_const(vm, OBJ(vm, recv->u.r)->aux);
+        np = str_data(vm, &nv, &len);
+        if (len > 63) len = 63;
+        memcpy(tn, np, len);
+        tn[len] = 0;
+    } else strcpy(tn, type_name(vm, recv));
+    return failn(vm, "no method '", nm, "' on ", tn, 0, 0);
+}
+
+static uint16_t find_method(tilvm *vm, uint16_t t, uint16_t name_c, int *found) {
+    /* binary search of the (type, name) sorted method table */
+    uint16_t lo = 0, hi = vm->n_methods;
+    while (lo < hi) {
+        uint16_t mid = (uint16_t)((lo + hi) / 2);
+        const uint8_t *e = vm->bc + vm->methods_off + 6u * mid;
+        uint16_t et = RD16(e), en = RD16(e + 2);
+        if (et == t && en == name_c) { *found = 1; return RD16(e + 4); }
+        if (et < t || (et == t && en < name_c)) lo = (uint16_t)(mid + 1);
+        else hi = mid;
+    }
+    *found = 0;
+    return 0;
+}
+
+/* Decode CALL / CALL_VALUE / INVOKE. Returns 1 when a bytecode function must be
+ * entered (outputs set), 2 when a builtin method already left its result on the
+ * stack, 0 on error. */
+static int prepare_call(tilvm *vm, uint8_t op, uint32_t *pc, uint16_t *fidx, uint8_t *argc,
+                        uint8_t *extra, tv_ref *clos) {
+    const uint8_t *code = vm->bc;
+    if (op == OP_CALL) {
+        *fidx = RD16(code + *pc);
+        *argc = code[*pc + 2];
+        *pc += 3;
+        return 1;
+    }
+    if (op == OP_CALL_VALUE) {
+        tv_val *callee;
+        *argc = code[*pc];
+        *pc += 1;
+        callee = &STK[SP - *argc - 1];
+        *extra = 1;
+        if (callee->t == TV_FUNC) { *fidx = callee->u.k; return 1; }
+        if (callee->t == TV_CLOSURE) { *clos = callee->u.r; *fidx = CLOSOBJ(vm, *clos)->func; return 1; }
+        return failn(vm, type_name(vm, callee), " is not callable", 0, 0, 0, 0);
+    }
+    {
+        uint16_t name_c = RD16(code + *pc), k;
+        uint8_t mid = code[*pc + 2];
+        tv_val *recv;
+        int found = 0;
+        *argc = code[*pc + 3];
+        *pc += 4;
+        recv = &STK[SP - *argc - 1];
+        if (recv->t == TV_STRUCT) {
+            uint16_t t = OBJ(vm, recv->u.r)->aux;
+            *fidx = find_method(vm, t, name_c, &found);
+            if (found) { (*argc)++; return 1; }       /* the receiver becomes self */
+            if (t > TYPE_ERR) {
+                int slot = field_slot(vm, t, name_c);
+                if (slot >= 0) {                       /* field holding a function */
+                    tv_val fv;
+                    fv = STRUCTOBJ(vm, recv->u.r)->v[slot];
+                    *extra = 1;
+                    if (fv.t == TV_FUNC) { *fidx = fv.u.k; return 1; }
+                    if (fv.t == TV_CLOSURE) { *clos = fv.u.r; *fidx = CLOSOBJ(vm, *clos)->func; return 1; }
+                    return no_field(vm, name_c, recv);
+                }
+            }
+        }
+        for (k = 0; k < vm->n_prelude && recv->t == TV_ARRAY; k++) {
+            const uint8_t *e = vm->bc + vm->prelude_off + 3u * k;
+            if (e[0] == mid) { *fidx = RD16(e + 1); (*argc)++; return 1; }
+        }
+        if (mid == M_NONE_) return no_method_error(vm, name_c, recv);
+        if (!call_method(vm, mid, *argc)) return 0;
+        return 2;
+    }
+}
+
+/* Push a call frame. Returns 1 ok, 0 recoverable error (arity), -1 fatal. */
+static int push_frame(tilvm *vm, uint16_t fidx, uint8_t argc, uint8_t extra, tv_ref clos) {
+    tilvm_state *st = &vm->st;
+    const uint8_t *f = func_rec(vm, fidx);
+    tv_frame *fr;
+    uint16_t nb;
+    uint8_t i;
+    if (argc > FN_NPARAMS(f) || argc < FN_NREQ(f)) {
+        char name[48], n1[32], n2[32];
+        uint32_t nl;
+        tv_val nv;
+        const char *np;
+        nv.t = TV_STRK;
+        nv.u.k = FN_NAME(f);
+        np = str_data(vm, &nv, &nl);
+        if (nl > sizeof(name) - 1) nl = sizeof(name) - 1;
+        memcpy(name, np, nl);
+        name[nl] = 0;
+        return failn(vm, name, "() takes ", fmt_int(n1, (tv_int)FN_NPARAMS(f)), " argument(s), got ",
+                     fmt_int(n2, (tv_int)argc), 0);
+    }
+    if (st->n_frames >= TILVM_MAX_FRAMES) { fail(vm, "stack overflow (recursion too deep)"); return -1; }
+    if (SP + (FN_NLOCALS(f) - argc) + 4 > TILVM_STACK_SIZE) { fail(vm, "stack overflow"); return -1; }
+    nb = (uint16_t)(SP - argc);
+    for (i = argc; i < FN_NPARAMS(f); i++) { STK[SP].t = TV_UNDEF; STK[SP].u.i = 0; SP++; }
+    for (i = FN_NPARAMS(f); i < FN_NLOCALS(f); i++) set_nil(&STK[SP++]);
+    fr = &st->frames[st->n_frames++];
+    fr->func = fidx;
+    fr->base = nb;
+    fr->closure = clos;
+    fr->extra = extra;
+    fr->ret_pc = 0;
+    fr->pc = vm->code_off + FN_OFFSET(f);
+    return 1;
+}
+
+/* {k: v, ...} literal on top of the stack: normalise keys, later duplicates win */
+static int map_literal_fixup(tilvm *vm) {
+    tv_ref m = TOP.u.r;
+    uint32_t i, j, len = ARROBJ(vm, m)->len;
+    tv_val *v = VALS(vm, ARROBJ(vm, m)->buf);
+    for (i = 0; i < len; i++) { map_key(&v[2 * i]); if (!check_map_key(vm, &v[2 * i])) return 0; }
+    for (i = 0; i < len; i++) {
+        for (j = i + 1; j < len; j++) {
+            if (equal(vm, &v[2 * i], &v[2 * j], 0)) {
+                uint32_t k;
+                v[2 * i + 1] = v[2 * j + 1];
+                for (k = j; k + 1 < len; k++) { v[2 * k] = v[2 * k + 2]; v[2 * k + 1] = v[2 * k + 3]; }
+                len--;
+                set_nil(&v[2 * len]);
+                set_nil(&v[2 * len + 1]);
+                j--;
+            }
+        }
+    }
+    ARROBJ(vm, m)->len = (tv_size)len;
+    return 1;
+}
+
+/* replace the top n values by one string (f-strings) */
+static int concat_values(tilvm *vm, uint8_t n) {
+    uint8_t i;
+    uint32_t total = 0, k = 0, l;
+    uint16_t first = (uint16_t)(SP - n);
+    tv_ref r;
+    for (i = 0; i < n; i++) {
+        if (!to_str_slot(vm, (uint16_t)(first + i))) return 0;
+        str_data(vm, &STK[first + i], &l);
+        total += l;
+    }
+    if (total > 0xFFFF) return fail(vm, "string too long");
+    r = new_str(vm, total);
+    if (!r) return 0;
+    for (i = 0; i < n; i++) {
+        const char *p = str_data(vm, &STK[first + i], &l);
+        memcpy(STROBJ(vm, r)->data + k, p, l);
+        k += l;
+    }
+    SP = first;
+    set_ref(&STK[SP++], TV_STR, r);
+    return 1;
+}
+
+/* retry / timeout / intent recovery point */
+static int push_try(tilvm *vm, uint8_t op, uint32_t handler) {
+    tilvm_state *st = &vm->st;
+    tv_try *t;
+    uint32_t deadline = 0;
+    if (op == OP_TRY_TIMEOUT) {
+        tv_val *ms = &STK[--SP];
+        tv_int v = ms->t == TV_INT ? ms->u.i : 0;
+#if TILVM_FLOAT
+        if (ms->t == TV_FLOAT) v = (tv_int)ms->u.f;
+#endif
+        deadline = now_ms(vm) + (uint32_t)(v > 0 ? v : 0) + 1;
+    }
+    if (st->n_try >= TILVM_MAX_TRY) return fail(vm, "too many nested retry/timeout blocks");
+    t = &st->tries[st->n_try++];
+    t->handler = handler;
+    t->deadline = deadline;
+    t->n_frames = st->n_frames;
+    t->sp = SP;
+    if (deadline) st->n_deadlines++;
+    return 1;
+}
+
+/* index of the outermost recovery point whose deadline has passed, or -1 */
+static int expired_try(tilvm *vm) {
+    tilvm_state *st = &vm->st;
+    uint32_t now = now_ms(vm);
+    uint16_t i;
+    for (i = 0; i < st->n_try; i++)
+        if (st->tries[i].deadline && (int32_t)(now - st->tries[i].deadline) >= 0) return i;
+    return -1;
+}
+
 /* ─── the interpreter ───────────────────────────────────────────────────── */
 #define READ8() (code[pc++])
 #define READ16() (pc += 2, RD16(code + pc - 2))
@@ -2367,45 +2614,7 @@ resume:
         case OP_PUSH_FALSE: CHECK_STACK(1); set_bool(&STK[SP++], 0); break;
         case OP_PUSH_I8: CHECK_STACK(1); set_int(&STK[SP++], (tv_int)(int8_t)READ8()); break;
         case OP_PUSH_I16: CHECK_STACK(1); set_int(&STK[SP++], (tv_int)READS16()); break;
-        case OP_PUSH_CONST: {
-            uint16_t k = READ16();
-            const uint8_t *p = vm->bc + vm->const_off[k];
-            uint8_t tag = p[-1];
-            CHECK_STACK(1);
-            if (tag == 3) { STK[SP].t = TV_STRK; STK[SP].u.i = 0; STK[SP].u.k = k; }
-            else if (tag == 1) {
-#if TILVM_INT_BITS == 64
-                set_int(&STK[SP], (tv_int)((uint64_t)RD32(p) | ((uint64_t)RD32(p + 4) << 32)));
-#else
-                set_int(&STK[SP], (tv_int)(int32_t)RD32(p));
-#endif
-            } else {
-#if TILVM_FLOAT == 2 && !defined(__SDCC)
-                uint64_t bits = (uint64_t)RD32(p) | ((uint64_t)RD32(p + 4) << 32);
-                double d;
-                memcpy(&d, &bits, sizeof d);
-                set_float(&STK[SP], (tv_float)d);
-#elif TILVM_FLOAT
-                /* single precision (or SDCC, where double is 32-bit): decode IEEE754 */
-                uint32_t hi = RD32(p + 4), lo = RD32(p);
-                int e = (int)((hi >> 20) & 0x7FF) - 1023;
-                tv_float m = (tv_float)1 + (tv_float)(hi & 0xFFFFF) / (tv_float)1048576.0
-                             + (tv_float)lo / (tv_float)4503599627370496.0;
-                if (((hi >> 20) & 0x7FF) == 0) m = 0;
-                if (e > 200) m = (tv_float)1e30 * (tv_float)1e30;   /* inf in float */
-                else if (e < -200) m = 0;
-                else {
-                    while (e > 0) { m *= 2; e--; }
-                    while (e < 0) { m /= 2; e++; }
-                }
-                set_float(&STK[SP], (hi >> 31) ? -m : m);
-#else
-                set_nil(&STK[SP]);
-#endif
-            }
-            SP++;
-            break;
-        }
+        case OP_PUSH_CONST: CHECK_STACK(1); push_const(vm, READ16()); break;
         case OP_POP: SP--; break;
         case OP_DUP: CHECK_STACK(1); STK[SP] = STK[SP - 1]; SP++; break;
         case OP_DUP2: CHECK_STACK(2); STK[SP] = STK[SP - 2]; STK[SP + 1] = STK[SP - 1]; SP += 2; break;
@@ -2513,117 +2722,21 @@ resume:
             break;
         }
         case OP_CALL: case OP_CALL_VALUE: case OP_INVOKE: {
-            uint16_t fidx = 0, nb;
-            uint8_t argc, extra = 0;
+            uint16_t fidx = 0;
+            uint8_t argc = 0, extra = 0;
             tv_ref clos = 0;
-            const uint8_t *f;
-            uint8_t i;
-            if (op == OP_CALL) {
-                fidx = READ16();
-                argc = READ8();
-            } else if (op == OP_CALL_VALUE) {
-                tv_val *callee;
-                argc = READ8();
-                callee = &STK[SP - argc - 1];
-                if (callee->t == TV_FUNC) fidx = callee->u.k;
-                else if (callee->t == TV_CLOSURE) { clos = callee->u.r; fidx = CLOSOBJ(vm, clos)->func; }
-                else PANIC_IF(!failn(vm, type_name(vm, callee), " is not callable", 0, 0, 0, 0));
-                extra = 1;
-            } else {
-                uint16_t name_c = READ16();
-                uint8_t mid = READ8();
-                tv_val *recv;
-                int found = 0;
-                argc = READ8();
-                recv = &STK[SP - argc - 1];
-                if (recv->t == TV_STRUCT) {
-                    uint16_t t = OBJ(vm, recv->u.r)->aux;
-                    /* binary search the (type, name) sorted method table */
-                    uint16_t lo = 0, hi = vm->n_methods;
-                    while (lo < hi) {
-                        uint16_t mid2 = (uint16_t)((lo + hi) / 2);
-                        const uint8_t *e = vm->bc + vm->methods_off + 6u * mid2;
-                        uint16_t et = RD16(e), en = RD16(e + 2);
-                        if (et == t && en == name_c) { fidx = RD16(e + 4); found = 1; break; }
-                        if (et < t || (et == t && en < name_c)) lo = (uint16_t)(mid2 + 1);
-                        else hi = mid2;
-                    }
-                    if (found) { argc++; }
-                    else if (t > TYPE_ERR) {
-                        int slot = field_slot(vm, t, name_c);
-                        if (slot >= 0) {
-                            tv_val fv; fv = STRUCTOBJ(vm, recv->u.r)->v[slot];
-                            if (fv.t == TV_FUNC) { fidx = fv.u.k; found = 1; extra = 1; }
-                            else if (fv.t == TV_CLOSURE) { clos = fv.u.r; fidx = CLOSOBJ(vm, clos)->func; found = 1; extra = 1; }
-                            else { no_field(vm, name_c, recv); goto panic; }
-                        }
-                    }
-                }
-                if (!found) {
-                    uint16_t k;
-                    for (k = 0; k < vm->n_prelude && recv->t == TV_ARRAY; k++) {
-                        const uint8_t *e = vm->bc + vm->prelude_off + 3u * k;
-                        if (e[0] == mid) { fidx = RD16(e + 1); found = 1; argc++; break; }
-                    }
-                }
-                if (!found) {
-                    if (mid == M_NONE_) {
-                        char nm[64], tn[64];
-                        uint32_t len;
-                        tv_val nv;
-                        const char *np;
-                        nv.t = TV_STRK;
-                        nv.u.k = name_c;
-                        np = str_data(vm, &nv, &len);
-                        if (len > 63) len = 63;
-                        memcpy(nm, np, len);
-                        nm[len] = 0;
-                        if (recv->t == TV_STRUCT) {
-                            nv.u.k = type_name_const(vm, OBJ(vm, recv->u.r)->aux);
-                            np = str_data(vm, &nv, &len);
-                            if (len > 63) len = 63;
-                            memcpy(tn, np, len);
-                            tn[len] = 0;
-                        } else strcpy(tn, type_name(vm, recv));
-                        failn(vm, "no method '", nm, "' on ", tn, 0, 0);
-                        goto panic;
-                    }
-                    fr->pc = pc;
-                    PANIC_IF(!call_method(vm, mid, argc));
-                    break;
-                }
-            }
-            f = func_rec(vm, fidx);
-            if (argc > FN_NPARAMS(f) || argc < FN_NREQ(f)) {
-                char name[48], n1[32], n2[32];
-                uint32_t nl;
-                tv_val nv;
-                const char *np;
-                nv.t = TV_STRK;
-                nv.u.k = FN_NAME(f);
-                np = str_data(vm, &nv, &nl);
-                if (nl > sizeof(name) - 1) nl = sizeof(name) - 1;
-                memcpy(name, np, nl);
-                name[nl] = 0;
-                failn(vm, name, "() takes ", fmt_int(n1, (tv_int)FN_NPARAMS(f)), " argument(s), got ",
-                      fmt_int(n2, (tv_int)argc), 0);
-                goto panic;
-            }
-            if (st->n_frames >= TILVM_MAX_FRAMES) { fail(vm, "stack overflow (recursion too deep)"); st->failed = 1; goto fatal; }
-            if (SP + (FN_NLOCALS(f) - argc) + 4 > TILVM_STACK_SIZE) { fail(vm, "stack overflow"); st->failed = 1; goto fatal; }
-            nb = (uint16_t)(SP - argc);
-            for (i = argc; i < FN_NPARAMS(f); i++) { STK[SP].t = TV_UNDEF; STK[SP].u.i = 0; SP++; }
-            for (i = FN_NPARAMS(f); i < FN_NLOCALS(f); i++) set_nil(&STK[SP++]);
+            int r;
             fr->pc = pc;
-            fr = &st->frames[st->n_frames++];
-            fr->func = fidx;
-            fr->base = nb;
-            fr->closure = clos;
-            fr->extra = extra;
-            fr->ret_pc = 0;
-            pc = vm->code_off + FN_OFFSET(f);
+            r = prepare_call(vm, op, &pc, &fidx, &argc, &extra, &clos);
+            if (r == 0) goto panic;
+            if (r == 2) break;                     /* builtin method: result pushed */
             fr->pc = pc;
-            base = nb;
+            r = push_frame(vm, fidx, argc, extra, clos);
+            if (r == 0) goto panic;
+            if (r < 0) { st->failed = 1; goto fatal; }
+            fr = &st->frames[st->n_frames - 1];
+            pc = fr->pc;
+            base = fr->base;
             goto backedge;
         }
         case OP_RETURN: case OP_RETURN_NIL: {
@@ -2671,27 +2784,7 @@ resume:
             uint16_t n = READ16();
             CHECK_STACK(2);
             PANIC_IF(!make_array(vm, op == OP_NEW_MAP ? OBJ_MAP : OBJ_ARRAY, n));
-            if (op == OP_NEW_MAP && n) {
-                /* normalise keys / detect duplicates: rebuild through map_set */
-                tv_ref m = TOP.u.r;
-                uint32_t i, j, len = ARROBJ(vm, m)->len;
-                tv_val *v = VALS(vm, ARROBJ(vm, m)->buf);
-                for (i = 0; i < len; i++) { map_key(&v[2 * i]); PANIC_IF(!check_map_key(vm, &v[2 * i])); }
-                for (i = 0; i < len; i++) {
-                    for (j = i + 1; j < len; j++) {
-                        if (equal(vm, &v[2 * i], &v[2 * j], 0)) {   /* later value wins, first position kept */
-                            uint32_t k;
-                            v[2 * i + 1] = v[2 * j + 1];
-                            for (k = j; k + 1 < len; k++) { v[2 * k] = v[2 * k + 2]; v[2 * k + 1] = v[2 * k + 3]; }
-                            len--;
-                            set_nil(&v[2 * len]);
-                            set_nil(&v[2 * len + 1]);
-                            j--;
-                        }
-                    }
-                }
-                ARROBJ(vm, m)->len = (tv_size)len;
-            }
+            if (op == OP_NEW_MAP && n) PANIC_IF(!map_literal_fixup(vm));
             break;
         }
         case OP_NEW_STRUCT: {
@@ -2735,28 +2828,7 @@ resume:
             break;
         }
         case OP_PUSH_FUNC: CHECK_STACK(1); STK[SP].t = TV_FUNC; STK[SP].u.i = 0; STK[SP].u.k = READ16(); SP++; break;
-        case OP_CONCAT: {
-            uint8_t n = READ8(), i;
-            uint32_t total = 0, k = 0, l;
-            uint16_t first = (uint16_t)(SP - n);
-            tv_ref r;
-            for (i = 0; i < n; i++) {
-                PANIC_IF(!to_str_slot(vm, (uint16_t)(first + i)));
-                str_data(vm, &STK[first + i], &l);
-                total += l;
-            }
-            PANIC_IF(total > 0xFFFF && !fail(vm, "string too long"));
-            r = new_str(vm, total);
-            PANIC_IF(!r);
-            for (i = 0; i < n; i++) {
-                const char *p = str_data(vm, &STK[first + i], &l);
-                memcpy(STROBJ(vm, r)->data + k, p, l);
-                k += l;
-            }
-            SP = first;
-            set_ref(&STK[SP++], TV_STR, r);
-            break;
-        }
+        case OP_CONCAT: PANIC_IF(!concat_values(vm, READ8())); break;
         case OP_FOR_ITER: {
             uint8_t slot = READ8();
             int16_t rel = READS16();
@@ -2789,23 +2861,7 @@ resume:
         case OP_CAST: PANIC_IF(!cast_slot(vm, (uint16_t)(SP - 1), READ8())); break;
         case OP_TRY: case OP_TRY_TIMEOUT: {
             int16_t rel = READS16();
-            tv_try *t;
-            uint32_t deadline = 0;
-            if (op == OP_TRY_TIMEOUT) {
-                tv_val *ms = &STK[--SP];
-                tv_int v = ms->t == TV_INT ? ms->u.i : 0;
-#if TILVM_FLOAT
-                if (ms->t == TV_FLOAT) v = (tv_int)ms->u.f;
-#endif
-                deadline = now_ms(vm) + (uint32_t)(v > 0 ? v : 0) + 1;
-            }
-            if (st->n_try >= TILVM_MAX_TRY) { fail(vm, "too many nested retry/timeout blocks"); goto panic; }
-            t = &st->tries[st->n_try++];
-            t->handler = (uint32_t)((int32_t)pc + rel);
-            t->deadline = deadline;
-            t->n_frames = st->n_frames;
-            t->sp = SP;
-            if (deadline) st->n_deadlines++;
+            PANIC_IF(!push_try(vm, op, (uint32_t)((int32_t)pc + rel)));
             break;
         }
         case OP_END_TRY:
@@ -2839,16 +2895,9 @@ resume:
             goto fatal;
         }
         if (st->n_deadlines && ++st->tick >= 256) {
-            uint32_t now = now_ms(vm);
-            uint16_t i;
             st->tick = 0;
-            for (i = 0; i < st->n_try; i++) {
-                if (st->tries[i].deadline && (int32_t)(now - st->tries[i].deadline) >= 0) {
-                    fail(vm, "timeout");
-                    target = i;
-                    goto panic;
-                }
-            }
+            target = expired_try(vm);
+            if (target >= 0) { fail(vm, "timeout"); goto panic; }
         }
         if (budget && !--budget) {
             fr->pc = pc;
