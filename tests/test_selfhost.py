@@ -788,6 +788,131 @@ class TestDiagnostics:
 
 
 # ═══════════════════════════════════════════════════════════════
+# EFFECT / CAPABILITY CHECKS FOR EVERY SPELLING (review round 1)
+# ═══════════════════════════════════════════════════════════════
+
+# tilc used to decide from the raw text whether the SemanticChecker was
+# needed and missed localized imports, tabs and some attribute layouts: the
+# checks were skipped and the program compiled. Now the token stream decides.
+SC_MODULES = {
+    "netcap.til": "cap Net { send }\n#[cap: Net]\nfetch()\n    return 42\n",
+    "netpure.til": "#[pure]\ncalc(x)\n    print(\"side effect\")\n    return x\n",
+}
+SNEAKY = "sneaky()\n    return fetch()\nmain()\n    print(sneaky())\n"
+SC_PROGRAMS = {
+    "kk_import": "импорт netcap\n" + SNEAKY,
+    "kk_from": "бастап netcap импорт fetch\n" + SNEAKY,
+    "ru_import": "#[lang: ru]\nимпорт netcap\n" + SNEAKY,
+    "ru_from": "#[lang: ru]\nиз netcap импорт fetch\n" + SNEAKY,
+    "kk_latn_from": "#[lang: kk-latn]\nbastap netcap import fetch\n" + SNEAKY,
+    "tab_import": "import\tnetcap\n" + SNEAKY,
+    "tab_from": "from\tnetcap import fetch\n" + SNEAKY,
+    "module_effect": "import\tnetpure\nmain()\n    print(calc(1))\n",
+    "two_attrs_cap": "cap Net { send }\n#[inline] #[cap: Net]\nfetch()\n    return 1\n" + SNEAKY,
+    "two_attrs_pure": "#[inline] #[pure]\nsq(x)\n    print(x)\n    return x * x\nmain()\n    print(sq(3))\n",
+    "spaces_effects": "#[    effects: fs]\nf()\n    print(1)\nmain()\n    f()\n",
+    "spaces_cap": "cap Net { send }\n#[         cap: Net]\nfetch()\n    return 1\n" + SNEAKY,
+    "trailing_attr": "x() => 1 #[pure]\nsq(x)\n    print(x)\n    return x * x\nmain()\n    print(sq(3))\n",
+    "attr_and_comment": "#[ pure ]  # no side effects\nsq(x)\n    print(x)\n    return x * x\nmain()\n    print(sq(3))\n",
+    "method_attrs": "struct P\n    x: int\nimpl P\n    #[inline] #[pure]\n    get(self)\n"
+                    "        print(self.x)\n        return self.x\nmain()\n    print(P { x: 1 }.get())\n",
+}
+
+
+def py_error(src: str, path: str):
+    """(code, message, line) of the Python compiler's first error."""
+    try:
+        py_compile(src, path)
+    except (til.CompileError, SyntaxError) as e:
+        text = str(e)
+        m = re.match(r'error\[(E-[A-Z]+)\]: (.*)\n --> .*:(\d+):\d+', text)
+        assert m, text
+        return m.group(1), m.group(2), int(m.group(3))
+    return None
+
+
+@needs_cc
+class TestEffectChecksAnySpelling:
+    @pytest.mark.parametrize("name", sorted(SC_PROGRAMS))
+    def test_rejected_like_python(self, tilc, tmp_path, name):
+        for mod, text in SC_MODULES.items():
+            (tmp_path / mod).write_text(text, encoding='utf-8')
+        main = tmp_path / (name + ".til")
+        main.write_text(SC_PROGRAMS[name], encoding='utf-8')
+        err = py_error(SC_PROGRAMS[name], str(main))
+        assert err and err[0] in ("E-CAP", "E-EFFECT"), err
+        rc, out, data = tilc.compile_file(str(main), str(tmp_path / "out.tbc"))
+        assert rc == 1 and data is None, f"tilc accepted it ({err})"
+        assert out.strip() == f"tilc: {main}:{err[2]}: error: {err[1]}"
+
+    def test_valid_programs_still_identical(self, tilc, tmp_path):
+        """The same spellings without a violation compile to the Python compiler's bytes."""
+        (tmp_path / "netcap.til").write_text(SC_MODULES["netcap.til"], encoding='utf-8')
+        ok = "#[cap: Net]\nsneaky()\n    return fetch()\nmain()\n    print(sneaky())\n"
+        for name, src in (("kk", "импорт netcap\n" + ok), ("ru", "#[lang: ru]\nиз netcap импорт fetch\n" + ok),
+                          ("tab", "import\tnetcap\n" + ok),
+                          ("attrs", "#[inline] #[pure]\nsq(x) => x * x\nmain()\n    print(sq(3))\n")):
+            main = tmp_path / (name + ".til")
+            main.write_text(src, encoding='utf-8')
+            rc, out, data = tilc.compile_file(str(main), str(tmp_path / "out.tbc"))
+            assert rc == 0, (name, out)
+            ref = py_compile(src, str(main))
+            assert data == ref or not classic_bytecode(ref), name
+
+
+# ═══════════════════════════════════════════════════════════════
+# C VM: measuring the text of a huge value (review round 1)
+# ═══════════════════════════════════════════════════════════════
+
+# 16 references to 16 references ... to a 64 KB string: the text of `a` is
+# 4 GB. The C VM measured it in a uint32 that wrapped, allocated a small
+# string and wrote 4 GB into it (heap overflow, segfault). The count now
+# stops above the 16 MB string limit: "string too long".
+HUGE_TEXT = """
+main()
+    let s = "x".repeat(65532)
+    var a = [s]
+    for level in 0..LEVELS
+        var b = []
+        for i in 0..16
+            b.push(a)
+        a = b
+    print(len(a))
+    let t = EXPR
+    print(len(t))
+"""
+
+
+@needs_cc
+class TestVMHugeText:
+    @pytest.mark.parametrize("levels,expr", [(4, '[a].join("")'), (4, 'str(a)'), (4, 'f"{a}"'),
+                                             (4, 'a.join(",")'), (15, 'str(a)')])
+    def test_string_too_long(self, levels, expr):
+        src = HUGE_TEXT.replace("LEVELS", str(levels)).replace("EXPR", expr)
+        rc, out, err = run_cvm(src, timeout=30)
+        assert (rc, out) == (1, "16\n"), (rc, out, err)
+        assert err.startswith("runtime error: string too long\n  at main (line 11)"), err
+
+    def test_sanitizers(self, tmp_path):
+        """The same programs under AddressSanitizer / UBSan (skipped without them)."""
+        exe = str(tmp_path / "tilvm-asan")
+        r = subprocess.run([CC, '-std=c99', '-O1', '-g', '-fsanitize=address,undefined',
+                            '-fno-sanitize-recover=undefined', '-o', exe,
+                            os.path.join(ROOT, 'vm', 'tilvm.c'), os.path.join(ROOT, 'vm', 'main.c'), '-lm'],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip("no sanitizer runtime: " + r.stderr[-200:])
+        probe = subprocess.run([exe, '--version'], capture_output=True, text=True)
+        if "AddressSanitizer" in probe.stderr:
+            pytest.skip("AddressSanitizer cannot run here: " + probe.stderr[-200:])
+        for expr in ('[a].join("")', 'str(a)'):
+            path = tmp_path / "huge.tbc"
+            path.write_bytes(py_compile(HUGE_TEXT.replace("LEVELS", "4").replace("EXPR", expr)))
+            r = subprocess.run([exe, str(path)], capture_output=True, text=True, timeout=60)
+            assert r.returncode == 1 and "runtime error: string too long" in r.stderr, r.stderr[-2000:]
+
+
+# ═══════════════════════════════════════════════════════════════
 # C VM FIX: big arrays (found while building tilc's output)
 # ═══════════════════════════════════════════════════════════════
 
