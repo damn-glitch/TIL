@@ -40,10 +40,7 @@ SLOW = bool(os.environ.get('TIL_TEST_SLOW'))
 
 # Constructs outside TIL Core: tilc must reject them with "unsupported: <what>"
 # (see selfhost/README.md). Any other "unsupported" message fails the tests.
-UNSUPPORTED = (
-    "handle (effects)", "perform (effects)", "import (tilc compiles one file)",
-    "capability declaration (cap)", "(effect checking; use til check)", "(capabilities)",
-)
+UNSUPPORTED = ("handle (effects)", "perform (effects)", "import (tilc compiles one file)")
 
 # Bytecode may differ from the Python compiler's only through constant folding
 # of float expressions (tilc folds integers, strings and booleans exactly).
@@ -279,7 +276,7 @@ class TestPrograms:
             stats[key] = stats.get(key, 0) + 1
         print("\n[selfhost] corpus:", stats)
         # most of the test-suite is inside TIL Core and compiles to identical bytes
-        assert stats.get('same', 0) >= 220, stats
+        assert stats.get('same', 0) >= 240, stats
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -622,11 +619,17 @@ ERRORS = [
     ("enum E\n    A(int)\nmain()\n    match E.A(1)\n        E.B(x) => print(x)\n", 5,
      "error: enum 'E' has no variant 'B'"),
     ("main()\n    match Some(1)\n        Some(a, b) => print(a)\n", 3, "error: pattern expects 1 field(s), got 2"),
+    ("#[pure]\nsq(x)\n    log(x)\n    return x * x\nlog(v)\n    print(v)\n", 3,
+     "error: pure function 'sq' performs effect 'io' (through the call to 'log')"),
+    ("#[effects: fs]\nf()\n    print(1)\n", 3, "error: function 'f' performs effect 'io', but declares only #[effects: fs]"),
+    ("cap Net { send }\n#[cap: Net]\nfetch()\n    return 1\nsneaky()\n    return fetch()\n", 6,
+     "error: 'sneaky' uses 'fetch', which requires capability 'Net', but 'sneaky' does not hold it"),
+    ("#[cap: Net]\nfetch()\n    return 1\nlaunder()\n    let f = fetch\n    return f\n", 5,
+     "error: 'launder' uses 'fetch', which requires capability 'Net', but 'launder' does not hold it"),
 ]
 
 UNSUPPORTED_PROGRAMS = [
     ("import math_utils\n", 1, "import (tilc compiles one file)"),
-    ("#[pure]\nf(x)\n    return x\n", 2, "#[pure] (effect checking; use til check)"),
     ("main()\n    perform Log(1)\n", 2, "perform (effects)"),
 ]
 

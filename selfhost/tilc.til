@@ -1602,6 +1602,10 @@ struct FI
     req: any
     ens: any
     nstmts: int
+    decl: any
+    pure: bool
+    caps: any
+    sc: any
 
 struct Prm
     name: str
@@ -1644,6 +1648,21 @@ var SEM_CONSTS = {}
 # kind of the statement stmt_c just read: 1 expression, 2 match, 3 if with
 # else, 4 intent, 0 other (what compile_block_value needs of a last statement)
 var LAST_STMT = 0
+# SemanticChecker (effects, capabilities): while the first pass parses a
+# function body it records the calls and the names it uses (SCI). Only done
+# when the program has #[pure] / #[effects] / #[cap] attributes.
+var SC_ON = false
+var SC_CUR = None
+var SC_SCRIPT = None
+var IO_BUILTINS = {"print": 1, "println": 1, "input": 1, "read_file": 1, "write_file": 1,
+    "file_exists": 1, "screen_init": 1, "screen_clear": 1, "draw_pixel": 1, "draw_line": 1,
+    "draw_rect": 1, "fill_rect": 1, "draw_circle": 1, "draw_text": 1, "get_pixel": 1,
+    "screen_show": 1, "key_pressed": 1, "wait_key": 1, "energy_mode": 1}
+
+struct SCI
+    io: int
+    calls: any
+    refs: any
 
 new_stream(lx)
     TSG = TS { lx: lx, buf: [], p: 0 }
@@ -1683,6 +1702,9 @@ skip_nl()
 
 # ── top level ───────────────────────────────────────────────────────────────
 parse_program(src)
+    SC_ON = has_effect_attributes(src)
+    if SC_ON
+        SC_SCRIPT = SCI { calls: {}, refs: {} }
     DRY = true
     new_stream(new_lexer(src, 0, 1, [0], true))
     skip_nl()
@@ -1723,7 +1745,16 @@ parse_top_level(src)
     elif t == T_CONST or t == T_LET or t == T_VAR
         node = parse_global(tok)
     elif t == T_CAP
-        unsupported(TK.ln, "capability declaration (cap)")
+        adv()
+        expect(T_IDENT)
+        if TK.t == T_LBRACE
+            adv()
+            while TK.t != T_RBRACE
+                expect(T_IDENT)
+                if TK.t == T_COMMA
+                    adv()
+            expect(T_RBRACE)
+        node = mk(K_TYPEALIAS, 0)
     elif t == T_IDENT and is_func_def()
         node = parse_func_simple(src, 0)
     else
@@ -1731,8 +1762,10 @@ parse_top_level(src)
         node = mk(K_STMT, TK.ln)
         node.c = [TK.sp, TK.ln]
         CAPT = SCRIPT_CAPT
+        SC_CUR = SC_SCRIPT
         stmt_c()
         CAPT = None
+        SC_CUR = None
     if node.ln == 0
         node.ln = tok.ln
     ITEMS.push(node)
@@ -1762,9 +1795,14 @@ parse_global(tok)
         return node
     let capt = {}
     CAPT = capt
-    node.c = [TK.sp, TK.ln, capt]
+    var sci = None
+    if SC_ON
+        sci = SCI { calls: {}, refs: {} }
+    SC_CUR = sci
+    node.c = [TK.sp, TK.ln, capt, sci]
     let v = parse_expression()
     CAPT = None
+    SC_CUR = None
     if is_literal(v)
         node.a = v
     if node.n != 1
@@ -1827,27 +1865,45 @@ parse_func_body(name_tok, src, ind, allow_sig)
     let bline = TK.ln
     let save_capt = CAPT
     CAPT = {}
+    let save_sc = SC_CUR
+    if SC_ON
+        SC_CUR = SCI { calls: {}, refs: {} }
     let nstmts = func_body_c(allow_sig)
     let attrs = PENDING_ATTRS
     PENDING_ATTRS = []
+    let sci = SC_CUR
+    SC_CUR = save_sc
     var req = []
     var ens = []
+    var decl = None
+    var pure = false
+    var caps = []
     for a in attrs
-        if a == "pure" or a.starts_with("effects:")
-            unsupported(name_tok.ln, "#[" + a + "] (effect checking; use til check)")
-        if a.starts_with("cap:")
-            unsupported(name_tok.ln, "#[" + a + "] (capabilities)")
-        if a.starts_with("requires:") or a.starts_with("ensures:")
+        if a == "pure"
+            pure = true
+            if decl == None or len(decl) == 0
+                decl = []
+        elif a.starts_with("effects:")
+            if decl == None or len(decl) == 0
+                decl = []
+            for e in strip_ws(a.slice(8, len(a))).split(",")
+                if len(strip_ws(e)) > 0
+                    decl.push(strip_ws(e))
+        elif a.starts_with("requires:") or a.starts_with("ensures:")
             let colon = a.find(":")
             let text = strip_ws(a.slice(colon + 1, len(a)))
-            let e = parse_sub_expr(text, name_tok.ln)
+            let e = parse_sub_expr(text, name_tok.ln, false)
             if a.starts_with("requires:")
                 req.push([e, text])
             else
                 ens.push([e, text])
+        elif a.starts_with("cap:")
+            for c in a.slice(4, len(a)).split(",")
+                if len(strip_ws(c)) > 0
+                    caps.push(strip_ws(c))
     let fi = FI { name: name_tok.v, params: params, ret: ret, ln: name_tok.ln, src: src,
                   bpos: bpos, bline: bline, bind: ind, capt: CAPT, req: req, ens: ens,
-                  nstmts: nstmts }
+                  nstmts: nstmts, decl: decl, pure: pure, caps: caps, sc: sci }
     CAPT = save_capt
     let node = mk(K_FUNC, name_tok.ln)
     node.a = fi
@@ -2082,7 +2138,31 @@ parse_pipe()
             call.a = right
             call.c = [left]
             left = call
+            if SC_CUR != None and SINIT_DEPTH == 0
+                sc_call(right, op.ln)
     return left
+
+# a call seen by the SemanticChecker walk: callee (unresolved) and io effect
+sc_call(f, ln)
+    let s = SC_CUR
+    var key = ""
+    var rec = None
+    if f.k == K_IDENT
+        if s.io == 0 and IO_BUILTINS.has(f.s)
+            s.io = ln
+        key = "1" + f.s
+        rec = [1, f.s, None, ln]
+    elif f.k == K_ATTR
+        if f.a.k == K_IDENT
+            key = "2" + f.a.s + "." + f.s
+            rec = [2, f.a.s, f.s, ln]
+        else
+            key = "3" + f.s
+            rec = [3, None, f.s, ln]
+    else
+        return
+    if not s.calls.has(key)
+        s.calls[key] = rec
 
 binop(op, ln, a, b)
     let node = mk(K_BIN, ln)
@@ -2215,10 +2295,15 @@ parse_power()
 
 parse_postfix()
     var expr = parse_primary()
+    if SC_CUR != None and SINIT_DEPTH == 0 and expr.k == K_IDENT and TK.t != T_LPAREN
+        if not SC_CUR.refs.has(expr.s)
+            SC_CUR.refs[expr.s] = expr.ln
     loop
         let t = TK.t
         if t == T_LPAREN
             let op = adv()
+            if SC_CUR != None and SINIT_DEPTH == 0
+                sc_call(expr, op.ln)
             var args = []
             if TK.t != T_RPAREN
                 loop
@@ -2541,11 +2626,14 @@ parse_match()
 # expression inside an f-string: lexed and parsed on its own, at the line of
 # the f-string (as Parser._parse_fstring_expr)
 parse_fexpr(text, line)
-    return parse_sub_expr(text, line)
+    return parse_sub_expr(text, line, true)
 
 # an expression from another text (f-string part, #[requires: ...]) whose
 # tokens all carry `line`
-parse_sub_expr(text, line)
+parse_sub_expr(text, line, walked)
+    let save_sc = SC_CUR
+    if not walked
+        SC_CUR = None
     let save_ts = TSG
     let save_tk = TK
     var l = line
@@ -2557,6 +2645,7 @@ parse_sub_expr(text, line)
         adv()
     TSG = save_ts
     TK = save_tk
+    SC_CUR = save_sc
     return e
 
 # ── script mode (Parser.hoist_script_statements) ───────────────────────────
@@ -2609,7 +2698,167 @@ hoist()
         if it.k == K_GINIT
             for k in it.a.c[2]
                 main.capt[k] = 1
+    if SC_ON
+        var merged = SCI { calls: {}, refs: {} }
+        sc_merge(merged, SC_SCRIPT)
+        for it in script
+            if it.k == K_GINIT
+                sc_merge(merged, it.a.c[3])
+        if main.sc != None
+            sc_merge(merged, main.sc)
+        main.sc = merged
     ITEMS = rest
+
+# any #[pure] / #[effects: ...] / #[cap: ...] in the source? (a quick scan;
+# a false positive only costs memory)
+has_effect_attributes(src)
+    var i = src.find("#[")
+    while i >= 0
+        var j = skip_ws_any(src, i + 2)
+        let rest = src.slice(j, j + 7)
+        if rest.starts_with("pure") or rest.starts_with("effects") or rest.starts_with("cap")
+            return true
+        let next = src.slice(i + 2, len(src)).find("#[")
+        if next < 0
+            return false
+        i = i + 2 + next
+    return false
+
+# ── SemanticChecker.check_effects / check_capabilities ─────────────────────
+sc_check()
+    # self.funcs: functions and impl methods, in program order
+    var funcs = {}
+    var structs = {}
+    var by_name = {}
+    for it in ITEMS
+        if it.k == K_FUNC
+            funcs[it.a.name] = it.a
+        elif it.k == K_STRUCTDEF or it.k == K_ENUMDEF
+            structs[it.s] = 1
+        elif it.k == K_IMPL
+            for m in it.c
+                let key = it.s + "." + m.name
+                funcs[key] = m
+                if not by_name.has(m.name)
+                    by_name[m.name] = []
+                by_name[m.name].push(key)
+    # call edges [callee, line, precise]
+    var edges = {}
+    var inferred = {}
+    for key in funcs
+        let fi = funcs[key]
+        var es = []
+        var base = {}
+        let sc = fi.sc
+        if sc != None
+            if sc.io > 0
+                base["io"] = 1
+            for ck in sc.calls
+                let r = sc.calls[ck]
+                if r[0] == 1
+                    if funcs.has(r[1]) and not r[1].contains(".")
+                        es.push([r[1], r[3], true])
+                else
+                    var done = false
+                    if r[0] == 2
+                        if structs.has(r[1])
+                            let k2 = r[1] + "." + r[2]
+                            if funcs.has(k2)
+                                es.push([k2, r[3], true])
+                            done = true
+                        elif r[1] == "self" and key.contains(".")
+                            let k2 = key.slice(0, key.find(".")) + "." + r[2]
+                            if funcs.has(k2)
+                                es.push([k2, r[3], true])
+                                done = true
+                    if not done
+                        let cands = by_name.get_or(r[2], [])
+                        for c in cands
+                            es.push([c, r[3], len(cands) == 1])
+            for name in sc.refs
+                if funcs.has(name) and len(funcs[name].caps) > 0
+                    es.push([name, sc.refs[name], true])
+        edges[key] = es
+        inferred[key] = base
+    # interface effects: declared if present, else inferred (fixpoint)
+    var changed = true
+    while changed
+        changed = false
+        for key in funcs
+            for e in edges[key]
+                let ce = sc_effects(funcs, inferred, e[0])
+                for eff in ce
+                    if not inferred[key].has(eff)
+                        inferred[key][eff] = 1
+                        changed = true
+    for key in funcs
+        let fi = funcs[key]
+        if fi.decl != None
+            var allowed = {}
+            for d in fi.decl
+                allowed[d] = 1
+            var actual = {}
+            var via = {}
+            if fi.sc != None and fi.sc.io > 0
+                actual["io"] = fi.sc.io
+            for e in edges[key]
+                let ce = sc_effects(funcs, inferred, e[0])
+                for eff in ce
+                    if not allowed.has(eff) and not actual.has(eff)
+                        actual[eff] = e[1]
+                        via[eff] = e[0]
+            var bad = []
+            for eff in actual
+                if not allowed.has(eff)
+                    bad.push(eff)
+            bad.sort()
+            if len(bad) > 0
+                let eff = bad[0]
+                var how = ""
+                if via.has(eff)
+                    how = " (through the call to '" + via[eff] + "')"
+                if fi.pure and len(fi.decl) == 0
+                    fail_at(actual[eff], "pure function '" + key + "' performs effect '" + eff + "'" + how)
+                var names = []
+                for a in allowed
+                    names.push(a)
+                names.sort()
+                var shown = names.join(", ")
+                if len(shown) == 0
+                    shown = "none"
+                fail_at(actual[eff], "function '" + key + "' performs effect '" + eff + "'" + how + ", but declares only #[effects: " + shown + "]")
+    for key in funcs
+        if key != "main"
+            var held = {}
+            for c in funcs[key].caps
+                held[c] = 1
+            for e in edges[key]
+                if e[2]
+                    for c in funcs[e[0]].caps
+                        if not held.has(c)
+                            fail_at(e[1], "'" + key + "' uses '" + e[0] + "', which requires capability '" + c + "', but '" + key + "' does not hold it")
+
+# effects of a callee: declared ones if any, else the inferred ones
+sc_effects(funcs, inferred, callee)
+    let d = funcs[callee].decl
+    if d == None
+        return inferred[callee]
+    var m = {}
+    for e in d
+        m[e] = 1
+    return m
+
+sc_merge(dst, src)
+    if src == None
+        return
+    if dst.io == 0
+        dst.io = src.io
+    for k in src.calls
+        if not dst.calls.has(k)
+            dst.calls[k] = src.calls[k]
+    for k in src.refs
+        if not dst.refs.has(k)
+            dst.refs[k] = src.refs[k]
 
 # ═══════════════════════════════════════════════════════════════════════════
 #                     BYTECODE COMPILER (BytecodeCompiler)
@@ -4969,6 +5218,8 @@ main()
     SRC = src
     parse_program(src)
     hoist()
+    if SC_ON
+        sc_check()
     TSG = None
     TK = None
     compile_program()
