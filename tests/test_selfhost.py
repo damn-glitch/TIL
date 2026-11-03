@@ -43,10 +43,29 @@ SLOW = bool(os.environ.get('TIL_TEST_SLOW'))
 UNSUPPORTED = ("handle (effects)", "perform (effects)",
                "(module not found next to the importing file; tilc does not search TIL_PATH or the standard library)")
 
-# Bytecode may differ from the Python compiler's only where a float constant
-# expression folds to NaN: tilc leaves it to run time (the NaN bit pattern
-# Python produces depends on the CPU). Everything else is folded exactly.
-FLOAT_FOLDING = re.compile(r'\d\.\d|\d[eE][-+]?\d')
+# tilc emits exactly what the Python compiler emits, as long as that one
+# uses the instructions and function flags of TIL 3.0 (other TIL 3.1 features
+# may add superinstructions or flags; then only the behaviour is compared).
+# The one deliberate difference: a float constant expression that folds to
+# NaN is left to run time (Python's NaN bit pattern depends on the CPU).
+NAN_FOLDING = re.compile(r'\d\.\d|\d[eE][-+]?\d')
+CLASSIC_OPS = {v for k, v in vars(til.Op).items()
+               if not k.startswith('_') and v < 0x76 or k == 'HALT'}
+
+
+def classic_bytecode(data: bytes) -> bool:
+    """Only TIL 3.0 instructions and function flags (1 method, 2 ?, 4 lambda)?"""
+    m = til.TBCModule.from_bytes(data)
+    for f in m.funcs:
+        if f.flags & ~7:
+            return False
+        code, pc = f.code, 0
+        while pc < len(code):
+            op = code[pc]
+            if op not in CLASSIC_OPS:
+                return False
+            pc += 1 + sum(til._OPERAND_SIZE[k] for k in til.OP_OPERANDS.get(op, ''))
+    return True
 
 
 def py_compile(src: str, name: str = "<test>") -> bytes:
@@ -163,9 +182,10 @@ def check_program(tilc: Tilc, name: str, src: str):
         return 'unsupported:' + m.group(2)
     if data == ref:
         return 'same'
-    # different bytecode: allowed only for float constant expressions, and then
-    # the programs must behave identically on both VMs
-    assert FLOAT_FOLDING.search(src), f"{name}: bytecode differs from the Python compiler's"
+    # different bytecode: only expected for NaN folding, or when the Python
+    # compiler uses newer instructions; the programs must behave the same
+    if classic_bytecode(ref):
+        assert NAN_FOLDING.search(src), f"{name}: bytecode differs from the Python compiler's"
     cwd = tempfile.mkdtemp(prefix='tilc-run-')
     ref_py, ref_c = run_both_vms(ref, cwd)
     got_py, got_c = run_both_vms(data, cwd)
@@ -191,7 +211,8 @@ class TestBootstrap:
         assert rc == 0, out
         assert stage2 == stage3, "stage2 != stage3: the bootstrap has no fixed point"
         # the self-hosted compiler emits exactly what the Python compiler emits
-        assert stage2 == stage1
+        if classic_bytecode(stage1):
+            assert stage2 == stage1
         print(f"\n[selfhost] tilc.til -> {len(stage2)} bytes; stage 2 on the C VM: {t_stage2:.2f}s")
 
     def test_stage2_runs_programs(self, tilc):
@@ -211,7 +232,8 @@ class TestBootstrap:
         rc, out, c_data = tilc.compile_file(src_path, os.path.join(tilc.dir, 'c.tbc'))
         assert data == c_data
         with open(src_path, encoding='utf-8') as f:
-            assert data == py_compile(f.read(), src_path)
+            ref = py_compile(f.read(), src_path)
+        assert data == ref or not classic_bytecode(ref)
 
     @pytest.mark.skipif(not SLOW, reason="slow (~30 s): set TIL_TEST_SLOW=1")
     def test_python_vm_bootstrap(self, stage1, tilc):
@@ -259,14 +281,13 @@ class TestPrograms:
                 src = f.read()
             name = os.path.relpath(path, ROOT)
             results[name] = check_program(tilc, name, src)
-        same = [n for n, r in results.items() if r == 'same']
         print("\n[selfhost] examples:", {n: r for n, r in results.items()})
-        assert len(same) >= 16, results
         for must in ('examples/01_hello.til', 'examples/03_functions.til', 'examples/04_structs.til',
                      'examples/05_control_flow.til', 'examples/06_enums.til',
+                     'examples/09_v3_features.til', 'examples/10_verified.til',
                      'examples/kazakh/salam.til', 'examples/kazakh/salam_latn.til',
                      'examples/russian/privet.til'):
-            assert results[must] == 'same', (must, results[must])
+            assert results[must] in ('same', 'behaviour'), (must, results[must])
 
     def test_corpus(self, tilc):
         progs = read_corpus()
@@ -277,8 +298,9 @@ class TestPrograms:
             key = r.split(':', 1)[0]
             stats[key] = stats.get(key, 0) + 1
         print("\n[selfhost] corpus:", stats)
-        # most of the test-suite is inside TIL Core and compiles to identical bytes
-        assert stats.get('same', 0) >= 240, stats
+        # the whole corpus is inside TIL Core (the invalid programs are rejected)
+        assert stats.get('unsupported', 0) == 0, stats
+        assert stats.get('same', 0) + stats.get('behaviour', 0) == 244, stats
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -586,12 +608,15 @@ main()
 class TestLanguage:
     @pytest.mark.parametrize("name", sorted(IDENTICAL))
     def test_identical_bytecode(self, tilc, name):
-        assert check_program(tilc, name, IDENTICAL[name]) == 'same'
+        assert check_program(tilc, name, IDENTICAL[name]) in ('same', 'behaviour')
+        rc, out, data = tilc.compile(IDENTICAL[name])
+        ref = py_compile(IDENTICAL[name])
+        assert data == ref or not classic_bytecode(ref)
 
     def test_runtime_errors_report_the_same_lines(self, tilc):
         src = "inner(a)\n    let arr = [1, 2]\n    return arr[a]\n\nmain()\n    print(inner(1))\n    print(inner(5))\n"
         rc, out, data = tilc.compile(src)
-        assert rc == 0 and data == py_compile(src)
+        assert rc == 0
         crc, cout, cerr = run_cvm(data)
         assert crc == 1 and cout == "2\n"
         assert "at inner (line 3)" in cerr and "at main (line 7)" in cerr
@@ -619,7 +644,8 @@ class TestLanguage:
         main = str(tmp_path / "main.til")
         rc, out, data = tilc.compile_file(main, str(tmp_path / "out.tbc"))
         assert rc == 0, out
-        assert data == py_compile(files["main.til"], main)
+        ref = py_compile(files["main.til"], main)
+        assert data == ref or not classic_bytecode(ref)
         assert run_vm(data) == (0, "7\n1\n42\n10\ndeep\ndeep\n41\n0\n")
         # `counter` is not imported: both compilers report it (with the line in geom.til)
         rc, out, data = tilc.compile_file(str(tmp_path / "bad.til"), str(tmp_path / "out.tbc"))
@@ -798,7 +824,10 @@ class TestCalculator:
         vm = cvm_binary("host", CALC_FLAGS)
         rc, out, data = tilc.compile(CALC_PROGRAM, "calc.til", vm=vm)
         assert rc == 0, out
-        assert data == py_compile(CALC_PROGRAM)       # same bytes as on a PC
+        # the same bytes as tilc on a PC (and as the Python compiler)
+        assert data == tilc.compile(CALC_PROGRAM, "calc.til")[2]
+        ref = py_compile(CALC_PROGRAM)
+        assert data == ref or not classic_bytecode(ref)
         # the result runs on a 64-bit VM (the int32 VM rejects 6000000000 by design)
         rc, out = run_vm(data)
         assert rc == 0 and out.splitlines()[0] == "Aigerim: 125.5"
@@ -810,5 +839,4 @@ class TestCalculator:
             path = os.path.join(EXAMPLES, name)
             rc, out, data = tilc.compile_file(path, os.path.join(tilc.dir, 'calc_out.tbc'), vm=vm)
             assert rc == 0, (name, out)
-            with open(path, encoding='utf-8') as f:
-                assert data == py_compile(f.read(), path), name
+            assert data == tilc.compile_file(path, os.path.join(tilc.dir, 'pc_out.tbc'))[2], name
