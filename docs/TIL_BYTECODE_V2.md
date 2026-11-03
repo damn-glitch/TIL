@@ -12,9 +12,10 @@ instructions and natives. Numbers are append-only and never change meaning.
 | opcodes `0x80–0xBF`: **superinstructions** | this document |
 
 Both VMs load versions 1 and 2. A version-1 file never contains the new
-opcodes; a TIL 3.0 VM (or any VM without these opcodes) runs programs built
-with `--no-fuse`, which emits only the instructions of TIL_BYTECODE.md (plus the
-natives / effect opcodes a program really uses).
+opcodes. `--no-fuse` builds contain no superinstructions: such a file runs on a
+version-2 VM that predates them (for example the TIL 3.1 foundation, commit
+`6f4d00b`), and its bytes are exactly what that compiler wrote. (A TIL 3.0
+release VM loads only version 1.)
 
 ## 1. Superinstructions
 
