@@ -344,6 +344,16 @@ class Solver:
                 ok = False
         return ok
 
+    def flow(self, src, dst):
+        """dst receives src's values (one way): dst is unified with src's type
+        constructor once it is known, never with src's variable, so widening the
+        destination later (a variable assigned something else) leaves src alone."""
+        v = resolve(src)
+        if isinstance(v, TVar):
+            self.add(FlowC(src, dst))
+        else:
+            self.unify(dst, v)
+
     # ── constraints ─────────────────────────────────────────────────────────
     def add(self, c: 'Constraint'):
         self.track(c)
@@ -407,6 +417,7 @@ class Constraint:
     """A deferred typing rule. solve() returns None when done, else a TVar to wait on."""
     done = False
     report = True
+    reportable = True               # may this kind of rule produce E-TYPE at all?
     node = None
     ctx = None
     error: Optional[str] = None     # message when the rule found a definite error
@@ -435,7 +446,7 @@ class Constraint:
     def fail(self, s: Solver, message: str):
         """Record a (possible) definite error; checked again once types settle."""
         self.error = message
-        if self.ctx is not None and self.report:
+        if self.ctx is not None and self.report and self.reportable and self.ctx.phase == 'E':
             self.ctx.infer.suspects.append(self)
 
 
@@ -478,6 +489,8 @@ class Arith(Constraint):
 class Compare(Constraint):
     """`<`, `<=`, `>`, `>=`: numbers with numbers or strings with strings."""
 
+    reportable = False      # the VMs report it at run time (not an E-TYPE category)
+
     def __init__(self, op, a, b, node=None):
         self.op, self.a, self.b, self.node = op, a, b, node
 
@@ -511,6 +524,8 @@ class Compare(Constraint):
 
 
 class Bitwise(Constraint):
+    reportable = False      # the VMs report it at run time (not an E-TYPE category)
+
     def __init__(self, op, a, b, node=None):
         self.op, self.a, self.b, self.node = op, a, b, node
 
@@ -540,6 +555,8 @@ class Bitwise(Constraint):
 
 class Unary(Constraint):
     """`-x` (int/float) and `~x` (int)."""
+
+    reportable = False      # the VMs report it at run time (not an E-TYPE category)
 
     def __init__(self, op, a, r, node=None):
         self.op, self.a, self.r, self.node = op, a, r, node
@@ -577,6 +594,8 @@ class Unary(Constraint):
 class IndexC(Constraint):
     """obj[idx] -> r (also used for assignments obj[idx] = r)."""
 
+    reportable = False      # the VMs report it at run time (not an E-TYPE category)
+
     def __init__(self, obj, idx, r, node=None, store=False):
         self.obj, self.idx, self.r, self.node, self.store = obj, idx, r, node, store
 
@@ -594,7 +613,10 @@ class IndexC(Constraint):
         if isinstance(o, TVar):
             return o
         if o.name == 'array':
-            s.unify(self.r, o.args[0])
+            if self.store:
+                s.flow(self.r, o.args[0])
+            else:
+                s.unify(self.r, o.args[0])
             i = resolve(self.idx)
             if isinstance(i, TCon) and i not in (INT, DYN, UNK):
                 self.fail(s, f"array index must be an integer, got {show(i)}")
@@ -604,8 +626,11 @@ class IndexC(Constraint):
             else:
                 s.unify(self.r, INT)
         elif o.name == 'map':
-            s.unify(o.args[0], self.idx)
-            s.unify(self.r, o.args[1])
+            s.flow(self.idx, o.args[0])
+            if self.store:
+                s.flow(self.r, o.args[1])
+            else:
+                s.unify(self.r, o.args[1])
         elif o in (DYN, UNK):
             if not self.store:
                 s.unify(self.r, o)
@@ -633,6 +658,8 @@ class IndexC(Constraint):
 class IterC(Constraint):
     """`for x in obj`: the element type."""
 
+    reportable = False      # the VMs report it at run time (not an E-TYPE category)
+
     def __init__(self, obj, elem, node=None):
         self.obj, self.elem, self.node = obj, elem, node
 
@@ -650,11 +677,11 @@ class IterC(Constraint):
         if isinstance(o, TVar):
             return o
         if o.name == 'array':
-            s.unify(self.elem, o.args[0])
+            s.flow(o.args[0], self.elem)
         elif o is STR:
             s.unify(self.elem, INT)
         elif o.name == 'map':
-            s.unify(self.elem, o.args[0])
+            s.flow(o.args[0], self.elem)
         elif o in (DYN, UNK):
             s.unify(self.elem, o)
         else:
@@ -763,6 +790,8 @@ class FoldC(Constraint):
 class CallValueC(Constraint):
     """Calling a value (closure / function reference)."""
 
+    reportable = False      # the VMs report it at run time (not an E-TYPE category)
+
     def __init__(self, f, args, r, node=None):
         self.f, self.args, self.r, self.node = f, list(args), r, node
 
@@ -788,7 +817,7 @@ class CallValueC(Constraint):
                 s.unify(self.r, DYN)
                 return None
             for p, a in zip(params, self.args):
-                s.unify(p, a)
+                s.flow(a, p)
             s.unify(self.r, f.args[0])
         elif f in (DYN, UNK):
             s.unify(self.r, f)
@@ -835,8 +864,9 @@ class FieldC(Constraint):
             elif self.store:
                 if self.ctx is not None:
                     self.ctx.check(info.ann.get(self.name), self.r, self.node,
-                                   f"field '{self.name}' of '{nominal_name(o)}'", self.report)
-                s.unify(ft, self.r)
+                                   f"field '{self.name}' of '{nominal_name(o)}'", self.report,
+                                   getattr(self.node, 'value', None))
+                s.flow(self.r, ft)
             else:
                 s.unify(self.r, ft)
         elif o.name in ('option', 'result') and self.name in ('value', 'error') and not self.store:
@@ -846,7 +876,6 @@ class FieldC(Constraint):
             if not self.store:
                 s.unify(self.r, o)
         elif o.name in ('int', 'float', 'bool', 'str', 'nil', 'array', 'map', 'fn'):
-            self.fail(s, f"{show(o)} has no field '{self.name}'")
             if not self.store:
                 s.unify(self.r, DYN)
         elif not self.store:
@@ -860,7 +889,7 @@ class FieldC(Constraint):
         if is_struct(o):
             info = self.infer.structs.get(nominal_name(o))
             return info is not None and info.field_type(self.name, 'A') is None
-        return o.name in ('int', 'float', 'bool', 'str', 'nil', 'array', 'map', 'fn')
+        return False
 
 
 class MethodC(Constraint):
@@ -890,9 +919,32 @@ class MethodC(Constraint):
 
     def still_wrong(self):
         o = resolve(self.obj)
-        if not isinstance(o, TCon):
+        if not isinstance(o, TCon) or not is_struct(o):
             return False
         return self.infer.method_missing(o, self.name)
+
+
+class FlowC(Constraint):
+    """See Solver.flow."""
+
+    def __init__(self, src, dst, node=None):
+        self.src, self.dst, self.node = src, dst, node
+
+    def terms(self):
+        return [self.src, self.dst]
+
+    def outputs(self):
+        return [self.dst]
+
+    def copy(self, sub):
+        return FlowC(sub(self.src), sub(self.dst))
+
+    def solve(self, s):
+        v = resolve(self.src)
+        if isinstance(v, TVar):
+            return v
+        s.unify(self.dst, v)
+        return None
 
 
 class JoinC(Constraint):
@@ -927,37 +979,67 @@ class JoinC(Constraint):
             if b.name == 'strish' and a in (STR, b.args[0]):
                 s.unify(self.r, b)
                 return None
-        s.unify(self.r, self.a)
-        s.unify(self.r, self.b)
+        s.flow(self.a, self.r)
+        s.flow(self.b, self.r)
         return None
 
 
 class CheckC(Constraint):
-    """An annotation check made when the value type is known (E-TYPE)."""
+    """An annotation check made when the value type is known (E-TYPE).
+    `converts`: the VMs convert the value here (declarations, parameters,
+    returns): a string is then only definitely wrong for a number when it is a
+    literal that does not parse as one (`let x: int = "a"`; `f("12")` is fine)."""
 
-    def __init__(self, declared, value, node, what):
+    def __init__(self, declared, value, node, what, value_node=None, converts=False):
         self.declared, self.value, self.node, self.what = declared, value, node, what
+        self.value_node, self.converts = value_node, converts
+        self.argument = False       # call arguments: a failing conversion is the callee's run-time error
 
     def terms(self):
         return [self.declared, self.value]
 
     def copy(self, sub):
-        return CheckC(sub(self.declared), sub(self.value), None, self.what)
+        return CheckC(sub(self.declared), sub(self.value), None, self.what, None, self.converts)
+
+    def mismatch(self) -> bool:
+        d, v = resolve(self.declared), resolve(self.value)
+        if not (isinstance(d, TCon) and isinstance(v, TCon)):
+            return False
+        if d.name in NUMERIC and v is STR and self.converts:
+            vn = self.value_node
+            return not self.argument and isinstance(vn, til.StringLit) and not parses_as(vn.value, d)
+        return kind_mismatch(d, v)
 
     def solve(self, s):
         v = resolve(self.value)
         if isinstance(v, TVar):
             return v
-        if kind_mismatch(resolve(self.declared), v):
+        if self.mismatch():
             self.fail(s, self.message())
         return None
 
     def message(self):
+        v = resolve(self.value)
+        if v is STR and self.converts and isinstance(self.value_node, til.StringLit) and \
+                resolve(self.declared).name in NUMERIC:
+            return (f"{self.what} is {show(self.declared)}, but the value is the string "
+                    f"{self.value_node.value!r}, which is not a number")
         return f"{self.what} is {show(self.declared)}, but the value is {show(self.value)}"
 
     def still_wrong(self):
-        d, v = resolve(self.declared), resolve(self.value)
-        return isinstance(d, TCon) and isinstance(v, TCon) and kind_mismatch(d, v)
+        return self.mismatch()
+
+
+def parses_as(text: str, t) -> bool:
+    """Would the VMs convert this string to the number type t?"""
+    try:
+        if t is INT:
+            int(text.strip(' \t\n\r\x0b\x0c'))
+        else:
+            float(text.strip(' \t\n\r\x0b\x0c'))
+        return True
+    except ValueError:
+        return False
 
 
 def kind_mismatch(d, v) -> bool:
@@ -1014,7 +1096,7 @@ class StructInfo:
         self.statics: Dict[str, str] = {}       # Name.f(...) functions without self
 
     def field_type(self, name: str, phase: str):
-        if phase == 'B':
+        if phase in ('B', 'E'):
             return self.frozen.get(name)
         return self.flow.get(name)
 
@@ -1028,7 +1110,7 @@ class AdtInfo:
         self.frozen: Dict[str, List[TCon]] = {}
 
     def payload(self, variant: str, phase: str):
-        return (self.frozen if phase == 'B' else self.flow).get(variant)
+        return (self.frozen if phase in ('B', 'E') else self.flow).get(variant)
 
 
 class GlobalInfo:
@@ -1039,7 +1121,7 @@ class GlobalInfo:
         self.frozen = None
 
     def type_for(self, phase: str):
-        return self.frozen if phase == 'B' else self.type
+        return self.frozen if phase in ('B', 'E') else self.type
 
 
 class Sig:
@@ -1069,7 +1151,7 @@ class Scheme:
                     if v is None:
                         v = mapping[t] = TVar()
                     return v
-                return UNK if s.phase == 'B' else t
+                return UNK if s.phase in ('B', 'E') else t
             if not t.args:
                 return t
             return TCon(t.name, [sub(a) for a in t.args])
@@ -1229,6 +1311,10 @@ class FuncCtx:
         self.s.current_node = node
         return self.s.unify(a, b)
 
+    def flow(self, src, dst, node=None):
+        self.s.current_node = node
+        self.s.flow(src, dst)
+
     def reporting(self) -> bool:
         return self.report and self.guard == 0
 
@@ -1237,12 +1323,15 @@ class FuncCtx:
         c.report = self.reporting() if report is None else report
         self.s.add(c)
 
-    def check(self, declared, value, node, what: str, report=None):
-        """E-TYPE if the value can never be of the declared type (phase A only)."""
+    def check(self, declared, value, node, what: str, report=None, value_node=None, converts=False,
+              argument=False):
+        """E-TYPE if the value can never be of the declared type (phase E only)."""
         if report is None:
             report = self.reporting()
-        if self.phase == 'A' and report and declared is not None:
-            self.add(CheckC(declared, value, node, what), report)
+        if self.phase == 'E' and report and declared is not None and not isinstance(declared, TVar):
+            c = CheckC(declared, value, node, what, value_node, converts)
+            c.argument = argument
+            self.add(c, report)
 
     def push(self):
         self.scopes.append({})
@@ -1266,10 +1355,12 @@ class FuncCtx:
         info = self.infer.funcs[key]
         if info.scheme is None:              # same SCC (phase A): monomorphic recursion
             return list(info.mono.params), info.mono.ret, info.mono.modes
+        if self.phase == 'E' and self.infer.is_generic(key):
+            return self.infer.opaque(key)
         params, ret = info.scheme.instantiate(self.s)
         return params, ret, info.scheme.sig.modes
 
-    def bind_args(self, key: str, params, modes, args, node, skip_self=False, report=None):
+    def bind_args(self, key: str, params, modes, args, node, skip_self=False, report=None, arg_nodes=None):
         fdef = self.infer.funcs[key].fdef
         names = [p.name for p in fdef.params]
         offset = 1 if skip_self else 0
@@ -1279,13 +1370,14 @@ class FuncCtx:
                 break
             mode = modes[k]
             what = f"argument '{names[k]}' of '{key}'"
+            an = arg_nodes[i] if arg_nodes is not None and i < len(arg_nodes) else None
             if mode == 'num':
-                self.check(params[k], at, node, what, report)   # the VM converts numbers
+                self.check(params[k], at, node, what, report, an, converts=True, argument=True)
             elif mode == 'ann':
-                self.check(params[k], at, node, what, report)
-                self.unify(params[k], at, node)
+                self.check(params[k], at, node, what, report, an, converts=True, argument=True)
+                self.flow(at, params[k], node)
             else:
-                self.unify(params[k], at, node)
+                self.flow(at, params[k], node)
 
     # ── statements ──────────────────────────────────────────────────────────
     def block(self, body):
@@ -1320,12 +1412,12 @@ class FuncCtx:
         if n.value is not None:
             vt = self.expr(n.value)
             if declared is not None:
-                self.check(declared, vt, n, f"'{n.name}'")
+                self.check(declared, vt, n, f"'{n.name}'", value_node=n.value, converts=True)
                 self.s.bind(t, declared)
                 if declared.name not in NUMERIC:
-                    self.unify(t, vt, n)     # numbers are converted at the declaration
+                    self.flow(vt, t, n)      # numbers are converted at the declaration
             else:
-                self.unify(t, vt, n)
+                self.flow(vt, t, n)
         elif declared is not None:
             self.s.bind(t, declared)        # zero value of the declared type
         self.declare(n.name, t, n.mutable, declared)
@@ -1339,10 +1431,10 @@ class FuncCtx:
             return
         gt = g.type_for(self.phase)
         if g.declared is not None:
-            self.check(g.declared, vt, n, f"'{decl.name}'")
+            self.check(g.declared, vt, n, f"'{decl.name}'", value_node=decl.value, converts=True)
             if g.declared.name in NUMERIC:
                 return                      # converted (the global already has the declared type)
-        self.unify(gt, vt, n)
+        self.flow(vt, gt, n)
 
     def st_Assignment(self, n):
         target = n.target
@@ -1357,15 +1449,15 @@ class FuncCtx:
             loc = self.lookup(target.name)
             if loc is not None:
                 if loc.declared is not None:
-                    self.check(loc.declared, vt, n, f"'{target.name}'")
-                self.unify(loc.type, vt, n)
+                    self.check(loc.declared, vt, n, f"'{target.name}'", value_node=n.value)
+                self.flow(vt, loc.type, n)
                 self.types[id(target)] = loc.type
                 return
             g = self.infer.globals.get(target.name)
             if g is not None:
                 if g.declared is not None:
-                    self.check(g.declared, vt, n, f"'{target.name}'")
-                self.unify(g.type_for(self.phase), vt, n)
+                    self.check(g.declared, vt, n, f"'{target.name}'", value_node=n.value)
+                self.flow(vt, g.type_for(self.phase), n)
                 self.types[id(target)] = g.type_for(self.phase)
             return
         if isinstance(target, til.Index):
@@ -1417,19 +1509,19 @@ class FuncCtx:
                 self.unify(self.ret, NIL, n)
             return
         vt = self.expr(n.value)
-        self.return_value(vt, n)
+        self.return_value(vt, n, n.value)
 
-    def return_value(self, vt, node):
+    def return_value(self, vt, node, value_node=None):
         what = f"the return value of '{self.info.key if self.info else '?'}'"
         if self.ret_mode == 'main':
             return                          # the VM ignores main's result
         if self.ret_mode == 'num':
-            self.check(self.ret, vt, node, what)
+            self.check(self.ret, vt, node, what, value_node=value_node, converts=True)
         elif self.ret_mode == 'ann':
-            self.check(self.ret, vt, node, what)
-            self.unify(self.ret, vt, node)
+            self.check(self.ret, vt, node, what, value_node=value_node, converts=True)
+            self.flow(vt, self.ret, node)
         else:
-            self.unify(self.ret, vt, node)
+            self.flow(vt, self.ret, node)
 
     def st_MatchExpr(self, n):
         self.match(n, False)
@@ -1476,8 +1568,8 @@ class FuncCtx:
         r = self.fresh()
         for cond, body in [(n.condition, n.then_body)] + list(n.elifs):
             self.expr(cond)
-            self.unify(r, self.block_value(body), n)
-        self.unify(r, self.block_value(n.else_body), n)
+            self.flow(self.block_value(body), r, n)
+        self.flow(self.block_value(n.else_body), r, n)
         self.types[id(n)] = r
         return r
 
@@ -1502,7 +1594,7 @@ class FuncCtx:
             return NIL
         r = self.fresh()
         for t in results:
-            self.unify(r, t, n)
+            self.flow(t, r, n)
         if not self.exhaustive(n, subj):
             self.open_matches.add(id(n))
         return r
@@ -1750,7 +1842,7 @@ class FuncCtx:
     def ex_ArrayLit(self, n):
         e = self.fresh()
         for el in n.elements:
-            self.unify(e, self.expr(el), el)
+            self.flow(self.expr(el), e, el)
         return arr(e)
 
     ex_TupleLit = ex_ArrayLit
@@ -1758,8 +1850,8 @@ class FuncCtx:
     def ex_DictLit(self, n):
         k, v = self.fresh(), self.fresh()
         for ke, ve in n.pairs:
-            self.unify(k, self.expr(ke), ke)
-            self.unify(v, self.expr(ve), ve)
+            self.flow(self.expr(ke), k, ke)
+            self.flow(self.expr(ve), v, ve)
         return mapt(k, v)
 
     def ex_Range(self, n):
@@ -1779,11 +1871,12 @@ class FuncCtx:
             if fld.name in n.fields:
                 vt = self.expr(n.fields[fld.name])
                 declared = info.ann[fld.name]
-                self.check(declared, vt, n, what)
+                self.check(declared, vt, n, what, value_node=n.fields[fld.name],
+                           converts=declared is FLOAT)
                 if declared is not FLOAT:           # float fields are converted by the VM
-                    self.unify(ft, vt, n)
+                    self.flow(vt, ft, n)
             elif fld.default is not None:
-                self.unify(ft, self.expr(fld.default), n)
+                self.flow(self.expr(fld.default), ft, n)
         return structt(n.name)
 
     def ex_Lambda(self, n):
@@ -1808,8 +1901,8 @@ class FuncCtx:
     def ex_IfExpr(self, n):
         self.expr(n.condition)
         r = self.fresh()
-        self.unify(r, self.expr(n.then_expr), n)
-        self.unify(r, self.expr(n.else_expr) if n.else_expr is not None else NIL, n)
+        self.flow(self.expr(n.then_expr), r, n)
+        self.flow(self.expr(n.else_expr) if n.else_expr is not None else NIL, r, n)
         return r
 
     def ex_MatchExpr(self, n):
@@ -1883,7 +1976,7 @@ class FuncCtx:
         args = [self.expr(a) for a in n.args]
         if n.name in self.infer.funcs:
             params, ret, modes = self.instantiate(n.name)
-            self.bind_args(n.name, params, modes, args, n)
+            self.bind_args(n.name, params, modes, args, n, arg_nodes=n.args)
             self.calls[id(n)] = (n.name, params)
             return ret
         return DYN
@@ -1900,13 +1993,13 @@ class FuncCtx:
             if name in infer.funcs and '.' not in name:
                 args = [self.expr(a) for a in n.args]
                 params, ret, modes = self.instantiate(name)
-                self.bind_args(name, params, modes, args, n)
+                self.bind_args(name, params, modes, args, n, arg_nodes=n.args)
                 self.calls[id(n)] = (name, params)
                 return ret
             if name in infer.structs:
                 info = infer.structs[name]
                 for a, fname in zip(n.args, info.order):
-                    self.unify(info.field_type(fname, self.phase), self.expr(a), n)
+                    self.flow(self.expr(a), info.field_type(fname, self.phase), n)
                 for a in n.args[len(info.order):]:
                     self.expr(a)
                 return structt(name)
@@ -1936,7 +2029,7 @@ class FuncCtx:
                     args = [self.expr(a) for a in n.args]
                     if key in infer.funcs:
                         params, ret, modes = self.instantiate(key)
-                        self.bind_args(key, params, modes, args, n)
+                        self.bind_args(key, params, modes, args, n, arg_nodes=n.args)
                         self.calls[id(n)] = (key, params)
                         return ret
                     return DYN
@@ -1946,14 +2039,14 @@ class FuncCtx:
                     args = [self.expr(a) for a in n.args]
                     if payload is not None:
                         for pt, at in zip(payload, args):
-                            self.unify(pt, at, n)
+                            self.flow(at, pt, n)
                         return adtt(oname)
                     return DYN
                 if oname in infer.module_names and oname not in infer.globals:
                     args = [self.expr(a) for a in n.args]
                     if meth in infer.funcs:
                         params, ret, modes = self.instantiate(meth)
-                        self.bind_args(meth, params, modes, args, n)
+                        self.bind_args(meth, params, modes, args, n, arg_nodes=n.args)
                         self.calls[id(n)] = (meth, params)
                         return ret
                     return DYN
@@ -2263,9 +2356,9 @@ class TypeInfer:
             if p.default is not None:
                 dt = ctx.expr(p.default)
                 if mode == 'num':
-                    ctx.check(t, dt, p.default, f"the default of '{p.name}'")
+                    ctx.check(t, dt, p.default, f"the default of '{p.name}'", value_node=p.default, converts=True)
                 elif mode == 'ann':
-                    ctx.check(t, dt, p.default, f"the default of '{p.name}'")
+                    ctx.check(t, dt, p.default, f"the default of '{p.name}'", value_node=p.default, converts=True)
                     ctx.unify(t, dt, p.default)
                 else:
                     ctx.unify(t, dt, p.default)
@@ -2383,8 +2476,45 @@ class TypeInfer:
             s.sink = None
         s.run()
         self.freeze()
+        self.phase_e()
         self.collect_errors()
         return self
+
+    # ── phase E: definite errors ────────────────────────────────────────────
+    def opaque(self, key: str):
+        """A generic function seen from phase E: its annotated parameters are
+        checked, its result is dynamic (it depends on the instantiation)."""
+        sig = self.funcs[key].scheme.sig
+        params = []
+        for p, mode in zip(sig.params, sig.modes):
+            t = deep(p, None)
+            params.append(t if mode in ('num', 'ann', 'self') and not contains(t, ('var',)) else DYN)
+        return params, DYN, sig.modes
+
+    def phase_e(self):
+        """Re-infer every body with unannotated parameters dynamic: a type error
+        found now does not depend on how a generic function is instantiated."""
+        for key, info in self.funcs.items():
+            s = Solver('E')
+            sig = self.signature(info)
+            for t, mode in zip(sig.params, sig.modes):
+                if mode is None and isinstance(resolve(t), TVar):
+                    s.bind(resolve(t), DYN)
+            for tv in sig.tparams.values():
+                if isinstance(resolve(tv), TVar):
+                    s.bind(resolve(tv), DYN)
+            self.infer_body(info, sig, s, 'E', True)
+            s.run()
+        s = Solver('E')
+        ctx = FuncCtx(self, s, None, 'E', True)
+        for g in self.globals.values():
+            decl = g.decl
+            if decl.value is None or decl.deferred:
+                continue
+            vt = ctx.expr(decl.value)
+            if g.declared is not None:
+                ctx.check(g.declared, vt, decl, f"'{decl.name}'", value_node=decl.value)
+        s.run()
 
     def infer_globals(self):
         self.solver.sink = None
@@ -2395,8 +2525,6 @@ class TypeInfer:
             if decl.value is None or decl.deferred:
                 continue
             vt = ctx.expr(decl.value)
-            if g.declared is not None:
-                ctx.check(g.declared, vt, decl, f"'{decl.name}'")
             ctx.unify(g.type, vt, decl)
 
     def env_vars(self) -> Set[TVar]:
@@ -2414,6 +2542,21 @@ class TypeInfer:
     def generalize(self, infos: List[FuncInfo], created: List[Constraint]):
         env = self.env_vars()
         pending = [c for c in created if not c.done]
+        # variables tied to the environment through open constraints are not
+        # generalised (the constraint must stay live to inform the globals)
+        cvars = []
+        for c in pending:
+            fv: Set[TVar] = set()
+            for t in c.terms():
+                _free(t, fv)
+            cvars.append(fv)
+        changed = True
+        while changed:
+            changed = False
+            for fv in cvars:
+                if fv & env and not fv <= env:
+                    env |= fv
+                    changed = True
         cand: Set[TVar] = set()
         for info in infos:
             for t in list(info.mono.params) + [info.mono.ret]:
@@ -2499,12 +2642,15 @@ class TypeInfer:
                 finfo = self.funcs[key]
                 if finfo.scheme is None:
                     params, ret, modes = list(finfo.mono.params), finfo.mono.ret, finfo.mono.modes
+                elif s.phase == 'E' and self.is_generic(key):
+                    params, ret, modes = self.opaque(key)
                 else:
                     params, ret = finfo.scheme.instantiate(s)
                     modes = finfo.scheme.sig.modes
                 s.unify(params[0], o)
                 if c.ctx is not None:
-                    c.ctx.bind_args(key, params, modes, args, c.node, skip_self=True, report=c.report)
+                    c.ctx.bind_args(key, params, modes, args, c.node, skip_self=True, report=c.report,
+                                    arg_nodes=getattr(c.node, 'args', None))
                     c.ctx.calls[id(c.node)] = (key, params)
                 else:
                     for p, a in zip(params[1:], args):
@@ -2522,8 +2668,6 @@ class TypeInfer:
         if handler is not None:
             handler(self, s, c, o)
             return None
-        if self.method_missing(o, name):
-            c.fail(s, f"{show(o)} has no method '{name}'")
         s.unify(r, DYN)
         return None
 
@@ -2624,7 +2768,7 @@ def _m_array(infer, s, c, o):
         s.unify(r, INT)
     elif name in ('push', 'set', 'insert'):
         if args:
-            s.unify(e, args[-1])
+            s.flow(args[-1], e)
         s.unify(r, NIL)
     elif name in ('pop', 'get', 'remove', 'first', 'last'):
         s.unify(r, e)
@@ -2650,7 +2794,7 @@ def _m_array(infer, s, c, o):
     elif name == 'reduce':
         acc = TVar()
         if len(args) > 1:
-            s.unify(acc, args[1])
+            s.flow(args[1], acc)
         if args:
             s.unify(args[0], fnt(acc, [acc, e]))
         s.unify(r, acc)
@@ -2673,22 +2817,24 @@ def _m_map(infer, s, c, o):
         s.unify(r, INT)
     elif name == 'set':
         if len(args) == 2:
-            s.unify(k, args[0])
-            s.unify(v, args[1])
+            s.flow(args[0], k)
+            s.flow(args[1], v)
         s.unify(r, NIL)
     elif name in ('get', 'get_or'):
         if args:
-            s.unify(k, args[0])
+            s.flow(args[0], k)
         if name == 'get_or' and len(args) > 1:
-            s.unify(v, args[1])
-        s.unify(r, v)
+            s.flow(v, r)
+            s.flow(args[1], r)
+        else:
+            s.unify(r, v)
     elif name in ('has', 'contains'):
         if args:
-            s.unify(k, args[0])
+            s.flow(args[0], k)
         s.unify(r, BOOL)
     elif name in ('delete', 'remove'):
         if args:
-            s.unify(k, args[0])
+            s.flow(args[0], k)
         s.unify(r, NIL)
     elif name == 'keys':
         s.unify(r, arr(k))
@@ -2712,9 +2858,9 @@ def _m_optres(infer, s, c, o):
     elif name in ('unwrap', 'expect'):
         s.unify(r, t)
     elif name == 'unwrap_or':
+        s.flow(t, r)
         if args:
-            s.unify(t, args[0])
-        s.unify(r, t)
+            s.flow(args[0], r)
     elif name == 'error' and o.name == 'result':
         s.unify(r, o.args[1])
     else:
@@ -2730,7 +2876,6 @@ def _m_nil(infer, s, c, o):
     elif name in ('unwrap', 'expect', 'error'):
         pass
     else:
-        c.fail(s, f"None has no method '{name}'")
         s.unify(r, DYN)
 
 
@@ -3222,6 +3367,7 @@ static int64_t til_ord(const char* s) {
 static const char* til_fmt_spec(int kind, int64_t iv, double fv, const char* body, const char* spec) {
     const char* p = spec;
     char align = 0, conv = 0, num[80];
+    char* big = NULL;
     int zero = 0, width = 0, prec = -1, is_num = kind == 0 || kind == 1;
     size_t blen, pad, k;
     char* r;
@@ -3243,11 +3389,19 @@ static const char* til_fmt_spec(int kind, int64_t iv, double fv, const char* bod
         if (x != x) snprintf(num, sizeof num, "nan");
         else if (isinf(x)) snprintf(num, sizeof num, x > 0 ? "inf" : "-inf");
         else {
+            int need;
             snprintf(f, sizeof f, "%%.%d%c", prec < 0 ? 6 : prec, conv == 'e' ? 'e' : 'f');
-            snprintf(num, sizeof num, f, x);
+            need = snprintf(NULL, 0, f, x);
+            big = (char*)til_alloc_obj((size_t)need + 2);
+            snprintf(big, (size_t)need + 1, f, x);
         }
-        if (conv == '%') strcat(num, "%");
-        body = num;
+        if (big) {
+            if (conv == '%') strcat(big, "%");
+            body = big;
+        } else {
+            if (conv == '%') strcat(num, "%");
+            body = num;
+        }
     } else if (conv && strchr("dxXob", conv) && is_num) {
         int64_t n = kind == 0 ? iv : til_f2i(fv);
         uint64_t u = n < 0 ? 0 - (uint64_t)n : (uint64_t)n;
@@ -3264,8 +3418,15 @@ static const char* til_fmt_spec(int kind, int64_t iv, double fv, const char* bod
     } else if (kind == 1 && prec >= 0) {
         if (fv != fv) snprintf(num, sizeof num, "nan");
         else if (isinf(fv)) snprintf(num, sizeof num, fv > 0 ? "inf" : "-inf");
-        else { char f[16]; snprintf(f, sizeof f, "%%.%dg", prec); snprintf(num, sizeof num, f, fv); }
-        body = num;
+        else {
+            char f[16];
+            int need;
+            snprintf(f, sizeof f, "%%.%dg", prec);
+            need = snprintf(NULL, 0, f, fv);
+            big = (char*)til_alloc_obj((size_t)need + 1);
+            snprintf(big, (size_t)need + 1, f, fv);
+        }
+        body = big ? big : num;
     }
     blen = strlen(body);
     if ((int)blen >= width) return til_strdup_n(body, blen);
@@ -3409,6 +3570,30 @@ UNSUPPORTED_NATIVES = {'bytes_to_str', 'screen_init', 'screen_clear', 'draw_pixe
                        'draw_rect', 'fill_rect', 'draw_circle', 'draw_text', 'get_pixel',
                        'screen_show', 'key_pressed', 'wait_key', 'screen_width', 'screen_height',
                        'energy_mode', 'iter'}
+
+
+C_RESERVED = set("""
+auto break case char const continue default do double else enum extern float for goto if inline int long
+register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while
+_Bool bool true false NULL errno stdin stdout stderr EOF INFINITY NAN main argc argv
+printf puts malloc calloc realloc free strlen strcmp strncmp strstr strchr strcat strcpy memcpy memmove memset
+memchr snprintf fflush fputs fprintf getchar fopen fclose fread fwrite ferror exit setjmp longjmp jmp_buf
+sqrt pow fabs floor ceil round log exp sin cos tan fmod copysign isnan isinf clock time abs labs
+nanosleep clock_gettime strtod error self _result
+""".split())
+
+
+def c_local(name: str) -> str:
+    """C identifier for a TIL local: TIL names never collide with C keywords,
+    the C library or the generated temporaries (which start with '_')."""
+    m = til.CCodeGenerator.mangle_name(name)
+    if m in C_RESERVED or m.startswith('_') or m.lower().startswith('til_'):
+        return 'v_' + m
+    return m
+
+
+def c_global(name: str) -> str:
+    return 'g_' + til.CCodeGenerator.mangle_name(name)
 
 
 def c_string_opaque(text: str) -> str:
@@ -3830,7 +4015,7 @@ class TypedCGen(til.CCodeGenerator):
         self.cnames_used.pop()
 
     def declare_var(self, name: str, t, node=None) -> str:
-        base = self.mangle_name(name)
+        base = c_local(name) if name != 'error' else 'error'
         cname = base
         used = set().union(*self.cnames_used) if self.cnames_used else set()
         if cname in self.cnames_used[-1] or cname in ('self', '_result') or (cname in used and False):
@@ -3889,6 +4074,13 @@ class TypedCGen(til.CCodeGenerator):
                 self.unsupported(f"'{ikey[0]}' cannot be compiled")
         global_lines = self.global_decls()
         struct_lines = self.struct_defs()
+        self.no_main_inits = []
+        if ('main', ()) not in self.insts:
+            # no main(): the program is its global initialisers
+            self.output, self.indent = [], 0
+            self.scopes, self.cnames_used, self._recover_stack = [], [], []
+            self.global_inits()
+            self.no_main_inits = list(self.output)
 
         self.output = []
         self.emit_header()
@@ -3926,14 +4118,18 @@ class TypedCGen(til.CCodeGenerator):
         self.emit_raw("// TIL Functions")
         for ikey, (_proto, text, _comment) in functions:
             self.emit_raw(text)
+        self.emit_raw("// Main Entry Point")
+        self.emit_raw("int main(int argc, char** argv) {")
+        self.emit_raw("    til_argc = argc;")
+        self.emit_raw("    til_argv = argv;")
         if ('main', ()) in self.insts:
-            self.emit_raw("// Main Entry Point")
-            self.emit_raw("int main(int argc, char** argv) {")
-            self.emit_raw("    til_argc = argc;")
-            self.emit_raw("    til_argv = argv;")
             self.emit_raw("    til_main();")
-            self.emit_raw("    return 0;")
-            self.emit_raw("}")
+        else:
+            self.emit_raw("    (void)argc; (void)argv;")
+            for line in self.no_main_inits:
+                self.emit_raw("    " + line)
+        self.emit_raw("    return 0;")
+        self.emit_raw("}")
         return '\n'.join(self.output)
 
     def emit_type_aliases_typed(self):
@@ -4016,7 +4212,7 @@ class TypedCGen(til.CCodeGenerator):
             g = self.ti.globals[decl.name]
             t = g.frozen
             c = self.ct(t, decl, f"global '{decl.name}'")
-            cname = self.mangle_name(decl.name)
+            cname = c_global(decl.name)
             if decl.value is not None and not decl.deferred and \
                     isinstance(decl.value, (til.IntLit, til.FloatLit, til.StringLit, til.BoolLit, til.CharLit)):
                 lines.append(f"static {c} {cname} = {self.x(decl.value)};")
@@ -4144,7 +4340,7 @@ class TypedCGen(til.CCodeGenerator):
                 continue
             g = self.ti.globals[decl.name]
             code = self.coerce(self.x(decl.value), self.T(decl.value), g.frozen, decl)
-            self.emit(f"{self.mangle_name(decl.name)} = {code};")
+            self.emit(f"{c_global(decl.name)} = {code};")
         self.inst = saved
 
     # ── statements ──────────────────────────────────────────────────────────
@@ -4212,7 +4408,7 @@ class TypedCGen(til.CCodeGenerator):
         decl = n.decl
         g = self.ti.globals[decl.name]
         code = self.coerce(self.x(decl.value), self.T(decl.value), g.frozen, n)
-        self.emit(f"{self.mangle_name(decl.name)} = {code};")
+        self.emit(f"{c_global(decl.name)} = {code};")
 
     def place(self, target):
         """(C lvalue, type) of an identifier target."""
@@ -4223,7 +4419,7 @@ class TypedCGen(til.CCodeGenerator):
             return found[0], found[1]
         g = self.ti.globals.get(target.name)
         if g is not None:
-            return self.mangle_name(target.name), g.frozen
+            return c_global(target.name), g.frozen
         self.unsupported(f"assignment to unknown name '{target.name}'", target)
 
     def g_Assignment(self, n):
@@ -4632,13 +4828,68 @@ class TypedCGen(til.CCodeGenerator):
                 self.unsupported(f"the lambda '{name}' used as a value", n)
             return found[0]
         if name in self.ti.globals:
-            return self.mangle_name(name)
+            return c_global(name)
         if name in self.ti.funcs:
             self.unsupported(f"the function '{name}' used as a value", n)
         self.unsupported(f"unknown name '{name}'", n)
 
+    def folded(self, n) -> Optional[str]:
+        """The bytecode compiler folds constant operator trees with const_eval
+        (Python semantics: `true == 1` is true there); use the same value."""
+        if not hasattr(self, '_inline_consts'):
+            env = {}
+            for name, g in self.ti.globals.items():
+                d = g.decl
+                if not d.mutable and isinstance(d.value, (til.IntLit, til.FloatLit, til.StringLit,
+                                                          til.BoolLit, til.CharLit)):
+                    env[name] = ord(d.value.value) if isinstance(d.value, til.CharLit) else d.value.value
+            self._inline_consts = env
+        if not self.fold_differs(n):
+            return None             # run-time semantics give the same value: generate normally
+        try:
+            v = til.const_eval(n, self._inline_consts)
+        except (til.NotConstant, OverflowError, ValueError, ZeroDivisionError, TypeError):
+            return None
+        want = BOOL if isinstance(v, bool) else INT if isinstance(v, int) else \
+            FLOAT if isinstance(v, float) else STR if isinstance(v, str) else None
+        if want is None:
+            return None
+        if self.T(n) is not want:
+            # e.g. a local that shadows a global constant (the VM still folds with the constant)
+            self.unsupported("an expression the bytecode compiler folds with a different type", n)
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, int):
+            return self.e_IntLit(til.IntLit(value=v))
+        if isinstance(v, float):
+            return self.e_FloatLit(til.FloatLit(value=v))
+        if '\0' in v:
+            self.unsupported("a string containing a NUL byte", n)
+        return til.c_string_literal(v)
+
+    def fold_differs(self, n) -> bool:
+        """Does const_eval disagree with the run-time rules somewhere in n?
+        (bool == number is true when folded, false at run time; a local that
+        shadows an inlined constant is still folded with the constant)."""
+        env = self._inline_consts
+        for x in walk(n):
+            if isinstance(x, til.Identifier) and x.name in env and self.lookup_var(x.name) is not None:
+                return True
+            if isinstance(x, til.BinaryOp) and x.op in ('==', '!='):
+                try:
+                    a, b = til.const_eval(x.left, env), til.const_eval(x.right, env)
+                except (til.NotConstant, OverflowError, ValueError, ZeroDivisionError, TypeError):
+                    continue
+                if isinstance(a, (int, float)) and isinstance(b, (int, float)) and \
+                        isinstance(a, bool) != isinstance(b, bool):
+                    return True
+        return False
+
     def e_BinaryOp(self, n):
         op = n.op
+        f = self.folded(n)
+        if f is not None:
+            return f
         if op in ('and', 'or'):
             return f"({self.truthy(n.left)} {'&&' if op == 'and' else '||'} {self.truthy(n.right)})"
         lt, rt = self.T(n.left), self.T(n.right)
@@ -4691,6 +4942,9 @@ class TypedCGen(til.CCodeGenerator):
         self.unsupported(f"{show(ta)} {op} {show(tb)}", node)
 
     def e_UnaryOp(self, n):
+        f = self.folded(n) if n.op in ('-', 'not', '~') else None
+        if f is not None:
+            return f
         t = self.T(n.operand)
         c = self.x(n.operand)
         if n.op == 'not':
@@ -5208,7 +5462,7 @@ class TypedCGen(til.CCodeGenerator):
                 tests.append(self.eq_code(subj, st, "NULL", NIL, pat))
                 return
             if self.lookup_var(name) is None and name in self.ti.globals:
-                tests.append(self.eq_code(subj, st, self.mangle_name(name), self.ti.globals[name].frozen, pat))
+                tests.append(self.eq_code(subj, st, c_global(name), self.ti.globals[name].frozen, pat))
                 return
             bt = self.T(pat)
             cname = self.declare_var(name, bt, pat)
@@ -5532,22 +5786,41 @@ class TypedCGen(til.CCodeGenerator):
 
     # ── print ───────────────────────────────────────────────────────────────
     def print_call(self, n):
+        """print(a, b, ...): like the VMs, every argument is evaluated before
+        anything is printed (one line per argument)."""
         if not n.args:
             self.emit('til_print_str("");')
+            return
+        literal = (til.IntLit, til.FloatLit, til.StringLit, til.BoolLit, til.CharLit)
+        hoist = len(n.args) > 1
+        codes = []
+        if hoist:
+            self.emit("{")
+            self.indent += 1
         for a in n.args:
             t = self.T(a)
+            code = self.x(a)
+            if hoist and not isinstance(a, literal):
+                tmp = f"_pa{self.fresh_id()}"
+                self.emit(f"{self.ct(t, a, 'a printed value')} {tmp} = {code};")
+                code = tmp
+            codes.append((a, t, code))
+        for a, t, code in codes:
             if isinstance(a, til.StringLit):
-                self.emit(f"til_print_str({self.x(a)});")
+                self.emit(f"til_print_str({code});")
             elif t is STR or t.name == 'strish':
-                self.emit(f"til_print_s({self.x(a)});")
+                self.emit(f"til_print_s({code});")
             elif t is INT or t is UNK:
-                self.emit(f"til_print_int({self.x(a)});")
+                self.emit(f"til_print_int({code});")
             elif t is FLOAT:
-                self.emit(f"til_print_g({self.x(a)});")
+                self.emit(f"til_print_g({code});")
             elif t is BOOL:
-                self.emit(f"til_print_bool({self.x(a)});")
+                self.emit(f"til_print_bool({code});")
             else:
-                self.emit(f"til_print_str({self.to_s(self.x(a), t, a)});")
+                self.emit(f"til_print_str({self.to_s(code, t, a)});")
+        if hoist:
+            self.indent -= 1
+            self.emit("}")
 
     # ── natives ─────────────────────────────────────────────────────────────
     def native(self, name: str, n, statement=False):
@@ -5601,7 +5874,7 @@ class TypedCGen(til.CCodeGenerator):
                 self.unsupported("ord() of a non-string", n)
             return w(f"til_ord({a0})")
         if name == 'range':
-            if any(t not in (INT, UNK) for t in types):
+            if any(t not in (INT, UNK) for t in types[:2]):
                 self.unsupported("range() with non-integer bounds", n)
             if len(codes) == 1:
                 return w(f"til_range(0, {codes[0]}, false)")
@@ -5877,11 +6150,15 @@ class TypedCGen(til.CCodeGenerator):
             hi = args[1] if len(args) > 1 else f"til_arr_len(_sa{k})"
             return self.sx([f"TIL_Arr* _sa{k} = {a};"], f"til_arr_slice(_sa{k}, {args[0]}, {hi})")
         if meth in ('first', 'last'):
-            if not (is_ptr(e) or e is NIL):
-                self.unsupported(f"array.{meth}() (None for an empty array cannot be represented)", n)
             idx = "0" if meth == 'first' else f"_fa{k}->len - 1"
-            return self.sx([f"TIL_Arr* _fa{k} = {a};"],
-                           f"(til_arr_len(_fa{k}) ? {self.slot_get(e, f'_fa{k}->data[{idx}]')} : NULL)")
+            if is_ptr(e) or e is NIL:
+                return self.sx([f"TIL_Arr* _fa{k} = {a};"],
+                               f"(til_arr_len(_fa{k}) ? {self.slot_get(e, f'_fa{k}->data[{idx}]')} : NULL)")
+            # the VMs give None for an empty array; a native int/float/bool cannot be None
+            return self.sx([f"TIL_Arr* _fa{k} = {a};",
+                            f"if (til_arr_len(_fa{k}) == 0) til_panic(\"{meth}() of an empty array is None, "
+                            f"which the native backend cannot represent as {show(e)}\");"],
+                           self.slot_get(e, f"_fa{k}->data[{idx}]"))
         if meth == 'join':
             sep = self.to_s(args[0], at[0], n) if args else '""'
             item = self.to_s(self.slot_get(e, f"_ja{k}->data[_i{k}]"), e, n)
