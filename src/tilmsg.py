@@ -286,6 +286,32 @@ MESSAGES: List[Tuple[str, str, str]] = [
      "обработчики эффектов недоступны в этой сборке VM",
      "әсер өңдеушілері бұл VM құрастырмасында қолжетімсіз"),
 
+    # ── graphics and keys (TIL 3.1; written against the til31/gfx branch) ───
+    ("screen not initialized (call screen_init)",
+     "экран не инициализирован (вызовите screen_init)",
+     "экран іске қосылмаған (screen_init шақырыңыз)"),
+    ("key code out of range",
+     "код клавиши вне допустимого диапазона",
+     "перне коды рұқсат етілген ауқымнан тыс"),
+    ("{name}() argument {index} must be an int, got {type}",
+     "{name}(): аргумент {index} должен иметь тип int, получено {type}",
+     "{name}(): {index}-аргумент int типті болуы керек, бірақ {type} берілді"),
+    ("{name}() argument {index} must be 1..4096, got {value}",
+     "{name}(): аргумент {index} должен быть в диапазоне 1..4096, получено {value}",
+     "{name}(): {index}-аргумент 1..4096 аралығында болуы керек, бірақ {value} берілді"),
+    ("{name}() argument {index} must be -32768..32767, got {value}",
+     "{name}(): аргумент {index} должен быть в диапазоне -32768..32767, получено {value}",
+     "{name}(): {index}-аргумент -32768..32767 аралығында болуы керек, бірақ {value} берілді"),
+    ("{name}() argument {index} must be a color 0..0xFFFFFF, got {value}",
+     "{name}(): аргумент {index} должен быть цветом 0..0xFFFFFF, получено {value}",
+     "{name}(): {index}-аргумент 0..0xFFFFFF аралығындағы түс болуы керек, бірақ {value} берілді"),
+    ("bad --keys entry '{entry}' (use UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, TAB, BACKSPACE, "
+     "COMMA, NONE or one character)",
+     "неверный элемент --keys '{entry}' (используйте UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, TAB, "
+     "BACKSPACE, COMMA, NONE или один символ)",
+     "--keys ішіндегі '{entry}' элементі жарамсыз (UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, TAB, "
+     "BACKSPACE, COMMA, NONE немесе бір таңба қолданыңыз)"),
+
     # ── bytecode compiler (E-VM) ───────────────────────────────────────────
     ("operand out of range ({value}); too many locals/arguments?",
      "операнд вне допустимого диапазона ({value}); слишком много локальных переменных или аргументов?",

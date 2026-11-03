@@ -188,6 +188,10 @@ KNOWN = [
     ("Syntax Error: error: duplicate clause for effect 'Ask' in one handle",
      "Синтаксическая ошибка: повторная ветвь для эффекта 'Ask' в одном handle",
      "Синтаксистік қате: бір handle ішінде 'Ask' әсерінің тармағы қайталанған"),
+    # graphics (the til31/gfx branch)
+    ("runtime error: draw_pixel() argument 3 must be a color 0..0xFFFFFF, got -1",
+     "ошибка выполнения: draw_pixel(): аргумент 3 должен быть цветом 0..0xFFFFFF, получено -1",
+     "орындау қатесі: draw_pixel(): 3-аргумент 0..0xFFFFFF аралығындағы түс болуы керек, бірақ -1 берілді"),
 ]
 
 
@@ -577,6 +581,17 @@ class TestCoverage:
         report = i18n_coverage.analyse(i18n_coverage.extract_c(path))
         assert _texts(report['missing']) == {"warp core breach"}
         assert _texts(report['covered']) == {"no method 'x' on {}"}
+
+    def test_c_forwarding_helpers_are_expanded_per_call_site(self, tmp_path):
+        # like gfx_arg_error(vm, id, k, " must be 1..4096, got ", ...): the message tail is a parameter
+        path = write(tmp_path, 'vm.c',
+                     'static int arg_error(tilvm *vm, uint8_t id, const char *what, const char *got) {\n'
+                     '    return failn(vm, NATIVE_NAMES[id], "() argument", what, got, 0, 0);\n}\n'
+                     'static int check(tilvm *vm, int x, char *buf) {\n'
+                     '    if (x < 0) return arg_error(vm, 3, " must be positive, got ", fmt_int(buf, x));\n'
+                     '    return arg_error(vm, 3, " must be small, got ", fmt_int(buf, x));\n}\n')
+        assert _texts(i18n_coverage.extract_c(path)) == {"{}() argument must be positive, got {}",
+                                                          "{}() argument must be small, got {}"}
 
     def test_a_half_english_translation_is_not_coverage(self):
         # without its own entry, "expects 1 to 2" would come out as "ожидает аргументов: 1 to 2"

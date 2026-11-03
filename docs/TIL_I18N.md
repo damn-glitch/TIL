@@ -157,8 +157,8 @@ templates:
    lookup `til` uses. `tests/test_i18n.py` fails while a message of the
    enforced categories has no entry; plain `print(..., file=sys.stderr)`
    messages are reported but not enforced. Entries may exist ahead of the
-   code (the effects messages were written against their branch before it was
-   merged); `--unused` lists them, they do no harm.
+   code (the effects and graphics messages were written against their
+   branches before those were merged); `--unused` lists them, they do no harm.
 3. Add the entry to `MESSAGES` (in the section of its subsystem) with the
    Russian and Kazakh text, following the conventions below. Rename the `x1`,
    `x2` placeholders of the skeleton to meaningful names.

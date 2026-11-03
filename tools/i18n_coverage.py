@@ -29,6 +29,8 @@ Message templates are extracted statically:
   `failf(vm, ...)`, `type_error2(vm, "...", ...)`, `invalid_number(vm, ...,
   "...")` and the few messages assembled by hand in `vm->errbuf` (C_HANDBUILT
   below; each is used only while its anchor literal is still in the source).
+  A helper that passes one of its `const char *` parameters on to
+  fail/failn/failf is expanded at each of its call sites.
 
 A template is covered when the catalog translates it: each of its lines is
 rendered with placeholder markers and looked up exactly as `til` does at run
@@ -496,7 +498,64 @@ def _is_null(arg: str) -> bool:
     return arg.strip() in ('0', 'NULL', '(const char *)0')
 
 
+_C_FAIL_CALL = re.compile(r'\b(fail|failn|failf|type_error2|invalid_number)\s*\(')
+_C_HELPER = re.compile(r'\bstatic\s+int\s+(\w+)\s*\(\s*tilvm\s*\*\s*vm\s*,([^)]*)\)\s*\{')
+
+
+def _c_block_end(text: str, brace: int) -> int:
+    """Index just past the '}' that closes the '{' at text[brace]."""
+    depth, i = 0, brace
+    while i < len(text):
+        c = text[i]
+        if c == '"' or c == "'":
+            j = i + 1
+            while j < len(text) and text[j] != c:
+                j += 2 if text[j] == '\\' else 1
+            i = j + 1
+            continue
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return len(text)
+
+
+def c_message_parts(name: str, args: List[str]) -> List[List[Optional[str]]]:
+    """Template alternatives of one fail/failn/failf/... call (arguments after vm)."""
+    if name == 'fail':
+        if args and args[0].strip() != 'vm->errbuf':
+            alts = c_alternatives(args[0])
+            if alts != [[PH]]:
+                return alts
+        return []
+    if name == 'failn':
+        alts: List[List[Optional[str]]] = [[]]
+        for a in args:
+            if not _is_null(a):
+                alts = _product(alts, c_alternatives(a) if c_literal(a) is not None else [[PH]])
+        return alts
+    if name == 'failf' and len(args) == 5:
+        a, _n1, b, _n2, c = args
+        parts: List[Optional[str]] = [c_literal(a) or PH, PH]
+        if not _is_null(b):
+            parts += [c_literal(b) or PH, PH]
+            if not _is_null(c):
+                parts.append(c_literal(c) or PH)
+        return [parts]
+    if name == 'type_error2' and len(args) == 3:
+        return [[c_literal(args[0]) or PH, PH, " and ", PH]]
+    if name == 'invalid_number' and len(args) == 2:
+        return [[c_literal(args[1]) or PH, '"', PH, '"']]
+    return []
+
+
 def extract_c(path: str = TILVM_C) -> List[Template]:
+    """Templates of vm/tilvm.c. A helper `static int f(tilvm *vm, ..., const char *p, ...)`
+    that passes its parameter p on to fail/failn/failf is expanded per call site
+    (gfx_arg_error(vm, id, k, " must be 1..4096, got ", ...)), not reported itself."""
     with open(path, encoding='utf-8') as f:
         raw = f.read()
     text = strip_c_comments(raw)
@@ -512,37 +571,39 @@ def extract_c(path: str = TILVM_C) -> List[Template]:
             if any(p is not PH and re.search(r'[A-Za-z]', p) for p in t.parts):
                 out.append(t)
 
-    for m in re.finditer(r'\b(fail|failn|failf|type_error2|invalid_number)\s*\(', text):
-        name = m.group(1)
-        if re.search(r'(?:int|static|void)\s+$', text[max(0, m.start() - 20):m.start()]):
-            continue                                   # the definition itself
-        args, _end = split_c_args(text, m.end() - 1)
-        if not args or args[0] != 'vm':
-            continue
-        args = args[1:]
-        if name == 'fail':
-            if args and args[0].strip() != 'vm->errbuf':
-                alts = c_alternatives(args[0])
-                if alts != [[PH]]:
-                    add(alts, m.start())
-        elif name == 'failn':
-            alts: List[List[Optional[str]]] = [[]]
-            for a in args:
-                if not _is_null(a):
-                    alts = _product(alts, c_alternatives(a) if c_literal(a) is not None else [[PH]])
-            add(alts, m.start())
-        elif name == 'failf' and len(args) == 5:
-            a, _n1, b, _n2, c = args
-            parts: List[Optional[str]] = [c_literal(a) or PH, PH]
-            if not _is_null(b):
-                parts += [c_literal(b) or PH, PH]
-                if not _is_null(c):
-                    parts.append(c_literal(c) or PH)
-            add([parts], m.start())
-        elif name == 'type_error2' and len(args) == 3:
-            add([[c_literal(args[0]) or PH, PH, " and ", PH]], m.start())
-        elif name == 'invalid_number' and len(args) == 2:
-            add([[c_literal(args[1]) or PH, '"', PH, '"']], m.start())
+    def fail_calls(lo: int, hi: int):
+        for m in _C_FAIL_CALL.finditer(text, lo, hi):
+            if re.search(r'(?:int|static|void)\s+$', text[max(0, m.start() - 20):m.start()]):
+                continue                                   # the definition itself
+            args, _end = split_c_args(text, m.end() - 1)
+            if args and args[0] == 'vm':
+                yield m, args[1:]
+
+    # forwarding helpers: name -> (parameter names, [(call name, call args)], body range)
+    helpers: Dict[str, Tuple[List[str], List[Tuple[str, List[str]]], Tuple[int, int]]] = {}
+    for h in _C_HELPER.finditer(text):
+        params = [re.findall(r'\w+', p)[-1] if re.findall(r'\w+', p) else '' for p in h.group(2).split(',')]
+        strings = {p for p, decl in zip(params, h.group(2).split(',')) if 'char' in decl and '*' in decl}
+        body = (h.end() - 1, _c_block_end(text, h.end() - 1))
+        forwards = [(m.group(1), args) for m, args in fail_calls(*body)
+                    if any(a.strip() in strings for a in args)]
+        if forwards:
+            helpers[h.group(1)] = (params, forwards, body)
+
+    for m, args in fail_calls(0, len(text)):
+        if any(lo <= m.start() < hi for _p, _f, (lo, hi) in helpers.values()):
+            continue                                       # expanded at its call sites below
+        add(c_message_parts(m.group(1), args), m.start())
+    for name, (params, forwards, (lo, hi)) in helpers.items():
+        for m in re.finditer(r'\b' + name + r'\s*\(', text):
+            if lo - 200 <= m.start() < hi:
+                continue                                   # the definition (and recursion)
+            args, _end = split_c_args(text, m.end() - 1)
+            if not args or args[0] != 'vm':
+                continue
+            given = dict(zip(params, args[1:]))
+            for call, call_args in forwards:
+                add(c_message_parts(call, [given.get(a.strip(), a) for a in call_args]), m.start())
     for anchor, parts in C_HANDBUILT:
         pos = text.find(anchor)
         if pos >= 0:
