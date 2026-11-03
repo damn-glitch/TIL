@@ -8659,8 +8659,8 @@ class TILVM:
     def report(self, msg: bytes, pc: int):
         out = getattr(sys.stderr, 'buffer', None)
         text = msg + b"\n" + (self.traceback(pc) + b"\n" if pc >= 0 else b"")
-        text = localize_bytes(text)      # the CLI's message language (programs still see English)
-        self.flush()
+        self.flush()                     # the program's output first: translation never holds it back
+        text = localize_report_bytes(text)   # the CLI's message language (programs still see English)
         if out is not None:
             out.write(text)
             out.flush()
@@ -9584,12 +9584,14 @@ def feature_module(name: str):
 # with the catalog in src/tilmsg.py. Language: --lang > TIL_LANG > the
 # program's #[lang: ...] pragma (ru -> ru, kk / kk-latn -> kk) > English.
 # Values that programs see (`error` in a retry/timeout else branch) stay English.
-# Without tilmsg.py everything stays English.
+# Without tilmsg.py (or with one that cannot be loaded) everything stays English,
+# and a note says so before the first diagnostic that would have been translated.
 
 MESSAGE_LANGUAGES = ('en', 'ru', 'kk')
 MESSAGE_LANG: Optional[str] = None      # set by main(); None / 'en' = English
 _MESSAGE_LANG_FROM_USER = False          # --lang or TIL_LANG given (they beat the pragma)
-_MESSAGE_CATALOG: List[Any] = []         # [tilmsg module or None] once loaded
+_MESSAGE_CATALOG: List[Any] = []         # [tilmsg module or None, why it is None] once loaded
+_CATALOG_NOTE_SHOWN = False              # the note about a missing catalog (once per main() call)
 
 
 def message_language_code(value: Optional[str]) -> Optional[str]:
@@ -9623,38 +9625,87 @@ def message_language(cli_value: Optional[str] = None, source: str = "",
 
 
 def message_catalog():
-    """src/tilmsg.py, or None when it is not installed (then messages stay English)."""
+    """src/tilmsg.py, or None when it is missing or cannot be loaded (then
+    messages stay English). Loading builds the catalog, so a broken entry shows
+    up here and never in the middle of a diagnostic."""
     if not _MESSAGE_CATALOG:
+        module, problem = None, None
         try:
-            _MESSAGE_CATALOG.append(feature_module('tilmsg'))
+            module = feature_module('tilmsg')
         except ImportError as e:
-            if getattr(e, 'name', None) != 'tilmsg':
-                raise
-            _MESSAGE_CATALOG.append(None)
+            if getattr(e, 'name', None) != 'tilmsg':      # tilmsg.py is there but imports something missing
+                problem = _catalog_problem(e)
+        except Exception as e:      # a syntax error, a missing comma between two entries, ...
+            problem = _catalog_problem(e)
+        if module is not None:
+            try:
+                module.entries()
+            except Exception as e:  # a malformed template
+                module, problem = None, f"tilmsg.py: {type(e).__name__}: {e}"
+        _MESSAGE_CATALOG[:] = [module, problem]
     return _MESSAGE_CATALOG[0]
 
 
+def _catalog_problem(e: Exception) -> str:
+    """'tilmsg.py, line 73: TypeError: ...' for an exception raised while importing tilmsg.py."""
+    line = e.lineno if isinstance(e, SyntaxError) else None
+    text = e.msg if isinstance(e, SyntaxError) else str(e)
+    tb = e.__traceback__
+    while tb is not None:
+        if os.path.basename(tb.tb_frame.f_code.co_filename) == 'tilmsg.py':
+            line = tb.tb_lineno
+        tb = tb.tb_next
+    where = "tilmsg.py, line %d" % line if line else "tilmsg.py"
+    return f"{where}: {type(e).__name__}: {text}"
+
+
+def _catalog_note():
+    """A translation was asked for but the catalog cannot be used: say so once
+    (per main() call), before the first diagnostic that stays English."""
+    global _CATALOG_NOTE_SHOWN
+    if _CATALOG_NOTE_SHOWN:
+        return
+    _CATALOG_NOTE_SHOWN = True
+    problem = _MESSAGE_CATALOG[1] if len(_MESSAGE_CATALOG) > 1 else None
+    if problem is None:
+        note = "note: message translations are not installed (tilmsg.py is missing); messages stay in English"
+    else:
+        note = f"note: message translations could not be loaded ({problem}); messages stay in English"
+    print(note, file=sys.stderr, flush=True)
+
+
 def localize(text: str, lang: Optional[str] = None) -> str:
-    """Translate a diagnostic (any number of lines) into `lang` (default: the
-    language chosen by main()). Unknown messages stay English."""
+    """Translate a compiler or command-line diagnostic (any number of lines) into
+    `lang` (default: the language chosen by main()). Unknown messages stay English."""
     lang = MESSAGE_LANG if lang is None else lang
     if not text or not lang or lang == 'en':
         return text
-    catalog = message_catalog()
-    if catalog is None:
-        return text
     try:
+        catalog = message_catalog()
+        if catalog is None:
+            _catalog_note()
+            return text
         return catalog.localize(text, lang)
-    except Exception:          # a bug in a translation must never hide the diagnostic
+    except Exception:          # a failure in a translation must never hide the diagnostic
         return text
 
 
-def localize_bytes(data: bytes, lang: Optional[str] = None) -> bytes:
-    """localize() for VM error reports (bytes; invalid UTF-8 is kept as it is)."""
+def localize_report_bytes(data: bytes, lang: Optional[str] = None) -> bytes:
+    """A VM's uncaught-error report (bytes; invalid UTF-8 is kept as it is) in
+    `lang`: the frame, the known message, the traceback. The rest of a program's
+    own message is copied unchanged (tilmsg.ReportLocalizer)."""
     lang = MESSAGE_LANG if lang is None else lang
     if not data or not lang or lang == 'en':
         return data
-    return localize(data.decode('utf-8', 'surrogateescape'), lang).encode('utf-8', 'surrogateescape')
+    try:
+        catalog = message_catalog()
+        if catalog is None:
+            _catalog_note()
+            return data
+        text = catalog.localize_report(data.decode('utf-8', 'surrogateescape'), lang)
+        return text.encode('utf-8', 'surrogateescape')
+    except Exception:
+        return data
 
 
 def set_message_language(args: List[str]) -> Optional[str]:
@@ -9674,14 +9725,12 @@ def set_message_language(args: List[str]) -> Optional[str]:
         MESSAGE_LANG = message_language(None, "")
         return localize(f"Error: unknown message language '{value}' (use: en, ru, kk)")
     if env_value and value is None and message_language_code(env_value) is None:
-        print(f"warning: TIL_LANG={env_value!r} is not a message language (en, ru, kk); using English",
+        # (English: the language is not chosen yet; a program's pragma may still choose one)
+        print(f"warning: TIL_LANG={env_value!r} is not a message language (en, ru, kk); it is ignored",
               file=sys.stderr)
     MESSAGE_LANG = message_language(value, "")
     _MESSAGE_LANG_FROM_USER = message_language_code(value) is not None or \
         message_language_code(env_value) is not None
-    if value is not None and MESSAGE_LANG != 'en' and message_catalog() is None:
-        print("note: message translations are not installed (tilmsg.py is missing); "
-              "messages stay in English", file=sys.stderr)
     return None
 
 
@@ -9709,12 +9758,13 @@ def scoped_message_language(func):
 
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        global MESSAGE_LANG, _MESSAGE_LANG_FROM_USER
-        saved = (MESSAGE_LANG, _MESSAGE_LANG_FROM_USER)
+        global MESSAGE_LANG, _MESSAGE_LANG_FROM_USER, _CATALOG_NOTE_SHOWN
+        saved = (MESSAGE_LANG, _MESSAGE_LANG_FROM_USER, _CATALOG_NOTE_SHOWN)
+        _CATALOG_NOTE_SHOWN = False
         try:
             return func(*args, **kwargs)
         finally:
-            MESSAGE_LANG, _MESSAGE_LANG_FROM_USER = saved
+            MESSAGE_LANG, _MESSAGE_LANG_FROM_USER, _CATALOG_NOTE_SHOWN = saved
     return wrapper
 
 
@@ -9726,22 +9776,51 @@ def use_program_message_language(source: str):
         MESSAGE_LANG = pragma_message_language(source) or 'en'
 
 
+class _StderrTranslator:
+    """The C VM's standard error in the message language, as it arrives: lines
+    before the report one by one, the report's tail at once (linear time, the
+    same translation as TILVM.report's: tilmsg.ReportLocalizer)."""
+
+    def __init__(self, lang: str):
+        catalog = message_catalog()
+        self.loc = None if catalog is None else catalog.ReportLocalizer(lang)
+
+    def feed(self, data: bytes) -> bytes:
+        if self.loc is None:
+            _catalog_note()
+            return data
+        try:
+            return self.loc.feed(data.decode('utf-8', 'surrogateescape')).encode('utf-8', 'surrogateescape')
+        except Exception:          # never hide the report
+            return data
+
+
 def run_localized(cmd: List[str]) -> int:
     """Run a TIL executable (the C VM): with a non-English message language its
-    error reports (stderr) are translated line by line as they arrive."""
-    if not MESSAGE_LANG or MESSAGE_LANG == 'en' or message_catalog() is None:
+    standard error (runner messages, the uncaught-error report) is translated."""
+    if not MESSAGE_LANG or MESSAGE_LANG == 'en':
         return subprocess.run(cmd).returncode
     proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
     out = getattr(sys.stderr, 'buffer', None)
+
+    def emit(data: bytes):
+        if out is not None:
+            out.write(data)
+            out.flush()
+        else:
+            sys.stderr.write(data.decode('utf-8', 'replace'))
+            sys.stderr.flush()
     try:
+        translator = _StderrTranslator(MESSAGE_LANG)
         for line in iter(proc.stderr.readline, b''):
-            data = localize_bytes(line)
-            if out is not None:
-                out.write(data)
-                out.flush()
-            else:
-                sys.stderr.write(data.decode('utf-8', 'replace'))
-                sys.stderr.flush()
+            emit(translator.feed(line))
+            if translator.loc is None:                 # no catalog (after its note): copy as it comes
+                for chunk in iter(lambda: proc.stderr.read1(65536), b''):
+                    emit(chunk)
+                break
+            if translator.loc.in_report:               # the report's tail: at once, in linear time
+                emit(translator.feed(proc.stderr.read()))
+                break
     except BaseException:            # Ctrl-C, closed stderr, ...: do not leave the VM running
         proc.kill()
         raise

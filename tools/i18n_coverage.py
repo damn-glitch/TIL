@@ -34,11 +34,13 @@ Message templates are extracted statically:
 
 A template is covered when the catalog translates it: each of its lines is
 rendered with placeholder markers and looked up exactly as `til` does at run
-time (tilmsg.split_frame + tilmsg.find), and no plain placeholder of the
-matching entry may swallow several words of the template (a generic
-"expects {n} argument(s)" does not cover "expects 1 to 2 argument(s)": that
-would print a half-English message). Templates matched by
-`tilmsg.UNTRANSLATED` are English on purpose.
+time (tilmsg.split_frame + tilmsg.find; a marker fits every placeholder kind),
+and no word or text placeholder of the matching entry may swallow several
+words of the template (a generic "expects {n} argument(s)" does not cover
+"expects 1 to 2 argument(s)": that would print a half-English message).
+Run-time messages (categories 'runtime' and 'runtime-c') must be covered by
+tilmsg.RUNTIME_MESSAGES: a program's error report is looked up there only.
+Templates matched by `tilmsg.UNTRANSLATED` are English on purpose.
 """
 
 import ast
@@ -64,7 +66,9 @@ def python_sources() -> List[str]:
 # 'internal' are reported but not enforced. 'localized' = text passed to localize().
 ENFORCED = ('syntax', 'semantic', 'vm-compile', 'type-warning', 'compile', 'runtime', 'runtime-c',
             'hint', 'localized')
-LOCALIZE_FUNCS = ('localize', 'localize_bytes')
+# Categories printed in a VM's error report: looked up in tilmsg.RUNTIME_MESSAGES only.
+RUNTIME_CATEGORIES = ('runtime', 'runtime-c')
+LOCALIZE_FUNCS = ('localize', 'localize_report_bytes')
 
 PH = None          # a placeholder part inside a template
 MARK = '\x00'      # placeholders when a template is rendered as text
@@ -636,14 +640,19 @@ def merge(templates: List[Template]) -> List[Template]:
 
 
 def _absorbs_text(entry, groups: Dict[str, str]) -> bool:
-    """True when a plain placeholder of `entry` swallowed several words of the
-    extracted template (`expects {n} argument(s)` matching `expects 1 to 2
-    argument(s)`): the message would come out half English."""
+    """True when a word or text placeholder of `entry` swallowed several words
+    of the extracted template (`expects {n} argument(s)` matching `expects 1 to
+    2 argument(s)`): the message would come out half English."""
     for name, value in groups.items():
-        if entry.kinds.get(name) == '' and re.search(r'[A-Za-z]', value.replace(MARK, '')) \
+        if entry.kinds.get(name) in ('', 'text') and re.search(r'[A-Za-z]', value.replace(MARK, '')) \
                 and re.search(r'\s', value):
             return True
     return False
+
+
+def scope_of(t: Template) -> Optional[str]:
+    """The catalog list a template's lookup uses at run time (None: all of them)."""
+    return 'runtime' if t.category in RUNTIME_CATEGORIES else None
 
 
 def coverage_of(cat, t: Template, entries=None) -> Tuple[bool, List[str]]:
@@ -657,7 +666,10 @@ def coverage_of(cat, t: Template, entries=None) -> Tuple[bool, List[str]]:
         kind, message = cat.split_frame(line)
         if kind in ('source', 'at') or not re.search(r'[A-Za-z]', message.replace(MARK, '')):
             continue                                     # pure frame: "Error: {}", "Syntax Error: {}"
-        hit = cat.find(message) if entries is None else _find_in(entries, message)
+        if entries is None:
+            hit = cat.find(message, scope_of(t), any_value=MARK)
+        else:
+            hit = _find_in(entries, message)
         if hit is None or _absorbs_text(hit[0], hit[1]):
             return False, used
         used.append(hit[0].en)
@@ -666,9 +678,9 @@ def coverage_of(cat, t: Template, entries=None) -> Tuple[bool, List[str]]:
 
 def _find_in(entries, message: str):
     for e in sorted(entries, key=lambda e: -e.literal_size):
-        m = e.pattern.fullmatch(message)
-        if m:
-            return e, m.groupdict()
+        groups = e.match(message, MARK)
+        if groups is not None:
+            return e, groups
     return None
 
 
@@ -698,6 +710,13 @@ def enforced_missing(report: dict) -> List[Template]:
     return [t for t in report['missing'] if t.category in ENFORCED]
 
 
+def catalog_list(t: Template) -> str:
+    """The list of src/tilmsg.py a new entry for `t` belongs to."""
+    if t.category in RUNTIME_CATEGORIES:
+        return 'RUNTIME_MESSAGES'
+    return 'COMMAND_LINE_MESSAGES' if t.category == 'cli' else 'COMPILER_MESSAGES'
+
+
 def skeleton(t: Template) -> str:
     names = iter(f"x{i}" for i in range(1, 100))
     text = ''.join('{' + next(names) + '}' if p is PH else p.replace('{', '{{').replace('}', '}}')
@@ -724,7 +743,7 @@ def main(argv: Sequence[str]) -> int:
         return 0
     if '--skeleton' in argv:
         for t in enforced_missing(report):
-            sys.stdout.write(f"    # {', '.join(t.where)}\n" + skeleton(t))
+            sys.stdout.write(f"    # {catalog_list(t)}: {', '.join(t.where)}\n" + skeleton(t))
         return 0
     by_cat: Dict[str, List[int]] = {}
     for key in ('covered', 'missing', 'allowed'):

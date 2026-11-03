@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -111,15 +112,24 @@ class TestCatalog:
                 assert not re.search(r'\}[А-Яа-яЁёӘәІіҢңҒғҮүҰұҚқӨөҺһ]', text), text
 
     def test_bad_templates_are_reported(self):
-        saved = list(tilmsg.MESSAGES)
+        saved = list(tilmsg.COMMAND_LINE_MESSAGES)
         try:
-            tilmsg.MESSAGES.append(("broken {name}", "сломано", "бұзылған {name}"))
-            tilmsg.MESSAGES.append(("lone { brace", "одинокая { скобка", "жалғыз { жақша"))
+            tilmsg.COMMAND_LINE_MESSAGES.append(("broken {name}", "сломано", "бұзылған {name}"))
+            tilmsg.COMMAND_LINE_MESSAGES.append(("lone { brace", "одинокая { скобка", "жалғыз { жақша"))
+            tilmsg.COMMAND_LINE_MESSAGES.append(("{a}{b} glued", "{a}{b} склеены", "{a}{b} жабысқан"))
+            tilmsg.COMMAND_LINE_MESSAGES.append(("{rest:text} at the end", "{rest} в конце", "соңында {rest}"))
+            tilmsg.COMMAND_LINE_MESSAGES.append(("bad kind {n:number}", "плохой {n}", "жаман {n}"))
             problems = tilmsg.check_catalog()
             assert any("ru placeholders" in p for p in problems), problems
             assert any("unescaped '{'" in p for p in problems), problems
+            assert any("adjacent placeholders" in p for p in problems), problems
+            assert any("free-text placeholder rest" in p for p in problems), problems
+            assert any("unknown placeholder kind 'number'" in p for p in problems), problems
+            # MESSAGES is the three lists: an entry appended to it alone would never be used
+            assert any("MESSAGES is not" in p for p in problems), problems
         finally:
-            tilmsg.MESSAGES[:] = saved
+            tilmsg.COMMAND_LINE_MESSAGES[:] = saved
+        assert tilmsg.check_catalog() == []
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -248,8 +258,8 @@ class TestLocalize:
         assert tilmsg.localize(text, 'en') == text
         assert tilmsg.localize(text, 'de') == text
         assert til.localize(text, None) == text      # main() chose nothing: English
-        assert til.localize_bytes(b"runtime error: \xff\n", 'ru') == "ошибка выполнения: \udcff\n".encode(
-            'utf-8', 'surrogateescape')
+        assert til.localize_report_bytes(b"runtime error: \xff\n", 'ru') == \
+            "ошибка выполнения: \udcff\n".encode('utf-8', 'surrogateescape')
 
     def test_a_broken_catalog_never_hides_a_diagnostic(self, monkeypatch):
         class Broken:
@@ -480,9 +490,20 @@ class TestCommandLine:
         assert lines[0] == "note: message translations are not installed (tilmsg.py is missing); " \
                            "messages stay in English"
         assert lines[1] == IMMUTABLE_HEADER['en'] and IMMUTABLE_HINT['en'] in lines
+        # TIL_LANG and the program's pragma ask for a translation too: the note says why there
+        # is none (review round 1: an installation without tilmsg.py ignored them silently)
         r = subprocess.run([sys.executable, str(alone / 'til.py'), 'check', prog], capture_output=True,
                            text=True, env=dict(os.environ, TIL_LANG='kk', PYTHONPATH=''))
-        assert r.stderr.split('\n')[0] == IMMUTABLE_HEADER['en']   # no note without --lang
+        assert r.stderr.split('\n')[:2] == [lines[0], IMMUTABLE_HEADER['en']]
+        pragma = write(tmp_path, 'ru.til', "#[lang: ru]\n" + IMMUTABLE)
+        r = subprocess.run([sys.executable, str(alone / 'til.py'), 'check', pragma], capture_output=True,
+                           text=True, env=dict(os.environ, TIL_LANG='', PYTHONPATH=''))
+        assert r.stderr.split('\n')[:2] == [lines[0], IMMUTABLE_HEADER['en']]
+        assert r.stderr.count("note:") == 1                    # once, however many diagnostics follow
+        ok = write(tmp_path, 'ok.til', "#[lang: ru]\nprint(1)\n")
+        r = subprocess.run([sys.executable, str(alone / 'til.py'), 'run', '--vm', ok], capture_output=True,
+                           text=True, env=dict(os.environ, TIL_LANG='kk', PYTHONPATH=''))
+        assert (r.returncode, r.stdout, r.stderr) == (0, "1\n", "")   # nothing to translate: no note
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -531,7 +552,7 @@ class TestBothVMs:
     def test_identical_localized_reports(self, src):
         rc, out, err = reference_vm_report(src)
         assert rc == 1 and err.startswith("runtime error: ")
-        localized = {lang: tilmsg.localize(err, lang) for lang in ('ru', 'kk')}
+        localized = {lang: tilmsg.localize_report(err, lang) for lang in ('ru', 'kk')}
         for lang, text in localized.items():
             first = text.split('\n')[0]
             assert first != err.split('\n')[0] and CYRILLIC.search(first.split(':', 1)[1]), \
@@ -540,7 +561,7 @@ class TestBothVMs:
         if CC:
             crc, cout, cerr = run_cvm(src)
             assert (crc, cout, cerr) == (rc, out, err), "the VMs report differently"
-            assert {lang: tilmsg.localize(cerr, lang) for lang in ('ru', 'kk')} == localized
+            assert {lang: tilmsg.localize_report(cerr, lang) for lang in ('ru', 'kk')} == localized
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -636,3 +657,314 @@ class TestCoverage:
         assert all(l.endswith('(not enforced)') for l in listed), listed     # plain CLI prints only
         assert i18n_coverage.skeleton(i18n_coverage.Template(["'", None, "' broke"], 'runtime', 'x:1')) == (
             '    ("\'{x1}\' broke",\n     "\'{x1}\' broke",   # ru: TODO\n     "\'{x1}\' broke"),  # kk: TODO\n')
+
+
+# ═══════════════════════════════════════════════════════════════
+# REVIEW ROUND 1: REGRESSION TESTS
+# ═══════════════════════════════════════════════════════════════
+
+# Reports that took the round-0 matcher cubic or quadratic time (minutes to
+# hours at these sizes: a line of blanks, a message repeating a template's
+# text, colour codes); each now takes milliseconds. The time limit leaves a
+# margin of 100x and more, so it only fails if the work stops being linear.
+PATHOLOGICAL = {
+    'blank line': "runtime error: bad record:\n" + " " * 20000 + "x\n  at main (line 3)\n",
+    'blanks and tabs': "runtime error: x\n" + " \t" * 10000 + "7 x\n",
+    'quoted template repeated': "runtime error: '" + "x' takes y' takes " * 8000 + "\n",
+    'expects repeated': "runtime error: " + "'f' expects " * 10000 + "\n",
+    'colour codes': "runtime error: " + "\x1b[m" * 50000 + "x\n",
+    'header colour codes': "error: " + "\x1b[1m" * 50000 + "x",
+    'huge message': "runtime error: " + "word " * 200000 + "\n",
+    'huge key': "runtime error: key not found: " + "a.b'c " * 20000 + "\n",
+    'nested intents': "runtime error: " + "intent 'a' failed: " * 500 + "division by zero\n",
+    'many lines': "runtime error: x\n" + "a line of program data\n" * 100000 + "  at main (line 2)\n",
+}
+
+# A program's own panic messages that look like catalog templates: they stay
+# English (review round 1 saw "ожидалось 3 items, получено 2").
+PROGRAM_TEXT = [
+    "Expected 3 items, got 2",                       # parser: "Expected {expected}, got {got}"
+    "cannot convert negative balance to int",        # VM: "cannot convert {type:type} to int"
+    "cannot compare apples and oranges",             # VM: "cannot compare {left:type} and {right:type}"
+    "Parser expects a number, got letters",          # VM: "{what:builtin} expects a number, got {type:type}"
+    "File not found: config.txt",                    # command line: "File not found: {path:text}"
+    "Unexpected token: foo",                         # parser: "Unexpected token: {token}"
+    "Type mismatch: expected a number, got a string",
+    "my list cannot be indexed",
+]
+
+
+def broken_installation(tmp_path, catalog_edit):
+    """til.py with a tilmsg.py changed by `catalog_edit(text) -> text`, in a directory of its own."""
+    here = tmp_path / 'inst'
+    here.mkdir()
+    shutil.copy(TIL, str(here / 'til.py'))
+    with open(os.path.join(SRC, 'tilmsg.py'), encoding='utf-8') as f:
+        original = f.read()
+    catalog = catalog_edit(original)
+    assert catalog != original
+    (here / 'tilmsg.py').write_text(catalog, encoding='utf-8')
+    return str(here / 'til.py')
+
+
+def run_installed(til_py, *args, til_lang=''):
+    return subprocess.run([sys.executable, til_py, *args], capture_output=True, text=True, timeout=120,
+                          env=dict(os.environ, TIL_LANG=til_lang, PYTHONPATH='', PYTHONDONTWRITEBYTECODE='1'))
+
+
+class TestLinearTime:
+    """Finding 1 (major): localizing a report could take cubic time."""
+
+    @pytest.mark.parametrize("name", sorted(PATHOLOGICAL))
+    def test_pathological_reports(self, name):
+        text = PATHOLOGICAL[name]
+        start = time.perf_counter()
+        for lang in ('ru', 'kk'):
+            out = tilmsg.localize_report(text, lang)
+            assert out.count('\n') == text.count('\n')
+            if name != 'many lines':      # (compiler diagnostics: short; reports: localize_report)
+                assert tilmsg.localize(text, lang).count('\n') == text.count('\n')
+        assert time.perf_counter() - start < 5.0, f"{name}: not linear"
+
+    def test_program_data_in_a_report_is_copied(self):
+        text = PATHOLOGICAL['blank line']
+        assert tilmsg.localize_report(text, 'ru') == \
+            "ошибка выполнения: bad record:\n" + " " * 20000 + "x\n  в main (строка 3)\n"
+        # lines after the report's first one are the program's message: never looked up
+        text = "runtime error: x\ndivision by zero\nerror: unknown name 'q'\n  at main (line 2)\n"
+        assert tilmsg.localize_report(text, 'kk') == \
+            "орындау қатесі: x\ndivision by zero\nerror: unknown name 'q'\n  main ішінде (2-жол)\n"
+
+    def test_long_messages_are_not_looked_up(self):
+        key = "k" * tilmsg.MAX_LOOKUP
+        assert tilmsg.localize_report("runtime error: key not found: " + key + "\n", 'ru') == \
+            "ошибка выполнения: key not found: " + key + "\n"           # the frame is still translated
+        key = "k" * (tilmsg.MAX_LOOKUP - 100)
+        assert tilmsg.localize_report("runtime error: key not found: " + key + "\n", 'ru') == \
+            "ошибка выполнения: ключ не найден: " + key + "\n"
+
+    @pytest.mark.parametrize("vm", ['--vm', pytest.param('--cvm', marks=needs_cc)])
+    def test_a_program_cannot_stall_its_own_report(self, tmp_path, til_main, vm):
+        # the program's pragma turns translation on; --max-steps does not bound the report
+        prog = write(tmp_path, 'p.til', '#[lang: ru]\nmain()\n    let pad = " ".repeat(20000)\n'
+                                        '    panic("bad record:\\n" + pad + "x")\n')
+        start = time.perf_counter()
+        r = til_main('run', vm, '--max-steps', '50', prog)
+        assert time.perf_counter() - start < 30, "the report took too long"
+        assert (r.returncode, r.stdout) == (1, "")
+        assert r.stderr == ("ошибка выполнения: bad record:\n" + " " * 20000 + "x\n"
+                            "  в main (строка 4)\n  в __start__ (строка 2)\n")
+
+    def test_streamed_and_whole_reports_agree(self):
+        # run_localized feeds the C VM's stderr line by line until the report starts, then the
+        # rest at once; TILVM.report localizes the whole text: the results must be identical
+        texts = [RUNTIME_REPORT['en'], PATHOLOGICAL['blank line'], PATHOLOGICAL['many lines'][:2000],
+                 RUNTIME_REPORT['en'].replace('\n', '\r\n'),
+                 "tilvm: cannot write /tmp/x\n[tilvm] paused\nfatal error: step limit exceeded (50)\n"
+                 "  at f (line 9)\n  at main\n",
+                 "runtime error: intent 'x' failed: key not found: a\nb\n  at main (line 2)",
+                 "runtime error: no traceback", "", "\n\n"]
+        for text in texts:
+            for lang in ('ru', 'kk'):
+                whole = tilmsg.localize_report(text, lang)
+                lines = text.splitlines(keepends=True)
+                loc = tilmsg.ReportLocalizer(lang)
+                out, i = [], 0
+                while i < len(lines) and not loc.in_report:
+                    out.append(loc.feed(lines[i]))
+                    i += 1
+                out.append(loc.feed(''.join(lines[i:])))
+                assert ''.join(out) == whole, text[:60]
+                loc = tilmsg.ReportLocalizer(lang)
+                assert ''.join(loc.feed(line) for line in lines) == whole, text[:60]
+
+    def test_program_output_is_flushed_before_the_report_is_translated(self, monkeypatch):
+        # the round-0 TILVM.report translated first and flushed the program's output after it
+        events = []
+
+        class Stdout(io.StringIO):
+            def flush(self):
+                events.append('flush')
+
+        def localize_report_bytes(data, lang=None):
+            events.append('translate')
+            return data
+        monkeypatch.setattr(sys, 'stdout', Stdout())
+        monkeypatch.setattr(sys, 'stderr', io.StringIO())
+        monkeypatch.setattr(til, 'localize_report_bytes', localize_report_bytes)
+        module = til.TBCModule.from_bytes(compile_vm(RUNTIME).serialize())
+        assert til.TILVM(module).run() == 1
+        assert sys.stdout.getvalue() == "start\n"
+        assert events[:2] == ['flush', 'translate']
+
+
+def _drop_first_comma(text):
+    # a missing comma between two entries: "TypeError: 'tuple' object is not callable"
+    return text.replace("\"күтілмеген таңба: '{ch}'\"),", "\"күтілмеген таңба: '{ch}'\")", 1)
+
+
+class TestCatalogFailures:
+    """Finding 2: a tilmsg.py that fails to load must not replace diagnostics with a traceback."""
+
+    BROKEN = {
+        'missing comma': _drop_first_comma,
+        'syntax error': lambda s: s.replace("LANGUAGES = ('en', 'ru', 'kk')", "LANGUAGES = ('en', 'ru', 'kk'", 1),
+        'bad template': lambda s: s.replace('("division by zero",', '("division by zero {",', 1),
+        'failing import': lambda s: s.replace("import re\n", "import re\nimport tilmsg_part_that_is_missing\n", 1),
+    }
+
+    @pytest.mark.parametrize("name", sorted(BROKEN))
+    def test_english_with_a_note(self, tmp_path, name):
+        til_py = broken_installation(tmp_path, self.BROKEN[name])
+        imm = write(tmp_path, 'imm.til', IMMUTABLE)
+        div = write(tmp_path, 'div.til', RUNTIME)
+        for args, env, english in ((('check', '--lang', 'ru', imm), '', [IMMUTABLE_HEADER['en']]),
+                                   (('check', imm), 'kk', [IMMUTABLE_HEADER['en']]),
+                                   (('run', '--vm', div), 'kk', RUNTIME_REPORT['en'].split('\n'))):
+            r = run_installed(til_py, *args, til_lang=env)
+            assert r.returncode == 1 and "Traceback" not in r.stderr, r.stderr
+            lines = r.stderr.split('\n')
+            at = [i for i, line in enumerate(lines) if line.startswith("note: ")]
+            assert len(at) == 1, r.stderr
+            # before the note: only Python's own SyntaxWarning about the catalog, if any
+            assert all("SyntaxWarning" in line or line.startswith("  ") for line in lines[:at[0]]), r.stderr
+            note = lines[at[0]]
+            assert note.startswith("note: message translations could not be loaded (tilmsg.py"), note
+            assert note.endswith("); messages stay in English"), note
+            assert lines[at[0] + 1:at[0] + 1 + len(english)] == english, r.stderr
+
+    def test_a_failing_import_in_process(self, monkeypatch, capsys):
+        def broken(name):
+            raise SyntaxError("'(' was never closed", ('tilmsg.py', 38, 13, 'LANGUAGES = (\n'))
+        monkeypatch.setattr(til, 'feature_module', broken)
+        monkeypatch.setattr(til, '_MESSAGE_CATALOG', [])
+        monkeypatch.setattr(til, '_CATALOG_NOTE_SHOWN', False)
+        assert til.localize("error: x", 'ru') == "error: x"
+        assert til.localize_report_bytes(b"runtime error: division by zero\n", 'kk') == \
+            b"runtime error: division by zero\n"
+        assert capsys.readouterr().err == ("note: message translations could not be loaded (tilmsg.py, "
+                                           "line 38: SyntaxError: '(' was never closed); messages stay "
+                                           "in English\n")
+
+
+class TestProgramText:
+    """Finding 3: a program's own message is not translated piecemeal."""
+
+    @pytest.mark.parametrize("message", PROGRAM_TEXT)
+    def test_free_text_stays_english(self, message):
+        for lang, frame in (('ru', "ошибка выполнения: "), ('kk', "орындау қатесі: ")):
+            assert tilmsg.localize_report(f"runtime error: {message}\n", lang) == f"{frame}{message}\n"
+            nested = f"runtime error: intent 'load' failed: {message}\n"
+            assert tilmsg.localize_report(nested, lang).endswith(f": {message}\n")
+
+    @pytest.mark.parametrize("vm", ['--vm', pytest.param('--cvm', marks=needs_cc)])
+    def test_programs(self, tmp_path, til_main, vm):
+        prog = write(tmp_path, 'p.til',
+                     'main()\n    let n = 2\n    if n != 3\n        panic(f"Expected 3 items, got {n}")\n')
+        r = til_main('run', vm, '--lang', 'ru', prog)
+        assert r.stderr.split('\n')[0] == "ошибка выполнения: Expected 3 items, got 2"
+        prog = write(tmp_path, 'q.til', 'check(n: int)\n    if n < 0\n'
+                                        '        panic("cannot convert negative balance to int")\n'
+                                        'main()\n    check(0 - 5)\n')
+        r = til_main('run', vm, '--lang', 'kk', prog)
+        assert r.stderr == ("орындау қатесі: cannot convert negative balance to int\n"
+                            "  check ішінде (3-жол)\n  main ішінде (5-жол)\n  __start__ ішінде (4-жол)\n")
+
+    def test_real_messages_still_match(self):
+        # the same templates still translate what the VMs and the compiler really say
+        for en, ru in (
+                ("runtime error: cannot convert str to int", "ошибка выполнения: нельзя преобразовать str в int"),
+                ("runtime error: sqrt expects a number, got str",
+                 "ошибка выполнения: sqrt ожидает число, получено str"),
+                ("runtime error: key not found: my key", "ошибка выполнения: ключ не найден: my key"),
+                ("runtime error: Assertion failed: x > 0 is false",
+                 "ошибка выполнения: проверка не пройдена: x > 0 is false"),
+                ("runtime error: intent 'load the data' failed: division by zero",
+                 "ошибка выполнения: намерение 'load the data' не выполнено: деление на ноль")):
+            assert tilmsg.localize_report(en, 'ru') == ru
+        for en, ru in (
+                ("Syntax Error: error: Expected INDENT, got NEWLINE",
+                 "Синтаксическая ошибка: ожидалось INDENT, получено NEWLINE"),
+                ("Error: File not found: my file.til", "Ошибка: файл не найден: my file.til"),
+                ("Warning: Line 2: Type mismatch: expected [int; 3], got fn(int) -> int",
+                 "Предупреждение: строка 2: несоответствие типов: ожидался [int; 3], получен fn(int) -> int")):
+            assert tilmsg.localize(en, 'ru') == ru
+
+    def test_runtime_templates_never_take_prose(self):
+        # a placeholder that is not free text takes one word: a sentence written by the
+        # program does not fit it (free-text placeholders follow a distinctive literal)
+        sample = {'int': '3', 'type': 'int', 'builtin': 'abs', 'word': 'x', 'quoted': 'x', 'text': 'x'}
+        checked = 0
+        for e in tilmsg.entries():
+            if e.scope != 'runtime':
+                continue
+            for i, p in enumerate(e.parts):
+                if isinstance(p, str) or e.shapes[i] in ('text', 'quoted'):
+                    continue
+                message = ''.join(q if isinstance(q, str) else
+                                  "negative balance" if q[0] == p[0] else sample[e.shapes[j]]
+                                  for j, q in enumerate(e.parts))
+                assert tilmsg.find(message, 'runtime') is None, (e.en, message)
+                checked += 1
+        assert checked > 50
+
+    def test_placeholder_kinds(self):
+        def match(template, message):
+            return tilmsg.Entry(template, template, template).match(message)
+        assert match("cannot convert {type} to int", "cannot convert str to int") == {'type': 'str'}
+        assert match("cannot convert {type} to int", "cannot convert my str to int") is None     # a word
+        assert match("unknown name '{name}'", "unknown name 'a b'") == {'name': 'a b'}            # quoted
+        assert match("key not found: {key:text}", "key not found: a b") == {'key': 'a b'}
+        assert match("got {n:int} items", "got -12 items") == {'n': '-12'}
+        assert match("got {n:int} items", "got twelve items") is None
+        assert match("{f:builtin} expects", "abs_2 expects") == {'f': 'abs_2'}
+        assert match("{f:builtin} expects", "Abs expects") is None
+        assert match("'{a}' uses '{b}', but '{a}' is", "'f' uses 'g', but 'f' is") == {'a': 'f', 'b': 'g'}
+        assert match("'{a}' uses '{b}', but '{a}' is", "'f' uses 'g', but 'h' is") is None
+        assert match("{a} to {b}", "x to y to z") is None       # the first " to "; "y to z" is no word
+        for value, ok in (('int', True), ('struct', True), ('Point', True), ('Shape.Circle', True),
+                          ('Нүкте', True), ('apples', False), ('point', False), ('Big Point', False)):
+            assert (match("cannot negate {t:type}", "cannot negate " + value) is not None) == ok, value
+        assert tilmsg.find("cannot convert str to int", 'compiler') is None                       # scopes
+        assert tilmsg.find("cannot convert str to int", 'runtime')[0].en == "cannot convert {type:type} to int"
+        with pytest.raises(ValueError):
+            tilmsg.find("x", 'nowhere')
+
+
+class TestRunnerAndWarnings:
+    """Findings 4 and 5: the TIL_LANG warning, and the runners' 'tilvm:' / 'til:' messages."""
+
+    def test_invalid_til_lang_warning_is_true(self, tmp_path, til_main):
+        prog = write(tmp_path, 'p.til', "#[lang: ru]\nглавная()\n    пусть х = 1\n    х = 2\n")
+        r = til_main('check', prog, til_lang='fr')
+        lines = r.stderr.split('\n')
+        assert lines[0] == "warning: TIL_LANG='fr' is not a message language (en, ru, kk); it is ignored"
+        assert lines[1] == "ошибка[E-VM]: нельзя повторно присвоить значение неизменяемой переменной 'х'"
+
+    KEYS = ("bad --keys entry 'FOO' (use UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, TAB, BACKSPACE, COMMA, "
+            "NONE or one character)")
+    KEYS_RU = ("неверный элемент --keys 'FOO' (используйте UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, TAB, "
+               "BACKSPACE, COMMA, NONE или один символ)")
+
+    def test_runner_prefixes(self):
+        assert tilmsg.localize("Error: " + self.KEYS, 'ru') == "Ошибка: " + self.KEYS_RU
+        assert tilmsg.localize("tilvm: " + self.KEYS, 'ru') == "tilvm: " + self.KEYS_RU
+        assert tilmsg.localize_report("tilvm: " + self.KEYS + "\n", 'ru') == "tilvm: " + self.KEYS_RU + "\n"
+        assert tilmsg.localize("til: --screen: the program did not call screen_init (no image written)", 'kk') \
+            == "til: --screen: бағдарлама screen_init шақырмады (сурет жазылмады)"
+        assert tilmsg.localize("til: cannot write /tmp/my image.ppm", 'ru') == \
+            "til: не удаётся записать /tmp/my image.ppm"
+        assert tilmsg.localize_report("tilvm: not enough memory for a 4096x4096 screen\n", 'ru') == \
+            "tilvm: недостаточно памяти для экрана 4096x4096\n"
+        # a 'tilvm:' line inside a program's message is the program's text
+        assert tilmsg.localize_report("runtime error: x\ntilvm: " + self.KEYS + "\n", 'ru') == \
+            "ошибка выполнения: x\ntilvm: " + self.KEYS + "\n"
+
+    def test_c_vm_stderr_is_translated(self, monkeypatch, capfd):
+        # run_localized() with a stand-in for the C VM's runner that rejects its options
+        script = ("import sys; sys.stderr.write(" + repr("tilvm: " + self.KEYS + "\n") + "); "
+                  "sys.stderr.flush(); sys.exit(2)")
+        monkeypatch.setattr(til, 'MESSAGE_LANG', 'ru')
+        capfd.readouterr()
+        assert til.run_localized([sys.executable, '-c', script]) == 2
+        assert capfd.readouterr().err == "tilvm: " + self.KEYS_RU + "\n"

@@ -51,7 +51,10 @@ Translated:
 * uncaught runtime-error reports of the reference VM (`til run --vm`,
   `til exec`, the REPL) and of the C VM (`til run --cvm`): the prefix
   (`runtime error:` / `fatal error:`), known messages and the traceback lines
-  (`  at f (line 3)` becomes `  в f (строка 3)` / `  f ішінде (3-жол)`).
+  (`  at f (line 3)` becomes `  в f (строка 3)` / `  f ішінде (3-жол)`);
+* the C VM runner's own messages (`tilvm: bad --keys entry ...`) and the
+  graphics messages of `til` (`til: --screen: ...`): the program name stays,
+  the message after it is translated.
 
 Kept as they are:
 
@@ -64,6 +67,18 @@ Kept as they are:
 * error codes (`E-VM`, `E-EFFECT`, ...), so they stay searchable;
 * messages that are not in the catalog yet: they stay English inside a
   translated frame (`ошибка[E-TYPE]: some new message`);
+* **a program's own message** in its error report (`panic(...)`, `expect(...)`,
+  an `Err` value): it is translated only when it is, as a whole, one of the
+  messages the VMs report (`panic("division by zero")`). Free text never is:
+  `panic("Expected 3 items, got 2")` and `panic("cannot convert negative
+  balance to int")` stay English, because the report is matched against the
+  run-time messages only and their placeholders take a single word or a type
+  name (see [The catalog](#the-catalog)). The lines after the first one of a
+  multi-line message are copied unchanged; only traceback lines are
+  translated there;
+* a message longer than 10,000 characters (`tilmsg.MAX_LOOKUP`) is not looked
+  up and stays English (its frame is translated), and `intent` failures nested
+  more than 32 deep (`MAX_NESTING`) keep their inner messages English;
 * standard output (`OK: prog.til`, `Built: ...`) and `til --help`;
 * runtime errors printed by **native executables** (`til run` with a C
   compiler, `til build`): they come from the generated C runtime, whose
@@ -73,8 +88,17 @@ Kept as they are:
   reports on the host. A device without a host shows English.
 
 Without `src/tilmsg.py` (for example an installation that only copied
-`til.py`) every message stays English; with an explicit `--lang` the compiler
-says so once (`note: message translations are not installed ...`).
+`til.py`), or with one that cannot be loaded (a syntax error, a missing comma
+between two entries, a malformed template), every message stays English. When
+a translation was asked for (`--lang`, `TIL_LANG` or the program's pragma),
+`til` says so once, right before the first diagnostic it prints:
+
+```
+note: message translations are not installed (tilmsg.py is missing); messages stay in English
+note: message translations could not be loaded (tilmsg.py, line 73: TypeError: 'tuple' object is not callable); messages stay in English
+```
+
+A run without diagnostics prints no note.
 
 ## How it works
 
@@ -82,16 +106,23 @@ Diagnostics are written in English where they are raised (`src/til.py`,
 `vm/tilvm.c`). Nothing in the compiler or the VMs depends on the language.
 The command line translates text at **output time**:
 
-* `til.localize(text)` (and `localize_bytes` for VM reports) translate a whole
-  diagnostic into the language chosen by `main()` (`til.MESSAGE_LANG`);
-  `til.localize(text, 'kk')` names the language explicitly. Library use of the
-  compiler and the VMs (tests, embedding) is unaffected: `MESSAGE_LANG` is
-  only set by `main()`.
-* `TILVM.report` localizes the uncaught-error report; `til run --cvm` reads the
-  C VM's standard error line by line (as it arrives) and translates it.
+* `til.localize(text)` translates a compiler or command-line diagnostic into
+  the language chosen by `main()` (`til.MESSAGE_LANG`); `til.localize(text,
+  'kk')` names the language explicitly. Library use of the compiler and the
+  VMs (tests, embedding) is unaffected: `MESSAGE_LANG` is only set by
+  `main()`.
+* `til.localize_report_bytes(data)` translates a VM's uncaught-error report
+  (`tilmsg.localize_report`). `TILVM.report` uses it after it has flushed the
+  program's output; `til run --cvm` reads the C VM's standard error as it
+  arrives (`tilmsg.ReportLocalizer`: lines before the report one by one, the
+  rest of the report at once) and gives the same text as the reference VM.
 * The catalog `src/tilmsg.py` is loaded lazily with `feature_module('tilmsg')`.
   A failure inside a translation never hides a diagnostic: the English text
   is printed instead.
+* Every step takes linear time: no regular expression can backtrack over a
+  line, templates are matched without backtracking, and the program's own
+  text in a report is copied, not looked up. A program cannot slow its own
+  report down (`--max-steps` does not bound the report, so this matters).
 
 `tilmsg.localize(text, lang)` works line by line. It recognises the frame of
 each line, translates the frame words and looks the message up in the
@@ -102,17 +133,33 @@ catalog:
 | header | `error[E-VM]: msg`, `warning: msg`, `Error: msg`, `Warning: msg`, `note: msg` |
 | syntax error | `Syntax Error: error: msg` (becomes `Синтаксическая ошибка: msg`) |
 | hint | `  = hint: msg`, `hint: msg`, `  = note: msg` |
-| runtime report | `runtime error: msg`, `fatal error: msg` |
+| runtime report | `runtime error: msg`, `fatal error: msg` (msg: run-time messages only) |
+| program name | `til: msg`, `tilvm: msg` (the name is kept) |
 | traceback | `  at main (line 7)` |
 | location, source | ` --> file:3:5`, `  3 | code`, `    |   ^` (never changed) |
 | anything else | the whole line is looked up as a message |
+
+`tilmsg.localize_report(text, lang)` handles what a VM writes to standard
+error: before the report, `tilvm: ...` lines are translated and other lines
+copied; the report's first line (`runtime error: msg`) is translated with
+`RUNTIME_MESSAGES` only; after it, traceback lines are translated and every
+other line, the rest of the program's message, is copied unchanged.
 
 ANSI colours (on a terminal) and Windows line endings are preserved.
 
 ### The catalog
 
-`MESSAGES` in `src/tilmsg.py` is a list of `(English, Russian, Kazakh)`
-templates:
+`src/tilmsg.py` holds `(English, Russian, Kazakh)` templates in three lists:
+
+* `COMPILER_MESSAGES`: syntax errors, the verifier, the bytecode compiler,
+  the native backend's warnings, hints;
+* `RUNTIME_MESSAGES`: everything the VMs can report at run time (both VMs'
+  errors, contracts, asserts and intents compiled into programs, effects,
+  graphics). A program's error report is matched against these only;
+* `COMMAND_LINE_MESSAGES`: the messages of `til` and of the C VM's runner.
+
+`MESSAGES` is the three lists together (compiler diagnostics are looked up in
+all of them).
 
 ```python
 ("'{func}' expects {lo} to {hi} argument(s), got {got}",
@@ -120,23 +167,43 @@ templates:
  "'{func}' {lo}–{hi} аргумент күтеді, бірақ {got} берілді"),
 ```
 
-* `{name}` matches any text, `{name:int}` an integer, `{name:msg}` a nested
-  message that is translated too (`intent '{intent}' failed: {error:msg}`);
-  `{{` / `}}` are literal braces. A name used twice must match the same text.
-* Every translation uses exactly the placeholders of the English template;
-  their text is copied unchanged.
-* Lookup: exact (placeholder-free) entries first, then the template with the
-  most literal text wins (`'f' expects 1 to 2 argument(s)` uses the "to"
-  entry, not the generic one; `value is not iterable` beats
-  `{type} is not iterable`). A template that starts with a placeholder only
-  matches when that placeholder is a single word, so `{type} cannot be
-  indexed` never translates a free-text panic message that happens to end the
-  same way.
-* `UNTRANSLATED` lists the few messages that are English on purpose (the
-  default `panic` message is the builtin's name).
-* `FRAME` holds the frame words of each language.
-* `tilmsg.check_catalog()` reports malformed templates, placeholder
-  mismatches, duplicates and untranslated entries (a test runs it).
+A placeholder says what text it stands for (the kind is written in the English
+template only):
+
+| placeholder | matches |
+|---|---|
+| `{name}` | one word: no blanks (`str`, `abs`, `<lambda:2>`, `-1`) |
+| `'{name}'` (between matching `'`, `"` or `` ` ``) | any text on one line (`'load the class list'`) |
+| `{name:text}` | any text: a condition, a path, a key, a user's message |
+| `{name:int}` | an integer |
+| `{name:type}` | a type as the VMs name it: `nil`, `bool`, `int`, `float`, `str`, `array`, `map`, `fn`, `struct`, or a capitalized name (`Point`, `Shape.Circle`, `Нүкте`) |
+| `{name:builtin}` | the name of a builtin function (`[a-z_][a-z0-9_]*`) |
+| `{name:msg}` | a nested message, translated too (`intent '{intent}' failed: {error:msg}`) |
+
+`{{` / `}}` are literal braces. A name used twice must match the same text.
+Every translation uses exactly the placeholders of the English template; their
+text is copied unchanged. Choose the narrowest kind that fits every real
+value: that is what keeps a program's own sentences out (`cannot compare
+{left:type} and {right:type}` translates `cannot compare str and int`, not
+`cannot compare apples and oranges`). A template must not start with a
+`text` or `msg` placeholder, and two placeholders must not touch.
+
+Lookup:
+
+* exact (placeholder-free) entries first, then the template with the most
+  literal text wins (`'f' expects 1 to 2 argument(s)` uses the "to" entry,
+  not the generic one; `value is not iterable` beats
+  `{type:type} is not iterable`);
+* matching never backtracks: a placeholder ends where the text after it in
+  the template first occurs (the template's last text ends the message). A
+  value that contains that text does not match, and the message stays
+  English. This keeps every lookup linear.
+
+`UNTRANSLATED` lists the few messages that are English on purpose (the
+default `panic` message is the builtin's name; the notes about a missing
+catalog). `FRAME` holds the frame words of each language.
+`tilmsg.check_catalog()` reports malformed templates, placeholder mismatches,
+bad kinds, duplicates and untranslated entries (a test runs it).
 
 ## Adding a message
 
@@ -154,14 +221,18 @@ templates:
    It extracts message templates statically from `src/til.py`, the feature
    modules next to it (`src/til*.py`) and `vm/tilvm.c` (see its docstring for
    the exact rules) and checks each one against the catalog with the same
-   lookup `til` uses. `tests/test_i18n.py` fails while a message of the
-   enforced categories has no entry; plain `print(..., file=sys.stderr)`
-   messages are reported but not enforced. Entries may exist ahead of the
-   code (the effects and graphics messages were written against their
-   branches before those were merged); `--unused` lists them, they do no harm.
-3. Add the entry to `MESSAGES` (in the section of its subsystem) with the
-   Russian and Kazakh text, following the conventions below. Rename the `x1`,
-   `x2` placeholders of the skeleton to meaningful names.
+   lookup `til` uses (run-time messages against `RUNTIME_MESSAGES` only).
+   `tests/test_i18n.py` fails while a message of the enforced categories has
+   no entry; plain `print(..., file=sys.stderr)` messages are reported but
+   not enforced. Entries may exist ahead of the code (the effects and
+   graphics messages were written against their branches before those were
+   merged); `--unused` lists them, they do no harm.
+3. Add the entry to the list that `--skeleton` names (`COMPILER_MESSAGES`,
+   `RUNTIME_MESSAGES` or `COMMAND_LINE_MESSAGES`), in the section of its
+   subsystem, with the Russian and Kazakh text, following the conventions
+   below. Rename the `x1`, `x2` placeholders of the skeleton to meaningful
+   names and give each the narrowest kind that fits (`{type:type}`,
+   `{n:int}`, `{cond:text}`, ...).
 4. If a message is internal and should stay English, add it to
    `UNTRANSLATED` with a comment saying why.
 5. `python3 -m pytest tests/test_i18n.py`.
@@ -178,7 +249,7 @@ by hand and keep a generic fallback.
    `MESSAGE_LANGUAGES` in `src/til.py` (and to `message_language_code` if it
    has aliases).
 2. Add its `FRAME` words (same keys as the other languages).
-3. Add its text as a new last column to every `MESSAGES` entry.
+3. Add its text as a new last column to every entry of the three lists.
    `check_catalog()` lists every entry that still lacks it.
 4. Extend the glossary below and the tests' expectations.
 
@@ -266,6 +337,8 @@ dispatches to a tool and removes `--lang X` / `--lang=X` (before any `--`)
 from the tool's arguments, so `til pkg --lang ru list` works with any option
 parser. `til.message_language(cli_value, source)` applies the full precedence
 (including a program's pragma) for a tool that reads a program. The reference
-VM's error reports are localized by themselves (`til debug`). Text printed
-with plain `print(..., file=sys.stderr)` stays English until it goes through
-`til.localize()` and its messages are in the catalog.
+VM's error reports are localized by themselves (`til debug`); a tool that runs
+the C VM uses `til.run_localized(cmd)`, or `til.localize_report_bytes(data)`
+on what it captured. Text printed with plain `print(..., file=sys.stderr)`
+stays English until it goes through `til.localize()` and its messages are in
+the catalog.

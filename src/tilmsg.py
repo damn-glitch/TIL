@@ -7,18 +7,25 @@ The compiler (src/til.py) and both VMs write their diagnostics in English.
 The `til` command translates them at output time:
 
     import tilmsg
-    tilmsg.localize(text, 'ru')        # a whole diagnostic, any number of lines
-    tilmsg.translate(message, 'kk')    # one message, or None if it is not in the catalog
+    tilmsg.localize(text, 'ru')          # a compiler / command-line diagnostic, any number of lines
+    tilmsg.localize_report(text, 'kk')   # what a VM writes to stderr (uncaught-error report)
+    tilmsg.translate(message, 'kk')      # one message, or None if it is not in the catalog
 
 Only reports are translated. Values that programs see (the `error` of a
 retry/timeout `else` branch, a panic message caught by `retry`) stay English.
 
-A catalog entry is an English template with its Russian and Kazakh versions.
-Placeholders: `{name}` any text, `{name:int}` an integer, `{name:msg}` a nested
-message that is translated too; `{{` and `}}` are literal braces. Text inside
+A catalog entry is an English template with its Russian and Kazakh versions,
+in one of three lists: COMPILER_MESSAGES, RUNTIME_MESSAGES (what the VMs can
+report; a program's error report is only matched against these) and
+COMMAND_LINE_MESSAGES. Placeholders: `{name}` a word (any text between
+quotes: '{name}'), `{name:text}` any text, `{name:int}` an integer,
+`{name:msg}` a nested message that is translated too, `{name:builtin}` the
+name of a builtin function; `{{` and `}}` are literal braces. Text inside
 placeholders (identifiers, numbers, code, quotes) is copied unchanged. A
-message without an entry stays English, but the frame around it (`error[E-VM]:`,
-`= hint:`, `runtime error:`, `  at f (line 3)`) is still translated.
+message without an entry stays English, but the frame around it
+(`error[E-VM]:`, `= hint:`, `runtime error:`, `  at f (line 3)`) is still
+translated. Matching takes linear time (no backtracking), so a diagnostic
+that quotes program data never slows `til` down.
 
 docs/TIL_I18N.md explains how to add a message or a language;
 tools/i18n_coverage.py lists the diagnostics that have no entry yet.
@@ -52,14 +59,16 @@ FRAME: Dict[str, Dict[str, str]] = {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MESSAGES: (English, Russian, Kazakh)
+# MESSAGES: (English, Russian, Kazakh), in three lists by who prints them.
 # Conventions: translations start with a lowercase letter (they follow
 # "ошибка: ..." / "қате: ..."); Russian avoids number agreement with
 # placeholders ("аргументов: 2"); Kazakh never attaches a suffix to a
 # placeholder (the suffix goes on the following noun: "'f' функциясы").
+# A placeholder is a word unless it is quoted or has a kind (see KINDS below):
+# mark free text `{x:text}` so that only real diagnostics match.
 # ═══════════════════════════════════════════════════════════════════════════
 
-MESSAGES: List[Tuple[str, str, str]] = [
+COMPILER_MESSAGES: List[Tuple[str, str, str]] = [
     # ── lexer (syntax errors) ──────────────────────────────────────────────
     ("Unexpected character: '{ch}'",
      "неожиданный символ: '{ch}'",
@@ -148,11 +157,11 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("pure function '{func}' performs effect '{effect}' (through the call to '{via}')",
      "чистая функция '{func}' выполняет эффект '{effect}' (через вызов '{via}')",
      "'{func}' таза функциясы '{effect}' әсерін тудырады ('{via}' шақыруы арқылы)"),
-    ("function '{func}' performs effect '{effect}', but declares only #[effects: {allowed}]",
+    ("function '{func}' performs effect '{effect}', but declares only #[effects: {allowed:text}]",
      "функция '{func}' выполняет эффект '{effect}', но объявляет только #[effects: {allowed}]",
      "'{func}' функциясы '{effect}' әсерін тудырады, бірақ тек #[effects: {allowed}] жарияланған"),
     ("function '{func}' performs effect '{effect}' (through the call to '{via}'), "
-     "but declares only #[effects: {allowed}]",
+     "but declares only #[effects: {allowed:text}]",
      "функция '{func}' выполняет эффект '{effect}' (через вызов '{via}'), "
      "но объявляет только #[effects: {allowed}]",
      "'{func}' функциясы '{effect}' әсерін тудырады ('{via}' шақыруы арқылы), "
@@ -176,7 +185,7 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("'{func}' expects {count} argument(s), got {got}",
      "'{func}' ожидает аргументов: {count}, передано: {got}",
      "'{func}' {count} аргумент күтеді, бірақ {got} берілді"),
-    ("contract violation: call to '{func}' ({args}) breaks #[requires: {cond}]",
+    ("contract violation: call to '{func}' ({args:text}) breaks #[requires: {cond:text}]",
      "нарушение контракта: вызов '{func}' ({args}) не удовлетворяет #[requires: {cond}]",
      "келісімшарт бұзылды: '{func}' шақыруы ({args}) #[requires: {cond}] шартын бұзады"),
     ("proved false at compile time; fix the arguments",
@@ -185,10 +194,7 @@ MESSAGES: List[Tuple[str, str, str]] = [
 
     # ── effects with resumption: handle / with / resume (TIL 3.1) ──────────
     # (written against the til31/effects branch, so its diagnostics are
-    # translated as soon as it is merged)
-    ("unhandled effect '{effect}'",
-     "необработанный эффект '{effect}'",
-     "өңделмеген әсер: '{effect}'"),
+    # translated as soon as it is merged; run-time ones: RUNTIME_MESSAGES)
     ("Expected 'with' and effect clauses after the body of 'handle'",
      "после тела 'handle' ожидались 'with' и ветви эффектов",
      "'handle' денесінен кейін 'with' және әсер тармақтары күтілді"),
@@ -261,56 +267,10 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("too many effect clauses in one handle (max 255)",
      "слишком много ветвей эффектов в одном handle (максимум 255)",
      "бір handle ішінде әсер тармақтары тым көп (ең көбі 255)"),
-    ("effect '{effect}' expects {count} argument(s), got {got}",
-     "эффект '{effect}' ожидает аргументов: {count}, передано: {got}",
-     "'{effect}' әсері {count} аргумент күтеді, бірақ {got} берілді"),
     ("the clause of the enclosing handle takes a different number of parameters",
      "ветвь объемлющего handle принимает другое число параметров",
      "сыртқы handle тармағы параметрлердің басқа санын қабылдайды"),
-    ("effect '{effect}' has no callable clause",
-     "у эффекта '{effect}' нет вызываемой ветви",
-     "'{effect}' әсерінің шақырылатын тармағы жоқ"),
-    ("effect clause returned outside its handler",
-     "ветвь эффекта завершилась вне своего обработчика",
-     "әсер тармағы өз өңдеушісінен тыс аяқталды"),
-    ("too many nested handlers",
-     "слишком много вложенных обработчиков",
-     "кірістірілген өңдеушілер тым көп"),
-    ("END_HANDLE without an active handle",
-     "END_HANDLE без активного handle",
-     "белсенді handle жоқ кезде END_HANDLE орындалды"),
-    ("resume outside an effect clause",
-     "resume вне ветви эффекта",
-     "resume әсер тармағынан тыс"),
-    ("effect handlers are not available in this VM build",
-     "обработчики эффектов недоступны в этой сборке VM",
-     "әсер өңдеушілері бұл VM құрастырмасында қолжетімсіз"),
 
-    # ── graphics and keys (TIL 3.1; written against the til31/gfx branch) ───
-    ("screen not initialized (call screen_init)",
-     "экран не инициализирован (вызовите screen_init)",
-     "экран іске қосылмаған (screen_init шақырыңыз)"),
-    ("key code out of range",
-     "код клавиши вне допустимого диапазона",
-     "перне коды рұқсат етілген ауқымнан тыс"),
-    ("{name}() argument {index} must be an int, got {type}",
-     "{name}(): аргумент {index} должен иметь тип int, получено {type}",
-     "{name}(): {index}-аргумент int типті болуы керек, бірақ {type} берілді"),
-    ("{name}() argument {index} must be 1..4096, got {value}",
-     "{name}(): аргумент {index} должен быть в диапазоне 1..4096, получено {value}",
-     "{name}(): {index}-аргумент 1..4096 аралығында болуы керек, бірақ {value} берілді"),
-    ("{name}() argument {index} must be -32768..32767, got {value}",
-     "{name}(): аргумент {index} должен быть в диапазоне -32768..32767, получено {value}",
-     "{name}(): {index}-аргумент -32768..32767 аралығында болуы керек, бірақ {value} берілді"),
-    ("{name}() argument {index} must be a color 0..0xFFFFFF, got {value}",
-     "{name}(): аргумент {index} должен быть цветом 0..0xFFFFFF, получено {value}",
-     "{name}(): {index}-аргумент 0..0xFFFFFF аралығындағы түс болуы керек, бірақ {value} берілді"),
-    ("bad --keys entry '{entry}' (use UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, TAB, BACKSPACE, "
-     "COMMA, NONE or one character)",
-     "неверный элемент --keys '{entry}' (используйте UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, TAB, "
-     "BACKSPACE, COMMA, NONE или один символ)",
-     "--keys ішіндегі '{entry}' элементі жарамсыз (UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, TAB, "
-     "BACKSPACE, COMMA, NONE немесе бір таңба қолданыңыз)"),
 
     # ── bytecode compiler (E-VM) ───────────────────────────────────────────
     ("operand out of range ({value}); too many locals/arguments?",
@@ -453,7 +413,7 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("cannot find the TIL C VM sources (vm/tilvm.c). Set TIL_HOME to the TIL directory.",
      "не найдены исходники C VM для TIL (vm/tilvm.c). Укажите каталог TIL в TIL_HOME.",
      "TIL C VM бастапқы кодтары табылмады (vm/tilvm.c). TIL_HOME айнымалысында TIL каталогын көрсетіңіз."),
-    ("unknown language '{lang}' (use: {choices})",
+    ("unknown language '{lang}' (use: {choices:text})",
      "неизвестный язык '{lang}' (доступны: {choices})",
      "белгісіз тіл: '{lang}' (мүмкін мәндер: {choices})"),
 
@@ -461,27 +421,32 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("Line {line:int}: {message:msg}",
      "строка {line}: {message}",
      "{line}-жол: {message}"),
-    ("Type mismatch: expected {expected}, got {got}",
+    ("Type mismatch: expected {expected:text}, got {got:text}",
      "несоответствие типов: ожидался {expected}, получен {got}",
      "типтер сәйкес емес: {expected} күтілді, бірақ {got} алынды"),
     ("Cannot assign to immutable variable '{name}'",
      "нельзя присвоить значение неизменяемой переменной '{name}'",
      "өзгермейтін '{name}' айнымалысына мән меншіктеуге болмайды"),
-    ("Condition must be bool, got {got}",
+    ("Condition must be bool, got {got:text}",
      "условие должно иметь тип bool, получен {got}",
      "шарт bool типті болуы керек, бірақ {got} алынды"),
+]
 
+# Messages the VMs can report at run time (also looked up for compiler
+# diagnostics). The uncaught-error report of a program is matched against
+# these only: a program's own panic text never meets a compiler template.
+RUNTIME_MESSAGES: List[Tuple[str, str, str]] = [
     # ── runtime errors (reference VM and C VM) ─────────────────────────────
     ("division by zero",
      "деление на ноль",
      "нөлге бөлу"),
-    ("{what} expects a number, got {type}",
+    ("{what:builtin} expects a number, got {type:type}",
      "{what} ожидает число, получено {type}",
      "{what} сан күтеді, бірақ {type} берілді"),
-    ("unsupported operand types for {op}: {left} and {right}",
+    ("unsupported operand types for {op}: {left:type} and {right:type}",
      "неподдерживаемые типы операндов для {op}: {left} и {right}",
      "{op} операциясы үшін операнд типтеріне қолдау жоқ: {left} және {right}"),
-    ("cannot compare {left} and {right}",
+    ("cannot compare {left:type} and {right:type}",
      "нельзя сравнить {left} и {right}",
      "{left} және {right} мәндерін салыстыруға болмайды"),
     ("bitwise operators need integers",
@@ -502,10 +467,10 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("cannot convert value to float",
      "нельзя преобразовать значение в float",
      "мәнді float типіне түрлендіруге болмайды"),
-    ("cannot convert {type} to int",
+    ("cannot convert {type:type} to int",
      "нельзя преобразовать {type} в int",
      "{type} типін int типіне түрлендіруге болмайды"),
-    ("cannot convert {type} to float",
+    ("cannot convert {type:type} to float",
      "нельзя преобразовать {type} в float",
      "{type} типін float типіне түрлендіруге болмайды"),
     ("this TIL VM was built without floating point",
@@ -514,25 +479,25 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("index must be an integer",
      "индекс должен быть целым числом",
      "индекс бүтін сан болуы керек"),
-    ("index out of bounds: index {index}, length {length}",
+    ("index out of bounds: index {index:int}, length {length:int}",
      "индекс вне границ: индекс {index}, длина {length}",
      "индекс шектен тыс: индекс {index}, ұзындық {length}"),
-    ("key not found: {key}",
+    ("key not found: {key:text}",
      "ключ не найден: {key}",
      "кілт табылмады: {key}"),
-    ("{type} cannot be indexed",
+    ("{type:type} cannot be indexed",
      "{type} не поддерживает индексацию",
      "{type} типін индекстеуге болмайды"),
-    ("{type} cannot be a map key",
+    ("{type:type} cannot be a map key",
      "{type} не может быть ключом словаря",
      "{type} сөздік кілті бола алмайды"),
     ("strings are immutable",
      "строки неизменяемы",
      "жолдарды өзгертуге болмайды"),
-    ("{type} does not support item assignment",
+    ("{type:type} does not support item assignment",
      "{type} не поддерживает присваивание элементов",
      "{type} элементтеріне мән меншіктеуге болмайды"),
-    ("no field '{field}' on {type}",
+    ("no field '{field}' on {type:type}",
      "у {type} нет поля '{field}'",
      "{type} ішінде '{field}' өрісі жоқ"),
     ("{name}() is missing arguments",
@@ -541,10 +506,10 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("value is not iterable",
      "значение не является итерируемым",
      "бұл мән бойынша итерация жасауға болмайды"),
-    ("{type} is not iterable",
+    ("{type:type} is not iterable",
      "{type} не является итерируемым",
      "{type} мәні бойынша итерация жасауға болмайды"),
-    ("len() of {type}",
+    ("len() of {type:type}",
      "len() неприменима к {type}",
      "len() функциясын {type} типіне қолдануға болмайды"),
     ("{name}() of empty sequence",
@@ -565,16 +530,16 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("random(lo, hi) needs lo <= hi",
      "random(lo, hi) требует lo <= hi",
      "random(lo, hi) үшін lo <= hi болуы керек"),
-    ("cannot read file: {path}",
+    ("cannot read file: {path:text}",
      "не удаётся прочитать файл: {path}",
      "файлды оқу мүмкін емес: {path}"),
-    ("cannot write file: {path}",
+    ("cannot write file: {path:text}",
      "не удаётся записать файл: {path}",
      "файлға жазу мүмкін емес: {path}"),
-    ("file too large: {path}",
+    ("file too large: {path:text}",
      "файл слишком большой: {path}",
      "файл тым үлкен: {path}"),
-    ("{name}() expects a path string, got {type}",
+    ("{name}() expects a path string, got {type:type}",
      "{name}() ожидает путь к файлу (строку), получено {type}",
      "{name}() файл жолын (str) күтеді, бірақ {type} берілді"),
     ("{name}(): invalid path",
@@ -583,7 +548,7 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("bytes_to_str() expects an array of ints 0..255",
      "bytes_to_str() ожидает массив целых чисел 0..255",
      "bytes_to_str() 0..255 аралығындағы бүтін сандар массивін күтеді"),
-    ("str_bytes() expects a string, got {type}",
+    ("str_bytes() expects a string, got {type:type}",
      "str_bytes() ожидает строку, получено {type}",
      "str_bytes() жол күтеді, бірақ {type} берілді"),
     ("{name}() is not available in this VM build",
@@ -637,10 +602,10 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("pop() from empty array",
      "pop() из пустого массива",
      "бос массивке pop() қолданылды"),
-    ("insert index out of bounds: {index}",
+    ("insert index out of bounds: {index:int}",
      "индекс вставки вне границ: {index}",
      "кірістіру индексі шектен тыс: {index}"),
-    ("remove index out of bounds: {index}",
+    ("remove index out of bounds: {index:int}",
      "индекс удаления вне границ: {index}",
      "жою индексі шектен тыс: {index}"),
     ("sort() needs an array of numbers or of strings",
@@ -649,22 +614,22 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("unwrap() called on None",
      "unwrap() вызван для None",
      "unwrap() None мәніне шақырылды"),
-    ("unwrap() called on Err: {error}",
+    ("unwrap() called on Err: {error:text}",
      "unwrap() вызван для Err: {error}",
      "unwrap() Err мәніне шақырылды: {error}"),
     ("expect() failed",
      "expect() завершился неудачей",
      "expect() сәтсіз аяқталды"),
-    ("no method '{method}' on {type}",
+    ("no method '{method}' on {type:type}",
      "у {type} нет метода '{method}'",
      "{type} типінде '{method}' әдісі жоқ"),
     ("field '{field}' is not callable",
      "поле '{field}' нельзя вызвать",
      "'{field}' өрісін шақыруға болмайды"),
-    ("{type} is not callable",
+    ("{type:type} is not callable",
      "значение типа {type} нельзя вызвать",
      "{type} типті мәнді шақыруға болмайды"),
-    ("{func}() takes {count} argument(s), got {got}",
+    ("{func}() takes {count:int} argument(s), got {got:int}",
      "{func}() принимает аргументов: {count}, передано: {got}",
      "{func}() {count} аргумент қабылдайды, бірақ {got} берілді"),
     ("stack overflow (recursion too deep)",
@@ -682,7 +647,7 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("cannot negate a non-number",
      "нельзя применить унарный минус к нечисловому значению",
      "сан емес мәнге унарлық минус қолдануға болмайды"),
-    ("cannot negate {type}",
+    ("cannot negate {type:type}",
      "нельзя применить унарный минус к {type}",
      "{type} типіне унарлық минус қолдануға болмайды"),
     ("~ needs an integer",
@@ -694,10 +659,10 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("? applied to None",
      "оператор ? применён к None",
      "? операторы None мәніне қолданылды"),
-    ("? applied to Err: {error}",
+    ("? applied to Err: {error:text}",
      "оператор ? применён к Err: {error}",
      "? операторы Err мәніне қолданылды: {error}"),
-    ("step limit exceeded ({limit})",
+    ("step limit exceeded ({limit:int})",
      "превышен лимит шагов ({limit})",
      "қадам шегінен асып кетті ({limit})"),
     ("step limit exceeded",
@@ -709,44 +674,93 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("too many nested retry/timeout blocks",
      "слишком много вложенных блоков retry/timeout",
      "кірістірілген retry/timeout блоктары тым көп"),
-    ("bad opcode 0x{op} at {pc}",
+    ("bad opcode 0x{op} at {pc:int}",
      "неверный код операции 0x{op} по адресу {pc}",
      "{pc} адресінде қате операция коды: 0x{op}"),
     ("bad opcode",
      "неверный код операции",
      "қате операция коды"),
 
+    # ── effects with resumption (TIL 3.1; the til31/effects branch) ────────
+    ("unhandled effect '{effect}'",
+     "необработанный эффект '{effect}'",
+     "өңделмеген әсер: '{effect}'"),
+    ("effect '{effect}' expects {count:int} argument(s), got {got:int}",
+     "эффект '{effect}' ожидает аргументов: {count}, передано: {got}",
+     "'{effect}' әсері {count} аргумент күтеді, бірақ {got} берілді"),
+    ("effect '{effect}' has no callable clause",
+     "у эффекта '{effect}' нет вызываемой ветви",
+     "'{effect}' әсерінің шақырылатын тармағы жоқ"),
+    ("effect clause returned outside its handler",
+     "ветвь эффекта завершилась вне своего обработчика",
+     "әсер тармағы өз өңдеушісінен тыс аяқталды"),
+    ("too many nested handlers",
+     "слишком много вложенных обработчиков",
+     "кірістірілген өңдеушілер тым көп"),
+    ("END_HANDLE without an active handle",
+     "END_HANDLE без активного handle",
+     "белсенді handle жоқ кезде END_HANDLE орындалды"),
+    ("resume outside an effect clause",
+     "resume вне ветви эффекта",
+     "resume әсер тармағынан тыс"),
+    ("effect handlers are not available in this VM build",
+     "обработчики эффектов недоступны в этой сборке VM",
+     "әсер өңдеушілері бұл VM құрастырмасында қолжетімсіз"),
+
+    # ── graphics and keys (TIL 3.1; written against the til31/gfx branch) ───
+    ("screen not initialized (call screen_init)",
+     "экран не инициализирован (вызовите screen_init)",
+     "экран іске қосылмаған (screen_init шақырыңыз)"),
+    ("key code out of range",
+     "код клавиши вне допустимого диапазона",
+     "перне коды рұқсат етілген ауқымнан тыс"),
+    ("{name}() argument {index:int} must be an int, got {type:type}",
+     "{name}(): аргумент {index} должен иметь тип int, получено {type}",
+     "{name}(): {index}-аргумент int типті болуы керек, бірақ {type} берілді"),
+    ("{name}() argument {index:int} must be 1..4096, got {value:int}",
+     "{name}(): аргумент {index} должен быть в диапазоне 1..4096, получено {value}",
+     "{name}(): {index}-аргумент 1..4096 аралығында болуы керек, бірақ {value} берілді"),
+    ("{name}() argument {index:int} must be -32768..32767, got {value:int}",
+     "{name}(): аргумент {index} должен быть в диапазоне -32768..32767, получено {value}",
+     "{name}(): {index}-аргумент -32768..32767 аралығында болуы керек, бірақ {value} берілді"),
+    ("{name}() argument {index:int} must be a color 0..0xFFFFFF, got {value:int}",
+     "{name}(): аргумент {index} должен быть цветом 0..0xFFFFFF, получено {value}",
+     "{name}(): {index}-аргумент 0..0xFFFFFF аралығындағы түс болуы керек, бірақ {value} берілді"),
+
     # ── runtime errors compiled into programs (asserts, contracts, intents) ─
     ("Assertion failed",
      "проверка не пройдена",
      "тексеру сәтсіз аяқталды"),
-    ("Assertion failed: {message}",
+    ("Assertion failed: {message:text}",
      "проверка не пройдена: {message}",
      "тексеру сәтсіз аяқталды: {message}"),
     ("Invariant violated",
      "инвариант нарушен",
      "инвариант бұзылды"),
-    ("Invariant violated: {message}",
+    ("Invariant violated: {message:text}",
      "инвариант нарушен: {message}",
      "инвариант бұзылды: {message}"),
-    ("contract violation: {func} requires {cond}",
+    ("contract violation: {func} requires {cond:text}",
      "нарушение контракта: {func} требует {cond}",
      "келісімшарт бұзылды: {func} талабы орындалмады: {cond}"),
-    ("contract violation: {func} ensures {cond}",
+    ("contract violation: {func} ensures {cond:text}",
      "нарушение контракта: {func} гарантирует {cond}",
      "келісімшарт бұзылды: {func} кепілдігі орындалмады: {cond}"),
     ("intent '{intent}' failed: {error:msg}",
      "намерение '{intent}' не выполнено: {error}",
      "'{intent}' ниеті орындалмады: {error}"),
+]
 
+# Messages of the command line (`til`, and the C VM's runner `tilvm`).
+COMMAND_LINE_MESSAGES: List[Tuple[str, str, str]] = [
     # ── command line ───────────────────────────────────────────────────────
     ("No input file specified",
      "не указан входной файл",
      "кіріс файлы көрсетілмеген"),
-    ("File not found: {path}",
+    ("File not found: {path:text}",
      "файл не найден: {path}",
      "файл табылмады: {path}"),
-    ("unknown option {option}",
+    ("unknown option {option:text}",
      "неизвестный параметр {option}",
      "белгісіз параметр: {option}"),
     ("unknown message language '{lang}' (use: en, ru, kk)",
@@ -776,6 +790,23 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("cannot build the C VM (need vm/ sources and a C compiler)",
      "не удаётся собрать C VM (нужны исходники vm/ и компилятор C)",
      "C VM құрастыру мүмкін емес (vm/ бастапқы кодтары мен C компиляторы керек)"),
+    ("bad --keys entry '{entry}' (use UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, TAB, BACKSPACE, "
+     "COMMA, NONE or one character)",
+     "неверный элемент --keys '{entry}' (используйте UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, TAB, "
+     "BACKSPACE, COMMA, NONE или один символ)",
+     "--keys ішіндегі '{entry}' элементі жарамсыз (UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, TAB, "
+     "BACKSPACE, COMMA, NONE немесе бір таңба қолданыңыз)"),
+    # the graphics options of `til run` and of the C VM's runner (til31/gfx):
+    # printed as "til: ..." / "tilvm: ..." (the program name stays as it is)
+    ("--screen: the program did not call screen_init (no image written)",
+     "--screen: программа не вызвала screen_init (изображение не записано)",
+     "--screen: бағдарлама screen_init шақырмады (сурет жазылмады)"),
+    ("cannot write {path:text}",
+     "не удаётся записать {path}",
+     "жазу мүмкін емес: {path}"),
+    ("not enough memory for a {width:int}x{height:int} screen",
+     "недостаточно памяти для экрана {width}x{height}",
+     "{width}x{height} экраны үшін жад жетіспейді"),
     ("[TIL] No C compiler found - running on the TIL VM",
      "[TIL] компилятор C не найден — программа запускается на TIL VM",
      "[TIL] C компиляторы табылмады — бағдарлама TIL VM-де іске қосылады"),
@@ -788,17 +819,23 @@ MESSAGES: List[Tuple[str, str, str]] = [
     ("til check --prove: the prover (tilprove.py) is not installed",
      "til check --prove: модуль доказательства (tilprove.py) не установлен",
      "til check --prove: дәлелдеу модулі (tilprove.py) орнатылмаған"),
-    ("message translations are not installed (tilmsg.py is missing); messages stay in English",
-     "переводы сообщений не установлены (нет tilmsg.py); сообщения выводятся на английском",
-     "хабарлама аудармалары орнатылмаған (tilmsg.py жоқ); хабарламалар ағылшын тілінде шығады"),
 ]
+
+# Every entry, in lookup order (read-only: add entries to the lists above).
+MESSAGES: List[Tuple[str, str, str]] = COMPILER_MESSAGES + RUNTIME_MESSAGES + COMMAND_LINE_MESSAGES
+SCOPES: Tuple[str, ...] = ('compiler', 'runtime', 'command-line')
 
 # English-only on purpose (checked by tools/i18n_coverage.py).
 UNTRANSLATED: Tuple[str, ...] = (
     "panic",            # the default message of panic(): the name of the builtin
-    # printed only when TIL_LANG names no known language, i.e. in English anyway
-    "TIL_LANG={value} is not a message language (en, ru, kk); using English",
+    # printed at start-up, before the language is chosen (TIL_LANG names no
+    # known language, and --lang / the program's pragma are not applied yet)
+    "TIL_LANG={value} is not a message language (en, ru, kk); it is ignored",
+    # printed exactly when this catalog cannot be used
+    "message translations are not installed (tilmsg.py is missing); messages stay in English",
+    "message translations could not be loaded ({problem:text}); messages stay in English",
 )
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # templates
@@ -806,8 +843,32 @@ UNTRANSLATED: Tuple[str, ...] = (
 
 Part = Union[str, Tuple[str, str]]          # literal text, or (placeholder name, kind)
 
+# What a placeholder accepts when a message is matched (`{name}` / `{name:kind}`):
+#   ''         a word: at least one character, no whitespace; between matching
+#              quotes ('{x}', "{x}", `{x}`) any text on one line
+#   'text'     any text: a condition, a path, a key, a message written by a user
+#   'int'      an integer
+#   'msg'      a nested message, translated too (any text)
+#   'builtin'  the name of a builtin function: lowercase letters, digits and _
+#   'type'     a type as the VMs name it: nil, bool, int, float, str, array,
+#              map, fn, struct, or a capitalized name (Point, Shape.Circle, Нүкте)
+# So free text in a program's own message ("Expected 3 items, got 2") does not
+# fit "Expected {expected}, got {got}", whose placeholders are words, and
+# "cannot compare apples and oranges" does not fit "cannot compare {left:type}
+# and {right:type}".
+KINDS = ('', 'text', 'int', 'msg', 'builtin', 'type')
+
+MAX_LOOKUP = 10000      # a longer message is not looked up: it stays English
+MAX_NESTING = 32        # {x:msg} placeholders inside each other: deeper ones stay English
+
 _TOKEN = re.compile(r'\{\{|\}\}|\{([A-Za-z_][A-Za-z0-9_]*)(?::([a-z]+))?\}|[{}]')
-_KIND_PATTERN = {'': r'.*?', 'int': r'-?\d+', 'msg': r'.*?'}
+_QUOTES = "'\"`"
+_SPACE = re.compile(r'\s')
+_INT = re.compile(r'-?[0-9]+')
+_BUILTIN = re.compile(r'[a-z_][a-z0-9_]*')
+_TYPE_NAME = re.compile(r'[^\W\d_]\w*(?:\.[^\W\d_]\w*)*')
+BUILTIN_TYPES = frozenset(('nil', 'bool', 'int', 'float', 'str', 'array', 'map', 'fn', 'struct', '?'))
+_NON_EMPTY = ('word', 'int', 'builtin', 'type')
 
 
 def parse_template(text: str) -> List[Part]:
@@ -822,8 +883,8 @@ def parse_template(text: str) -> List[Part]:
             parts.append(tok[0])
         elif m.group(1):
             kind = m.group(2) or ''
-            if kind not in _KIND_PATTERN:
-                raise ValueError(f"unknown placeholder kind '{kind}' in {text!r}")
+            if kind not in KINDS:
+                raise ValueError(f"unknown placeholder kind '{kind}' in {text!r} (use: {', '.join(KINDS[1:])})")
             parts.append((m.group(1), kind))
         else:
             raise ValueError(f"unescaped '{tok}' in {text!r} (write '{tok}{tok}')")
@@ -839,25 +900,41 @@ def parse_template(text: str) -> List[Part]:
     return merged
 
 
-class Entry:
-    """A catalog entry: the English template, its regex and its translations."""
+def _accepts(shape: str, value: str) -> bool:
+    """Is `value` text that a placeholder of this shape stands for?"""
+    if shape == 'word':
+        return value != '' and _SPACE.search(value) is None
+    if shape == 'quoted':
+        return '\n' not in value
+    if shape == 'int':
+        return _INT.fullmatch(value) is not None
+    if shape == 'builtin':
+        return _BUILTIN.fullmatch(value) is not None
+    if shape == 'type':
+        return value in BUILTIN_TYPES or (_TYPE_NAME.fullmatch(value) is not None and value[0].isupper())
+    return True                                     # 'text'
 
-    def __init__(self, en: str, *translations: str):
+
+class Entry:
+    """A catalog entry: the English template, how it matches, its translations."""
+
+    def __init__(self, en: str, *translations: str, scope: str = 'compiler'):
         self.en = en
+        self.scope = scope
         self.parts = parse_template(en)
         self.kinds: Dict[str, str] = {}
-        regex = []
-        for p in self.parts:
+        self.shapes: List[Optional[str]] = []      # per part: None for literal text
+        for i, p in enumerate(self.parts):
             if isinstance(p, str):
-                regex.append(re.escape(p))
-            elif p[0] in self.kinds:
-                regex.append(f"(?P={p[0]})")
-            else:
-                self.kinds[p[0]] = p[1]
-                regex.append(f"(?P<{p[0]}>{_KIND_PATTERN[p[1]]})")
-        self.pattern = re.compile(''.join(regex), re.S)
+                self.shapes.append(None)
+                continue
+            if i and not isinstance(self.parts[i - 1], str):
+                raise ValueError(f"adjacent placeholders in {en!r} cannot be told apart")
+            self.kinds.setdefault(p[0], p[1])
+            self.shapes.append(self._shape(i, p[1]))
         self.literal_size = sum(len(p) for p in self.parts if isinstance(p, str))
         first = self.parts[0] if self.parts else ''
+        self.prefix = first if isinstance(first, str) else ''     # the literal text it starts with
         self.leading = None if isinstance(first, str) else first[0]
         self.texts: Dict[str, str] = {'en': en}
         self.targets: Dict[str, List[Part]] = {'en': self.parts}
@@ -865,19 +942,68 @@ class Entry:
             self.texts[lang] = text
             self.targets[lang] = parse_template(text)
 
+    def _shape(self, i: int, kind: str) -> str:
+        if kind == '':
+            before = self.parts[i - 1] if i > 0 else ''
+            after = self.parts[i + 1] if i + 1 < len(self.parts) else ''
+            if isinstance(before, str) and isinstance(after, str) and before and after \
+                    and before[-1] in _QUOTES and after[0] == before[-1]:
+                return 'quoted'
+            return 'word'
+        return 'text' if kind == 'msg' else kind
+
+    def match(self, message: str, any_value: Optional[str] = None) -> Optional[Dict[str, str]]:
+        """The placeholder values when `message` is this template, else None.
+
+        Linear time: a placeholder ends where the literal text after it first
+        occurs (the last literal text ends the message). There is no
+        backtracking, so a value that contains the text following it does not
+        match: the message stays English. A value equal to `any_value` fits
+        every kind (tools/i18n_coverage.py marks placeholders that way)."""
+        parts, shapes = self.parts, self.shapes
+        n, pos, last = len(message), 0, len(parts) - 1
+        groups: Dict[str, str] = {}
+        for i, p in enumerate(parts):
+            if isinstance(p, str):
+                if not message.startswith(p, pos):
+                    return None
+                pos += len(p)
+                continue
+            name = p[0]
+            if name in groups:                       # the same name again: the same text
+                if not message.startswith(groups[name], pos):
+                    return None
+                pos += len(groups[name])
+                continue
+            shape = shapes[i]
+            if i == last:
+                end = n
+            elif i + 1 == last:
+                end = n - len(parts[i + 1])
+            else:
+                end = message.find(parts[i + 1], pos + 1 if shape in _NON_EMPTY else pos)
+            if end < pos:
+                return None
+            value = message[pos:end]
+            if value != any_value and not _accepts(shape, value):
+                return None
+            groups[name] = value
+            pos = end
+        return groups if pos == n else None
+
     def render(self, mark: str) -> str:
         """The English text with every placeholder replaced by `mark`."""
         return ''.join(p if isinstance(p, str) else mark for p in self.parts)
 
-    def apply(self, groups: Dict[str, str], lang: str) -> str:
+    def apply(self, groups: Dict[str, str], lang: str, scope: Optional[str] = None, depth: int = 0) -> str:
         out = []
         for p in self.targets.get(lang, self.parts):
             if isinstance(p, str):
                 out.append(p)
             else:
                 value = groups.get(p[0]) or ''
-                if self.kinds.get(p[0]) == 'msg':
-                    value = translate(value, lang) or value
+                if self.kinds.get(p[0]) == 'msg' and depth < MAX_NESTING:
+                    value = translate(value, lang, scope, depth + 1) or value
                 out.append(value)
         return ''.join(out)
 
@@ -885,141 +1011,264 @@ class Entry:
         return f"Entry({self.en!r})"
 
 
+class _Index:
+    """Lookup tables for some entries: the exact texts, and per first character
+    of a message the templates that can match it, most literal text first (so
+    "'f' expects 1 to 2 argument(s)" finds the "to" entry before the generic
+    one; equal sizes keep the catalog order)."""
+
+    def __init__(self, entries: List[Entry]):
+        self.exact: Dict[str, Entry] = {}
+        ordered: List[Entry] = []
+        for e in entries:
+            if e.kinds:
+                ordered.append(e)
+            else:
+                self.exact.setdefault(e.render(''), e)         # the literal text, braces unescaped
+        ordered.sort(key=lambda e: -e.literal_size)
+        self.anywhere = [e for e in ordered if not e.prefix]   # templates that start with a placeholder
+        self.by_first: Dict[str, List[Entry]] = {}
+        for ch in sorted({e.prefix[0] for e in ordered if e.prefix}):
+            self.by_first[ch] = [e for e in ordered if not e.prefix or e.prefix[0] == ch]
+
+    def find(self, message: str, any_value: Optional[str]) -> Optional[Tuple[Entry, Dict[str, str]]]:
+        e = self.exact.get(message)
+        if e is not None:
+            return e, {}
+        for e in self.by_first.get(message[:1], self.anywhere):
+            groups = e.match(message, any_value)
+            if groups is not None:
+                return e, groups
+        return None
+
+
 _ENTRIES: List[Entry] = []
-_EXACT: Dict[str, Entry] = {}
-_ORDERED: List[Entry] = []
+_INDEXES: Dict[Optional[str], _Index] = {}
+
+
+def _scope_lists() -> Tuple[Tuple[str, List[Tuple[str, str, str]]], ...]:
+    return (('compiler', COMPILER_MESSAGES), ('runtime', RUNTIME_MESSAGES),
+            ('command-line', COMMAND_LINE_MESSAGES))
 
 
 def entries() -> List[Entry]:
     """All catalog entries (built on first use)."""
     if not _ENTRIES:
-        for row in MESSAGES:
-            _ENTRIES.append(Entry(*row))
-        for e in _ENTRIES:
-            if not e.kinds:
-                _EXACT.setdefault(e.render(''), e)          # the literal text, braces unescaped
-            else:
-                _ORDERED.append(e)
-        # the most specific template wins: more literal text first (stable order)
-        _ORDERED.sort(key=lambda e: -e.literal_size)
+        built = [Entry(*row, scope=scope) for scope, rows in _scope_lists() for row in rows]
+        indexes: Dict[Optional[str], _Index] = {None: _Index(built)}
+        for scope in SCOPES:
+            indexes[scope] = _Index([e for e in built if e.scope == scope])
+        _INDEXES.update(indexes)
+        _ENTRIES.extend(built)
     return _ENTRIES
 
 
-def find(message: str) -> Optional[Tuple[Entry, Dict[str, str]]]:
-    """The catalog entry for an English message and its placeholder values."""
+def find(message: str, scope: Optional[str] = None,
+         any_value: Optional[str] = None) -> Optional[Tuple[Entry, Dict[str, str]]]:
+    """The catalog entry for an English message and its placeholder values.
+    `scope` limits the lookup to one list: 'compiler', 'runtime' or 'command-line'."""
     entries()
-    e = _EXACT.get(message)
-    if e is not None:
-        return e, {}
-    for e in _ORDERED:
-        m = e.pattern.fullmatch(message)
-        if m is None:
-            continue
-        groups = m.groupdict()
-        # a template that starts with a placeholder ("{type} is not callable")
-        # only matches when that placeholder is a single word: it must not
-        # swallow arbitrary text in front of a familiar ending
-        if e.leading is not None and re.search(r'\s', groups.get(e.leading) or ''):
-            continue
-        return e, groups
-    return None
+    index = _INDEXES.get(scope)
+    if index is None:
+        raise ValueError(f"unknown scope {scope!r} (use: {', '.join(SCOPES)})")
+    if len(message) > MAX_LOOKUP:
+        return None
+    return index.find(message, any_value)
 
 
-def translate(message: str, lang: str) -> Optional[str]:
+def translate(message: str, lang: str, scope: Optional[str] = None, depth: int = 0) -> Optional[str]:
     """One message in `lang`, or None when the catalog has no entry for it."""
     if lang == 'en':
         return message
     if lang not in FRAME:
         return None
-    hit = find(message)
+    hit = find(message, scope)
     if hit is None:
         return None
     entry, groups = hit
-    return entry.apply(groups, lang)
+    return entry.apply(groups, lang, scope, depth)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # whole diagnostics
 # ═══════════════════════════════════════════════════════════════════════════
+# The expressions below take linear time on any line (a diagnostic can quote
+# program data): no two repetitions that can match the same characters follow
+# each other, and the colour codes that end a line are split off by hand.
 
-_ANSI = r'(?:\x1b\[[0-9;]*m)*'
-_SOURCE_LINE = re.compile(r'^' + _ANSI + r'[ \t]*' + _ANSI + r'[ \t]*\d*' + _ANSI + r'[ \t]*\|')
-_LOCATION = re.compile(r'^' + _ANSI + r'[ \t]*-->')
-_SYNTAX = re.compile(r'^(?P<a0>' + _ANSI + r')Syntax Error: (?P<rest>.*)$', re.S)
+_ANSI_CODE = r'\x1b\[[0-9;]*m'
+_ANSI = r'(?:' + _ANSI_CODE + r')*'
+_GAP = r'(?:' + _ANSI_CODE + r'|[ \t])*'                # blanks and colour codes
+_GUTTER_SPAN = 80       # the "  12 |" / " -->" of a source excerpt is within a line's first characters
+_SOURCE_LINE = re.compile(r'^' + _GAP + r'(?:[0-9]+' + _GAP + r')?\|')
+_LOCATION = re.compile(r'^' + _GAP + r'-->')
+_SYNTAX = re.compile(r'^(?P<a0>' + _ANSI + r')Syntax Error: (?P<rest>.*)\Z', re.S)
 _HEADER = re.compile(r'^(?P<a0>' + _ANSI + r')(?P<kind>error|warning|note|Error|Warning|Note)'
-                     r'(?P<code>\[[^\]\s]*\])?: (?P<msg>.*?)(?P<a1>' + _ANSI + r')$', re.S)
-_HINT = re.compile(r'^(?P<a0>' + _ANSI + r')(?P<lead>[ \t]*(?:= )?)(?P<kind>hint|note): '
-                   r'(?P<msg>.*?)(?P<a1>' + _ANSI + r')$', re.S)
-_REPORT = re.compile(r'^(?P<a0>' + _ANSI + r')(?P<kind>runtime error|fatal error): '
-                     r'(?P<msg>.*?)(?P<a1>' + _ANSI + r')$', re.S)
-_AT = re.compile(r'^(?P<indent>[ \t]+)at (?P<func>\S.*?)(?: \(line (?P<line>\d+)\))?$', re.S)
+                     r'(?P<code>\[[^\]\s]*\])?: (?P<msg>.*)\Z', re.S)
+_HINT = re.compile(r'^(?P<a0>' + _ANSI + r')(?P<lead>[ \t]*(?:= )?)(?P<kind>hint|note): (?P<msg>.*)\Z', re.S)
+_REPORT = re.compile(r'^(?P<a0>' + _ANSI + r')(?P<kind>runtime error|fatal error): (?P<msg>.*)\Z', re.S)
+_PROGRAM = re.compile(r'^(?P<a0>' + _ANSI + r')(?P<prog>tilvm|til): (?P<msg>.*)\Z', re.S)
+_AT = re.compile(r'^(?P<indent>[ \t]+)at (?P<func>\S[^\n]*?)(?: \(line (?P<line>[0-9]+)\))?(?P<cr>\r?)$',
+                 re.M)
+_ANSI_CODE_RE = re.compile(_ANSI_CODE)
 
 
-def _message(text: str, lang: str) -> str:
-    out = translate(text, lang)
+def _split_colour(text: str) -> Tuple[str, str]:
+    """(text, the colour codes at its end)."""
+    end = len(text)
+    while True:
+        k = text.rfind('\x1b[', 0, end)
+        if k < 0 or _ANSI_CODE_RE.fullmatch(text, k, end) is None:
+            return text[:end], text[end:]
+        end = k
+
+
+def _is_source(line: str) -> bool:
+    return bool(_SOURCE_LINE.match(line, 0, _GUTTER_SPAN) or _LOCATION.match(line, 0, _GUTTER_SPAN))
+
+
+def _message(text: str, lang: str, scope: Optional[str] = None) -> str:
+    out = translate(text, lang, scope)
     return text if out is None else out
+
+
+def _framed(m, word: str, lang: str, scope: Optional[str] = None) -> str:
+    """A matched frame line: its colour, `word`, ': ' and the translated message."""
+    msg, tail = _split_colour(m.group('msg'))
+    return m.group('a0') + word + ': ' + _message(msg, lang, scope) + tail
+
+
+def _report_line(m, lang: str) -> str:
+    """'runtime error: msg' -> the frame word and msg, translated with RUNTIME_MESSAGES."""
+    return _framed(m, FRAME[lang][m.group('kind')], lang, 'runtime')
+
+
+def _at_line(m, lang: str) -> str:
+    words = FRAME[lang]
+    template = words['at_line'] if m.group('line') else words['at']
+    return template.format(indent=m.group('indent'), func=m.group('func'), line=m.group('line')) + m.group('cr')
 
 
 def split_frame(line: str) -> Tuple[Optional[str], str]:
     """(frame kind, message) of one diagnostic line: kind is 'header', 'hint',
-    'report', 'at', 'source' or None for a bare line (then the message is the line)."""
-    if _SOURCE_LINE.match(line) or _LOCATION.match(line):
+    'report', 'program', 'at', 'source' or None for a bare line (then the
+    message is the line)."""
+    if _is_source(line):
         return 'source', ''
     syntax = _SYNTAX.match(line)
     if syntax:
         line = syntax.group('rest')
-    for kind, rx in (('header', _HEADER), ('report', _REPORT), ('hint', _HINT)):
+    for kind, rx in (('header', _HEADER), ('report', _REPORT), ('hint', _HINT), ('program', _PROGRAM)):
         m = rx.match(line)
         if m:
-            return kind, m.group('msg')
+            return kind, _split_colour(m.group('msg'))[0]
     if syntax:
         return 'header', line
-    if _AT.match(line):
+    if _AT.fullmatch(line):
         return 'at', ''
     return None, line
 
 
 def localize_line(line: str, lang: str) -> str:
-    """Translate one line of a diagnostic (source excerpts are kept as they are)."""
+    """Translate one line of a compiler or command-line diagnostic (source
+    excerpts are kept as they are)."""
     words = FRAME.get(lang)
     if words is None or not line.strip():
         return line
-    if line.endswith('\r'):
-        return localize_line(line[:-1], lang) + '\r'
-    if _SOURCE_LINE.match(line) or _LOCATION.match(line):
+    if line.endswith('\r'):                       # Windows line ending
+        return _localize_framed(line[:-1], lang, words, True) + '\r'
+    return _localize_framed(line, lang, words, True)
+
+
+def _localize_framed(line: str, lang: str, words: Dict[str, str], syntax_ok: bool) -> str:
+    if _is_source(line):
         return line
-    m = _SYNTAX.match(line)
+    m = _SYNTAX.match(line) if syntax_ok else None
     if m:
         rest = m.group('rest')
         h = _HEADER.match(rest)
         if h and h.group('kind') == 'error' and not h.group('code'):
             # "Syntax Error: error: X" -> "Синтаксическая ошибка: X"
-            return (m.group('a0') + h.group('a0') + words['Syntax Error'] + ': ' +
-                    _message(h.group('msg'), lang) + h.group('a1'))
-        return m.group('a0') + words['Syntax Error'] + ': ' + localize_line(rest, lang)
+            return m.group('a0') + _framed(h, words['Syntax Error'], lang)
+        return m.group('a0') + words['Syntax Error'] + ': ' + _localize_framed(rest, lang, words, False)
     m = _HEADER.match(line)
     if m:
-        return (m.group('a0') + words[m.group('kind')] + (m.group('code') or '') + ': ' +
-                _message(m.group('msg'), lang) + m.group('a1'))
+        return _framed(m, words[m.group('kind')] + (m.group('code') or ''), lang)
     m = _REPORT.match(line)
     if m:
-        return m.group('a0') + words[m.group('kind')] + ': ' + _message(m.group('msg'), lang) + m.group('a1')
+        return _report_line(m, lang)
     m = _HINT.match(line)
     if m:
-        return (m.group('a0') + m.group('lead') + words[m.group('kind')] + ': ' +
-                _message(m.group('msg'), lang) + m.group('a1'))
-    m = _AT.match(line)
+        return _framed(m, m.group('lead') + words[m.group('kind')], lang)
+    m = _PROGRAM.match(line)
     if m:
-        template = words['at_line'] if m.group('line') else words['at']
-        return template.format(indent=m.group('indent'), func=m.group('func'), line=m.group('line'))
+        return _framed(m, m.group('prog'), lang)
+    m = _AT.fullmatch(line)
+    if m:
+        return _at_line(m, lang)
     return _message(line, lang)
 
 
 def localize(text: str, lang: str) -> str:
-    """Translate a diagnostic (one or more lines) into `lang` ('en' returns it unchanged)."""
+    """Translate a compiler or command-line diagnostic (any number of lines)
+    into `lang` ('en' returns it unchanged). A VM's error report:
+    localize_report()."""
     if lang not in FRAME or not text:
         return text
     return '\n'.join(localize_line(line, lang) for line in text.split('\n'))
+
+
+class ReportLocalizer:
+    """Translates what a VM writes to standard error, piece by piece as it
+    arrives (feed whole lines; the last piece may lack its newline).
+
+    Before the report, the runner's own lines ('tilvm: ...') are translated and
+    any other line is copied. The report's first line ('runtime error: msg' /
+    'fatal error: msg') is translated with RUNTIME_MESSAGES only. After it,
+    traceback lines ('  at f (line 3)') are translated and every other line is
+    copied unchanged: it is the rest of the program's own message, which is
+    never looked up. The work is linear in the length of the text."""
+
+    def __init__(self, lang: str):
+        self.lang = lang if lang in FRAME else None
+        self.in_report = False
+
+    def feed(self, text: str) -> str:
+        if self.lang is None or not text:
+            return text
+        out = []
+        pos = 0
+        while pos < len(text) and not self.in_report:
+            nl = text.find('\n', pos)
+            end = len(text) if nl < 0 else nl + 1
+            out.append(self._before_report(text[pos:end]))
+            pos = end
+        if pos < len(text):
+            out.append(_AT.sub(self._at, text[pos:]))
+        return ''.join(out)
+
+    def _before_report(self, line: str) -> str:
+        body = line[:-1] if line.endswith('\n') else line
+        end = line[len(body):]
+        if body.endswith('\r'):
+            body, end = body[:-1], '\r' + end
+        m = _REPORT.match(body)
+        if m:
+            self.in_report = True
+            return _report_line(m, self.lang) + end
+        m = _PROGRAM.match(body)
+        if m:
+            return _framed(m, m.group('prog'), self.lang) + end
+        return line
+
+    def _at(self, m) -> str:
+        return _at_line(m, self.lang)
+
+
+def localize_report(text: str, lang: str) -> str:
+    """Translate a VM's standard error at once (an uncaught-error report and the
+    runner lines before it); see ReportLocalizer."""
+    return ReportLocalizer(lang).feed(text)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1030,32 +1279,28 @@ def check_catalog() -> List[str]:
     """Problems in the catalog: malformed templates, placeholders that differ
     between languages, duplicates, untranslated entries, frame gaps."""
     problems: List[str] = []
-    seen: Dict[str, int] = {}
-    for i, row in enumerate(MESSAGES):
-        if len(row) != len(COLUMNS):
-            problems.append(f"entry {i} {row[0]!r}: expected {len(COLUMNS)} texts ({', '.join(COLUMNS)})")
-            continue
-        if row[0] in seen:
-            problems.append(f"entry {i} {row[0]!r}: duplicate of entry {seen[row[0]]}")
-        seen[row[0]] = i
-        try:
-            e = Entry(*row)
-        except (ValueError, re.error) as err:
-            problems.append(f"entry {i} {row[0]!r}: {err}")
-            continue
-        names = {p[0] for p in e.parts if not isinstance(p, str)}
-        for lang in COLUMNS[1:]:
-            text = e.texts[lang]
-            if not text.strip():
-                problems.append(f"entry {i} {row[0]!r}: empty {lang} text")
-            got = {p[0] for p in e.targets[lang] if not isinstance(p, str)}
-            if got != names:
-                problems.append(f"entry {i} {row[0]!r}: {lang} placeholders {sorted(got)} != {sorted(names)}")
-            for p in e.targets[lang]:
-                if not isinstance(p, str) and p[1] and p[1] != e.kinds.get(p[0]):
-                    problems.append(f"entry {i} {row[0]!r}: {lang} placeholder {p[0]} has kind {p[1]}")
-            if text == row[0] and re.search(r'[A-Za-z]{4}', row[0]):
-                problems.append(f"entry {i} {row[0]!r}: {lang} text is the English text")
+    seen: Dict[str, str] = {}
+    lists = _scope_lists()
+    if tuple(scope for scope, _ in lists) != SCOPES:
+        problems.append(f"SCOPES {SCOPES} do not name the message lists")
+    if MESSAGES != [row for _, rows in lists for row in rows]:
+        problems.append("MESSAGES is not COMPILER_MESSAGES + RUNTIME_MESSAGES + COMMAND_LINE_MESSAGES "
+                        "(add entries to one of those lists)")
+    for scope, rows in lists:
+        for i, row in enumerate(rows):
+            where = f"{scope} entry {i} {row[0]!r}" if row else f"{scope} entry {i}"
+            if len(row) != len(COLUMNS):
+                problems.append(f"{where}: expected {len(COLUMNS)} texts ({', '.join(COLUMNS)})")
+                continue
+            if row[0] in seen:
+                problems.append(f"{where}: duplicate of {seen[row[0]]}")
+            seen[row[0]] = f"{scope} entry {i}"
+            try:
+                e = Entry(*row, scope=scope)
+            except (ValueError, re.error) as err:
+                problems.append(f"{where}: {err}")
+                continue
+            problems.extend(f"{where}: {p}" for p in _entry_problems(e, row))
     keys = None
     for lang, words in FRAME.items():
         if lang not in LANGUAGES:
@@ -1069,4 +1314,28 @@ def check_catalog() -> List[str]:
             problems.append(f"language {lang!r} has no FRAME words")
         if lang not in COLUMNS:
             problems.append(f"language {lang!r} has no MESSAGES column")
+    return problems
+
+
+def _entry_problems(e: Entry, row: Tuple[str, ...]) -> List[str]:
+    problems = []
+    names = {p[0] for p in e.parts if not isinstance(p, str)}
+    for p in e.parts:
+        if not isinstance(p, str) and p[1] and p[1] != e.kinds[p[0]]:
+            problems.append(f"placeholder {p[0]} is used with kinds {e.kinds[p[0]]!r} and {p[1]!r}")
+    if e.leading is not None and e.kinds[e.leading] in ('text', 'msg'):
+        problems.append(f"it starts with the free-text placeholder {e.leading} (it would match any "
+                        f"sentence with that ending)")
+    for lang in COLUMNS[1:]:
+        text = e.texts[lang]
+        if not text.strip():
+            problems.append(f"empty {lang} text")
+        got = {p[0] for p in e.targets[lang] if not isinstance(p, str)}
+        if got != names:
+            problems.append(f"{lang} placeholders {sorted(got)} != {sorted(names)}")
+        for p in e.targets[lang]:
+            if not isinstance(p, str) and p[1] and p[1] != e.kinds.get(p[0]):
+                problems.append(f"{lang} placeholder {p[0]} has kind {p[1]}")
+        if text == row[0] and re.search(r'[A-Za-z]{4}', row[0]):
+            problems.append(f"{lang} text is the English text")
     return problems
