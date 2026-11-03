@@ -512,11 +512,13 @@ static const uint8_t *func_rec(tilvm *vm, uint16_t f) { return vm->bc + vm->func
 #define F_NPARAMS(vm, f) ((vm)->funcs[f].nparams)
 #define F_NREQ(vm, f) ((vm)->funcs[f].nreq)
 #define F_NLOCALS(vm, f) ((vm)->funcs[f].nlocals)
+#define F_FLAGS(vm, f) ((vm)->funcs[f].flags)
 #else
 #define F_CODE(vm, f) ((vm)->code_off + FN_OFFSET(func_rec(vm, f)))
 #define F_NPARAMS(vm, f) FN_NPARAMS(func_rec(vm, f))
 #define F_NREQ(vm, f) FN_NREQ(func_rec(vm, f))
 #define F_NLOCALS(vm, f) FN_NLOCALS(func_rec(vm, f))
+#define F_FLAGS(vm, f) FN_FLAGS(func_rec(vm, f))
 #endif
 
 /* compile-time check: the lookup cache size is a power of two (or 0) */

@@ -72,13 +72,22 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_NO_TIME` | off | no `<time.h>`: `clock_ms()`/`timeout` count 1 ms per 1000 steps |
 | `TILVM_NO_MATH` | off | no `<math.h>`: built-in `sqrt`/`floor`/`pow` (integer powers) |
 | `TILVM_LEAN` | off | smallest code for 8-bit CPUs: the whole language core, without format specs, snapshots, `input/chr/ord/type_of/clock_ms/random/sleep_ms`, str `split/replace/trim/repeat/count`, array `insert/remove/sort/reverse/slice/copy/join/sum/min/max`, map `values/copy/clear` (calling them reports "not available"). ~20% smaller |
+| `TILVM_MAX_FUNCS` | `TILVM_MAX_CONSTS` (lean: 0) | function records decoded once at load, 8 bytes each; more functions → load error -10. 0 = read records from the bytecode on every call (no limit, no RAM) |
+| `TILVM_FIELD_CACHE` | 64 (lean: 0) | entries of the (struct type, name) → field / method lookup caches (power of two, 6 bytes each, two caches) |
+| `TILVM_COMPUTED_GOTO` | 1 with GCC/Clang, except lean and `-Os` | 1 = "labels as values" dispatch (one indirect jump per handler), 0 = portable `switch` |
+| `TILVM_FAST_PATHS` | 1, except lean and `-Os` | inline integer fast paths in the interpreter; 0 = smaller code, same results |
 
 Profiles in the `Makefile`: `make` (desktop), `make small` (32-bit, float,
 16 KB heap), `make tiny` (16-bit, no floats, 2 KB heap, lean), `make check`
 (AddressSanitizer + UBSan with a 4 KB heap — exercises the compacting GC).
 
 Code size of the whole VM (`arm-none-eabi-gcc -Os`, Cortex-M0, 32-bit ints, no
-floats): **24.5 KB**, or **19.4 KB** with `TILVM_LEAN`.
+floats): **27.3 KB**, or **20.8 KB** with `TILVM_LEAN` (TIL 3.1; 3.0: 26.2 / 19.9 KB; measured `tilvm.o`).
+
+Speed: the interpreter keeps its registers in C locals, dispatches with computed
+goto on GCC/Clang and runs the superinstructions of bytecode v2
+([docs/TIL_BYTECODE_V2.md](../docs/TIL_BYTECODE_V2.md)); on the desktop it is
+1.7–3x faster than TIL 3.0 (`benchmarks/RESULTS.md`, `python3 benchmarks/run.py`).
 
 ## API
 

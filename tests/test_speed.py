@@ -16,7 +16,6 @@ import glob
 import os
 import re
 import shutil
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -851,6 +850,86 @@ class TestSteps:
 
 
 # ═══════════════════════════════════════════════════════════════
+# AGAINST TIL 3.0 (commit 6f4d00b, when the git history is available)
+# ═══════════════════════════════════════════════════════════════
+
+BASELINE_REV = os.environ.get('TIL_BENCH_BASELINE', '6f4d00b')
+_BASELINE = {}
+
+
+def baseline():
+    """TIL 3.0 sources (git show) + its desktop C VM; skips without git history."""
+    if 'dir' not in _BASELINE:
+        base = tempfile.mkdtemp(prefix='til30-')
+        for rel in ('src/til.py', 'vm/tilvm.c', 'vm/tilvm.h', 'vm/main.c'):
+            r = subprocess.run(['git', '-C', ROOT, 'show', f'{BASELINE_REV}:{rel}'], capture_output=True)
+            if r.returncode != 0:
+                _BASELINE['dir'] = None
+                break
+            os.makedirs(os.path.dirname(os.path.join(base, rel)), exist_ok=True)
+            with open(os.path.join(base, rel), 'wb') as f:
+                f.write(r.stdout)
+        else:
+            exe = os.path.join(base, 'tilvm-3.0')
+            r = subprocess.run([CC, '-std=c99', '-O1', '-o', exe, os.path.join(base, 'vm', 'tilvm.c'),
+                                os.path.join(base, 'vm', 'main.c'), '-lm'], capture_output=True, text=True)
+            assert r.returncode == 0, r.stderr
+            _BASELINE['dir'], _BASELINE['exe'] = base, exe
+    if _BASELINE['dir'] is None:
+        pytest.skip(f"git history with {BASELINE_REV} is not available")
+    return _BASELINE['dir'], _BASELINE['exe']
+
+
+@needs_cc
+class TestAgainstTil30:
+    PROGRAMS = ('counters', 'recursion', 'closures', 'iteration', 'locals_and_fields', 'compare_branches')
+
+    def _old_tbc(self, tmp_path, name, src):
+        base, _exe = baseline()
+        path = tmp_path / f"{name}.til"
+        path.write_text(src, encoding='utf-8')
+        out = tmp_path / f"{name}.old.tbc"
+        r = subprocess.run([sys.executable, os.path.join(base, 'src', 'til.py'), 'build', '--target', 'vm',
+                            str(path), '-o', str(out)], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        return out.read_bytes()
+
+    @pytest.mark.parametrize("name", PROGRAMS)
+    def test_no_fuse_is_the_til_3_0_bytecode(self, tmp_path, name):
+        """--no-fuse output is byte-identical to what the TIL 3.0 compiler wrote."""
+        assert build(CORPUS[name], False, "<test>") != b""
+        old = self._old_tbc(tmp_path, name, CORPUS[name])
+        new = til.compile_to_bytecode(CORPUS[name], str(tmp_path / f"{name}.til"), fuse=False).serialize()
+        assert new == old
+
+    @pytest.mark.parametrize("name", PROGRAMS)
+    def test_steps_and_limits_as_in_til_3_0(self, tmp_path, name):
+        """Steps (--stats), --max-steps stops and snapshot pause points of the TIL 3.0
+        C VM are those of the new C VM, fused or not."""
+        _base, old_exe = baseline()
+        old_tbc = self._old_tbc(tmp_path, name, CORPUS[name])
+        fused = build(CORPUS[name])
+        ref = run_exe(old_exe, old_tbc)
+        assert c_run(old_tbc) == ref                    # new VM, TIL 3.0 bytecode
+        assert c_run(fused) == ref                      # new VM, superinstructions
+        steps = ref[3]
+        for limit in sorted({1, steps // 3, steps // 2, steps - 1}):
+            if limit <= 0:
+                continue
+            old = subprocess.run([old_exe, '--max-steps', str(limit), str(tmp_path / f"{name}.old.tbc")],
+                                 capture_output=True)
+            new = c_run(fused, vm_args=('--max-steps', str(limit)))
+            assert (new[0], new[1]) == (old.returncode, old.stdout.decode('utf-8', 'replace'))
+            snap_old, snap_new = tmp_path / "o.snap", tmp_path / "n.snap"
+            (tmp_path / "f.tbc").write_bytes(fused)
+            p_old = subprocess.run([old_exe, '--snapshot-after', str(limit), str(snap_old),
+                                    str(tmp_path / f"{name}.old.tbc")], capture_output=True)
+            p_new = subprocess.run([cvm_binary(), '--snapshot-after', str(limit), str(snap_new),
+                                    str(tmp_path / "f.tbc")], capture_output=True)
+            assert (p_new.returncode, p_new.stdout) == (p_old.returncode, p_old.stdout)
+
+
+# ═══════════════════════════════════════════════════════════════
 # C VM BUILD VARIANTS
 # ═══════════════════════════════════════════════════════════════
 
@@ -955,18 +1034,28 @@ class TestCBuilds:
 # PERFORMANCE (TIL_BENCH=1): against TIL 3.0 (commit 6f4d00b)
 # ═══════════════════════════════════════════════════════════════
 
-BASELINE_REV = os.environ.get('TIL_BENCH_BASELINE', '6f4d00b')
-
 
 def _cpu_time(cmd, repeat):
+    """Best CPU time of `repeat` runs (getrusage: microseconds; else wall clock).
+    The minimum is used because other load on the machine only ever adds time."""
+    try:
+        import resource
+    except ImportError:            # Windows
+        resource = None
     times = []
     for _ in range(repeat):
-        t0 = os.times()
+        if resource:
+            u0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        t0 = time.perf_counter()
         r = subprocess.run(cmd, capture_output=True)
-        t1 = os.times()
+        t1 = time.perf_counter()
         assert r.returncode == 0, r.stderr
-        times.append((t1.children_user - t0.children_user) + (t1.children_system - t0.children_system))
-    return statistics.median(times), r.stdout
+        if resource:
+            u1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+            times.append((u1.ru_utime - u0.ru_utime) + (u1.ru_stime - u0.ru_stime))
+        else:
+            times.append(t1 - t0)
+    return min(times), r.stdout
 
 
 @pytest.mark.skipif(os.environ.get('TIL_BENCH') != '1', reason="performance check: set TIL_BENCH=1")
@@ -993,8 +1082,8 @@ def test_speedup_against_til_3_0(tmp_path):
         assert cli('build', '--target', 'vm', src, '-o', str(new_tbc)).returncode == 0
         subprocess.run([sys.executable, str(base / 'src' / 'til.py'), 'build', '--target', 'vm', src,
                         '-o', str(old_tbc)], check=True, capture_output=True)
-        t_new, out_new = _cpu_time([exes['new'], str(new_tbc)], 7)
-        t_old, out_old = _cpu_time([exes['old'], str(old_tbc)], 7)
+        t_new, out_new = _cpu_time([exes['new'], str(new_tbc)], 9)
+        t_old, out_old = _cpu_time([exes['old'], str(old_tbc)], 9)
         assert out_new == out_old
         results[bench] = t_old / t_new
     print("C VM speedups vs TIL 3.0:", {k: round(v, 2) for k, v in results.items()})
@@ -1011,6 +1100,6 @@ def test_speedup_against_til_3_0(tmp_path):
     for name, srcdir, tbc in (('new', os.path.join(ROOT, 'src'), new_tbc), ('old', str(base / 'src'), old_tbc)):
         runs = [float(subprocess.run([sys.executable, '-c', driver, srcdir, str(tbc)], capture_output=True,
                                      text=True, check=True).stdout) for _ in range(3)]
-        py_times[name] = statistics.median(runs)
+        py_times[name] = min(runs)
     print("reference VM fib(27):", py_times)
     assert py_times['new'] <= py_times['old'] * 1.05

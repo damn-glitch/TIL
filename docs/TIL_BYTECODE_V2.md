@@ -193,6 +193,10 @@ on every benchmark (see `benchmarks/RESULTS.md`).
   fused == unfused on both VMs for every example, a corpus that reaches every
   superinstruction's fast and slow paths (including errors and their lines),
   step counts, `--max-steps`, snapshot/resume at many pause points, timeouts,
-  C build variants (switch, no tables, a 2-entry cache, lean) and strict builds.
-  `TIL_BENCH=1` adds a timing check against TIL 3.0 (commit `6f4d00b`).
+  C build variants (switch, no fast paths, no tables, a 2-entry cache, lean) and
+  strict builds. With the git history at hand it also checks against TIL 3.0
+  itself (commit `6f4d00b`): `--no-fuse` writes byte-identical bytecode, and
+  steps, `--max-steps` stops and snapshot pause points equal those of the 3.0
+  C VM. `TIL_BENCH=1` adds the timing check (at least 2x on fib / loops /
+  arrays / strings, reference VM not slower).
 * `benchmarks/run.py`: timings of any commit against any other.
