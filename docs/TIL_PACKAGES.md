@@ -40,8 +40,8 @@ only files.
 | `til pkg verify` | Re-hash every directory in `til_modules/` and compare with `til.lock`; exit code 1 on any difference. |
 | `til pkg help` | Usage. |
 
-All commands find the project by looking for `til.json` in the current
-directory and then in its parents, so they work from any subdirectory.
+All commands except `init` find the project by looking for `til.json` in the
+current directory and then in its parents, so they work from any subdirectory.
 `-C DIR` runs as if started in `DIR` (`til pkg -C ../app list`).
 
 Exit codes: `0` success, `1` error (message on stderr, prefixed `til pkg:
@@ -62,8 +62,8 @@ app 0.1.0 (/path/to/app)
 Each line is `name version  spec` where *spec* is what the parent declared;
 `[...]` is the resolved source when it differs (a commit SHA, a path relative
 to the project). A subtree printed earlier is marked `(*)`. Problems are shown
-inline: `(not installed: run `til pkg install`)`, `(missing from
-til_modules/...)`, `(til.lock has ...)`.
+inline: ``(not installed: run `til pkg install`)``, ``(missing from
+til_modules/: ...)``, ``(til.lock has ...: run `til pkg install`)``.
 
 ### `til pkg verify`
 
@@ -325,8 +325,8 @@ import geo.shapes.square        # til_modules/geo/shapes/square.til (or .../squa
 * Inside a package, `import helper` finds the package's own `helper.til`
   next to the importing file first, as for any program.
 * If an import is not found and a `til.json` above the program declares that
-  dependency, the compiler adds a hint: `hint: 'geo' is a dependency in
-  /path/til.json but is not installed - run `til pkg install``.
+  dependency, the compiler adds a hint:
+  ``hint: 'geo' is a dependency in /path/til.json but is not installed - run `til pkg install` ``
 
 Imported definitions are merged into the program at compile time, so a program
 that uses packages builds and runs the same way natively (`til run`,

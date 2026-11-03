@@ -801,6 +801,24 @@ class TestArchives:
         tgz2 = make_tar(str(tmp_path / 'p.tgz'), [('p.til', 'file', 'p() -> int\n    return 1\n')])
         assert tilpkg_run(proj, 'add', 'p', archive_spec(tgz2))[0] == 0
 
+    def test_archive_layouts(self, tmp_path, tilpkg_run):
+        # GNU tar style './' members; a zip whose directory is marked only by its mode bits
+        tgz = make_tar(str(tmp_path / 'dots.tgz'), [('./', 'dir', None), ('./dots.til', 'file', 'd() -> int\n    return 4\n'),
+                                                     ('./sub/', 'dir', None), ('./sub/x.til', 'file', '')])
+        archive = str(tmp_path / 'modes.zip')
+        with zipfile.ZipFile(archive, 'w') as zf:
+            info = zipfile.ZipInfo('modes/src')
+            info.external_attr = (stat.S_IFDIR | 0o755) << 16
+            zf.writestr(info, '')
+            zf.writestr('modes/modes.til', 'm() -> int\n    return 5\n')
+        proj = make_project(tmp_path / 'app', {"dots": archive_spec(tgz), "modes": archive_spec(archive)})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0, err
+        assert sorted(os.listdir(proj / 'til_modules' / 'dots')) == ['dots.til', 'sub']
+        assert os.listdir(proj / 'til_modules' / 'modes') == ['modes.til']
+        write(proj / 'main.til', 'import dots\nimport modes\nprint(d() + m())\n')
+        assert run_file_both(read(proj / 'main.til'), str(proj / 'main.til')) == "9\n"
+
     def test_wrong_hash_rejected_before_extracting(self, tmp_path, tilpkg_run, monkeypatch):
         tgz = make_tar(str(tmp_path / 'mathx-1.0.tar.gz'), MATHX)
         proj = make_project(tmp_path / 'app')

@@ -750,10 +750,10 @@ def extract_archive(path: str, fmt: str, dest: str, label: str):
                     if stat.S_ISLNK(mode):
                         raise PkgError(f"{label}: entry '{info.filename}' is a symbolic link "
                                        f"(links are not allowed in packages)")
-                    if info.is_dir():
+                    if info.is_dir() or stat.S_ISDIR(mode) or info.filename.endswith('\\'):
                         ex.directory(rel)
                         continue
-                    if mode and not stat.S_ISREG(mode):
+                    if stat.S_IFMT(mode) not in (0, stat.S_IFREG):    # many tools store no type bits
                         raise PkgError(f"{label}: entry '{info.filename}' is not a regular file")
                     with zf.open(info) as src:
                         ex.file(rel, src)
