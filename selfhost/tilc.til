@@ -161,9 +161,13 @@ var AL_KKL = {"basyp_shygaru": "print", "shygaru": "print", "negizgi": "main", "
 var AL_RU = {"печать": "print", "вывод": "print", "главная": "main", "длина": "len",
     "ввод": "input"}
 
-# keyword / alias lookup tables of the current file, indexed by first byte
-var KWB = []
-var ALB = []
+# a source file: its text and its keyword / alias tables (indexed by the
+# first byte of a word; the keyword languages depend on the file's pragmas)
+struct SrcFile
+    text: str
+    kwb: any
+    alb: any
+    name: str
 
 # ── opcodes (class Op) ───────────────────────────────────────────────────────
 const OP_PUSH_NIL = 1
@@ -308,8 +312,6 @@ init_tables()
     var i = 0
     while i < 256
         BYTE.push(bytes_to_str([i]))
-        KWB.push(None)
-        ALB.push(None)
         i += 1
     i = 0
     while i < 128
@@ -1022,6 +1024,7 @@ struct Tok
     sp: int
 
 struct Lx
+    sf: any
     src: str
     n: int
     pos: int
@@ -1035,9 +1038,10 @@ struct Lx
     tsp: int
     tln: int
 
-new_lexer(src, pos, line, stack, atls)
-    return Lx { src: src, n: len(src), pos: pos, line: line, stack: stack, atls: atls, paren: 0,
-                q: [], qh: 0, done: false, tsp: pos, tln: line }
+new_lexer(sf, pos, line, stack, atls)
+    let src = sf.text
+    return Lx { sf: sf, src: src, n: len(src), pos: pos, line: line, stack: stack, atls: atls,
+                paren: 0, q: [], qh: 0, done: false, tsp: pos, tln: line }
 
 # `#[lang: ...]` pragmas select extra keyword languages (detect_languages)
 skip_ws_any(s, j)
@@ -1064,10 +1068,16 @@ pragma_at(src, j0, langs)
         if (code == "kk-latn" or code == "ru") and not langs.contains(code)
             langs.push(code)
 
-setup_languages(src)
+setup_languages(src, name)
+    var sf = SrcFile { text: src, kwb: [], alb: [], name: name }
+    var i = 0
+    while i < 256
+        sf.kwb.push(None)
+        sf.alb.push(None)
+        i += 1
     var langs = ["en", "kk"]
     let n = len(src)
-    var i = 0
+    i = 0
     while i < n
         var j = i
         while j < n and (src[j] == 32 or src[j] == 9)
@@ -1077,27 +1087,28 @@ setup_languages(src)
         while i < n and src[i] != 10
             i += 1
         i += 1
-    add_keywords(KW_EN, None)
+    add_keywords(sf, KW_EN, None)
     for code in langs
         if code == "kk"
-            add_keywords(KW_KK, AL_KK)
+            add_keywords(sf, KW_KK, AL_KK)
         elif code == "kk-latn"
-            add_keywords(KW_KKL, AL_KKL)
+            add_keywords(sf, KW_KKL, AL_KKL)
         elif code == "ru"
-            add_keywords(KW_RU, AL_RU)
+            add_keywords(sf, KW_RU, AL_RU)
+    return sf
 
-add_keywords(kw, al)
+add_keywords(sf, kw, al)
     for k in kw
         let b = k[0]
-        if KWB[b] == None
-            KWB[b] = {}
-        KWB[b][k] = kw[k]
+        if sf.kwb[b] == None
+            sf.kwb[b] = {}
+        sf.kwb[b][k] = kw[k]
     if al != None
         for k in al
             let b = k[0]
-            if ALB[b] == None
-                ALB[b] = {}
-            ALB[b][k] = al[k]
+            if sf.alb[b] == None
+                sf.alb[b] = {}
+            sf.alb[b][k] = al[k]
 
 add_tok(lx, t, v)
     lx.q.push(Tok { t: t, v: v, ln: lx.tln, sp: lx.tsp })
@@ -1583,7 +1594,7 @@ lex_ident(lx)
     lx.pos = p
     let text = src.slice(st, p)
     let b = src[st]
-    let km = KWB[b]
+    let km = lx.sf.kwb[b]
     if km != None
         let kt = km.get_or(text, -1)
         if kt >= 0
@@ -1592,7 +1603,7 @@ lex_ident(lx)
             else
                 add_tok(lx, kt, text)
             return
-    let am = ALB[b]
+    let am = lx.sf.alb[b]
     if am != None
         add_tok(lx, T_IDENT, am.get_or(text, text))
         return
@@ -1729,6 +1740,7 @@ const K_ENUMDEF = 52
 const K_IMPL = 53
 const K_TYPEALIAS = 54
 const K_TRAIT = 55
+const K_IMPORT = 56
 
 # K_INT n=value | K_FLOAT s=8 bytes | K_STR s | K_CHAR n=code point | K_BOOL n
 # K_FSTR c=[K_STR | K_FPART(a=expr, s=spec)] | K_IDENT s | K_BIN s=op a b
@@ -1741,7 +1753,8 @@ const K_TRAIT = 55
 # K_FORK a=a token stream positioned at a block (compiled later as a value)
 # Statements have no tree: they are compiled while they are parsed (stmt_c).
 # Top-level items: K_FUNC a=FI | K_STRUCTDEF s c=[Fld] | K_ENUMDEF s c=[Vnt]
-# K_IMPL s=type b=trait c=[FI] | K_TRAIT s c=[FI] | K_TYPEALIAS | K_VAR (global) s b=type n=flags (1 mutable,
+# K_IMPL s=type b=trait c=[FI] | K_TRAIT s c=[FI] | K_TYPEALIAS s=name
+# K_IMPORT s=module b=alias c=[names] or None (all) | K_VAR (global) s b=type n=flags (1 mutable,
 # 2 const, 4 deferred) a=literal value or None c=[pos, line] of the value
 # K_STMT c=[pos, line] (script statement) | K_GINIT a=K_VAR (deferred init)
 
@@ -1800,7 +1813,7 @@ var TSG = None
 var TK = None
 var PENDING_ATTRS = []
 var ITEMS = []
-var SRC = ""
+var MAIN_SF = None
 # first pass: statements are only parsed (no code is generated)
 var DRY = false
 # first pass: names used inside lambdas of the function being parsed (they
@@ -1866,15 +1879,14 @@ skip_nl()
         adv()
 
 # ── top level ───────────────────────────────────────────────────────────────
-parse_program(src)
-    SC_ON = has_effect_attributes(src)
+parse_program(sf)
     if SC_ON
         SC_SCRIPT = SCI { calls: {}, refs: {} }
     DRY = true
-    new_stream(new_lexer(src, 0, 1, [0], true))
+    new_stream(new_lexer(sf, 0, 1, [0], true))
     skip_nl()
     while TK.t != T_EOF
-        parse_top_level(src)
+        parse_top_level(sf)
         skip_nl()
     DRY = false
 
@@ -1887,7 +1899,7 @@ parse_top_level(src)
     let t = TK.t
     var node = None
     if t == T_IMPORT or t == T_FROM
-        unsupported(TK.ln, "import (tilc compiles one file)")
+        node = parse_import()
     elif t == T_PUB
         adv()
         node = parse_pub_item(src)
@@ -1903,15 +1915,15 @@ parse_top_level(src)
         node = parse_fn(src, 0)
     elif t == T_TYPE
         expect(T_TYPE)
-        expect(T_IDENT)
+        node = mk(K_TYPEALIAS, 0)
+        node.s = expect(T_IDENT).v
         expect(T_EQ)
         parse_type()
-        node = mk(K_TYPEALIAS, 0)
     elif t == T_CONST or t == T_LET or t == T_VAR
         node = parse_global(tok)
     elif t == T_CAP
         adv()
-        expect(T_IDENT)
+        let cap_name = expect(T_IDENT).v
         if TK.t == T_LBRACE
             adv()
             while TK.t != T_RBRACE
@@ -1920,12 +1932,13 @@ parse_top_level(src)
                     adv()
             expect(T_RBRACE)
         node = mk(K_TYPEALIAS, 0)
+        node.s = cap_name
     elif t == T_IDENT and is_func_def()
         node = parse_func_simple(src, 0)
     else
         # a script statement: remember where it starts, compile it in main()
         node = mk(K_STMT, TK.ln)
-        node.c = [TK.sp, TK.ln]
+        node.c = [TK.sp, TK.ln, src]
         CAPT = SCRIPT_CAPT
         SC_CUR = SC_SCRIPT
         stmt_c()
@@ -1964,7 +1977,7 @@ parse_global(tok)
     if SC_ON
         sci = SCI { calls: {}, refs: {} }
     SC_CUR = sci
-    node.c = [TK.sp, TK.ln, capt, sci]
+    node.c = [TK.sp, TK.ln, capt, sci, TSG.lx.sf]
     let v = parse_expression()
     CAPT = None
     SC_CUR = None
@@ -1974,6 +1987,33 @@ parse_global(tok)
         let c = const_eval(v, SEM_CONSTS)
         if c != None
             SEM_CONSTS[node.s] = c
+    return node
+
+# import a.b [as x]   |   from a.b import x, y   |   from a.b import *
+parse_import()
+    let node = mk(K_IMPORT, 0)
+    let from_form = TK.t == T_FROM
+    adv()
+    var name = expect(T_IDENT).v
+    while TK.t == T_DOT
+        adv()
+        name = name + "." + expect(T_IDENT).v
+    node.s = name
+    if from_form
+        expect(T_IMPORT)
+        if TK.t == T_STAR
+            adv()
+        else
+            var items = []
+            loop
+                items.push(expect(T_IDENT).v)
+                if TK.t != T_COMMA
+                    break
+                adv()
+            node.c = items
+    elif TK.t == T_AS
+        adv()
+        node.b = expect(T_IDENT).v
     return node
 
 parse_pub_item(src)
@@ -2804,7 +2844,8 @@ parse_sub_expr(text, line, walked)
     var l = line
     if l < 1
         l = 1
-    new_stream(new_lexer(text, 0, l, [0], true))
+    let cur = TSG.lx.sf
+    new_stream(new_lexer(SrcFile { text: text, kwb: cur.kwb, alb: cur.alb, name: cur.name }, 0, l, [0], true))
     let e = parse_expression()
     while TK.t != T_EOF
         adv()
@@ -2926,7 +2967,10 @@ sc_check()
                 else
                     var done = false
                     if r[0] == 2
-                        if structs.has(r[1])
+                        if MODULE_NAMES.has(r[1]) and not structs.has(r[1]) and funcs.has(r[2])
+                            es.push([r[2], r[3], true])
+                            done = true
+                        elif structs.has(r[1])
                             let k2 = r[1] + "." + r[2]
                             if funcs.has(k2)
                                 es.push([k2, r[3], true])
@@ -3012,6 +3056,125 @@ sc_effects(funcs, inferred, callee)
     for e in d
         m[e] = 1
     return m
+
+# ── imports (ModuleResolver / resolve_imports): a module is looked for next
+#    to the importing file and in the current directory (not in TIL_PATH or
+#    the standard library: tilc cannot see them) ──────────────────────────
+var MODULE_NAMES = {}
+var MODULE_CACHE = {}
+
+dir_of(path)
+    var i = len(path) - 1
+    while i >= 0 and path[i] != 47
+        i -= 1
+    return path.slice(0, i + 1)
+
+# a/./b -> a/b, a/x/../b -> a/b
+norm_path(p)
+    var out = []
+    for part in p.split("/")
+        if part == "." or (part == "" and len(out) > 0)
+            continue
+        if part == ".." and len(out) > 0 and out[len(out) - 1] != ".." and out[len(out) - 1] != ""
+            out.pop()
+        else
+            out.push(part)
+    return out.join("/")
+
+resolve_module(name, from_file)
+    let parts = name.replace(".", "/")
+    for d in [dir_of(from_file), ""]
+        var cand = norm_path(d + parts + ".til")
+        if file_exists(cand)
+            return cand
+        cand = norm_path(d + parts + "/mod.til")
+        if file_exists(cand)
+            return cand
+    return None
+
+# a module's top-level items (parsed and hoisted once), as [key, item] pairs
+load_module(path)
+    let cached = MODULE_CACHE.get_or(path, None)
+    if cached != None
+        return cached
+    var text = read_file(path)
+    if text.contains("\r")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+    let save_items = ITEMS
+    let save_attrs = PENDING_ATTRS
+    let save_capt = SCRIPT_CAPT
+    let save_sc = SC_SCRIPT
+    let save_name = FNAME
+    ITEMS = []
+    PENDING_ATTRS = []
+    SCRIPT_CAPT = {}
+    FNAME = path
+    parse_program(setup_languages(text, path))
+    hoist()
+    var pairs = []
+    var i = 0
+    for it in ITEMS
+        pairs.push([path + ":" + str(i), it])
+        i += 1
+    ITEMS = save_items
+    PENDING_ATTRS = save_attrs
+    SCRIPT_CAPT = save_capt
+    SC_SCRIPT = save_sc
+    FNAME = save_name
+    MODULE_CACHE[path] = pairs
+    return pairs
+
+def_name(it)
+    if it.k == K_FUNC
+        return it.a.name
+    return it.s
+
+merge_imports(pairs, fname, stack)
+    var out = []
+    for pr in pairs
+        let it = pr[1]
+        if it.k != K_IMPORT
+            out.push(pr)
+        else
+            let path = resolve_module(it.s, fname)
+            if path == None
+                FNAME = fname
+                unsupported(it.ln, "import of '" + it.s + "' (module not found next to the importing file; tilc does not search TIL_PATH or the standard library)")
+            let dot_parts = it.s.split(".")
+            MODULE_NAMES[dot_parts[len(dot_parts) - 1]] = 1
+            if it.b != None
+                MODULE_NAMES[it.b] = 1
+            if not stack.contains(path)
+                var st2 = stack.copy()
+                st2.push(path)
+                for m in merge_imports(load_module(path), path, st2)
+                    let node = m[1]
+                    let k = node.k
+                    if k == K_FUNC or k == K_STRUCTDEF or k == K_ENUMDEF or k == K_IMPL or k == K_TRAIT or k == K_TYPEALIAS or k == K_VAR
+                        if not (k == K_FUNC and node.a.name == "main")
+                            if it.c == None or it.c.contains(def_name(node))
+                                out.push(m)
+    return out
+
+resolve_imports()
+    var pairs = []
+    var i = 0
+    var any_import = false
+    for it in ITEMS
+        pairs.push(["#" + str(i), it])
+        if it.k == K_IMPORT
+            any_import = true
+        i += 1
+    if not any_import
+        return
+    let main_path = norm_path(FNAME)
+    var seen = {}
+    var out = []
+    for pr in merge_imports(pairs, main_path, [main_path])
+        if not seen.has(pr[0])
+            seen[pr[0]] = 1
+            out.push(pr[1])
+    ITEMS = out
 
 sc_merge(dst, src)
     if src == None
@@ -3842,7 +4005,7 @@ compile_program()
     for g in globals
         if GLOBAL_SLOTS.has(g.s) and (g.n & 4) == 0
             if g.c != None
-                relex_at(SRC, g.c[0], g.c[1], 0)
+                relex_at(g.c[4], g.c[0], g.c[1], 0)
                 cexpr(parse_expression())
             else
                 emit(OP_PUSH_NIL, 0)
@@ -3860,11 +4023,11 @@ compile_program()
 # the body of a function, re-read from its source position
 # restart the lexer at a saved source position (top level: indentation
 # stack [0]; impl methods: [0, ind])
-relex_at(src, pos, line, ind)
+relex_at(sf, pos, line, ind)
     var stack = [0]
     if ind > 0
         stack = [0, ind]
-    new_stream(new_lexer(src, pos, line, stack, false))
+    new_stream(new_lexer(sf, pos, line, stack, false))
 
 # function body at the current token: block, { ... } or => expression
 # function body at the current token: block, { ... } or => expression.
@@ -3957,14 +4120,14 @@ compile_function(pe)
 script_item_c(item)
     if item.k == K_GINIT
         let d = item.a
-        relex_at(SRC, d.c[0], d.c[1], 0)
+        relex_at(d.c[4], d.c[0], d.c[1], 0)
         cexpr(parse_expression())
         let c = numeric_cast(d.b)
         if c >= 0
             emit_b(OP_CAST, c, item.ln)
         emit_h(OP_STORE_GLOBAL, GLOBAL_SLOTS[d.s], item.ln)
     else
-        relex_at(SRC, item.c[0], item.c[1], 0)
+        relex_at(item.c[2], item.c[0], item.c[1], 0)
         stmt_c()
 
 # ── statements: parsed and compiled in one go (only expressions are trees),
@@ -4118,7 +4281,7 @@ branch_c(want_value)
 fork_stream()
     let ts = TSG
     let lx = ts.lx
-    let l2 = Lx { src: lx.src, n: lx.n, pos: lx.pos, line: lx.line, stack: lx.stack.copy(),
+    let l2 = Lx { sf: lx.sf, src: lx.src, n: lx.n, pos: lx.pos, line: lx.line, stack: lx.stack.copy(),
                   atls: lx.atls, paren: lx.paren, q: lx.q.slice(lx.qh, len(lx.q)), qh: 0,
                   done: lx.done, tsp: lx.tsp, tln: lx.tln }
     return TS { lx: l2, buf: ts.buf.slice(ts.p, len(ts.buf)), p: 0 }
@@ -4839,11 +5002,11 @@ prelude_function(meth)
         return PRELUDE[mid]
     let save_ts = TSG
     let save_tk = TK
-    let text = PRELUDE_SRC[meth]
+    let sf = setup_languages(PRELUDE_SRC[meth], "<prelude>")
     let save_dry = DRY
     DRY = true
-    new_stream(new_lexer(text, 0, 1, [0], true))
-    let fi = parse_func_simple(text, 0).a
+    new_stream(new_lexer(sf, 0, 1, [0], true))
+    let fi = parse_func_simple(sf, 0).a
     DRY = save_dry
     TSG = save_ts
     TK = save_tk
@@ -5104,7 +5267,7 @@ sem_check(key, node)
             if p.def == None
                 required += 1
     let f = node.a
-    let inst = f.k == K_ATTR and not (f.a.k == K_IDENT and STRUCT_TYPES.has(f.a.s))
+    let inst = f.k == K_ATTR and not (f.a.k == K_IDENT and (STRUCT_TYPES.has(f.a.s) or MODULE_NAMES.has(f.a.s)))
     if len(fi.params) != n and not inst
         return
     let argc = len(node.c)
@@ -5241,6 +5404,14 @@ ccall(node)
                 cargs(args, node.ln)
                 emit_hb(OP_NEW_STRUCT, variant[0], argc, node.ln)
                 return
+            if MODULE_NAMES.has(oname) and not GLOBAL_SLOTS.has(oname)
+                if not FUNC_IX.has(meth)
+                    fail_at(node.ln, "module '" + oname + "' has no function '" + meth + "'")
+                sem_check(meth, node)
+                check_arity(node.ln, meth, argc)
+                cargs(args, node.ln)
+                emit_hb(OP_CALL, FUNC_IX[meth], argc, node.ln)
+                return
             if oname.starts_with("__Vec__") and meth == "new"
                 emit_h(OP_NEW_ARRAY, 0, node.ln)
                 return
@@ -5280,6 +5451,11 @@ cattr(node)
             if variant[1] != 0
                 fail_at(node.ln, "'" + oname + "." + node.s + "' needs " + str(variant[1]) + " value(s)")
             emit_hb(OP_NEW_STRUCT, variant[0], 0, node.ln)
+            return
+        if MODULE_NAMES.has(oname) and not GLOBAL_SLOTS.has(oname)
+            let id = mk(K_IDENT, node.ln)
+            id.s = node.s
+            cexpr(id)
             return
     cexpr(obj)
     emit_h(OP_GET_FIELD, const_str(node.s), node.ln)
@@ -5419,10 +5595,11 @@ main()
     var src = read_file(a[0])
     if src.contains("\r")
         src = src.replace("\r\n", "\n").replace("\r", "\n")
-    setup_languages(src)
-    SRC = src
-    parse_program(src)
+    MAIN_SF = setup_languages(src, a[0])
+    SC_ON = has_effect_attributes(src) or src.contains("import")
+    parse_program(MAIN_SF)
     hoist()
+    resolve_imports()
     if SC_ON
         sc_check()
     TSG = None

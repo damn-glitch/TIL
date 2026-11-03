@@ -40,7 +40,8 @@ SLOW = bool(os.environ.get('TIL_TEST_SLOW'))
 
 # Constructs outside TIL Core: tilc must reject them with "unsupported: <what>"
 # (see selfhost/README.md). Any other "unsupported" message fails the tests.
-UNSUPPORTED = ("handle (effects)", "perform (effects)", "import (tilc compiles one file)")
+UNSUPPORTED = ("handle (effects)", "perform (effects)",
+               "(module not found next to the importing file; tilc does not search TIL_PATH or the standard library)")
 
 # Bytecode may differ from the Python compiler's only where a float constant
 # expression folds to NaN: tilc leaves it to run time (the NaN bit pattern
@@ -595,6 +596,35 @@ class TestLanguage:
         assert crc == 1 and cout == "2\n"
         assert "at inner (line 3)" in cerr and "at main (line 7)" in cerr
 
+    def test_imports(self, tilc, tmp_path):
+        files = {
+            "geom.til": "import util\nstruct Point\n    x: int\n    y: int\nimpl Point\n"
+                        "    norm1(self) -> int\n        return abs(self.x) + abs(self.y)\n"
+                        "let ORIGIN_X = 0\nvar counter = 0\nmake(x, y) -> Point\n    counter += 1\n"
+                        "    return Point { x: x, y: y }\nmain()\n    print(\"not imported\")\n",
+            "util.til": "import geom\ntwice(v) => v * 2\n",
+            "rus.til": "#[lang: ru]\nфункция удвоить(х)\n    вернуть х * 2\n",
+            "pkg/sub/mod.til": "deep() -> str\n    return \"deep\"\n",
+            "pkg/leaf.til": "leaf_val() => 41\n",
+            "main.til": "import geom as g\nfrom util import twice\nimport rus\nimport pkg.sub\n"
+                        "from pkg.leaf import *\nmain()\n    let p = g.make(3, -4)\n    print(p.norm1())\n"
+                        "    print(g.counter, twice(21), удвоить(5), deep(), sub.deep(), leaf_val())\n"
+                        "    print(geom.ORIGIN_X)\n",
+            "bad.til": "from geom import Point, make\nmain()\n    print(make(1, 2))\n",
+        }
+        for name, text in files.items():
+            path = tmp_path / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding='utf-8')
+        main = str(tmp_path / "main.til")
+        rc, out, data = tilc.compile_file(main, str(tmp_path / "out.tbc"))
+        assert rc == 0, out
+        assert data == py_compile(files["main.til"], main)
+        assert run_vm(data) == (0, "7\n1\n42\n10\ndeep\ndeep\n41\n0\n")
+        # `counter` is not imported: both compilers report it (with the line in geom.til)
+        rc, out, data = tilc.compile_file(str(tmp_path / "bad.til"), str(tmp_path / "out.tbc"))
+        assert rc == 1 and out.strip().endswith(":11: error: unknown name 'counter'"), out
+
     def test_float_folding_nan_keeps_behaviour(self, tilc):
         src = "main()\n    print(1e400 - 1e400)\n    print(-1e400 * 0.0)\n    print(2.0 * 3.5)\n"
         assert check_program(tilc, "nan", src) == 'behaviour'
@@ -643,7 +673,8 @@ ERRORS = [
 ]
 
 UNSUPPORTED_PROGRAMS = [
-    ("import math_utils\n", 1, "import (tilc compiles one file)"),
+    ("import no_such_module\n", 1, "import of 'no_such_module' (module not found next to the importing "
+     "file; tilc does not search TIL_PATH or the standard library)"),
     ("main()\n    perform Log(1)\n", 2, "perform (effects)"),
 ]
 
