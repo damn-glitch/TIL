@@ -9265,12 +9265,16 @@ class ModuleResolver:
             candidate = os.path.join(d, parts, "mod.til")
             if os.path.exists(candidate):
                 return candidate
-        return None
+        # installed packages (til_modules/, `til pkg`) come after everything above
+        return find_package_module(module_name, from_file, self.base_path)
 
     def load_module(self, module_name: str, from_file: str = "") -> Optional[Program]:
         """Load and parse a module, returning its AST (cached per file)."""
         path = self.resolve(module_name, from_file)
         if not path:
+            hint = package_install_hint(module_name, from_file, self.base_path)
+            if hint:
+                print(hint, file=sys.stderr)
             return None
         key = os.path.abspath(path)
         if key in self.loaded:
@@ -9282,6 +9286,92 @@ class ModuleResolver:
         ast.filename = path
         self.loaded[key] = ast
         return ast
+
+
+# ── packages: til_modules/ (installed by `til pkg`, see docs/TIL_PACKAGES.md) ──
+# `import NAME` / `from NAME import x` look for til_modules/NAME/ in the
+# importing file's directory and then in each parent directory (nearest
+# first), after all the search paths above. Inside a package:
+#   import NAME      -> til.json "main", else NAME.til, lib.til, mod.til
+#   import NAME.a.b  -> a/b.til or a/b/mod.til (package root first, then the
+#                       directory of the entry file)
+PACKAGE_DIR = 'til_modules'
+
+
+def _package_manifest(directory: str) -> Dict[str, Any]:
+    """til.json of a directory as a dict ({} if missing or unreadable)."""
+    import json
+    try:
+        with open(os.path.join(directory, 'til.json'), encoding='utf-8-sig') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _package_start_dir(from_file: str, base_path: str) -> str:
+    if from_file and not from_file.startswith("<"):
+        return os.path.dirname(os.path.abspath(from_file))
+    return os.path.abspath(base_path)
+
+
+def package_entry_file(pkg_dir: str, name: str) -> Optional[str]:
+    """The file `import NAME` loads from a package directory: til.json "main"
+    (a relative path inside the package), else NAME.til, lib.til, mod.til."""
+    main = _package_manifest(pkg_dir).get('main')
+    if isinstance(main, str) and main:
+        root = os.path.abspath(pkg_dir)
+        path = os.path.abspath(os.path.join(root, main))
+        if os.path.isabs(main) or not path.startswith(root + os.sep) or not os.path.isfile(path):
+            return None             # `til pkg` rejects such packages; never look elsewhere
+        return path
+    for candidate in (name + ".til", "lib.til", "mod.til"):
+        path = os.path.join(pkg_dir, candidate)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def find_package_module(module_name: str, from_file: str = "", base_path: str = ".") -> Optional[str]:
+    """Resolve `import NAME[.sub...]` against installed packages: the nearest
+    til_modules/NAME/ directory, walking up from the importing file."""
+    parts = module_name.split(".")
+    d = _package_start_dir(from_file, base_path)
+    while True:
+        pkg_dir = os.path.join(d, PACKAGE_DIR, parts[0])
+        if os.path.isdir(pkg_dir):
+            entry = package_entry_file(pkg_dir, parts[0])
+            if len(parts) == 1:
+                return entry
+            roots = [pkg_dir]
+            if entry and os.path.dirname(entry) != os.path.abspath(pkg_dir):
+                roots.append(os.path.dirname(entry))
+            sub = os.path.join(*parts[1:])
+            for root in roots:
+                for candidate in (os.path.join(root, sub + ".til"), os.path.join(root, sub, "mod.til")):
+                    if os.path.isfile(candidate):
+                        return candidate
+            return None             # the nearest package of that name wins
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def package_install_hint(module_name: str, from_file: str = "", base_path: str = ".") -> Optional[str]:
+    """A hint when a missing module is a dependency declared in a til.json
+    above the importing file (i.e. `til pkg install` was not run)."""
+    name = module_name.split(".")[0]
+    d = _package_start_dir(from_file, base_path)
+    while True:
+        deps = _package_manifest(d).get('dependencies')
+        if isinstance(deps, dict) and name in deps:
+            return (f"hint: '{name}' is a dependency in {os.path.join(d, 'til.json')} but is not "
+                    f"installed - run `til pkg install`")
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
 
 
 IMPORTABLE_NODES = (FuncDef, StructDef, EnumDef, ImplBlock, TraitDef, TypeAlias,
