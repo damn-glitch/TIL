@@ -31,6 +31,8 @@ from typing import Dict, List, Optional, Set, Tuple, Any, Union
 from enum import Enum, auto
 from abc import ABC, abstractmethod
 
+TIL_VERSION = "3.0.0"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              ERROR REPORTING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -64,7 +66,7 @@ class ErrorReporter:
         parts = []
 
         # Error header
-        code_str = f"[{error_code}] " if error_code else ""
+        code_str = f"[{error_code}]" if error_code else ""
         parts.append(self._c(self.BOLD + self.RED, f"error{code_str}: {msg}"))
 
         # Location
@@ -1453,7 +1455,7 @@ class Parser:
                            body=Block(statements=script), line=script[0].line)
             rest.append(main)
         else:
-            body = main.body if isinstance(main.body, Block) else Block([main.body])
+            body = main.body if isinstance(main.body, Block) else Block(statements=[main.body])
             main.body = Block(statements=script + body.statements, line=body.line)
         return rest
 
@@ -1585,7 +1587,7 @@ class Parser:
         name = self.consume(TokenType.IDENT).value
         return self.parse_func_body(name)
     
-    def parse_func_body(self, name: str) -> FuncDef:
+    def parse_func_body(self, name: str, allow_signature: bool = False) -> FuncDef:
         name_tok = self.tokens[self.pos - 1] if self.pos > 0 else self.current()
         self.consume(TokenType.LPAREN)
         params = self.parse_params()
@@ -1607,7 +1609,9 @@ class Parser:
         elif self.match(TokenType.FAT_ARROW):
             fat = self.advance()
             expr = self.parse_expression()
-            body = Block([self._mark(Return(expr), fat)])
+            body = Block(statements=[self._mark(Return(value=expr), fat)])
+        elif allow_signature:
+            body = Block(statements=[])     # trait method signature (no default body)
         else:
             self.error("Expected function body")
 
@@ -1915,7 +1919,7 @@ class Parser:
         elif self.match(TokenType.LBRACE):
             then_body = self.parse_brace_block()
         else:
-            then_body = Block([self.parse_statement()])
+            then_body = Block(statements=[self.parse_statement()])
         
         elifs = []
         else_body = None
@@ -1935,7 +1939,7 @@ class Parser:
             elif self.match(TokenType.LBRACE):
                 elif_body = self.parse_brace_block()
             else:
-                elif_body = Block([self.parse_statement()])
+                elif_body = Block(statements=[self.parse_statement()])
             elifs.append((elif_cond, elif_body))
             self.skip_newlines()
         
@@ -1947,7 +1951,7 @@ class Parser:
             elif self.match(TokenType.LBRACE):
                 else_body = self.parse_brace_block()
             else:
-                else_body = Block([self.parse_statement()])
+                else_body = Block(statements=[self.parse_statement()])
         
         return If(condition=condition, then_body=then_body, elifs=elifs, else_body=else_body)
     
@@ -1963,7 +1967,7 @@ class Parser:
         elif self.match(TokenType.LBRACE):
             body = self.parse_brace_block()
         else:
-            body = Block([self.parse_statement()])
+            body = Block(statements=[self.parse_statement()])
         
         return For(var=var, iter=iter_expr, body=body)
     
@@ -1977,7 +1981,7 @@ class Parser:
         elif self.match(TokenType.LBRACE):
             body = self.parse_brace_block()
         else:
-            body = Block([self.parse_statement()])
+            body = Block(statements=[self.parse_statement()])
         
         return While(condition=condition, body=body)
     
@@ -1990,7 +1994,7 @@ class Parser:
         elif self.match(TokenType.LBRACE):
             body = self.parse_brace_block()
         else:
-            body = Block([self.parse_statement()])
+            body = Block(statements=[self.parse_statement()])
         
         return Loop(body=body)
     
@@ -2285,9 +2289,10 @@ class Parser:
                 break
             
             if self.match(TokenType.FN):
-                method = self.parse_fn()
-            elif self.match(TokenType.IDENT) and self.is_func_def():
-                method = self.parse_func_def_simple()
+                self.advance()
+            if self.match(TokenType.IDENT) and self.peek().type == TokenType.LPAREN:
+                method_name = self.advance().value
+                method = self.parse_func_body(method_name, allow_signature=True)
             else:
                 self.error("Expected method definition in trait")
             
@@ -2660,7 +2665,7 @@ class Parser:
                     self.advance()
             
             self.consume(TokenType.RBRACE)
-            return DictLit(pairs)
+            return DictLit(pairs=pairs)
         
         # Lambda: |x, y| x + y  OR  |x: int| -> int { x + 1 }
         if self.match(TokenType.PIPE):
@@ -3071,6 +3076,330 @@ class TypeChecker:
         if expected == T_FLOAT and actual == T_INT:
             return True
         return False
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                     SEMANTIC VERIFIER (effects, capabilities, contracts)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def iter_children(node):
+    """Yield the direct AST children of a node (works for every node class)."""
+    if not isinstance(node, ASTNode) and not isinstance(node, (FuncParam, StructField)):
+        return
+    for value in vars(node).values():
+        if isinstance(value, ASTNode):
+            yield value
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                if isinstance(item, ASTNode):
+                    yield item
+                elif isinstance(item, (list, tuple)):
+                    for sub in item:
+                        if isinstance(sub, ASTNode):
+                            yield sub
+
+
+def walk(node):
+    """Depth-first iteration over a subtree (node included)."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if n is None:
+            continue
+        yield n
+        stack.extend(reversed(list(iter_children(n))))
+
+
+INT64_MASK = (1 << 64) - 1
+
+def wrap_int64(x: int) -> int:
+    """Two's-complement 64-bit wrap-around (TIL `int` semantics)."""
+    x &= INT64_MASK
+    return x - (1 << 64) if x >= (1 << 63) else x
+
+def til_idiv(a: int, b: int) -> int:
+    """Integer division truncating toward zero (C semantics, not Python's floor)."""
+    q = abs(a) // abs(b)
+    return wrap_int64(q if (a >= 0) == (b >= 0) else -q)
+
+def til_imod(a: int, b: int) -> int:
+    """Remainder with the sign of the dividend (C semantics)."""
+    return wrap_int64(a - til_idiv(a, b) * b)
+
+
+class NotConstant(Exception):
+    pass
+
+
+def const_eval(node, env: Dict[str, Any]):
+    """Evaluate an expression at compile time, or raise NotConstant."""
+    if isinstance(node, (IntLit, FloatLit, StringLit, BoolLit)):
+        return node.value
+    if isinstance(node, CharLit):
+        return ord(node.value)
+    if isinstance(node, Identifier):
+        if node.name in env:
+            return env[node.name]
+        raise NotConstant(node.name)
+    if isinstance(node, UnaryOp):
+        v = const_eval(node.operand, env)
+        if node.op == '-' and isinstance(v, (int, float)) and not isinstance(v, bool):
+            return wrap_int64(-v) if isinstance(v, int) else -v
+        if node.op == 'not':
+            return not v
+        if node.op == '~' and isinstance(v, int):
+            return wrap_int64(~v)
+        raise NotConstant(node.op)
+    if isinstance(node, BinaryOp):
+        if node.op == 'and':
+            return bool(const_eval(node.left, env)) and bool(const_eval(node.right, env))
+        if node.op == 'or':
+            return bool(const_eval(node.left, env)) or bool(const_eval(node.right, env))
+        a, b = const_eval(node.left, env), const_eval(node.right, env)
+        num = (int, float)
+        if node.op in ('==', '!='):
+            return (a == b) if node.op == '==' else (a != b)
+        if node.op in ('<', '>', '<=', '>=') and type(a) in num and type(b) in num:
+            return {'<': a < b, '>': a > b, '<=': a <= b, '>=': a >= b}[node.op]
+        if type(a) is int and type(b) is int:
+            if node.op == '+': return wrap_int64(a + b)
+            if node.op == '-': return wrap_int64(a - b)
+            if node.op == '*': return wrap_int64(a * b)
+            if node.op in ('/', '%'):
+                if b == 0:
+                    raise NotConstant("division by zero")
+                return til_idiv(a, b) if node.op == '/' else til_imod(a, b)
+        if type(a) in num and type(b) in num and node.op in ('+', '-', '*', '/'):
+            if node.op == '/' and b == 0:
+                raise NotConstant("division by zero")
+            return {'+': a + b, '-': a - b, '*': a * b, '/': a / b if b else 0}[node.op]
+        if node.op == '+' and isinstance(a, str) and isinstance(b, str):
+            return a + b
+        raise NotConstant(node.op)
+    if isinstance(node, Call) and isinstance(node.func, Identifier) and node.func.name == 'len' \
+            and len(node.args) == 1:
+        v = const_eval(node.args[0], env)
+        if isinstance(v, str):
+            return len(v.encode('utf-8'))
+    raise NotConstant(type(node).__name__)
+
+
+class SemanticChecker:
+    """Compile-time verification shared by both backends.
+
+    * Effects (gradual): a function's effects are inferred from its body
+      (print/input -> io, `perform X` -> X, plus everything its callees do).
+      `#[pure]` / `#[effects: ...]` declare an upper bound that is ENFORCED.
+    * Capabilities: a function marked `#[cap: X]` may only be called (or
+      referenced) by functions that also hold X; `main` holds every capability.
+    * Contracts: calls whose arguments are compile-time constants are checked
+      against `#[requires: ...]` at compile time.
+    * Arity: calls to known functions must pass a valid number of arguments.
+    """
+
+    IO_BUILTINS = {'print', 'println', 'input'}
+
+    def __init__(self, source: str = "", filename: str = "<stdin>"):
+        self.reporter = ErrorReporter(source, filename)
+        self.errors: List[str] = []
+
+    def error(self, node, msg: str, code: str = "", hint: str = ""):
+        line = getattr(node, 'line', 0) or 0
+        col = getattr(node, 'col', 0) or 1
+        self.errors.append(self.reporter.format_error(line, col, msg, code, hint))
+
+    @staticmethod
+    def describe(key: str) -> str:
+        return f"'{key}'"
+
+    def check(self, program: Program) -> List[str]:
+        self.funcs: Dict[str, FuncDef] = {}
+        self.methods_by_name: Dict[str, List[str]] = {}
+        self.struct_names: Set[str] = set()
+        self.enum_names: Set[str] = set()
+        self.module_names = set(getattr(program, 'module_names', set()) or ())
+        self.consts: Dict[str, Any] = {}
+        for stmt in program.statements:
+            if isinstance(stmt, FuncDef):
+                self.funcs[stmt.name] = stmt
+            elif isinstance(stmt, StructDef):
+                self.struct_names.add(stmt.name)
+            elif isinstance(stmt, EnumDef):
+                self.enum_names.add(stmt.name)
+            elif isinstance(stmt, ImplBlock):
+                for m in stmt.methods:
+                    key = f"{stmt.type_name}.{m.name}"
+                    self.funcs[key] = m
+                    self.methods_by_name.setdefault(m.name, []).append(key)
+            elif isinstance(stmt, VarDecl) and stmt.value is not None and not stmt.mutable:
+                try:
+                    self.consts[stmt.name] = const_eval(stmt.value, self.consts)
+                except NotConstant:
+                    pass
+
+        # Per function: base effects and resolved call edges
+        self.base_effects: Dict[str, Set[str]] = {}
+        self.edges: Dict[str, List[Tuple[str, ASTNode, bool]]] = {}  # (callee, node, precise)
+        self.effect_origin: Dict[Tuple[str, str], ASTNode] = {}
+        for key, fn in self.funcs.items():
+            self.scan_function(key, fn)
+
+        self.check_effects()
+        self.check_capabilities()
+        return self.errors
+
+    # ── call graph ──────────────────────────────────────────────────────────
+    def resolve_call(self, owner_key: str, call: Call) -> List[Tuple[str, bool]]:
+        f = call.func
+        if isinstance(f, Identifier):
+            if f.name in self.funcs and '.' not in f.name:
+                return [(f.name, True)]
+            return []
+        if isinstance(f, Attribute):
+            obj = f.obj
+            if isinstance(obj, Identifier):
+                if obj.name in self.struct_names or obj.name in self.enum_names:
+                    key = f"{obj.name}.{f.attr}"
+                    return [(key, True)] if key in self.funcs else []
+                if obj.name in self.module_names and f.attr in self.funcs:
+                    return [(f.attr, True)]
+                if obj.name == "self" and '.' in owner_key:
+                    key = f"{owner_key.split('.')[0]}.{f.attr}"
+                    if key in self.funcs:
+                        return [(key, True)]
+            candidates = self.methods_by_name.get(f.attr, [])
+            return [(c, len(candidates) == 1) for c in candidates]
+        return []
+
+    def scan_function(self, key: str, fn: FuncDef):
+        effects: Set[str] = set()
+        edges: List[Tuple[str, ASTNode, bool]] = []
+        callee_nodes = set()
+        for node in walk(fn.body):
+            if isinstance(node, Call):
+                if isinstance(node.func, Identifier) and node.func.name in self.IO_BUILTINS:
+                    effects.add('io')
+                    self.effect_origin.setdefault((key, 'io'), node)
+                for callee, precise in self.resolve_call(key, node):
+                    edges.append((callee, node, precise))
+                    if precise:
+                        self.check_call_site(callee, node)
+                callee_nodes.add(id(node.func))
+            elif isinstance(node, PerformEffect):
+                effects.add(node.name)
+                self.effect_origin.setdefault((key, node.name), node)
+        # Taking a function as a value (e.g. `let f = read_file`) counts as a
+        # reference for capability purposes: no capability laundering.
+        for node in walk(fn.body):
+            if isinstance(node, Identifier) and id(node) not in callee_nodes \
+                    and node.name in self.funcs and self.funcs[node.name].caps:
+                edges.append((node.name, node, True))
+        self.base_effects[key] = effects
+        self.edges[key] = edges
+
+    # ── effects ─────────────────────────────────────────────────────────────
+    def declared(self, key: str) -> Optional[Set[str]]:
+        fn = self.funcs[key]
+        if fn.declared_effects is None:
+            return None
+        return set(fn.declared_effects)
+
+    def check_effects(self):
+        # Interface effects: declared if present, else inferred (fixpoint).
+        inferred = {k: set(v) for k, v in self.base_effects.items()}
+        changed = True
+        while changed:
+            changed = False
+            for key, edges in self.edges.items():
+                for callee, _node, _precise in edges:
+                    callee_eff = self.declared(callee)
+                    if callee_eff is None:
+                        callee_eff = inferred.get(callee, set())
+                    new = callee_eff - inferred[key]
+                    if new:
+                        inferred[key] |= new
+                        changed = True
+        for key, fn in self.funcs.items():
+            allowed = self.declared(key)
+            if allowed is None:
+                continue
+            actual = set(self.base_effects[key])
+            for callee, node, _precise in self.edges[key]:
+                callee_eff = self.declared(callee)
+                if callee_eff is None:
+                    callee_eff = inferred.get(callee, set())
+                for eff in callee_eff - allowed:
+                    if eff not in actual:
+                        actual.add(eff)
+                        self.effect_origin.setdefault((key, eff), node)
+                        self.effect_origin[(key, eff, 'via')] = callee
+            for eff in sorted(actual - allowed):
+                origin = self.effect_origin.get((key, eff), fn)
+                via = self.effect_origin.get((key, eff, 'via'))
+                how = f" (through the call to '{via}')" if via else ""
+                if 'pure' in (fn.effects or []) and not fn.declared_effects:
+                    msg = f"pure function '{key}' performs effect '{eff}'{how}"
+                    hint = f"remove #[pure] or declare #[effects: {eff}]"
+                else:
+                    msg = (f"function '{key}' performs effect '{eff}'{how}, "
+                           f"but declares only #[effects: {', '.join(sorted(allowed)) or 'none'}]")
+                    hint = f"add '{eff}' to the #[effects: ...] list"
+                self.error(origin, msg, "E-EFFECT", hint)
+
+    # ── capabilities ────────────────────────────────────────────────────────
+    def check_capabilities(self):
+        for key, edges in self.edges.items():
+            if key == "main":
+                continue  # the program entry point holds all authority
+            held = set(self.funcs[key].caps)
+            for callee, node, precise in edges:
+                if not precise:
+                    continue
+                missing = [c for c in self.funcs[callee].caps if c not in held]
+                for cap in missing:
+                    self.error(node,
+                               f"'{key}' uses '{callee}', which requires capability '{cap}', "
+                               f"but '{key}' does not hold it",
+                               "E-CAP", f"add #[cap: {cap}] to '{key}' (only main holds every capability)")
+
+    # ── call sites: arity + constant contracts ─────────────────────────────
+    def check_call_site(self, callee: str, call: Call):
+        fn = self.funcs[callee]
+        params = [p for p in fn.params if p.name != "self"]
+        is_instance_call = (isinstance(call.func, Attribute) and not (
+            isinstance(call.func.obj, Identifier) and (
+                call.func.obj.name in self.struct_names or call.func.obj.name in self.module_names)))
+        if len(fn.params) != len(params) and not is_instance_call:
+            return  # static reference to an instance method; leave to the backend
+        required = sum(1 for p in params if p.default is None)
+        if not (required <= len(call.args) <= len(params)):
+            expected = f"{required}" if required == len(params) else f"{required} to {len(params)}"
+            self.error(call, f"'{callee}' expects {expected} argument(s), got {len(call.args)}",
+                       "E-ARITY")
+            return
+        if not fn.requires:
+            return
+        env = dict(self.consts)
+        try:
+            for i, p in enumerate(params):
+                arg = call.args[i] if i < len(call.args) else p.default
+                env[p.name] = const_eval(arg, self.consts)
+        except NotConstant:
+            return  # not all arguments are known: checked at run time instead
+        for expr, text in zip(fn.requires, fn.requires_text or [""] * len(fn.requires)):
+            try:
+                ok = const_eval(expr, env)
+            except NotConstant:
+                continue
+            if not ok:
+                shown = ", ".join(f"{p.name}={env[p.name]!r}" for p in params)
+                self.error(call, f"contract violation: call to '{callee}' ({shown}) "
+                                 f"breaks #[requires: {text}]",
+                           "E-CONTRACT", "proved false at compile time; fix the arguments")
+
+
+class CompileError(Exception):
+    """A fatal, already formatted, compile-time error."""
+    pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              CODE GENERATOR
@@ -4406,14 +4735,9 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 return "bool"
             return "int"
         if isinstance(arg, Attribute):
-            # self.x in method context — check struct field type
-            if isinstance(arg.obj, Identifier):
-                obj_name = arg.obj.name
-                stype = None
-                if obj_name == "self" and self.current_struct:
-                    stype = self.current_struct
-                elif obj_name in self.struct_vars:
-                    stype = self.struct_vars[obj_name]
+            # self.x / p.x / a.b.c - resolve the struct type of the object expression
+            if True:
+                stype = self._resolve_expr_struct_type(arg.obj)
                 if stype and stype in self.structs:
                     for fld in self.structs[stype].fields:
                         if fld.name == arg.attr:
@@ -4851,16 +5175,11 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         if isinstance(node, Call):
             return self._infer_call_ret_type(node) == "const char*"
         if isinstance(node, Attribute):
-            if isinstance(node.obj, Identifier):
-                stype = None
-                if node.obj.name == "self" and self.current_struct:
-                    stype = self.current_struct
-                elif node.obj.name in self.struct_vars:
-                    stype = self.struct_vars[node.obj.name]
-                if stype and stype in self.structs:
-                    for fld in self.structs[stype].fields:
-                        if fld.name == node.attr:
-                            return self.type_to_c(fld.type) == "const char*"
+            stype = self._resolve_expr_struct_type(node.obj)
+            if stype and stype in self.structs:
+                for fld in self.structs[stype].fields:
+                    if fld.name == node.attr:
+                        return self.type_to_c(fld.type) == "const char*"
         return False
 
     def gen_UnaryOp(self, node: UnaryOp) -> str:
@@ -5693,6 +6012,2925 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#              TIL VM - PORTABLE BYTECODE BACKEND ("TIL Micro")
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# The second backend of TIL. Instead of C it emits compact bytecode (.tbc) that
+# runs on a tiny virtual machine:
+#   * the reference VM below (pure Python: `til run --vm`, no C compiler needed)
+#   * vm/tilvm.c - a portable C99 VM with no malloc, a fixed arena, a compacting
+#     GC and pluggable I/O, small enough for graphing calculators (Z80 / eZ80 /
+#     SH4 / ARM) and microcontrollers.
+# Values are dynamically tagged, so every language feature has the same meaning
+# on every device. Format: docs/TIL_BYTECODE.md.
+
+import struct as _struct
+import math as _math
+import time as _time
+
+TBC_MAGIC = b"TILB"
+TBC_VERSION = 1
+
+
+class Op:
+    NOP = 0x00; PUSH_NIL = 0x01; PUSH_TRUE = 0x02; PUSH_FALSE = 0x03
+    PUSH_I8 = 0x04; PUSH_I16 = 0x05; PUSH_CONST = 0x06; POP = 0x07
+    DUP = 0x08; DUP2 = 0x09; SWAP = 0x0A
+    LOAD_LOCAL = 0x10; STORE_LOCAL = 0x11; LOAD_GLOBAL = 0x12; STORE_GLOBAL = 0x13
+    LOAD_UPVAL = 0x14; STORE_UPVAL = 0x15; LOAD_CELL = 0x16; STORE_CELL = 0x17
+    MAKE_CELL = 0x18; LOAD_UPVAL_RAW = 0x19; ARG_DEFAULT = 0x1A
+    ADD = 0x20; SUB = 0x21; MUL = 0x22; DIV = 0x23; MOD = 0x24; POW = 0x25
+    NEG = 0x26; NOT = 0x27; BAND = 0x28; BOR = 0x29; BXOR = 0x2A; BNOT = 0x2B
+    SHL = 0x2C; SHR = 0x2D
+    EQ = 0x30; NE = 0x31; LT = 0x32; LE = 0x33; GT = 0x34; GE = 0x35
+    JUMP = 0x40; JUMP_IF_FALSE = 0x41; JUMP_IF_TRUE = 0x42
+    CALL = 0x50; CALL_VALUE = 0x51; INVOKE = 0x52; RETURN = 0x53
+    RETURN_NIL = 0x54; NATIVE = 0x55
+    NEW_ARRAY = 0x60; NEW_MAP = 0x61; NEW_STRUCT = 0x62; GET_INDEX = 0x63
+    SET_INDEX = 0x64; GET_FIELD = 0x65; SET_FIELD = 0x66; GET_SLOT = 0x67
+    MAKE_CLOSURE = 0x68; PUSH_FUNC = 0x69; CONCAT = 0x6A; FOR_ITER = 0x6B
+    MATCH_TYPE = 0x6C; CAST = 0x6D; IS_ARRAY_LEN = 0x6E
+    TRY = 0x70; TRY_TIMEOUT = 0x71; END_TRY = 0x72; PANIC = 0x73
+    UNWRAP_OR_RETURN = 0x74; UNWRAP_OR_PANIC = 0x75
+    HALT = 0x7F
+
+
+OP_NAMES = {v: k for k, v in vars(Op).items() if not k.startswith('_')}
+
+# Operand layout per opcode: b=u8 c=i8 h=u16 s=i16 (little endian)
+OP_OPERANDS = {
+    Op.PUSH_I8: 'c', Op.PUSH_I16: 's', Op.PUSH_CONST: 'h',
+    Op.LOAD_LOCAL: 'b', Op.STORE_LOCAL: 'b', Op.LOAD_GLOBAL: 'h', Op.STORE_GLOBAL: 'h',
+    Op.LOAD_UPVAL: 'b', Op.STORE_UPVAL: 'b', Op.LOAD_CELL: 'b', Op.STORE_CELL: 'b',
+    Op.MAKE_CELL: 'b', Op.LOAD_UPVAL_RAW: 'b', Op.ARG_DEFAULT: 'bs',
+    Op.JUMP: 's', Op.JUMP_IF_FALSE: 's', Op.JUMP_IF_TRUE: 's',
+    Op.CALL: 'hb', Op.CALL_VALUE: 'b', Op.INVOKE: 'hbb', Op.NATIVE: 'bb',
+    Op.NEW_ARRAY: 'h', Op.NEW_MAP: 'h', Op.NEW_STRUCT: 'hb', Op.GET_FIELD: 'h',
+    Op.SET_FIELD: 'h', Op.GET_SLOT: 'b', Op.MAKE_CLOSURE: 'hb', Op.PUSH_FUNC: 'h',
+    Op.CONCAT: 'b', Op.FOR_ITER: 'bs', Op.MATCH_TYPE: 'h', Op.CAST: 'b',
+    Op.IS_ARRAY_LEN: 'h', Op.TRY: 's', Op.TRY_TIMEOUT: 's',
+}
+_OPERAND_SIZE = {'b': 1, 'c': 1, 'h': 2, 's': 2}
+
+# Builtin functions callable with NATIVE <id> <argc>. The order is part of the
+# bytecode format (shared with vm/tilvm.c).
+NATIVES = [
+    'print', 'len', 'str', 'int', 'float', 'abs', 'sqrt', 'pow', 'sin', 'cos',
+    'tan', 'log', 'exp', 'floor', 'ceil', 'round', 'min', 'max', 'input', 'chr',
+    'ord', 'range', 'type_of', 'format', 'clock_ms', 'random', 'seed', 'sleep_ms',
+    'exit', 'bool', 'sum', 'panic', 'iter', 'println',
+]
+NATIVE_ID = {name: i for i, name in enumerate(NATIVES)}
+
+# Builtin methods (INVOKE ... <method id> ...) of str / array / map / Option / Result.
+METHODS = [
+    'len', 'push', 'pop', 'get', 'set', 'contains', 'starts_with', 'ends_with',
+    'trim', 'to_upper', 'to_lower', 'replace', 'slice', 'find', 'eq', 'split',
+    'repeat', 'to_int', 'to_float', 'is_empty', 'insert', 'remove', 'index_of',
+    'reverse', 'sort', 'join', 'first', 'last', 'clear', 'sum', 'min', 'max',
+    'has', 'delete', 'keys', 'values', 'get_or', 'unwrap', 'expect', 'unwrap_or',
+    'is_some', 'is_none', 'is_ok', 'is_err', 'error', 'to_string', 'copy', 'count',
+    'map', 'filter', 'reduce', 'each', 'any', 'all',
+]
+METHOD_ID = {name: i for i, name in enumerate(METHODS)}
+NO_METHOD = 0xFF
+
+# Higher-order array methods are written in TIL itself (no native->bytecode
+# re-entrancy is needed in the C VM). Compiled into a module only when used.
+PRELUDE_SOURCE = {
+    'map': "__prelude_map(a, f)\n    var out = []\n    for x in a\n        out.push(f(x))\n    return out\n",
+    'filter': "__prelude_filter(a, f)\n    var out = []\n    for x in a\n        if f(x)\n            out.push(x)\n    return out\n",
+    'reduce': "__prelude_reduce(a, f, init)\n    var acc = init\n    for x in a\n        acc = f(acc, x)\n    return acc\n",
+    'each': "__prelude_each(a, f)\n    for x in a\n        f(x)\n",
+    'any': "__prelude_any(a, f)\n    for x in a\n        if f(x)\n            return true\n    return false\n",
+    'all': "__prelude_all(a, f)\n    for x in a\n        if not f(x)\n            return false\n    return true\n",
+}
+
+CAST_KINDS = {'int': 0, 'float': 1, 'str': 2, 'bool': 3}
+BUILTIN_TYPES = [('Some', ['value']), ('Ok', ['value']), ('Err', ['error'])]
+TYPE_SOME, TYPE_OK, TYPE_ERR = 0, 1, 2
+
+
+class TBCFunction:
+    FLAG_METHOD = 1      # param 0 is `self`
+    FLAG_PROPAGATE = 2   # `?` inside returns None/Err from this function
+    FLAG_LAMBDA = 4
+
+    def __init__(self, name: str):
+        self.name = name
+        self.n_params = 0
+        self.n_required = 0
+        self.n_locals = 0
+        self.n_upvals = 0
+        self.flags = 0
+        self.code = bytearray()
+        self.lines: List[Tuple[int, int]] = []   # (offset in code, source line)
+        self.offset = 0                           # absolute offset in module code
+
+
+class TBCModule:
+    """An in-memory bytecode module (what a .tbc file contains)."""
+
+    def __init__(self):
+        self.consts: List[Any] = []          # int | float | bytes
+        self._const_index: Dict[Any, int] = {}
+        self.funcs: List[TBCFunction] = []
+        self.types: List[Tuple[str, List[str]]] = list(BUILTIN_TYPES)
+        self.methods: List[Tuple[int, int, int]] = []   # (type, name const, func)
+        self.globals: List[str] = []
+        self.entry = 0
+        self.prelude: Dict[int, int] = {}    # method id -> func index
+        self.code = b""
+        self.lines: List[Tuple[int, int]] = []
+        self.uses_float = False
+
+    def const(self, value) -> int:
+        if isinstance(value, str):
+            value = value.encode('utf-8')
+        if isinstance(value, bool):
+            value = int(value)
+        if isinstance(value, float):
+            key = ('f', _struct.pack('<d', value))
+            self.uses_float = True
+        elif isinstance(value, int):
+            key = ('i', value)
+        else:
+            key = ('s', bytes(value))
+        if key not in self._const_index:
+            self._const_index[key] = len(self.consts)
+            self.consts.append(value)
+        return self._const_index[key]
+
+    def link(self):
+        """Concatenate function code into one code section."""
+        code = bytearray()
+        self.lines = []
+        for f in self.funcs:
+            f.offset = len(code)
+            code += f.code
+            for off, line in f.lines:
+                self.lines.append((f.offset + off, line))
+        self.code = bytes(code)
+        self.methods.sort(key=lambda m: (m[0], m[1]))
+
+    # ── serialization ───────────────────────────────────────────────────────
+    def to_bytes(self, strip: bool = False) -> bytes:
+        """Write the module (call serialize(): it interns all names first)."""
+        self.link()
+        out = bytearray()
+        flags = (1 if self.uses_float else 0) | (0 if strip else 2)
+        out += TBC_MAGIC + bytes([TBC_VERSION, flags])
+        out += _struct.pack('<HH', len(self.globals), self.entry)
+        out += _struct.pack('<H', len(self.consts))
+        for c in self.consts:
+            if isinstance(c, float):
+                out += b'\x02' + _struct.pack('<d', c)
+            elif isinstance(c, int):
+                out += b'\x01' + _struct.pack('<q', wrap_int64(c))
+            else:
+                if len(c) > 0xFFFF:
+                    raise CompileError("string constant longer than 65535 bytes")
+                out += b'\x03' + _struct.pack('<H', len(c)) + c
+        out += _struct.pack('<H', len(self.funcs))
+        for f in self.funcs:
+            out += _struct.pack('<HBBBBBI', self.const(f.name), f.n_params, f.n_required,
+                                f.n_locals, f.n_upvals, f.flags, f.offset)
+        out += _struct.pack('<H', len(self.types))
+        for name, fields in self.types:
+            out += _struct.pack('<HB', self.const(name), len(fields))
+            for fld in fields:
+                out += _struct.pack('<H', self.const(fld))
+        out += _struct.pack('<H', len(self.methods))
+        for t, n, fidx in self.methods:
+            out += _struct.pack('<HHH', t, n, fidx)
+        out += bytes([len(self.prelude)])
+        for mid, fidx in sorted(self.prelude.items()):
+            out += _struct.pack('<BH', mid, fidx)
+        out += _struct.pack('<I', len(self.code)) + self.code
+        lines = [] if strip else self.lines
+        out += _struct.pack('<H', min(len(lines), 0xFFFF))
+        for pc, line in lines[:0xFFFF]:
+            out += _struct.pack('<IH', pc, min(line, 0xFFFF))
+        return bytes(out)
+
+    def serialize(self, strip: bool = False) -> bytes:
+        for f in self.funcs:
+            self.const(f.name)
+        for name, fields in self.types:
+            self.const(name)
+            for fld in fields:
+                self.const(fld)
+        return self.to_bytes(strip)
+
+    @staticmethod
+    def from_bytes(data: bytes) -> 'TBCModule':
+        m = TBCModule()
+        m.types = []
+        if data[:4] != TBC_MAGIC:
+            raise ValueError("not a TIL bytecode file (bad magic)")
+        if data[4] != TBC_VERSION:
+            raise ValueError(f"unsupported bytecode version {data[4]}")
+        flags = data[5]
+        m.uses_float = bool(flags & 1)
+        pos = 6
+        def rd(fmt):
+            nonlocal pos
+            vals = _struct.unpack_from('<' + fmt, data, pos)
+            pos += _struct.calcsize('<' + fmt)
+            return vals if len(vals) > 1 else vals[0]
+        n_globals, m.entry = rd('HH')
+        m.globals = [f"g{i}" for i in range(n_globals)]
+        for _ in range(rd('H')):
+            tag = rd('B')
+            if tag == 1:
+                m.consts.append(rd('q'))
+            elif tag == 2:
+                m.consts.append(rd('d'))
+            elif tag == 3:
+                n = rd('H')
+                m.consts.append(bytes(data[pos:pos + n]))
+                pos += n
+            else:
+                raise ValueError(f"bad constant tag {tag}")
+        for _ in range(rd('H')):
+            name, np_, nr, nl, nu, fl, off = rd('HBBBBBI')
+            f = TBCFunction(m.consts[name].decode('utf-8', 'replace'))
+            f.n_params, f.n_required, f.n_locals, f.n_upvals, f.flags, f.offset = np_, nr, nl, nu, fl, off
+            m.funcs.append(f)
+        for _ in range(rd('H')):
+            name, nf = rd('HB')
+            fields = [m.consts[rd('H')].decode('utf-8', 'replace') for _ in range(nf)]
+            m.types.append((m.consts[name].decode('utf-8', 'replace'), fields))
+        for _ in range(rd('H')):
+            m.methods.append(rd('HHH'))
+        for _ in range(rd('B')):
+            mid, fidx = rd('BH')
+            m.prelude[mid] = fidx
+        n = rd('I')
+        m.code = bytes(data[pos:pos + n])
+        pos += n
+        for _ in range(rd('H')):
+            m.lines.append(rd('IH'))
+        return m
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                         BYTECODE COMPILER (AST -> .tbc)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class _Local:
+    __slots__ = ('slot', 'mutable', 'celled', 'name')
+
+    def __init__(self, name, slot, mutable, celled):
+        self.name, self.slot, self.mutable, self.celled = name, slot, mutable, celled
+
+
+class _FuncState:
+    def __init__(self, proto: TBCFunction, parent: Optional['_FuncState'], fdef=None):
+        self.proto = proto
+        self.parent = parent
+        self.fdef = fdef
+        self.scopes: List[Dict[str, _Local]] = [{}]
+        self.next_slot = 0
+        self.upvals: List[Tuple[str, bool, int, bool]] = []   # (name, from_parent_local, index, mutable)
+        self.loops: List[dict] = []
+        self.try_depth = 0
+        self.captured: Set[str] = set()
+        self.last_line = -1
+        self.result_slot: Optional[int] = None   # `result` inside #[ensures]
+
+
+class BytecodeCompiler:
+    """Compiles a (resolved) TIL Program into a TBCModule."""
+
+    def __init__(self, source: str = "", filename: str = "<stdin>"):
+        self.reporter = ErrorReporter(source, filename)
+        self.filename = filename
+        self.m = TBCModule()
+
+    # ── errors ──────────────────────────────────────────────────────────────
+    def error(self, node, msg: str, hint: str = ""):
+        line = getattr(node, 'line', 0) or 0
+        col = getattr(node, 'col', 0) or 1
+        raise CompileError(self.reporter.format_error(line, col, msg, "E-VM", hint))
+
+    # ── emission helpers ────────────────────────────────────────────────────
+    def emit(self, op: int, *operands, node=None):
+        fs = self.fs
+        line = getattr(node, 'line', 0) if node is not None else 0
+        if line and line != fs.last_line:
+            fs.proto.lines.append((len(fs.proto.code), line))
+            fs.last_line = line
+        code = fs.proto.code
+        code.append(op)
+        fmt = OP_OPERANDS.get(op, '')
+        for kind, val in zip(fmt, operands):
+            if kind == 'b':
+                if not 0 <= val <= 0xFF:
+                    self.error(node, f"operand out of range ({val}); too many locals/arguments?")
+                code.append(val)
+            elif kind == 'c':
+                code += _struct.pack('<b', val)
+            elif kind == 'h':
+                if not 0 <= val <= 0xFFFF:
+                    self.error(node, "program too large for the bytecode format")
+                code += _struct.pack('<H', val)
+            elif kind == 's':
+                code += _struct.pack('<h', val)
+        return len(code)
+
+    def emit_jump(self, op: int, node=None) -> int:
+        """Emit a forward jump (single i16 operand); returns the patch position."""
+        self.emit(op, 0, node=node)
+        return len(self.fs.proto.code) - 2
+
+    def patch_jump(self, at: int, target: Optional[int] = None):
+        code = self.fs.proto.code
+        target = len(code) if target is None else target
+        rel = target - (at + 2)
+        if not -32768 <= rel <= 32767:
+            raise CompileError("function too large: jump offset exceeds 32 KB")
+        code[at:at + 2] = _struct.pack('<h', rel)
+
+    def emit_loop(self, target: int, node=None):
+        self.emit(Op.JUMP, 0, node=node)
+        self.patch_jump(len(self.fs.proto.code) - 2, target)
+
+    def here(self) -> int:
+        return len(self.fs.proto.code)
+
+    def push_int(self, v: int, node=None):
+        v = wrap_int64(v)
+        if -128 <= v <= 127:
+            self.emit(Op.PUSH_I8, v, node=node)
+        elif -32768 <= v <= 32767:
+            self.emit(Op.PUSH_I16, v, node=node)
+        else:
+            self.emit(Op.PUSH_CONST, self.m.const(v), node=node)
+
+    def push_const(self, value, node=None):
+        if isinstance(value, bool):
+            self.emit(Op.PUSH_TRUE if value else Op.PUSH_FALSE, node=node)
+        elif value is None:
+            self.emit(Op.PUSH_NIL, node=node)
+        elif isinstance(value, int):
+            self.push_int(value, node)
+        else:
+            self.emit(Op.PUSH_CONST, self.m.const(value), node=node)
+
+    # ── scopes ──────────────────────────────────────────────────────────────
+    def begin_scope(self):
+        self.fs.scopes.append({})
+
+    def end_scope(self):
+        self.fs.scopes.pop()
+        # slots are not reused, which keeps closures/cells simple and safe
+
+    def declare_local(self, name: str, mutable: bool = True, node=None) -> _Local:
+        fs = self.fs
+        slot = fs.next_slot
+        fs.next_slot += 1
+        if fs.next_slot > 250:
+            self.error(node, "too many local variables in one function (max 250)")
+        fs.proto.n_locals = max(fs.proto.n_locals, fs.next_slot)
+        local = _Local(name, slot, mutable, name in fs.captured)
+        fs.scopes[-1][name] = local
+        return local
+
+    def hidden_local(self) -> int:
+        return self.declare_local(f" tmp{self.fs.next_slot}").slot
+
+    def find_local(self, fs: _FuncState, name: str) -> Optional[_Local]:
+        for scope in reversed(fs.scopes):
+            if name in scope:
+                return scope[name]
+        return None
+
+    def resolve_upval(self, fs: _FuncState, name: str) -> Optional[int]:
+        if fs.parent is None:
+            return None
+        for i, (n, _from_local, _idx, _mut) in enumerate(fs.upvals):
+            if n == name:
+                return i
+        local = self.find_local(fs.parent, name)
+        if local is not None:
+            if not local.celled:
+                return None   # cannot happen: capture analysis cells captured names
+            fs.upvals.append((name, True, local.slot, local.mutable))
+            return len(fs.upvals) - 1
+        idx = self.resolve_upval(fs.parent, name)
+        if idx is None:
+            return None
+        fs.upvals.append((name, False, idx, fs.parent.upvals[idx][3]))
+        return len(fs.upvals) - 1
+
+    def store_new_local(self, local: _Local, node=None):
+        """Value on the stack -> freshly declared local (celled if captured)."""
+        self.emit(Op.STORE_LOCAL, local.slot, node=node)
+        if local.celled:
+            self.emit(Op.MAKE_CELL, local.slot, node=node)
+
+    # ── program ─────────────────────────────────────────────────────────────
+    def compile_program(self, program: Program) -> TBCModule:
+        m = self.m
+        self.funcs: Dict[str, int] = {}          # function name -> index
+        self.fdefs: Dict[str, FuncDef] = {}
+        self.struct_types: Dict[str, int] = {}   # struct name -> type index
+        self.struct_fields: Dict[str, List[StructField]] = {}
+        self.enum_values: Dict[str, Dict[str, int]] = {}   # C-like enums
+        self.adt_variants: Dict[str, Dict[str, Tuple[int, int]]] = {}  # enum -> variant -> (type, arity)
+        self.global_slots: Dict[str, int] = {}
+        self.global_mutable: Dict[str, bool] = {}
+        self.inline_consts: Dict[str, Any] = {}
+        self.module_names = set(getattr(program, 'module_names', set()) or ())
+        self.user_method_names: Set[str] = set()
+        self.pending: List[Tuple[int, Any, Optional[str]]] = []   # (func idx, FuncDef/lambda, owner type)
+
+        traits: Dict[str, TraitDef] = {}
+        impls: List[ImplBlock] = []
+        globals_: List[VarDecl] = []
+        for stmt in program.statements:
+            if isinstance(stmt, StructDef):
+                self.struct_types[stmt.name] = len(m.types)
+                self.struct_fields[stmt.name] = stmt.fields
+                m.types.append((stmt.name, [f.name for f in stmt.fields]))
+            elif isinstance(stmt, EnumDef):
+                self.declare_enum(stmt)
+            elif isinstance(stmt, TraitDef):
+                traits[stmt.name] = stmt
+            elif isinstance(stmt, ImplBlock):
+                impls.append(stmt)
+            elif isinstance(stmt, VarDecl):
+                globals_.append(stmt)
+
+        # functions
+        for stmt in program.statements:
+            if isinstance(stmt, FuncDef):
+                if stmt.name in self.funcs:
+                    self.error(stmt, f"function '{stmt.name}' is defined twice")
+                self.add_function(stmt.name, stmt, None)
+        # methods (+ trait default methods)
+        for impl in impls:
+            if impl.type_name not in self.struct_types:
+                self.error(impl, f"impl for unknown struct '{impl.type_name}'")
+            tidx = self.struct_types[impl.type_name]
+            defined = set()
+            for meth in impl.methods:
+                fidx = self.add_function(f"{impl.type_name}.{meth.name}", meth, impl.type_name)
+                defined.add(meth.name)
+                self.user_method_names.add(meth.name)
+                if any(p.name == "self" for p in meth.params):
+                    m.methods.append((tidx, m.const(meth.name), fidx))
+            if impl.trait_name and impl.trait_name in traits:
+                for tm in traits[impl.trait_name].methods:
+                    if tm.name in defined:
+                        continue
+                    if not (isinstance(tm.body, Block) and tm.body.statements):
+                        self.error(impl, f"impl {impl.trait_name} for {impl.type_name} is missing "
+                                         f"method '{tm.name}'")
+                    fidx = self.add_function(f"{impl.type_name}.{tm.name}", tm, impl.type_name)
+                    self.user_method_names.add(tm.name)
+                    if any(p.name == "self" for p in tm.params):
+                        m.methods.append((tidx, m.const(tm.name), fidx))
+
+        # globals: literal constants are inlined, everything else gets a slot
+        for g in globals_:
+            if not g.mutable and isinstance(g.value, (IntLit, FloatLit, StringLit, BoolLit, CharLit)):
+                self.inline_consts[g.name] = ord(g.value.value) if isinstance(g.value, CharLit) \
+                    else g.value.value
+                continue
+            self.global_slots[g.name] = len(m.globals)
+            self.global_mutable[g.name] = g.mutable
+            m.globals.append(g.name)
+
+        # entry point: initialise globals, then call main
+        start = TBCFunction("__start__")
+        m.entry = len(m.funcs)
+        m.funcs.append(start)
+        self.fs = _FuncState(start, None)
+        for g in globals_:
+            if g.name in self.global_slots:
+                self.compile_expr(g.value, g) if g.value is not None else self.emit(Op.PUSH_NIL)
+                self.emit(Op.STORE_GLOBAL, self.global_slots[g.name], node=g)
+        if "main" in self.funcs:
+            self.emit(Op.CALL, self.funcs["main"], 0)
+            self.emit(Op.POP)
+        self.emit(Op.HALT)
+
+        # compile bodies (lambdas and prelude functions are appended as we go)
+        i = 0
+        while i < len(self.pending):
+            fidx, fdef, owner = self.pending[i]
+            self.compile_function(fidx, fdef, owner)
+            i += 1
+        return m
+
+    def declare_enum(self, e: EnumDef):
+        if any(v.fields for v in e.variants):
+            # Algebraic data type: every variant is a (possibly empty) record
+            variants = {}
+            for v in e.variants:
+                tidx = len(self.m.types)
+                self.m.types.append((f"{e.name}.{v.name}", [str(i) for i in range(len(v.fields))]))
+                variants[v.name] = (tidx, len(v.fields))
+            self.adt_variants[e.name] = variants
+        else:
+            values, nxt = {}, 0
+            for v in e.variants:
+                if v.value is not None:
+                    try:
+                        nxt = const_eval(v.value, {})
+                    except NotConstant:
+                        self.error(v.value if isinstance(v.value, ASTNode) else e,
+                                   "enum values must be constants")
+                values[v.name] = nxt
+                nxt += 1
+            self.enum_values[e.name] = values
+
+    def add_function(self, name: str, fdef, owner: Optional[str]) -> int:
+        proto = TBCFunction(name)
+        idx = len(self.m.funcs)
+        self.m.funcs.append(proto)
+        self.funcs[name] = idx
+        self.fdefs[name] = fdef
+        self.pending.append((idx, fdef, owner))
+        return idx
+
+    def prelude_function(self, method: str) -> int:
+        mid = METHOD_ID[method]
+        if mid in self.m.prelude:
+            return self.m.prelude[mid]
+        fdef = parse_source(PRELUDE_SOURCE[method], "<prelude>").statements[0]
+        idx = self.add_function(fdef.name, fdef, None)
+        self.m.prelude[mid] = idx
+        return idx
+
+    # ── capture analysis ────────────────────────────────────────────────────
+    @staticmethod
+    def captured_names(body) -> Set[str]:
+        """Names referenced inside lambdas (they must live in cells)."""
+        names: Set[str] = set()
+        for node in walk(body):
+            if isinstance(node, Lambda):
+                params = {p for p, _ in node.params}
+                for inner in walk(node.body):
+                    if isinstance(inner, Identifier) and inner.name not in params:
+                        names.add(inner.name)
+        return names
+
+    # ── functions ───────────────────────────────────────────────────────────
+    def compile_function(self, fidx: int, fdef, owner: Optional[str]):
+        proto = self.m.funcs[fidx]
+        parent_fs = getattr(self, 'fs', None)
+        fs = _FuncState(proto, None, fdef)
+        self.fs = fs
+        fs.captured = self.captured_names(fdef.body)
+        for c in fdef.requires + fdef.ensures:
+            fs.captured |= self.captured_names(c)
+        params = fdef.params
+        proto.n_params = len(params)
+        proto.n_required = 0
+        seen_default = False
+        for i, p in enumerate(params):
+            if p.default is None and not seen_default:
+                proto.n_required = i + 1
+            elif p.default is not None:
+                seen_default = True
+        if fdef.name == "main" and params:
+            self.error(fdef, "main() takes no parameters")
+        if params and params[0].name == "self":
+            proto.flags |= TBCFunction.FLAG_METHOD
+        if isinstance(fdef.ret_type, (OptionType, ResultType)):
+            proto.flags |= TBCFunction.FLAG_PROPAGATE
+        for p in params:
+            self.declare_local(p.name, mutable=True, node=fdef)
+        # default arguments are evaluated by the callee when the slot is unset
+        for i, p in enumerate(params):
+            if p.default is not None:
+                at = self.emit(Op.ARG_DEFAULT, i, 0, node=fdef) - 2
+                self.compile_expr(p.default, fdef)
+                self.emit(Op.STORE_LOCAL, i)
+                self.patch_jump(at)
+        # annotated numeric parameters are converted like C does (f(x: float) with f(3))
+        for i, p in enumerate(params):
+            cast = self.numeric_cast_for(p.type)
+            if cast is not None:
+                self.emit(Op.LOAD_LOCAL, i)
+                self.emit(Op.CAST, cast)
+                self.emit(Op.STORE_LOCAL, i)
+        for p in params:
+            local = self.find_local(fs, p.name)
+            if local.celled:
+                self.emit(Op.MAKE_CELL, local.slot)
+        # contracts: preconditions at entry
+        for cond, text in zip(fdef.requires, fdef.requires_text or [""] * len(fdef.requires)):
+            self.compile_expr(cond, fdef)
+            skip = self.emit_jump(Op.JUMP_IF_TRUE, node=cond)
+            self.push_const(f"contract violation: {fdef.name} requires {text}".strip(), cond)
+            self.emit(Op.PANIC, node=cond)
+            self.patch_jump(skip)
+        self.compile_block_stmts(fdef.body)
+        self.emit_return_nil(fdef)
+        self.fs = parent_fs
+
+    def emit_return_nil(self, node):
+        fdef = self.fs.fdef
+        if isinstance(fdef, FuncDef) and fdef.ensures and not isinstance(fdef.ret_type, VoidType):
+            self.emit(Op.PUSH_NIL)
+            self.emit_return_value(node)
+        else:
+            self.emit(Op.RETURN_NIL, node=node)
+
+    def emit_return_value(self, node):
+        """Return the value on the stack, checking #[ensures] first."""
+        fs = self.fs
+        fdef = fs.fdef
+        if isinstance(fdef, FuncDef):
+            cast = self.numeric_cast_for(fdef.ret_type)
+            if cast is not None:
+                self.emit(Op.CAST, cast, node=node)   # `-> float` returning an int, etc.
+        if isinstance(fdef, FuncDef) and fdef.ensures:
+            if fs.result_slot is None:
+                fs.result_slot = self.hidden_local()
+            self.emit(Op.STORE_LOCAL, fs.result_slot, node=node)
+            fs.ensures_active = True
+            for cond, text in zip(fdef.ensures, fdef.ensures_text or [""] * len(fdef.ensures)):
+                self.compile_expr(cond, fdef)
+                ok = self.emit_jump(Op.JUMP_IF_TRUE, node=cond)
+                self.push_const(f"contract violation: {fdef.name} ensures {text}".strip(), cond)
+                self.emit(Op.PANIC, node=cond)
+                self.patch_jump(ok)
+            fs.ensures_active = False
+            self.emit(Op.LOAD_LOCAL, fs.result_slot)
+        self.emit(Op.RETURN, node=node)
+
+    def compile_lambda(self, node: Lambda) -> None:
+        proto = TBCFunction(f"<lambda:{node.line}>")
+        proto.flags |= TBCFunction.FLAG_LAMBDA
+        fidx = len(self.m.funcs)
+        self.m.funcs.append(proto)
+        parent = self.fs
+        fs = _FuncState(proto, parent, node)
+        fs.captured = self.captured_names(node.body)
+        self.fs = fs
+        proto.n_params = proto.n_required = len(node.params)
+        for pname, _ptype in node.params:
+            self.declare_local(pname, node=node)
+        for pname, _ptype in node.params:
+            local = self.find_local(fs, pname)
+            if local.celled:
+                self.emit(Op.MAKE_CELL, local.slot)
+        if isinstance(node.body, Block):
+            self.compile_block_value(node.body)
+        else:
+            self.compile_expr(node.body, node)
+        self.emit(Op.RETURN, node=node)
+        proto.n_upvals = len(fs.upvals)
+        upvals = fs.upvals
+        self.fs = parent
+        if not upvals:
+            self.emit(Op.PUSH_FUNC, fidx, node=node)
+            return
+        for _name, from_local, index, _mut in upvals:
+            if from_local:
+                self.emit(Op.LOAD_LOCAL, index, node=node)       # pushes the cell itself
+            else:
+                self.emit(Op.LOAD_UPVAL_RAW, index, node=node)
+        self.emit(Op.MAKE_CLOSURE, fidx, len(upvals), node=node)
+
+
+    # ── blocks & statements ─────────────────────────────────────────────────
+    def compile_block_stmts(self, body):
+        stmts = body.statements if isinstance(body, Block) else [body]
+        self.begin_scope()
+        for s in stmts:
+            self.compile_stmt(s)
+        self.end_scope()
+
+    def compile_block_value(self, body):
+        """A block used as an expression evaluates to its last expression."""
+        stmts = body.statements if isinstance(body, Block) else [body]
+        self.begin_scope()
+        if not stmts:
+            self.emit(Op.PUSH_NIL)
+        for s in stmts[:-1]:
+            self.compile_stmt(s)
+        if stmts:
+            last = stmts[-1]
+            if isinstance(last, ExprStmt):
+                self.compile_expr(last.expr, last)
+            elif isinstance(last, MatchExpr):
+                self.compile_match(last, True)
+            elif isinstance(last, If) and last.else_body is not None:
+                self.compile_if(last, want_value=True)
+            elif isinstance(last, (Block, IntentBlock)):
+                self.compile_expr(last, last)
+            else:
+                self.compile_stmt(last)
+                self.emit(Op.PUSH_NIL)
+        self.end_scope()
+
+    def compile_stmt(self, node):
+        t = type(node)
+        if t is ExprStmt:
+            self.compile_expr(node.expr, node)
+            self.emit(Op.POP)
+        elif t is VarDecl:
+            self.compile_var_decl(node)
+        elif t is Assignment:
+            self.compile_assignment(node)
+        elif t is If:
+            self.compile_if(node, want_value=False)
+        elif t is While:
+            self.compile_while(node)
+        elif t is Loop:
+            self.compile_while(node, infinite=True)
+        elif t is For:
+            self.compile_for(node)
+        elif t is Break or t is Continue:
+            self.compile_break_continue(node, t is Break)
+        elif t is Return:
+            for _ in range(self.fs.try_depth):
+                self.emit(Op.END_TRY)
+            if node.value is not None:
+                self.compile_expr(node.value, node)
+                self.emit_return_value(node)
+            else:
+                self.emit_return_nil(node)
+        elif t is MatchExpr:
+            self.compile_match(node, False)
+        elif t is AssertStmt or t is InvariantStmt:
+            self.compile_expr(node.condition, node)
+            ok = self.emit_jump(Op.JUMP_IF_TRUE, node)
+            kind = "Assertion failed" if t is AssertStmt else "Invariant violated"
+            self.push_const(f"{kind}: {node.message}" if node.message else kind, node)
+            self.emit(Op.PANIC, node=node)
+            self.patch_jump(ok)
+        elif t is IntentBlock:
+            self.compile_intent(node, False)
+        elif t is Block:
+            self.compile_block_stmts(node)
+        elif t in (FuncDef, StructDef, EnumDef, ImplBlock, TraitDef):
+            self.error(node, "definitions are only allowed at the top level")
+        elif t in (TypeAlias, Import, CapabilityType):
+            pass
+        else:
+            self.compile_expr(node, node)
+            self.emit(Op.POP)
+
+    def numeric_cast_for(self, type_ann) -> Optional[int]:
+        if isinstance(type_ann, PrimitiveType):
+            if type_ann.name in ('float', 'f32', 'f64'):
+                return CAST_KINDS['float']
+            if type_ann.name in ('int', 'i8', 'i16', 'i32', 'i64', 'uint', 'u8', 'u16', 'u32', 'u64'):
+                return CAST_KINDS['int']
+        return None
+
+    def compile_var_decl(self, node: VarDecl):
+        if node.value is None:
+            self.push_const(self.zero_value(node.type_ann), node)
+        else:
+            self.compile_expr(node.value, node)
+            cast = self.numeric_cast_for(node.type_ann)
+            if cast is not None and not isinstance(node.value, (IntLit if cast == 0 else FloatLit)):
+                self.emit(Op.CAST, cast, node=node)
+        local = self.declare_local(node.name, mutable=node.mutable, node=node)
+        self.store_new_local(local, node)
+
+    @staticmethod
+    def zero_value(type_ann):
+        if isinstance(type_ann, PrimitiveType):
+            return {'float': 0.0, 'f32': 0.0, 'f64': 0.0, 'str': "", 'bool': False,
+                    'char': 0}.get(type_ann.name, 0)
+        return None
+
+    def emit_load_var(self, name: str, node) -> bool:
+        fs = self.fs
+        if name == 'result' and getattr(fs, 'ensures_active', False):
+            self.emit(Op.LOAD_LOCAL, fs.result_slot, node=node)
+            return True
+        local = self.find_local(fs, name)
+        if local is not None:
+            self.emit(Op.LOAD_CELL if local.celled else Op.LOAD_LOCAL, local.slot, node=node)
+            return True
+        up = self.resolve_upval(fs, name)
+        if up is not None:
+            self.emit(Op.LOAD_UPVAL, up, node=node)
+            return True
+        if name in self.inline_consts:
+            self.push_const(self.inline_consts[name], node)
+            return True
+        if name in self.global_slots:
+            self.emit(Op.LOAD_GLOBAL, self.global_slots[name], node=node)
+            return True
+        return False
+
+    def emit_store_var(self, name: str, node):
+        fs = self.fs
+        local = self.find_local(fs, name)
+        hint = "declare it with 'var' to make it mutable"
+        if local is not None:
+            if not local.mutable:
+                self.error(node, f"cannot assign twice to immutable variable '{name}'", hint)
+            self.emit(Op.STORE_CELL if local.celled else Op.STORE_LOCAL, local.slot, node=node)
+            return
+        up = self.resolve_upval(fs, name)
+        if up is not None:
+            if not fs.upvals[up][3]:
+                self.error(node, f"cannot assign to immutable captured variable '{name}'", hint)
+            self.emit(Op.STORE_UPVAL, up, node=node)
+            return
+        if name in self.global_slots:
+            if not self.global_mutable[name]:
+                self.error(node, f"cannot assign to immutable global '{name}'", hint)
+            self.emit(Op.STORE_GLOBAL, self.global_slots[name], node=node)
+            return
+        if name in self.inline_consts:
+            self.error(node, f"cannot assign to constant '{name}'")
+        self.unknown_name(node, name)
+
+    def unknown_name(self, node, name: str, what: str = "name"):
+        import difflib
+        known = set(self.funcs) | set(self.global_slots) | set(self.inline_consts) | set(NATIVES)
+        for scope in self.fs.scopes:
+            known |= {k for k in scope if not k.startswith(' ')}
+        close = difflib.get_close_matches(name, [k for k in known if '.' not in k], n=1)
+        self.error(node, f"unknown {what} '{name}'", f"did you mean '{close[0]}'?" if close else "")
+
+    BINOPS = {'+': Op.ADD, '-': Op.SUB, '*': Op.MUL, '/': Op.DIV, '%': Op.MOD, '**': Op.POW,
+              '&': Op.BAND, '|': Op.BOR, '^': Op.BXOR, '<<': Op.SHL, '>>': Op.SHR,
+              '==': Op.EQ, '!=': Op.NE, '<': Op.LT, '<=': Op.LE, '>': Op.GT, '>=': Op.GE}
+
+    def compile_assignment(self, node: Assignment):
+        target, op = node.target, node.op
+        binop = None if op == '=' else self.BINOPS[op[:-1]]
+        if isinstance(target, Identifier):
+            if binop is not None:
+                if not self.emit_load_var(target.name, target):
+                    self.unknown_name(target, target.name)
+                self.compile_expr(node.value, node)
+                self.emit(binop, node=node)
+            else:
+                self.compile_expr(node.value, node)
+            self.emit_store_var(target.name, node)
+        elif isinstance(target, Index):
+            self.compile_expr(target.obj, target)
+            self.compile_expr(target.index, target)
+            if binop is not None:
+                self.emit(Op.DUP2)
+                self.emit(Op.GET_INDEX, node=target)
+                self.compile_expr(node.value, node)
+                self.emit(binop, node=node)
+            else:
+                self.compile_expr(node.value, node)
+            self.emit(Op.SET_INDEX, node=node)
+        elif isinstance(target, Attribute):
+            self.compile_expr(target.obj, target)
+            name = self.m.const(target.attr)
+            if binop is not None:
+                self.emit(Op.DUP)
+                self.emit(Op.GET_FIELD, name, node=target)
+                self.compile_expr(node.value, node)
+                self.emit(binop, node=node)
+            else:
+                self.compile_expr(node.value, node)
+            self.emit(Op.SET_FIELD, name, node=node)
+        else:
+            self.error(node, "invalid assignment target")
+
+    def compile_if(self, node: If, want_value: bool):
+        ends = []
+        branches = [(node.condition, node.then_body)] + list(node.elifs)
+        for cond, body in branches:
+            self.compile_expr(cond, node)
+            nxt = self.emit_jump(Op.JUMP_IF_FALSE, cond)
+            if want_value:
+                self.compile_block_value(body)
+            else:
+                self.compile_block_stmts(body)
+            ends.append(self.emit_jump(Op.JUMP))
+            self.patch_jump(nxt)
+        if node.else_body is not None:
+            if want_value:
+                self.compile_block_value(node.else_body)
+            else:
+                self.compile_block_stmts(node.else_body)
+        elif want_value:
+            self.emit(Op.PUSH_NIL)
+        for e in ends:
+            self.patch_jump(e)
+
+    def push_loop(self, continue_target: Optional[int]):
+        ctx = {'breaks': [], 'continues': [], 'continue_target': continue_target,
+               'try_depth': self.fs.try_depth}
+        self.fs.loops.append(ctx)
+        return ctx
+
+    def pop_loop(self, ctx):
+        self.fs.loops.pop()
+        for b in ctx['breaks']:
+            self.patch_jump(b)
+
+    def compile_while(self, node, infinite: bool = False):
+        top = self.here()
+        exit_jump = None
+        if not infinite:
+            self.compile_expr(node.condition, node)
+            exit_jump = self.emit_jump(Op.JUMP_IF_FALSE, node)
+        ctx = self.push_loop(top)
+        self.compile_block_stmts(node.body)
+        self.emit_loop(top, node)
+        if exit_jump is not None:
+            self.patch_jump(exit_jump)
+        self.pop_loop(ctx)
+
+    def compile_break_continue(self, node, is_break: bool):
+        fs = self.fs
+        if not fs.loops:
+            self.error(node, f"'{'break' if is_break else 'continue'}' outside of a loop")
+        ctx = fs.loops[-1]
+        for _ in range(fs.try_depth - ctx['try_depth']):
+            self.emit(Op.END_TRY)
+        if is_break:
+            ctx['breaks'].append(self.emit_jump(Op.JUMP, node))
+        elif ctx['continue_target'] is not None:
+            self.emit_loop(ctx['continue_target'], node)
+        else:
+            ctx['continues'].append(self.emit_jump(Op.JUMP, node))
+
+    def compile_for(self, node: For):
+        self.begin_scope()
+        if isinstance(node.iter, Range):
+            self.compile_expr(node.iter.start, node)
+            var = self.declare_local(node.var, mutable=True, node=node)
+            self.store_new_local(var, node)
+            self.compile_expr(node.iter.end, node)
+            end_slot = self.hidden_local()
+            self.emit(Op.STORE_LOCAL, end_slot)
+            top = self.here()
+            self.emit(Op.LOAD_CELL if var.celled else Op.LOAD_LOCAL, var.slot, node=node)
+            self.emit(Op.LOAD_LOCAL, end_slot)
+            self.emit(Op.LE if node.iter.inclusive else Op.LT)
+            exit_jump = self.emit_jump(Op.JUMP_IF_FALSE, node)
+            ctx = self.push_loop(None)
+            self.compile_block_stmts(node.body)
+            for c in ctx['continues']:
+                self.patch_jump(c)
+            self.emit(Op.LOAD_CELL if var.celled else Op.LOAD_LOCAL, var.slot)
+            self.emit(Op.PUSH_I8, 1)
+            self.emit(Op.ADD)
+            self.emit(Op.STORE_CELL if var.celled else Op.STORE_LOCAL, var.slot)
+            self.emit_loop(top, node)
+            self.patch_jump(exit_jump)
+            self.pop_loop(ctx)
+        else:
+            self.compile_expr(node.iter, node)
+            self.emit(Op.NATIVE, NATIVE_ID['iter'], 1, node=node)
+            it = self.hidden_local()
+            idx = self.hidden_local()
+            assert idx == it + 1
+            self.emit(Op.STORE_LOCAL, it)
+            self.emit(Op.PUSH_I8, 0)
+            self.emit(Op.STORE_LOCAL, idx)
+            top = self.here()
+            at = self.emit(Op.FOR_ITER, it, 0, node=node) - 2
+            var = self.declare_local(node.var, mutable=True, node=node)
+            self.store_new_local(var, node)
+            ctx = self.push_loop(top)
+            self.compile_block_stmts(node.body)
+            self.emit_loop(top, node)
+            self.patch_jump(at)
+            self.pop_loop(ctx)
+        self.end_scope()
+
+    # ── pattern matching ────────────────────────────────────────────────────
+    def compile_match(self, node: MatchExpr, want_value: bool):
+        self.begin_scope()
+        self.compile_expr(node.value, node)
+        subj = self.hidden_local()
+        self.emit(Op.STORE_LOCAL, subj)
+        ends = []
+        for arm in node.arms:
+            pat, guard, body = arm if len(arm) == 3 else (arm[0], None, arm[1])
+            self.begin_scope()
+            fails: List[int] = []
+            self.compile_pattern(pat, subj, fails)
+            if guard is not None:
+                self.compile_expr(guard, guard)
+                fails.append(self.emit_jump(Op.JUMP_IF_FALSE, guard))
+            if want_value:
+                if isinstance(body, Block):
+                    self.compile_block_value(body)
+                else:
+                    self.compile_expr(body, node)
+            else:
+                if isinstance(body, Block):
+                    self.compile_block_stmts(body)
+                else:
+                    self.compile_expr(body, node)
+                    self.emit(Op.POP)
+            ends.append(self.emit_jump(Op.JUMP))
+            for f in fails:
+                self.patch_jump(f)
+            self.end_scope()
+        if want_value:
+            self.emit(Op.PUSH_NIL)
+        for e in ends:
+            self.patch_jump(e)
+        self.end_scope()
+
+    def pattern_type(self, callee) -> Optional[Tuple[int, int]]:
+        """(type index, arity) for constructor patterns like Some(x), Shape.Circle(r)."""
+        if isinstance(callee, Identifier):
+            if callee.name in ('Some', 'Ok', 'Err'):
+                return ({'Some': TYPE_SOME, 'Ok': TYPE_OK, 'Err': TYPE_ERR}[callee.name], 1)
+            if callee.name in self.struct_types:
+                return (self.struct_types[callee.name], len(self.struct_fields[callee.name]))
+        if isinstance(callee, Attribute) and isinstance(callee.obj, Identifier):
+            variants = self.adt_variants.get(callee.obj.name)
+            if variants and callee.attr in variants:
+                return variants[callee.attr]
+        return None
+
+    def compile_pattern(self, pat, subj: int, fails: List[int]):
+        def compare_with(value_node):
+            self.emit(Op.LOAD_LOCAL, subj)
+            self.compile_expr(value_node, pat)
+            self.emit(Op.EQ)
+            fails.append(self.emit_jump(Op.JUMP_IF_FALSE, pat))
+
+        if isinstance(pat, Identifier):
+            name = pat.name
+            if name == '_':
+                return
+            if name == 'NULL':
+                self.emit(Op.LOAD_LOCAL, subj)
+                self.emit(Op.PUSH_NIL)
+                self.emit(Op.EQ)
+                fails.append(self.emit_jump(Op.JUMP_IF_FALSE, pat))
+                return
+            if (self.find_local(self.fs, name) is None and
+                    (name in self.inline_consts or name in self.global_slots)):
+                compare_with(pat)
+                return
+            local = self.declare_local(name, mutable=False, node=pat)
+            self.emit(Op.LOAD_LOCAL, subj)
+            self.store_new_local(local, pat)
+            return
+        if isinstance(pat, Attribute) and isinstance(pat.obj, Identifier) \
+                and pat.obj.name in self.adt_variants:
+            variant = self.adt_variants[pat.obj.name].get(pat.attr)
+            if variant is None:
+                self.error(pat, f"enum '{pat.obj.name}' has no variant '{pat.attr}'")
+            self.emit(Op.LOAD_LOCAL, subj)
+            self.emit(Op.MATCH_TYPE, variant[0])
+            fails.append(self.emit_jump(Op.JUMP_IF_FALSE, pat))
+            return
+        if isinstance(pat, Call):
+            info = self.pattern_type(pat.func)
+            if info is None:
+                compare_with(pat)
+                return
+            tidx, arity = info
+            if len(pat.args) != arity:
+                self.error(pat, f"pattern expects {arity} field(s), got {len(pat.args)}")
+            self.emit(Op.LOAD_LOCAL, subj)
+            self.emit(Op.MATCH_TYPE, tidx)
+            fails.append(self.emit_jump(Op.JUMP_IF_FALSE, pat))
+            self.destructure(pat.args, subj, fails, lambda i: self.emit(Op.GET_SLOT, i))
+            return
+        if isinstance(pat, (TupleLit, ArrayLit)):
+            self.emit(Op.LOAD_LOCAL, subj)
+            self.emit(Op.IS_ARRAY_LEN, len(pat.elements))
+            fails.append(self.emit_jump(Op.JUMP_IF_FALSE, pat))
+            self.destructure(pat.elements, subj, fails, lambda i: self.emit(Op.GET_SLOT, i))
+            return
+        if isinstance(pat, StructInit) and pat.name in self.struct_types:
+            self.emit(Op.LOAD_LOCAL, subj)
+            self.emit(Op.MATCH_TYPE, self.struct_types[pat.name])
+            fails.append(self.emit_jump(Op.JUMP_IF_FALSE, pat))
+            names = list(pat.fields.keys())
+            self.destructure(list(pat.fields.values()), subj, fails,
+                             lambda i: self.emit(Op.GET_FIELD, self.m.const(names[i])))
+            return
+        if isinstance(pat, Range):
+            self.emit(Op.LOAD_LOCAL, subj)
+            self.compile_expr(pat.start, pat)
+            self.emit(Op.GE)
+            fails.append(self.emit_jump(Op.JUMP_IF_FALSE, pat))
+            self.emit(Op.LOAD_LOCAL, subj)
+            self.compile_expr(pat.end, pat)
+            self.emit(Op.LE if pat.inclusive else Op.LT)
+            fails.append(self.emit_jump(Op.JUMP_IF_FALSE, pat))
+            return
+        if isinstance(pat, BinaryOp) and pat.op == '|':
+            alts, stack = [], [pat]
+            while stack:
+                p = stack.pop()
+                if isinstance(p, BinaryOp) and p.op == '|':
+                    stack.extend([p.right, p.left])
+                else:
+                    alts.append(p)
+            oks = []
+            for alt in alts:
+                self.emit(Op.LOAD_LOCAL, subj)
+                self.compile_expr(alt, pat)
+                self.emit(Op.EQ)
+                oks.append(self.emit_jump(Op.JUMP_IF_TRUE, alt))
+            fails.append(self.emit_jump(Op.JUMP, pat))
+            for o in oks:
+                self.patch_jump(o)
+            return
+        compare_with(pat)
+
+    def destructure(self, subpatterns, subj, fails, emit_get):
+        for i, sub in enumerate(subpatterns):
+            if isinstance(sub, Identifier) and sub.name == '_':
+                continue
+            tmp = self.hidden_local()
+            self.emit(Op.LOAD_LOCAL, subj)
+            emit_get(i)
+            self.emit(Op.STORE_LOCAL, tmp)
+            self.compile_pattern(sub, tmp, fails)
+
+    # ── error-handling forms (real semantics) ──────────────────────────────
+    def compile_guarded_body(self, body):
+        self.fs.try_depth += 1
+        if isinstance(body, Block):
+            self.compile_block_value(body)
+        else:
+            self.compile_expr(body, body)
+        self.fs.try_depth -= 1
+
+    def compile_fallback(self, fallback, err_slot: int, node):
+        """`else` branch of retry/timeout: the error message is bound to `error`."""
+        if fallback is None:
+            self.emit(Op.LOAD_LOCAL, err_slot)
+            self.emit(Op.PANIC, node=node)      # re-raise
+            return
+        self.begin_scope()
+        local = self.declare_local("error", mutable=False, node=node)
+        self.emit(Op.LOAD_LOCAL, err_slot)
+        self.store_new_local(local, node)
+        if isinstance(fallback, Block):
+            self.compile_block_value(fallback)
+        else:
+            self.compile_expr(fallback, node)
+        self.end_scope()
+
+    def compile_retry(self, node: RetryExpr):
+        """retry(n) { body } else { fallback }: run body; on any runtime error
+        (failed assert/contract, bounds, None unwrap, timeout, panic(...)) run it
+        again, up to n attempts; then evaluate the fallback (or re-raise)."""
+        self.begin_scope()
+        limit, count, err = self.hidden_local(), self.hidden_local(), self.hidden_local()
+        self.compile_expr(node.count, node)
+        self.emit(Op.STORE_LOCAL, limit)
+        self.emit(Op.PUSH_I8, 0)
+        self.emit(Op.STORE_LOCAL, count)
+        top = self.here()
+        handler = self.emit_jump(Op.TRY, node)
+        self.compile_guarded_body(node.body)
+        self.emit(Op.END_TRY)
+        done = self.emit_jump(Op.JUMP)
+        self.patch_jump(handler)
+        self.emit(Op.STORE_LOCAL, err)
+        self.emit(Op.LOAD_LOCAL, count)
+        self.emit(Op.PUSH_I8, 1)
+        self.emit(Op.ADD)
+        self.emit(Op.DUP)
+        self.emit(Op.STORE_LOCAL, count)
+        self.emit(Op.LOAD_LOCAL, limit)
+        self.emit(Op.LT)
+        again = self.emit_jump(Op.JUMP_IF_TRUE, node)
+        self.patch_jump(again, top)
+        self.compile_fallback(node.fallback, err, node)
+        self.patch_jump(done)
+        self.end_scope()
+
+    def compile_timeout(self, node: TimeoutExpr):
+        """timeout(ms) { body } else { fallback }: abort the body when it runs
+        longer than ms milliseconds (checked at loop back-edges and calls)."""
+        self.begin_scope()
+        err = self.hidden_local()
+        self.compile_expr(node.duration, node)
+        handler = self.emit_jump(Op.TRY_TIMEOUT, node)
+        self.compile_guarded_body(node.body)
+        self.emit(Op.END_TRY)
+        done = self.emit_jump(Op.JUMP)
+        self.patch_jump(handler)
+        self.emit(Op.STORE_LOCAL, err)
+        self.compile_fallback(node.fallback, err, node)
+        self.patch_jump(done)
+        self.end_scope()
+
+    def compile_intent(self, node: IntentBlock, want_value: bool):
+        """intent "goal" { body }: errors raised inside carry the intent, so a
+        failure reports *what the code was trying to do*, not just where."""
+        handler = self.emit_jump(Op.TRY, node)
+        self.fs.try_depth += 1
+        if want_value:
+            self.compile_block_value(node.body) if isinstance(node.body, Block) \
+                else self.compile_expr(node.body, node)
+        else:
+            self.compile_block_stmts(node.body) if isinstance(node.body, Block) \
+                else (self.compile_expr(node.body, node), self.emit(Op.POP))
+        self.fs.try_depth -= 1
+        self.emit(Op.END_TRY)
+        done = self.emit_jump(Op.JUMP)
+        self.patch_jump(handler)
+        self.push_const(f"intent '{node.description}' failed: ", node)
+        self.emit(Op.SWAP)
+        self.emit(Op.CONCAT, 2)
+        self.emit(Op.PANIC, node=node)
+        self.patch_jump(done)
+
+    # ── expressions ─────────────────────────────────────────────────────────
+    def try_fold(self, node):
+        if isinstance(node, (BinaryOp, UnaryOp)):
+            try:
+                v = const_eval(node, self.inline_consts)
+            except (NotConstant, OverflowError, ValueError, ZeroDivisionError):
+                return None
+            if isinstance(v, (bool, int, float, str)):
+                return v
+        return None
+
+    def compile_expr(self, node, parent=None):
+        t = type(node)
+        if t is IntLit:
+            self.push_int(node.value, node)
+        elif t is FloatLit:
+            self.emit(Op.PUSH_CONST, self.m.const(float(node.value)), node=node)
+        elif t is StringLit:
+            self.emit(Op.PUSH_CONST, self.m.const(node.value), node=node)
+        elif t is BoolLit:
+            self.emit(Op.PUSH_TRUE if node.value else Op.PUSH_FALSE, node=node)
+        elif t is CharLit:
+            self.push_int(ord(node.value), node)
+        elif t is Identifier:
+            if node.name == 'NULL':
+                self.emit(Op.PUSH_NIL, node=node)
+            elif not self.emit_load_var(node.name, node):
+                if node.name in self.funcs and '.' not in node.name:
+                    self.emit(Op.PUSH_FUNC, self.funcs[node.name], node=node)
+                elif node.name in self.struct_types or node.name in self.enum_values:
+                    self.error(node, f"'{node.name}' is a type, not a value")
+                else:
+                    self.unknown_name(node, node.name)
+        elif t is BinaryOp:
+            self.compile_binary(node)
+        elif t is UnaryOp:
+            folded = self.try_fold(node)
+            if folded is not None:
+                self.push_const(folded, node)
+                return
+            if node.op in ('&', '&mut', '*'):
+                # Structs, arrays and maps are references already: &x / *x are identity
+                self.compile_expr(node.operand, node)
+                return
+            self.compile_expr(node.operand, node)
+            self.emit({'-': Op.NEG, 'not': Op.NOT, '~': Op.BNOT}[node.op], node=node)
+        elif t is Call:
+            self.compile_call(node)
+        elif t is Index:
+            self.compile_expr(node.obj, node)
+            self.compile_expr(node.index, node)
+            self.emit(Op.GET_INDEX, node=node)
+        elif t is Attribute:
+            self.compile_attribute(node)
+        elif t is ArrayLit or t is TupleLit:
+            for e in node.elements:
+                self.compile_expr(e, node)
+            self.emit(Op.NEW_ARRAY, len(node.elements), node=node)
+        elif t is DictLit:
+            for k, v in node.pairs:
+                self.compile_expr(k, node)
+                self.compile_expr(v, node)
+            self.emit(Op.NEW_MAP, len(node.pairs), node=node)
+        elif t is Range:
+            self.compile_expr(node.start, node)
+            self.compile_expr(node.end, node)
+            self.emit(Op.PUSH_TRUE if node.inclusive else Op.PUSH_FALSE)
+            self.emit(Op.NATIVE, NATIVE_ID['range'], 3, node=node)
+        elif t is StructInit:
+            self.compile_struct_init(node)
+        elif t is Lambda:
+            self.compile_lambda(node)
+        elif t is IfExpr:
+            self.compile_expr(node.condition, node)
+            jf = self.emit_jump(Op.JUMP_IF_FALSE, node)
+            self.compile_expr(node.then_expr, node)
+            end = self.emit_jump(Op.JUMP)
+            self.patch_jump(jf)
+            if node.else_expr is not None:
+                self.compile_expr(node.else_expr, node)
+            else:
+                self.emit(Op.PUSH_NIL)
+            self.patch_jump(end)
+        elif t is MatchExpr:
+            self.compile_match(node, True)
+        elif t is Cast:
+            self.compile_expr(node.expr, node)
+            target = node.target_type
+            if isinstance(target, PrimitiveType):
+                name = target.name
+                kind = ('float' if name in ('float', 'f32', 'f64') else
+                        'str' if name == 'str' else 'bool' if name == 'bool' else 'int')
+                self.emit(Op.CAST, CAST_KINDS[kind], node=node)
+        elif t is NullCheck:
+            self.compile_expr(node.expr, node)
+            propagate = self.fs.proto.flags & TBCFunction.FLAG_PROPAGATE
+            self.emit(Op.UNWRAP_OR_RETURN if propagate else Op.UNWRAP_OR_PANIC, node=node)
+        elif t is ListComprehension:
+            self.compile_comprehension(node)
+        elif t is FStringLit:
+            self.compile_fstring(node)
+        elif t is RetryExpr:
+            self.compile_retry(node)
+        elif t is TimeoutExpr:
+            self.compile_timeout(node)
+        elif t is IntentBlock:
+            self.compile_intent(node, True)
+        elif t is Block:
+            self.compile_block_value(node)
+        elif t is EffectHandler:
+            if isinstance(node.expr, Block):
+                self.compile_block_value(node.expr)
+            else:
+                self.compile_expr(node.expr, node)
+        elif t is PerformEffect:
+            if node.name not in self.funcs:
+                self.error(node, f"no handler function '{node.name}' for effect '{node.name}'")
+            for a in node.args:
+                self.compile_expr(a, node)
+            self.emit(Op.CALL, self.funcs[node.name], len(node.args), node=node)
+        elif t is DurationLit:
+            mult = {"ms": 1, "s": 1000, "m": 60000, "h": 3600000}.get(node.unit, 1)
+            self.push_int(int(node.value * mult), node)
+        else:
+            self.error(node if isinstance(node, ASTNode) else parent,
+                       f"{t.__name__} is not supported by the VM backend")
+
+    def compile_binary(self, node: BinaryOp):
+        folded = self.try_fold(node)
+        if folded is not None:
+            self.push_const(folded, node)
+            return
+        op = node.op
+        if op == 'and':
+            self.compile_expr(node.left, node)
+            f1 = self.emit_jump(Op.JUMP_IF_FALSE, node)
+            self.compile_expr(node.right, node)
+            f2 = self.emit_jump(Op.JUMP_IF_FALSE, node)
+            self.emit(Op.PUSH_TRUE)
+            end = self.emit_jump(Op.JUMP)
+            self.patch_jump(f1)
+            self.patch_jump(f2)
+            self.emit(Op.PUSH_FALSE)
+            self.patch_jump(end)
+            return
+        if op == 'or':
+            self.compile_expr(node.left, node)
+            t1 = self.emit_jump(Op.JUMP_IF_TRUE, node)
+            self.compile_expr(node.right, node)
+            t2 = self.emit_jump(Op.JUMP_IF_TRUE, node)
+            self.emit(Op.PUSH_FALSE)
+            end = self.emit_jump(Op.JUMP)
+            self.patch_jump(t1)
+            self.patch_jump(t2)
+            self.emit(Op.PUSH_TRUE)
+            self.patch_jump(end)
+            return
+        if op not in self.BINOPS:
+            self.error(node, f"unsupported operator '{op}'")
+        self.compile_expr(node.left, node)
+        self.compile_expr(node.right, node)
+        self.emit(self.BINOPS[op], node=node)
+
+    def shadowed(self, name: str) -> bool:
+        return self.find_local(self.fs, name) is not None or \
+            any(n == name for n, *_ in self.fs.upvals)
+
+    def compile_args(self, args, node):
+        if len(args) > 255:
+            self.error(node, "too many arguments (max 255)")
+        for a in args:
+            self.compile_expr(a, node)
+
+    def check_arity(self, node, name: str, argc: int):
+        fdef = self.fdefs.get(name)
+        if fdef is None or isinstance(fdef, Lambda):
+            return
+        params = [p for p in fdef.params if p.name != 'self']
+        required = sum(1 for p in params if p.default is None)
+        if not required <= argc <= len(params):
+            self.error(node, f"'{name}' expects {required if required == len(params) else f'{required} to {len(params)}'}"
+                             f" argument(s), got {argc}")
+
+    def compile_call(self, node: Call):
+        f = node.func
+        argc = len(node.args)
+        if isinstance(f, Identifier):
+            name = f.name
+            if self.shadowed(name):
+                self.emit_load_var(name, f)
+                self.compile_args(node.args, node)
+                self.emit(Op.CALL_VALUE, argc, node=node)
+                return
+            if name in self.funcs and '.' not in name:
+                self.check_arity(node, name, argc)
+                self.compile_args(node.args, node)
+                self.emit(Op.CALL, self.funcs[name], argc, node=node)
+                return
+            if name in self.struct_types:
+                nfields = len(self.struct_fields[name])
+                if argc != nfields:
+                    self.error(node, f"'{name}(...)' needs {nfields} field value(s), got {argc}")
+                self.compile_args(node.args, node)
+                self.emit(Op.NEW_STRUCT, self.struct_types[name], argc, node=node)
+                return
+            if name in ('Some', 'Ok', 'Err'):
+                if argc > 1:
+                    self.error(node, f"{name}(...) takes one value")
+                self.compile_args(node.args, node)
+                if argc == 0:
+                    self.emit(Op.PUSH_NIL)
+                self.emit(Op.NEW_STRUCT, {'Some': TYPE_SOME, 'Ok': TYPE_OK, 'Err': TYPE_ERR}[name], 1,
+                          node=node)
+                return
+            if name in self.global_slots:
+                self.emit(Op.LOAD_GLOBAL, self.global_slots[name], node=f)
+                self.compile_args(node.args, node)
+                self.emit(Op.CALL_VALUE, argc, node=node)
+                return
+            if name in NATIVE_ID:
+                self.compile_args(node.args, node)
+                self.emit(Op.NATIVE, NATIVE_ID[name], argc, node=node)
+                return
+            self.unknown_name(f, name, "function")
+        if isinstance(f, Attribute):
+            obj, meth = f.obj, f.attr
+            if isinstance(obj, Identifier) and not self.shadowed(obj.name):
+                oname = obj.name
+                if oname in self.struct_types:
+                    key = f"{oname}.{meth}"
+                    if key not in self.funcs:
+                        self.error(node, f"struct '{oname}' has no function '{meth}'")
+                    self.check_arity(node, key, argc)
+                    self.compile_args(node.args, node)
+                    self.emit(Op.CALL, self.funcs[key], argc, node=node)
+                    return
+                if oname in self.adt_variants:
+                    variant = self.adt_variants[oname].get(meth)
+                    if variant is None:
+                        self.error(node, f"enum '{oname}' has no variant '{meth}'")
+                    if argc != variant[1]:
+                        self.error(node, f"'{oname}.{meth}' takes {variant[1]} value(s), got {argc}")
+                    self.compile_args(node.args, node)
+                    self.emit(Op.NEW_STRUCT, variant[0], argc, node=node)
+                    return
+                if oname in self.module_names and oname not in self.global_slots:
+                    if meth not in self.funcs:
+                        self.error(node, f"module '{oname}' has no function '{meth}'")
+                    self.check_arity(node, meth, argc)
+                    self.compile_args(node.args, node)
+                    self.emit(Op.CALL, self.funcs[meth], argc, node=node)
+                    return
+                if oname.startswith('__Vec__') and meth == 'new':
+                    self.emit(Op.NEW_ARRAY, 0, node=node)
+                    return
+                if oname.startswith('__HashMap__') and meth == 'new':
+                    self.emit(Op.NEW_MAP, 0, node=node)
+                    return
+            # dynamic method call: user struct method or builtin method
+            mid = METHOD_ID.get(meth, NO_METHOD)
+            known_field = any(meth in fields for _n, fields in self.m.types)
+            if mid == NO_METHOD and meth not in self.user_method_names and not known_field:
+                self.error(node, f"unknown method '{meth}'")
+            if meth in PRELUDE_SOURCE:
+                self.prelude_function(meth)
+            self.compile_expr(obj, node)
+            self.compile_args(node.args, node)
+            self.emit(Op.INVOKE, self.m.const(meth), mid, argc, node=node)
+            return
+        # calling an arbitrary expression: f(x)(y), arr[0](x), ...
+        self.compile_expr(f, node)
+        self.compile_args(node.args, node)
+        self.emit(Op.CALL_VALUE, argc, node=node)
+
+    def compile_attribute(self, node: Attribute):
+        obj = node.obj
+        if isinstance(obj, Identifier) and not self.shadowed(obj.name):
+            oname = obj.name
+            if oname in self.enum_values:
+                values = self.enum_values[oname]
+                if node.attr not in values:
+                    self.error(node, f"enum '{oname}' has no variant '{node.attr}'")
+                self.push_int(values[node.attr], node)
+                return
+            if oname in self.adt_variants:
+                variant = self.adt_variants[oname].get(node.attr)
+                if variant is None:
+                    self.error(node, f"enum '{oname}' has no variant '{node.attr}'")
+                if variant[1] != 0:
+                    self.error(node, f"'{oname}.{node.attr}' needs {variant[1]} value(s)")
+                self.emit(Op.NEW_STRUCT, variant[0], 0, node=node)
+                return
+            if oname in self.module_names and oname not in self.global_slots:
+                self.compile_expr(Identifier(name=node.attr, line=node.line, col=node.col), node)
+                return
+        self.compile_expr(obj, node)
+        self.emit(Op.GET_FIELD, self.m.const(node.attr), node=node)
+
+    def compile_struct_init(self, node: StructInit):
+        if node.name not in self.struct_types:
+            self.unknown_name(node, node.name, "struct")
+        fields = self.struct_fields[node.name]
+        names = {f.name for f in fields}
+        for given in node.fields:
+            if given not in names:
+                self.error(node, f"struct '{node.name}' has no field '{given}'")
+        for fld in fields:
+            if fld.name in node.fields:
+                self.compile_expr(node.fields[fld.name], node)
+                cast = self.numeric_cast_for(fld.type)
+                if cast == CAST_KINDS['float'] and not isinstance(node.fields[fld.name], FloatLit):
+                    self.emit(Op.CAST, cast)
+            elif fld.default is not None:
+                self.compile_expr(fld.default, node)
+            else:
+                self.push_const(self.zero_value(fld.type), node)
+        self.emit(Op.NEW_STRUCT, self.struct_types[node.name], len(fields), node=node)
+
+    def compile_comprehension(self, node: ListComprehension):
+        self.begin_scope()
+        self.emit(Op.NEW_ARRAY, 0, node=node)
+        res = self.hidden_local()
+        self.emit(Op.STORE_LOCAL, res)
+        body_stmts = []
+        push_call = Call(func=Attribute(obj=Identifier(name=f" res", line=node.line), attr="push"),
+                         args=[node.expr], line=node.line)
+        body = ExprStmt(expr=push_call, line=node.line)
+        if node.condition is not None:
+            body = If(condition=node.condition, then_body=Block(statements=[body]), line=node.line)
+        self.fs.scopes[-1][" res"] = _Local(" res", res, False, False)
+        self.compile_for(For(var=node.var, iter=node.iter, body=Block(statements=[body]), line=node.line))
+        self.emit(Op.LOAD_LOCAL, res)
+        self.end_scope()
+
+    def compile_fstring(self, node: FStringLit):
+        count = 0
+        for part in node.parts:
+            kind, value = part[0], part[1]
+            if kind == 'str':
+                self.emit(Op.PUSH_CONST, self.m.const(value.value), node=node)
+            else:
+                self.compile_expr(value, node)
+                if len(part) > 2:
+                    self.emit(Op.PUSH_CONST, self.m.const(part[2]))
+                    self.emit(Op.NATIVE, NATIVE_ID['format'], 2, node=node)
+            count += 1
+        if count == 0:
+            self.emit(Op.PUSH_CONST, self.m.const(""), node=node)
+        elif count > 255:
+            self.error(node, "f-string has too many parts")
+        else:
+            self.emit(Op.CONCAT, count, node=node)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                       REFERENCE VM (pure Python)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TILPanic(Exception):
+    """A recoverable TIL runtime error (caught by retry / timeout / intent)."""
+    def __init__(self, msg: bytes, target: Optional[int] = None):
+        super().__init__(msg)
+        self.msg = msg if isinstance(msg, bytes) else str(msg).encode('utf-8')
+        self.target = target          # recovery-frame index (deadline expiry)
+        self.pc = -1
+
+
+class TILFatal(Exception):
+    """A non-recoverable VM error (step budget exhausted, stack overflow)."""
+    def __init__(self, msg: str):
+        super().__init__(msg)
+        self.msg = msg.encode('utf-8')
+        self.pc = -1
+
+
+class TILExit(Exception):
+    def __init__(self, code: int):
+        super().__init__(code)
+        self.code = code
+
+
+class VMStruct:
+    __slots__ = ('t', 'f')
+
+    def __init__(self, t: int, f: list):
+        self.t, self.f = t, f
+
+
+class VMClosure:
+    __slots__ = ('fn', 'up')
+
+    def __init__(self, fn: int, up: tuple = ()):
+        self.fn, self.up = fn, up
+
+
+class VMCell:
+    __slots__ = ('v',)
+
+    def __init__(self, v):
+        self.v = v
+
+
+_UNDEF = object()   # argument slot not supplied by the caller (use the default)
+
+
+def fmt_g(x: float) -> bytes:
+    """C printf("%g") formatting (TIL's float output on every backend)."""
+    if x != x:
+        return b"nan"
+    if x in (float('inf'), float('-inf')):
+        return b"inf" if x > 0 else b"-inf"
+    return ('%g' % x).encode()
+
+
+def til_format_spec(v, spec: bytes, to_str) -> bytes:
+    """f-string format specs: [<>^][0][width][.prec][f|e|%|d|x|X|o|b]."""
+    m = re.match(rb'^([<>^]?)(0?)(\d*)(?:\.(\d+))?([fdxXobe%]?)$', spec)
+    if not m:
+        return to_str(v)
+    align, zero, width, prec, kind = m.groups()
+    width = int(width) if width else 0
+    prec = int(prec) if prec is not None else None
+    is_num = isinstance(v, (int, float)) and not isinstance(v, bool)
+    if kind in (b'f', b'e', b'%') and is_num:
+        p = 6 if prec is None else prec
+        x = float(v) * (100.0 if kind == b'%' else 1.0)
+        body = (('%.' + str(p) + ('e' if kind == b'e' else 'f')) % x).encode()
+        if kind == b'%':
+            body += b'%'
+    elif kind in (b'd', b'x', b'X', b'o', b'b') and is_num:
+        n = int(v)
+        digits = {b'd': '%d', b'x': '%x', b'X': '%X', b'o': '%o'}.get(kind)
+        body = (digits % abs(n)).encode() if digits else bin(abs(n))[2:].encode()
+        if n < 0:
+            body = b'-' + body
+    elif isinstance(v, float) and prec is not None:
+        body = (('%.' + str(prec) + 'g') % v).encode()
+    else:
+        body = to_str(v)
+    if len(body) >= width:
+        return body
+    pad = width - len(body)
+    if zero and is_num and not align:
+        sign = body[:1] if body[:1] in (b'-', b'+') else b''
+        return sign + b'0' * pad + body[len(sign):]
+    if not align:
+        align = b'>' if is_num else b'<'
+    if align == b'<':
+        return body + b' ' * pad
+    if align == b'>':
+        return b' ' * pad + body
+    left = pad // 2
+    return b' ' * left + body + b' ' * (pad - left)
+
+
+class TILVM:
+    """Reference interpreter for TIL bytecode modules."""
+
+    CHECK_INTERVAL = 256
+    MAX_FRAMES = 2000
+
+    def __init__(self, module: TBCModule, write=None, read_line=None, max_steps: int = 0):
+        self.m = module
+        self.code = module.code
+        self.consts = module.consts
+        self._own_stdout = write is None
+        self.write = write or self._stdout_write
+        self.read_line = read_line or self._stdin_line
+        self.max_steps = max_steps
+        self.steps = 0
+        self.globals = [None] * len(module.globals)
+        self.methods = {(t, n): f for t, n, f in module.methods}
+        const_of = {}
+        for i, c in enumerate(module.consts):
+            if isinstance(c, bytes):
+                const_of.setdefault(c, i)
+        self.type_names = [name for name, _ in module.types]
+        # per type: field-name const index -> slot
+        self.field_slots = []
+        for _name, fields in module.types:
+            slots = {}
+            for i, fname in enumerate(fields):
+                key = fname.encode('utf-8') if isinstance(fname, str) else fname
+                if key in const_of:
+                    slots[const_of[key]] = i
+            self.field_slots.append(slots)
+        self.field_names = [[f.encode('utf-8') if isinstance(f, str) else f for f in fields]
+                            for _n, fields in module.types]
+        self.rng = 0x9E3779B97F4A7C15
+        self.recover: List[list] = []     # [handler_pc, n_frames, sp, deadline_ms or 0]
+        self.deadlines = 0
+        self.tick = 0
+        self.stack: list = []
+        self.frames: List[list] = []      # [func, pc, base, closure, extra]
+
+    @staticmethod
+    def _stdout_write(data: bytes):
+        out = getattr(sys.stdout, 'buffer', None)
+        if out is not None:
+            out.write(data)
+        else:
+            sys.stdout.write(data.decode('utf-8', 'replace'))
+
+    def flush(self):
+        if self._own_stdout:
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+    def _stdin_line(self):
+        self.flush()
+        line = sys.stdin.buffer.readline()
+        return line[:-1] if line.endswith(b'\n') else line
+
+    # ── value helpers ───────────────────────────────────────────────────────
+    def type_name(self, v) -> bytes:
+        if v is None:
+            return b"nil"
+        if v is True or v is False:
+            return b"bool"
+        if type(v) is int:
+            return b"int"
+        if type(v) is float:
+            return b"float"
+        if type(v) is bytes:
+            return b"str"
+        if type(v) is list:
+            return b"array"
+        if type(v) is dict:
+            return b"map"
+        if type(v) is VMClosure:
+            return b"fn"
+        if type(v) is VMStruct:
+            return self.type_names[v.t].encode('utf-8')
+        return b"?"
+
+    def to_str(self, v, depth: int = 0, quote: bool = False) -> bytes:
+        if v is None:
+            return b"None"
+        if v is True:
+            return b"true"
+        if v is False:
+            return b"false"
+        tv = type(v)
+        if tv is int:
+            return str(v).encode()
+        if tv is float:
+            return fmt_g(v)
+        if tv is bytes:
+            return b'"' + v + b'"' if quote else v
+        if depth > 16:
+            return b"..."
+        if tv is list:
+            return b"[" + b", ".join(self.to_str(x, depth + 1, True) for x in v) + b"]"
+        if tv is dict:
+            return b"{" + b", ".join(self.to_str(k, depth + 1, True) + b": " +
+                                     self.to_str(x, depth + 1, True) for k, x in v.items()) + b"}"
+        if tv is VMStruct:
+            name = self.type_names[v.t].encode('utf-8')
+            fields = self.field_names[v.t]
+            if v.t <= TYPE_ERR or (fields and fields[0] == b"0"):
+                inner = b", ".join(self.to_str(x, depth + 1, True) for x in v.f)
+                return name + b"(" + inner + b")" if fields else name
+            if not fields:
+                return name
+            return name + b" { " + b", ".join(
+                fn + b": " + self.to_str(x, depth + 1, True) for fn, x in zip(fields, v.f)) + b" }"
+        if tv is VMClosure:
+            return b"<fn " + self.m.funcs[v.fn].name.encode('utf-8') + b">"
+        return b"?"
+
+    @staticmethod
+    def truthy(v) -> bool:
+        if v is None or v is False:
+            return False
+        if v is True:
+            return True
+        tv = type(v)
+        if tv is int or tv is float:
+            return v != 0
+        if tv is bytes or tv is list or tv is dict:
+            return len(v) != 0
+        return True
+
+    def equal(self, a, b, depth: int = 0) -> bool:
+        ta, tb = type(a), type(b)
+        if ta is bool or tb is bool:
+            return ta is tb and a == b
+        if (ta is int or ta is float) and (tb is int or tb is float):
+            return a == b
+        if ta is not tb:
+            return False
+        if a is b:
+            return True
+        if depth > 32:
+            return False
+        if ta is list:
+            return len(a) == len(b) and all(self.equal(x, y, depth + 1) for x, y in zip(a, b))
+        if ta is dict:
+            if len(a) != len(b):
+                return False
+            for k, v in a.items():
+                if k not in b or not self.equal(v, b[k], depth + 1):
+                    return False
+            return True
+        if ta is VMStruct:
+            return a.t == b.t and all(self.equal(x, y, depth + 1) for x, y in zip(a.f, b.f))
+        return a == b
+
+    def panic(self, msg):
+        raise TILPanic(msg if isinstance(msg, bytes) else msg.encode('utf-8'))
+
+    def num(self, v, what: str):
+        if type(v) is int or type(v) is float:
+            return v
+        self.panic(f"{what} expects a number, got {self.type_name(v).decode()}")
+
+    def arith(self, op: int, a, b):
+        ta, tb = type(a), type(b)
+        if ta is int and tb is int:
+            if op == Op.ADD:
+                return wrap_int64(a + b)
+            if op == Op.SUB:
+                return wrap_int64(a - b)
+            if op == Op.MUL:
+                return wrap_int64(a * b)
+            if op == Op.DIV:
+                if b == 0:
+                    self.panic("division by zero")
+                return til_idiv(a, b)
+            if op == Op.MOD:
+                if b == 0:
+                    self.panic("division by zero")
+                return til_imod(a, b)
+            if op == Op.POW:
+                if b < 0:
+                    return 1 if a == 1 else ((-1 if b & 1 else 1) if a == -1 else 0)
+                return wrap_int64(pow(a, b, 1 << 64))
+        if (ta is int or ta is float) and (tb is int or tb is float):
+            a, b = float(a), float(b)
+            if op == Op.ADD:
+                return a + b
+            if op == Op.SUB:
+                return a - b
+            if op == Op.MUL:
+                return a * b
+            if op == Op.DIV:
+                if b == 0.0:
+                    if a == 0.0 or a != a:
+                        return float('nan')
+                    return _math.copysign(float('inf'), a) * _math.copysign(1.0, b)
+                return a / b
+            if op == Op.MOD:
+                return _math.fmod(a, b) if b != 0.0 else float('nan')
+            if op == Op.POW:
+                try:
+                    return _math.pow(a, b)
+                except (OverflowError, ValueError):
+                    return float('inf') if a > 1 else float('nan')
+        if op == Op.ADD:
+            if ta is bytes or tb is bytes:
+                return self.to_str(a) + self.to_str(b)
+            if ta is list and tb is list:
+                return a + b
+        if op == Op.MUL:
+            if ta is bytes and tb is int:
+                return a * max(b, 0)
+            if ta is list and tb is int:
+                return a * max(b, 0)
+        names = {Op.ADD: '+', Op.SUB: '-', Op.MUL: '*', Op.DIV: '/', Op.MOD: '%', Op.POW: '**'}
+        self.panic(f"unsupported operand types for {names[op]}: "
+                   f"{self.type_name(a).decode()} and {self.type_name(b).decode()}")
+
+    def compare(self, op: int, a, b) -> bool:
+        ta, tb = type(a), type(b)
+        if (ta is int or ta is float) and (tb is int or tb is float):
+            pass
+        elif ta is bytes and tb is bytes:
+            pass
+        else:
+            self.panic(f"cannot compare {self.type_name(a).decode()} and {self.type_name(b).decode()}")
+        if op == Op.LT:
+            return a < b
+        if op == Op.LE:
+            return a <= b
+        if op == Op.GT:
+            return a > b
+        return a >= b
+
+    def bitwise(self, op: int, a, b):
+        if type(a) is not int or type(b) is not int:
+            self.panic("bitwise operators need integers")
+        if op == Op.BAND:
+            return a & b
+        if op == Op.BOR:
+            return a | b
+        if op == Op.BXOR:
+            return a ^ b
+        if op == Op.SHL:
+            return wrap_int64(a << (b & 63))
+        return a >> (b & 63)
+
+    def cast(self, kind: int, v):
+        if kind == 0:   # int
+            tv = type(v)
+            if tv is int:
+                return v
+            if v is True or v is False:
+                return int(v)
+            if tv is float:
+                if v != v or v in (float('inf'), float('-inf')):
+                    self.panic("cannot convert nan/inf to int")
+                return wrap_int64(int(v))
+            if tv is bytes:
+                try:
+                    return wrap_int64(int(v.strip()))
+                except ValueError:
+                    self.panic(b"invalid integer: \"" + v + b"\"")
+            if v is None:
+                return 0
+            self.panic(f"cannot convert {self.type_name(v).decode()} to int")
+        if kind == 1:   # float
+            tv = type(v)
+            if tv is float:
+                return v
+            if tv is int or v is True or v is False:
+                return float(v)
+            if tv is bytes:
+                try:
+                    return float(v.strip())
+                except ValueError:
+                    self.panic(b"invalid number: \"" + v + b"\"")
+            if v is None:
+                return 0.0
+            self.panic(f"cannot convert {self.type_name(v).decode()} to float")
+        if kind == 2:
+            return self.to_str(v)
+        return self.truthy(v)
+
+    def index_get(self, obj, idx):
+        to = type(obj)
+        if to is list or to is bytes:
+            if type(idx) is not int:
+                self.panic("index must be an integer")
+            if not 0 <= idx < len(obj):
+                self.panic(f"index out of bounds: index {idx}, length {len(obj)}")
+            return obj[idx]
+        if to is dict:
+            key = self.map_key(idx)
+            if key not in obj:
+                self.panic(b"key not found: " + self.to_str(idx))
+            return obj[key]
+        if to is VMStruct and type(idx) is int and 0 <= idx < len(obj.f):
+            return obj.f[idx]
+        self.panic(f"{self.type_name(obj).decode()} cannot be indexed")
+
+    def map_key(self, k):
+        tk = type(k)
+        if tk is bytes or tk is int or k is None or tk is bool:
+            return k
+        if tk is float:
+            return int(k) if k == int(k) else k
+        self.panic(f"{self.type_name(k).decode()} cannot be a map key")
+
+    def index_set(self, obj, idx, val):
+        to = type(obj)
+        if to is list:
+            if type(idx) is not int:
+                self.panic("index must be an integer")
+            if not 0 <= idx < len(obj):
+                self.panic(f"index out of bounds: index {idx}, length {len(obj)}")
+            obj[idx] = val
+        elif to is dict:
+            obj[self.map_key(idx)] = val
+        elif to is bytes:
+            self.panic("strings are immutable")
+        else:
+            self.panic(f"{self.type_name(obj).decode()} does not support item assignment")
+
+    def get_field(self, obj, name_const: int):
+        if type(obj) is VMStruct:
+            slot = self.field_slots[obj.t].get(name_const)
+            if slot is not None:
+                return obj.f[slot]
+        self.panic(b"no field '" + self.consts[name_const] + b"' on " + self.type_name(obj))
+
+    def set_field(self, obj, name_const: int, val):
+        if type(obj) is VMStruct:
+            slot = self.field_slots[obj.t].get(name_const)
+            if slot is not None:
+                obj.f[slot] = val
+                return
+        self.panic(b"no field '" + self.consts[name_const] + b"' on " + self.type_name(obj))
+
+    # ── natives ─────────────────────────────────────────────────────────────
+    def call_native(self, nid: int, args: list):
+        name = NATIVES[nid]
+        if name in ('print', 'println'):
+            if not args:
+                self.write(b"\n")
+            for a in args:
+                self.write(self.to_str(a) + b"\n")
+            return None
+        if name == 'iter':
+            v = args[0]
+            if type(v) is dict:
+                return list(v.keys())
+            if type(v) in (list, bytes):
+                return v
+            self.panic(f"{self.type_name(v).decode()} is not iterable")
+        if name == 'len':
+            v = args[0]
+            if type(v) in (bytes, list, dict):
+                return len(v)
+            self.panic(f"len() of {self.type_name(v).decode()}")
+        if name == 'str':
+            return self.to_str(args[0])
+        if name == 'int':
+            return self.cast(0, args[0])
+        if name == 'float':
+            return self.cast(1, args[0])
+        if name == 'bool':
+            return self.truthy(args[0])
+        if name == 'abs':
+            v = self.num(args[0], 'abs')
+            return wrap_int64(abs(v)) if type(v) is int else abs(v)
+        if name in ('sqrt', 'sin', 'cos', 'tan', 'log', 'exp', 'floor', 'ceil', 'round'):
+            x = float(self.num(args[0], name))
+            try:
+                if name == 'sqrt':
+                    return _math.sqrt(x) if x >= 0 else float('nan')
+                if name == 'log':
+                    return _math.log(x) if x > 0 else (float('-inf') if x == 0 else float('nan'))
+                if name == 'round':
+                    return _math.copysign(_math.floor(abs(x) + 0.5), x) if x == x else x
+                if name in ('floor', 'ceil') and (x != x or x in (float('inf'), float('-inf'))):
+                    return x
+                return float(getattr(_math, name)(x))
+            except (OverflowError, ValueError):
+                return float('inf') if name == 'exp' else float('nan')
+        if name == 'pow':
+            return self.arith(Op.POW, float(self.num(args[0], 'pow')), float(self.num(args[1], 'pow')))
+        if name in ('min', 'max'):
+            vals = args[0] if len(args) == 1 and type(args[0]) is list else args
+            if not vals:
+                self.panic(f"{name}() of empty sequence")
+            best = vals[0]
+            for v in vals[1:]:
+                if self.compare(Op.LT if name == 'min' else Op.GT, v, best):
+                    best = v
+            return best
+        if name == 'sum':
+            total = 0
+            for v in args[0] if len(args) == 1 and type(args[0]) is list else args:
+                total = self.arith(Op.ADD, total, v)
+            return total
+        if name == 'input':
+            if args:
+                self.write(self.to_str(args[0]))
+            return self.read_line()
+        if name == 'chr':
+            n = self.num(args[0], 'chr')
+            try:
+                return chr(int(n)).encode('utf-8')
+            except (ValueError, OverflowError):
+                self.panic("chr() argument out of range")
+        if name == 'ord':
+            s = args[0]
+            if type(s) is not bytes or not s:
+                self.panic("ord() expects a non-empty string")
+            return ord(s.decode('utf-8', 'replace')[0]) if s[0] >= 0x80 else s[0]
+        if name == 'range':
+            a, b = args[0], args[1]
+            incl = len(args) > 2 and self.truthy(args[2])
+            if type(a) is not int or type(b) is not int:
+                self.panic("range bounds must be integers")
+            return list(range(a, b + 1 if incl else b))
+        if name == 'type_of':
+            return self.type_name(args[0])
+        if name == 'format':
+            return til_format_spec(args[0], args[1], self.to_str)
+        if name == 'clock_ms':
+            return int(_time.monotonic() * 1000)
+        if name == 'random':
+            self.rng ^= (self.rng >> 12)
+            self.rng ^= (self.rng << 25) & INT64_MASK
+            self.rng ^= (self.rng >> 27)
+            r = (self.rng * 0x2545F4914F6CDD1D) & INT64_MASK
+            if len(args) >= 2:
+                lo, hi = args[0], args[1]
+                if hi < lo:
+                    self.panic("random(lo, hi) needs lo <= hi")
+                return lo + (r % (hi - lo + 1))
+            return (r >> 11) / float(1 << 53)
+        if name == 'seed':
+            self.rng = (args[0] & INT64_MASK) or 0x9E3779B97F4A7C15
+            return None
+        if name == 'sleep_ms':
+            _time.sleep(max(0, self.num(args[0], 'sleep_ms')) / 1000.0)
+            return None
+        if name == 'exit':
+            raise TILExit(int(args[0]) if args else 0)
+        if name == 'panic':
+            self.panic(self.to_str(args[0]) if args else b"panic")
+        self.panic(f"native '{name}' is not available")
+
+    # ── builtin methods ─────────────────────────────────────────────────────
+    def call_method(self, mid: int, recv, args: list):
+        name = METHODS[mid] if mid < len(METHODS) else '?'
+        argc = len(args)
+        tr = type(recv)
+        if name == 'to_string':
+            return self.to_str(recv)
+        if tr is bytes:
+            s = recv
+            if name == 'len':
+                return len(s)
+            if name in ('contains', 'starts_with', 'ends_with', 'find', 'index_of', 'count',
+                        'eq', 'split', 'replace') and argc and type(args[0]) is not bytes:
+                self.panic(f"str.{name} expects a string argument")
+            if name == 'contains':
+                return args[0] in s
+            if name == 'starts_with':
+                return s.startswith(args[0])
+            if name == 'ends_with':
+                return s.endswith(args[0])
+            if name == 'trim':
+                return s.strip(b' \t\r\n')
+            if name == 'to_upper':
+                return s.upper()
+            if name == 'to_lower':
+                return s.lower()
+            if name == 'replace':
+                return s if not args[0] else s.replace(args[0], self.to_str(args[1]))
+            if name == 'slice':
+                n = len(s)
+                a = max(0, min(args[0], n))
+                b = max(0, min(args[1] if argc > 1 else n, n))
+                return s[a:b] if a < b else b""
+            if name in ('find', 'index_of'):
+                return s.find(args[0])
+            if name == 'count':
+                return s.count(args[0]) if args[0] else 0
+            if name == 'eq':
+                return s == args[0]
+            if name == 'split':
+                if not argc:
+                    return s.split()
+                return s.split(args[0]) if args[0] else [bytes([c]) for c in s]
+            if name == 'repeat':
+                return s * max(args[0], 0)
+            if name == 'to_int':
+                return self.cast(0, s)
+            if name == 'to_float':
+                return self.cast(1, s)
+            if name == 'is_empty':
+                return len(s) == 0
+            if name == 'get':
+                return self.index_get(s, args[0])
+        elif tr is list:
+            a = recv
+            if name == 'len':
+                return len(a)
+            if name == 'push':
+                a.append(args[0])
+                return None
+            if name == 'pop':
+                if not a:
+                    self.panic("pop() from empty array")
+                return a.pop()
+            if name == 'get':
+                return self.index_get(a, args[0])
+            if name == 'set':
+                self.index_set(a, args[0], args[1])
+                return None
+            if name == 'contains':
+                return any(self.equal(x, args[0]) for x in a)
+            if name == 'index_of':
+                for i, x in enumerate(a):
+                    if self.equal(x, args[0]):
+                        return i
+                return -1
+            if name == 'count':
+                return sum(1 for x in a if self.equal(x, args[0]))
+            if name == 'insert':
+                i = args[0]
+                if type(i) is not int or not 0 <= i <= len(a):
+                    self.panic(f"insert index out of bounds: {i}")
+                a.insert(i, args[1])
+                return None
+            if name == 'remove':
+                i = args[0]
+                if type(i) is not int or not 0 <= i < len(a):
+                    self.panic(f"remove index out of bounds: {i}")
+                return a.pop(i)
+            if name == 'reverse':
+                a.reverse()
+                return None
+            if name == 'sort':
+                self.sort_array(a)
+                return None
+            if name == 'join':
+                sep = args[0] if argc else b""
+                return self.to_str(sep).join(self.to_str(x) for x in a)
+            if name == 'slice':
+                n = len(a)
+                lo = max(0, min(args[0], n))
+                hi = max(0, min(args[1] if argc > 1 else n, n))
+                return a[lo:hi] if lo < hi else []
+            if name == 'first':
+                return a[0] if a else None
+            if name == 'last':
+                return a[-1] if a else None
+            if name == 'clear':
+                a.clear()
+                return None
+            if name == 'is_empty':
+                return len(a) == 0
+            if name == 'copy':
+                return list(a)
+            if name in ('sum', 'min', 'max'):
+                return self.call_native(NATIVE_ID[name], [a])
+        elif tr is dict:
+            d = recv
+            if name == 'len':
+                return len(d)
+            if name == 'set':
+                d[self.map_key(args[0])] = args[1]
+                return None
+            if name == 'get':
+                return self.index_get(d, args[0])
+            if name == 'get_or':
+                return d.get(self.map_key(args[0]), args[1])
+            if name in ('has', 'contains'):
+                return self.map_key(args[0]) in d
+            if name in ('delete', 'remove'):
+                d.pop(self.map_key(args[0]), None)
+                return None
+            if name == 'keys':
+                return list(d.keys())
+            if name == 'values':
+                return list(d.values())
+            if name == 'is_empty':
+                return len(d) == 0
+            if name == 'clear':
+                d.clear()
+                return None
+            if name == 'copy':
+                return dict(d)
+        elif recv is None or (tr is VMStruct and recv.t <= TYPE_ERR):
+            kind = -1 if recv is None else recv.t
+            ok = kind in (TYPE_SOME, TYPE_OK)
+            if name in ('is_some', 'is_ok'):
+                return ok
+            if name in ('is_none', 'is_err'):
+                return not ok
+            if name == 'unwrap':
+                if ok:
+                    return recv.f[0]
+                self.panic(b"unwrap() called on None" if recv is None else
+                           b"unwrap() called on Err: " + self.to_str(recv.f[0]))
+            if name == 'expect':
+                if ok:
+                    return recv.f[0]
+                self.panic(self.to_str(args[0]))
+            if name == 'unwrap_or':
+                return recv.f[0] if ok else args[0]
+            if name == 'error':
+                return recv.f[0] if kind == TYPE_ERR else None
+        self.panic(f"no method '{name}' on {self.type_name(recv).decode()}")
+
+    def sort_array(self, a: list):
+        if not a:
+            return
+        if all(type(x) in (int, float) for x in a) or all(type(x) is bytes for x in a):
+            a.sort()
+        else:
+            self.panic("sort() needs an array of numbers or of strings")
+
+    # ── execution ───────────────────────────────────────────────────────────
+    def line_for(self, pc: int) -> int:
+        lines = self.m.lines
+        lo, hi, best = 0, len(lines) - 1, 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if lines[mid][0] <= pc:
+                best = lines[mid][1]
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return best
+
+    def func_at(self, pc: int) -> str:
+        best = None
+        for f in self.m.funcs:
+            if f.offset <= pc and (best is None or f.offset > best.offset):
+                best = f
+        return best.name if best else "?"
+
+    def traceback(self, pc: int) -> bytes:
+        parts = []
+        line = self.line_for(pc)
+        parts.append(f"  at {self.func_at(pc)}" + (f" (line {line})" if line else ""))
+        for fr in reversed(self.frames[:-1]):
+            ln = self.line_for(fr[1] - 1)
+            parts.append(f"  at {self.m.funcs[fr[0]].name}" + (f" (line {ln})" if ln else ""))
+        return ("\n".join(parts[:8])).encode()
+
+    def run(self) -> int:
+        """Run the module; returns the process exit code."""
+        entry = self.m.funcs[self.m.entry]
+        self.frames = [[self.m.entry, entry.offset, 0, None, 0]]
+        self.stack = [None] * entry.n_locals
+        try:
+            return self._run()
+        finally:
+            self.flush()
+
+    def _run(self) -> int:
+        try:
+            while True:
+                try:
+                    self.execute()
+                    return 0
+                except TILPanic as p:
+                    if not self.recover_from(p):
+                        self.report(b"runtime error: " + p.msg, p.pc)
+                        return 1
+        except TILFatal as f:
+            self.report(b"fatal error: " + f.msg, f.pc)
+            return 1
+        except TILExit as e:
+            return e.code
+        except RecursionError:
+            self.report(b"fatal error: native recursion limit", -1)
+            return 1
+
+    def report(self, msg: bytes, pc: int):
+        out = getattr(sys.stderr, 'buffer', None)
+        text = msg + b"\n" + (self.traceback(pc) + b"\n" if pc >= 0 else b"")
+        self.flush()
+        if out is not None:
+            out.write(text)
+            out.flush()
+        else:
+            sys.stderr.write(text.decode('utf-8', 'replace'))
+
+    def recover_from(self, p: TILPanic) -> bool:
+        if not self.recover:
+            return False
+        if p.target is not None:
+            for rf in self.recover[p.target + 1:]:
+                if rf[3]:
+                    self.deadlines -= 1
+            del self.recover[p.target + 1:]
+        handler, n_frames, sp, deadline = self.recover.pop()
+        if deadline:
+            self.deadlines -= 1
+        del self.frames[n_frames:]
+        del self.stack[sp:]
+        self.stack.append(p.msg)
+        self.frames[-1][1] = handler
+        return True
+
+    def check_budget(self, pc: int):
+        self.steps += 1
+        if self.max_steps and self.steps > self.max_steps:
+            err = TILFatal(f"step limit exceeded ({self.max_steps})")
+            raise err
+        if self.deadlines:
+            self.tick += 1
+            if self.tick >= self.CHECK_INTERVAL:
+                self.tick = 0
+                now = _time.monotonic() * 1000.0
+                for i, rf in enumerate(self.recover):
+                    if rf[3] and now > rf[3]:
+                        raise TILPanic(b"timeout", target=i)
+
+    def execute(self):
+        code = self.code
+        consts = self.consts
+        stack = self.stack
+        frames = self.frames
+        funcs = self.m.funcs
+        frame = frames[-1]
+        pc = frame[1]
+        base = frame[2]
+        closure = frame[3]
+        op_pc = pc
+        unpack_h = _struct.unpack_from
+        try:
+            while True:
+                op_pc = pc
+                op = code[pc]
+                pc += 1
+                if op == Op.LOAD_LOCAL:
+                    stack.append(stack[base + code[pc]])
+                    pc += 1
+                elif op == Op.STORE_LOCAL:
+                    stack[base + code[pc]] = stack.pop()
+                    pc += 1
+                elif op == Op.PUSH_I8:
+                    v = code[pc]
+                    stack.append(v - 256 if v > 127 else v)
+                    pc += 1
+                elif op == Op.PUSH_CONST:
+                    stack.append(consts[code[pc] | (code[pc + 1] << 8)])
+                    pc += 2
+                elif op == Op.ADD or op == Op.SUB or op == Op.MUL:
+                    b = stack.pop()
+                    a = stack[-1]
+                    if type(a) is int and type(b) is int:
+                        r = a + b if op == Op.ADD else (a - b if op == Op.SUB else a * b)
+                        if not -0x8000000000000000 <= r <= 0x7FFFFFFFFFFFFFFF:
+                            r = wrap_int64(r)
+                        stack[-1] = r
+                    else:
+                        stack[-1] = self.arith(op, a, b)
+                elif op == Op.LT or op == Op.LE or op == Op.GT or op == Op.GE:
+                    b = stack.pop()
+                    a = stack[-1]
+                    if type(a) is int and type(b) is int:
+                        stack[-1] = (a < b if op == Op.LT else a <= b if op == Op.LE else
+                                     a > b if op == Op.GT else a >= b)
+                    else:
+                        stack[-1] = self.compare(op, a, b)
+                elif op == Op.JUMP:
+                    rel = code[pc] | (code[pc + 1] << 8)
+                    if rel >= 0x8000:
+                        rel -= 0x10000
+                        self.check_budget(op_pc)
+                    pc += 2 + rel
+                elif op == Op.JUMP_IF_FALSE or op == Op.JUMP_IF_TRUE:
+                    v = stack.pop()
+                    t = v is True or (v is not False and v is not None and self.truthy(v))
+                    if t == (op == Op.JUMP_IF_TRUE):
+                        rel = code[pc] | (code[pc + 1] << 8)
+                        if rel >= 0x8000:
+                            rel -= 0x10000
+                            self.check_budget(op_pc)
+                        pc += 2 + rel
+                    else:
+                        pc += 2
+                elif op == Op.LOAD_GLOBAL:
+                    stack.append(self.globals[code[pc] | (code[pc + 1] << 8)])
+                    pc += 2
+                elif op == Op.STORE_GLOBAL:
+                    self.globals[code[pc] | (code[pc + 1] << 8)] = stack.pop()
+                    pc += 2
+                elif op == Op.EQ:
+                    b = stack.pop()
+                    stack[-1] = self.equal(stack[-1], b)
+                elif op == Op.NE:
+                    b = stack.pop()
+                    stack[-1] = not self.equal(stack[-1], b)
+                elif op == Op.CALL or op == Op.CALL_VALUE or op == Op.INVOKE:
+                    if op == Op.CALL:
+                        fidx = code[pc] | (code[pc + 1] << 8)
+                        argc = code[pc + 2]
+                        pc += 3
+                        new_closure = None
+                        extra = 0
+                    elif op == Op.CALL_VALUE:
+                        argc = code[pc]
+                        pc += 1
+                        callee = stack[-argc - 1]
+                        if type(callee) is not VMClosure:
+                            self.panic(f"{self.type_name(callee).decode()} is not callable")
+                        fidx = callee.fn
+                        new_closure = callee
+                        extra = 1
+                    else:
+                        name_c = code[pc] | (code[pc + 1] << 8)
+                        mid = code[pc + 2]
+                        argc = code[pc + 3]
+                        pc += 4
+                        recv = stack[-argc - 1]
+                        fidx = None
+                        if type(recv) is VMStruct:
+                            fidx = self.methods.get((recv.t, name_c))
+                            if fidx is not None:
+                                argc += 1          # receiver becomes `self`
+                                new_closure = None
+                                extra = 0
+                            elif recv.t > TYPE_ERR and name_c in self.field_slots[recv.t]:
+                                callee = recv.f[self.field_slots[recv.t][name_c]]
+                                if type(callee) is not VMClosure:
+                                    self.panic(b"field '" + consts[name_c] + b"' is not callable")
+                                fidx = callee.fn
+                                new_closure = callee
+                                extra = 1
+                        if fidx is None:
+                            if mid in self.m.prelude and type(recv) is list:
+                                fidx = self.m.prelude[mid]
+                                argc += 1
+                                new_closure = None
+                                extra = 0
+                            elif mid == NO_METHOD:
+                                self.panic(b"no method '" + consts[name_c] + b"' on " + self.type_name(recv))
+                            else:
+                                args = stack[len(stack) - argc:]
+                                del stack[len(stack) - argc - 1:]
+                                stack.append(self.call_method(mid, recv, args))
+                                continue
+                    fn = funcs[fidx]
+                    if argc > fn.n_params or argc < fn.n_required:
+                        self.panic(f"{fn.name}() takes {fn.n_params} argument(s), got {argc}")
+                    if len(frames) >= self.MAX_FRAMES:
+                        raise TILFatal("stack overflow (recursion too deep)")
+                    frame[1] = pc
+                    new_base = len(stack) - argc
+                    for _ in range(fn.n_params - argc):
+                        stack.append(_UNDEF)
+                    for _ in range(fn.n_locals - fn.n_params):
+                        stack.append(None)
+                    frame = [fidx, fn.offset, new_base, new_closure, extra]
+                    frames.append(frame)
+                    pc = fn.offset
+                    base = new_base
+                    closure = new_closure
+                    self.check_budget(op_pc)
+                elif op == Op.RETURN or op == Op.RETURN_NIL:
+                    result = stack.pop() if op == Op.RETURN else None
+                    depth = len(frames)
+                    while self.recover and self.recover[-1][1] >= depth:
+                        if self.recover.pop()[3]:
+                            self.deadlines -= 1
+                    frames.pop()
+                    del stack[base - frame[4]:]
+                    stack.append(result)
+                    if not frames:
+                        return
+                    frame = frames[-1]
+                    pc = frame[1]
+                    base = frame[2]
+                    closure = frame[3]
+                elif op == Op.POP:
+                    stack.pop()
+                elif op == Op.PUSH_NIL:
+                    stack.append(None)
+                elif op == Op.PUSH_TRUE:
+                    stack.append(True)
+                elif op == Op.PUSH_FALSE:
+                    stack.append(False)
+                elif op == Op.PUSH_I16:
+                    v = code[pc] | (code[pc + 1] << 8)
+                    stack.append(v - 0x10000 if v >= 0x8000 else v)
+                    pc += 2
+                elif op == Op.DUP:
+                    stack.append(stack[-1])
+                elif op == Op.DUP2:
+                    stack.extend(stack[-2:])
+                elif op == Op.SWAP:
+                    stack[-1], stack[-2] = stack[-2], stack[-1]
+                elif op == Op.DIV or op == Op.MOD or op == Op.POW:
+                    b = stack.pop()
+                    stack[-1] = self.arith(op, stack[-1], b)
+                elif op == Op.NEG:
+                    v = stack[-1]
+                    if type(v) is int:
+                        stack[-1] = wrap_int64(-v)
+                    elif type(v) is float:
+                        stack[-1] = -v
+                    else:
+                        self.panic(f"cannot negate {self.type_name(v).decode()}")
+                elif op == Op.NOT:
+                    stack[-1] = not self.truthy(stack[-1])
+                elif op == Op.BNOT:
+                    v = stack[-1]
+                    if type(v) is not int:
+                        self.panic("~ needs an integer")
+                    stack[-1] = ~v
+                elif op in (Op.BAND, Op.BOR, Op.BXOR, Op.SHL, Op.SHR):
+                    b = stack.pop()
+                    stack[-1] = self.bitwise(op, stack[-1], b)
+                elif op == Op.LOAD_CELL:
+                    stack.append(stack[base + code[pc]].v)
+                    pc += 1
+                elif op == Op.STORE_CELL:
+                    stack[base + code[pc]].v = stack.pop()
+                    pc += 1
+                elif op == Op.MAKE_CELL:
+                    slot = base + code[pc]
+                    stack[slot] = VMCell(stack[slot])
+                    pc += 1
+                elif op == Op.LOAD_UPVAL:
+                    stack.append(closure.up[code[pc]].v)
+                    pc += 1
+                elif op == Op.STORE_UPVAL:
+                    closure.up[code[pc]].v = stack.pop()
+                    pc += 1
+                elif op == Op.LOAD_UPVAL_RAW:
+                    stack.append(closure.up[code[pc]])
+                    pc += 1
+                elif op == Op.ARG_DEFAULT:
+                    if stack[base + code[pc]] is not _UNDEF:
+                        rel = code[pc + 1] | (code[pc + 2] << 8)
+                        pc += 3 + (rel - 0x10000 if rel >= 0x8000 else rel)
+                    else:
+                        pc += 3
+                elif op == Op.NATIVE:
+                    nid, argc = code[pc], code[pc + 1]
+                    pc += 2
+                    args = stack[len(stack) - argc:] if argc else []
+                    if argc:
+                        del stack[len(stack) - argc:]
+                    frame[1] = pc
+                    stack.append(self.call_native(nid, args))
+                elif op == Op.NEW_ARRAY:
+                    n = code[pc] | (code[pc + 1] << 8)
+                    pc += 2
+                    items = stack[len(stack) - n:] if n else []
+                    if n:
+                        del stack[len(stack) - n:]
+                    stack.append(items)
+                elif op == Op.NEW_MAP:
+                    n = code[pc] | (code[pc + 1] << 8)
+                    pc += 2
+                    d = {}
+                    items = stack[len(stack) - 2 * n:] if n else []
+                    if n:
+                        del stack[len(stack) - 2 * n:]
+                    for i in range(0, len(items), 2):
+                        d[self.map_key(items[i])] = items[i + 1]
+                    stack.append(d)
+                elif op == Op.NEW_STRUCT:
+                    t = code[pc] | (code[pc + 1] << 8)
+                    n = code[pc + 2]
+                    pc += 3
+                    fields = stack[len(stack) - n:] if n else []
+                    if n:
+                        del stack[len(stack) - n:]
+                    stack.append(VMStruct(t, fields))
+                elif op == Op.GET_INDEX:
+                    idx = stack.pop()
+                    stack[-1] = self.index_get(stack[-1], idx)
+                elif op == Op.SET_INDEX:
+                    val = stack.pop()
+                    idx = stack.pop()
+                    self.index_set(stack.pop(), idx, val)
+                elif op == Op.GET_FIELD:
+                    stack[-1] = self.get_field(stack[-1], code[pc] | (code[pc + 1] << 8))
+                    pc += 2
+                elif op == Op.SET_FIELD:
+                    val = stack.pop()
+                    self.set_field(stack.pop(), code[pc] | (code[pc + 1] << 8), val)
+                    pc += 2
+                elif op == Op.GET_SLOT:
+                    v = stack[-1]
+                    i = code[pc]
+                    pc += 1
+                    if type(v) is VMStruct and i < len(v.f):
+                        stack[-1] = v.f[i]
+                    elif type(v) is list and i < len(v):
+                        stack[-1] = v[i]
+                    else:
+                        self.panic("pattern slot out of range")
+                elif op == Op.MAKE_CLOSURE:
+                    fidx = code[pc] | (code[pc + 1] << 8)
+                    n = code[pc + 2]
+                    pc += 3
+                    ups = tuple(stack[len(stack) - n:])
+                    del stack[len(stack) - n:]
+                    stack.append(VMClosure(fidx, ups))
+                elif op == Op.PUSH_FUNC:
+                    stack.append(VMClosure(code[pc] | (code[pc + 1] << 8)))
+                    pc += 2
+                elif op == Op.CONCAT:
+                    n = code[pc]
+                    pc += 1
+                    parts = stack[len(stack) - n:]
+                    del stack[len(stack) - n:]
+                    stack.append(b"".join(p if type(p) is bytes else self.to_str(p) for p in parts))
+                elif op == Op.FOR_ITER:
+                    slot = base + code[pc]
+                    container = stack[slot]
+                    i = stack[slot + 1]
+                    if i < len(container):
+                        stack.append(container[i])
+                        stack[slot + 1] = i + 1
+                        pc += 3
+                    else:
+                        rel = code[pc + 1] | (code[pc + 2] << 8)
+                        pc += 3 + (rel - 0x10000 if rel >= 0x8000 else rel)
+                elif op == Op.MATCH_TYPE:
+                    t = code[pc] | (code[pc + 1] << 8)
+                    pc += 2
+                    v = stack[-1]
+                    stack[-1] = type(v) is VMStruct and v.t == t
+                elif op == Op.IS_ARRAY_LEN:
+                    n = code[pc] | (code[pc + 1] << 8)
+                    pc += 2
+                    v = stack[-1]
+                    stack[-1] = type(v) is list and len(v) == n
+                elif op == Op.CAST:
+                    stack[-1] = self.cast(code[pc], stack[-1])
+                    pc += 1
+                elif op == Op.TRY or op == Op.TRY_TIMEOUT:
+                    rel = code[pc] | (code[pc + 1] << 8)
+                    pc += 2
+                    handler = pc + (rel - 0x10000 if rel >= 0x8000 else rel)
+                    deadline = 0.0
+                    if op == Op.TRY_TIMEOUT:
+                        ms = self.num(stack.pop(), 'timeout')
+                        deadline = _time.monotonic() * 1000.0 + max(ms, 0)
+                        self.deadlines += 1
+                    self.recover.append([handler, len(frames), len(stack), deadline])
+                elif op == Op.END_TRY:
+                    if self.recover and self.recover.pop()[3]:
+                        self.deadlines -= 1
+                elif op == Op.PANIC:
+                    v = stack.pop()
+                    self.panic(v if type(v) is bytes else self.to_str(v))
+                elif op == Op.UNWRAP_OR_RETURN or op == Op.UNWRAP_OR_PANIC:
+                    v = stack[-1]
+                    if type(v) is VMStruct and (v.t == TYPE_SOME or v.t == TYPE_OK):
+                        stack[-1] = v.f[0]
+                    elif v is None or (type(v) is VMStruct and v.t == TYPE_ERR):
+                        if op == Op.UNWRAP_OR_PANIC:
+                            self.panic(b"? applied to None" if v is None else
+                                       b"? applied to Err: " + self.to_str(v.f[0]))
+                        # early return of None / Err from the current function
+                        result = stack.pop()
+                        depth = len(frames)
+                        while self.recover and self.recover[-1][1] >= depth:
+                            if self.recover.pop()[3]:
+                                self.deadlines -= 1
+                        frames.pop()
+                        del stack[base - frame[4]:]
+                        stack.append(result)
+                        if not frames:
+                            return
+                        frame = frames[-1]
+                        pc = frame[1]
+                        base = frame[2]
+                        closure = frame[3]
+                    # any other value passes through unchanged
+                elif op == Op.HALT:
+                    return
+                elif op == Op.NOP:
+                    pass
+                else:
+                    raise TILFatal(f"bad opcode 0x{op:02x} at {op_pc}")
+        except (TILPanic, TILFatal) as e:
+            if e.pc < 0:
+                e.pc = op_pc
+            frame[1] = pc
+            raise
+
+
+def disassemble(m: TBCModule) -> str:
+    """Human-readable listing of a bytecode module (`til dis`)."""
+    if not m.code:
+        m.link()
+    out = [f"; TIL bytecode v{TBC_VERSION}: {len(m.funcs)} functions, {len(m.consts)} constants, "
+           f"{len(m.globals)} globals, {len(m.code)} bytes of code"]
+    for i, (name, fields) in enumerate(m.types):
+        if i > TYPE_ERR:
+            out.append(f"; type #{i} {name} {{ {', '.join(fields)} }}")
+    bounds = sorted((f.offset, i) for i, f in enumerate(m.funcs))
+    ends = {idx: (bounds[k + 1][0] if k + 1 < len(bounds) else len(m.code))
+            for k, (_off, idx) in enumerate(bounds)}
+    line_at = dict(m.lines)
+
+    def show_const(ix):
+        c = m.consts[ix]
+        if isinstance(c, bytes):
+            text = c.decode('utf-8', 'replace')
+            return '"' + (text if len(text) <= 40 else text[:37] + '...').replace('\n', '\\n') + '"'
+        return repr(c)
+
+    for i, f in enumerate(m.funcs):
+        flags = [n for bit, n in ((1, 'method'), (2, 'propagates'), (4, 'lambda')) if f.flags & bit]
+        out.append("")
+        out.append(f"fn #{i} {f.name}  params={f.n_params} required={f.n_required} "
+                   f"locals={f.n_locals} upvals={f.n_upvals}" + (f" [{', '.join(flags)}]" if flags else ""))
+        pc, end = f.offset, ends[i]
+        while pc < end:
+            op = m.code[pc]
+            name = OP_NAMES.get(op, f"0x{op:02x}")
+            fmt = OP_OPERANDS.get(op, '')
+            p = pc + 1
+            vals = []
+            for kind in fmt:
+                if kind == 'b':
+                    vals.append(m.code[p]); p += 1
+                elif kind == 'c':
+                    vals.append(_struct.unpack_from('<b', m.code, p)[0]); p += 1
+                elif kind == 'h':
+                    vals.append(_struct.unpack_from('<H', m.code, p)[0]); p += 2
+                else:
+                    vals.append(_struct.unpack_from('<h', m.code, p)[0]); p += 2
+            note = ""
+            if op == Op.PUSH_CONST:
+                note = show_const(vals[0])
+            elif op in (Op.CALL, Op.PUSH_FUNC, Op.MAKE_CLOSURE):
+                note = m.funcs[vals[0]].name if vals[0] < len(m.funcs) else "?"
+            elif op == Op.INVOKE:
+                note = "." + m.consts[vals[0]].decode('utf-8', 'replace') + "()"
+            elif op in (Op.GET_FIELD, Op.SET_FIELD):
+                note = "." + m.consts[vals[0]].decode('utf-8', 'replace')
+            elif op == Op.NATIVE:
+                note = NATIVES[vals[0]] + "()" if vals[0] < len(NATIVES) else "?"
+            elif op in (Op.NEW_STRUCT, Op.MATCH_TYPE):
+                note = m.types[vals[0]][0] if vals[0] < len(m.types) else "?"
+            elif op in (Op.JUMP, Op.JUMP_IF_FALSE, Op.JUMP_IF_TRUE, Op.TRY, Op.TRY_TIMEOUT):
+                note = f"-> {p + vals[-1] - f.offset:04d}"
+            elif op in (Op.FOR_ITER, Op.ARG_DEFAULT):
+                note = f"-> {p + vals[-1] - f.offset:04d}"
+            elif op == Op.CAST:
+                note = {v: k for k, v in CAST_KINDS.items()}.get(vals[0], "?")
+            line = f"  {pc - f.offset:04d}  {name:<18}{' '.join(str(v) for v in vals):<12}"
+            if note:
+                line += f"; {note}"
+            if pc in line_at:
+                line = f"{line:<62} @ line {line_at[pc]}"
+            out.append(line.rstrip())
+            pc = p
+    return "\n".join(out)
+
+
+def compile_to_bytecode(source: str, filename: str = "<stdin>", verify: bool = True) -> TBCModule:
+    """TIL source -> bytecode module (parse, resolve imports, verify, compile)."""
+    program = resolve_imports(parse_source(source, filename), filename)
+    if verify:
+        errors = SemanticChecker(source, filename).check(program)
+        if errors:
+            raise CompileError("\n\n".join(errors))
+    module = BytecodeCompiler(source, filename).compile_program(program)
+    module.link()
+    return module
+
+
+def find_vm_sources() -> Optional[str]:
+    """Directory holding the portable C VM (vm/tilvm.c, vm/tilvm.h)."""
+    for home in til_home_dirs():
+        d = os.path.join(home, 'vm')
+        if os.path.exists(os.path.join(d, 'tilvm.c')) and os.path.exists(os.path.join(d, 'tilvm.h')):
+            return d
+    return None
+
+
+def bytes_to_c_array(name: str, data: bytes) -> str:
+    rows = []
+    for i in range(0, len(data), 16):
+        rows.append("    " + ", ".join(f"0x{b:02x}" for b in data[i:i + 16]) + ",")
+    return (f"static const unsigned char {name}[{len(data)}] = {{\n" + "\n".join(rows) +
+            f"\n}};\nstatic const unsigned long {name}_size = {len(data)}UL;\n")
+
+
+def amalgamate_c_vm(tbc: bytes, source_name: str = "program", with_main: bool = True) -> str:
+    """One self-contained C file: the TIL VM + this program's bytecode.
+    Compile it with any C99 compiler for any device (`til build --target c-vm`)."""
+    vm_dir = find_vm_sources()
+    if vm_dir is None:
+        raise CompileError("cannot find the TIL C VM sources (vm/tilvm.c). "
+                           "Set TIL_HOME to the TIL directory.")
+    with open(os.path.join(vm_dir, 'tilvm.h'), encoding='utf-8') as f:
+        header = f.read()
+    with open(os.path.join(vm_dir, 'tilvm.c'), encoding='utf-8') as f:
+        impl = f.read().replace('#include "tilvm.h"', '/* tilvm.h inlined above */')
+    parts = [
+        f"/* Generated by TIL {TIL_VERSION} from {os.path.basename(source_name)}:",
+        "   the portable TIL virtual machine + the program's bytecode in one file.",
+        "   Build: cc -O2 -o program this_file.c -lm   (or with any calculator / MCU toolchain) */",
+        "#define TILVM_AMALGAMATED 1",
+        header,
+        impl,
+        bytes_to_c_array("til_program", tbc),
+    ]
+    if with_main:
+        parts.append('''
+#ifndef TILVM_NO_MAIN
+int main(void) {
+    static tilvm vm;
+    int rc = tilvm_load(&vm, til_program, (unsigned long)til_program_size);
+    if (rc != 0) { tilvm_default_write(NULL, "TIL VM: cannot load program\\n", 29); return 1; }
+    return tilvm_run(&vm);
+}
+#endif
+''')
+    return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #                                COMPILER
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -5831,6 +9069,7 @@ class TILCompiler:
         self.optimize = 2
         self.keep_c = False
         self.check_types = True
+        self.verify = True      # effects / capabilities / constant contracts (fatal errors)
 
     def compile(self, source: str, filename: str = "<stdin>") -> str:
         """Compile TIL source to C code"""
@@ -5846,6 +9085,13 @@ class TILCompiler:
         if self.verbose:
             print(f"[TIL] Resolving imports...")
         ast = resolve_imports(ast, filename)
+
+        if self.verify:
+            if self.verbose:
+                print(f"[TIL] Verifying effects, capabilities and contracts...")
+            errors = SemanticChecker(source, filename).check(ast)
+            if errors:
+                raise CompileError("\n\n".join(errors))
 
         if self.check_types:
             if self.verbose:
@@ -6188,6 +9434,9 @@ def main():
     
     except SyntaxError as e:
         print(f"Syntax Error: {e}", file=sys.stderr)
+        return 1
+    except CompileError as e:
+        print(str(e), file=sys.stderr)
         return 1
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
