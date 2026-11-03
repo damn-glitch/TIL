@@ -547,9 +547,12 @@ def test_screen_option_all_paths(tmp_path):
 def test_screen_option_without_screen(tmp_path, monkeypatch, capsys):
     prog = _write(tmp_path, 'print("no screen")\n')
     out = str(tmp_path / "x.ppm")
-    rc, stdout, err = til_main(monkeypatch, capsys, "run", "--vm", prog, "--screen", out)
-    assert (rc, stdout) == (0, "no screen\n")
-    assert "did not call screen_init (no image written)" in err
+    # `run` without --vm too: a screen option selects the VM even for a program
+    # the native backend could compile (only the VM prints this note)
+    for flags in (["--vm"], []):
+        rc, stdout, err = til_main(monkeypatch, capsys, "run", *flags, prog, "--screen", out)
+        assert (rc, stdout) == (0, "no screen\n")
+        assert "did not call screen_init (no image written)" in err
     if CC:
         tbc = tmp_path / "x.tbc"
         tbc.write_bytes(tbc_bytes('print("no screen")\n'))
