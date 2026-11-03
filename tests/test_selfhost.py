@@ -42,8 +42,9 @@ SLOW = bool(os.environ.get('TIL_TEST_SLOW'))
 # (see selfhost/README.md). Any other "unsupported" message fails the tests.
 UNSUPPORTED = ("handle (effects)", "perform (effects)", "import (tilc compiles one file)")
 
-# Bytecode may differ from the Python compiler's only through constant folding
-# of float expressions (tilc folds integers, strings and booleans exactly).
+# Bytecode may differ from the Python compiler's only where a float constant
+# expression folds to NaN: tilc leaves it to run time (the NaN bit pattern
+# Python produces depends on the CPU). Everything else is folded exactly.
 FLOAT_FOLDING = re.compile(r'\d\.\d|\d[eE][-+]?\d')
 
 
@@ -300,6 +301,19 @@ main()
     print(1_000.5_5)
     print(-0.0)
     print(-2.5e-3)
+""",
+    "float_folding": """
+main()
+    print(0.1 + 0.2, 1e308 * 10.0, -0.0 + 0.0, -0.0 + -0.0, -0.0 * 5, 1 / 3.0)
+    print(9007199254740993 + 0.0, 9007199254740995 * 1.0, 1e-320 * 0.5, 5e-324 / 2)
+    print(1.5e-323 / 2, 2.0 - 2.0, 1e16 + 1.0, 1e16 + 2.0, 123.456 - 0.456)
+    print(9007199254740993 == 9007199254740992.0, 9007199254740993 > 9007199254740992.0)
+    print(true == 1.0, "a" == 1.0, 1e400 > 1e308, -1e400 < -1e308, 1.5 / 0, 1.5 % 2.0)
+    print(1e400 * -2.0, 3.0 / 1e400, -3 / 1e400, 0.5 < 1, 2 >= 2.0, -0.0 == 0.0)
+    print(not 0.0, not -0.0, 0.0 or 1.5, 2.5 and 0, 1.0 != 1, -(-1.5))
+    print(4611686018427387903 * 2.0, -9223372036854775808 * 1.0)
+    print(1.7976931348623157e308 + 9.979201547673598e291, 1.0e-5 * 1e-5 * 1e-300)
+    print(2.2250738585072014e-308 - 2.2250738585072009e-308, 3.14159 * 2.0)
 """,
     "ints": """
 main()
@@ -581,9 +595,9 @@ class TestLanguage:
         assert crc == 1 and cout == "2\n"
         assert "at inner (line 3)" in cerr and "at main (line 7)" in cerr
 
-    def test_float_folding_keeps_behaviour(self, tilc):
-        src = "main()\n    print(2.0 * 3.14159)\n    print(1.5 * 2 + 0.25)\n"
-        assert check_program(tilc, "fold", src) in ('same', 'behaviour')
+    def test_float_folding_nan_keeps_behaviour(self, tilc):
+        src = "main()\n    print(1e400 - 1e400)\n    print(-1e400 * 0.0)\n    print(2.0 * 3.5)\n"
+        assert check_program(tilc, "nan", src) == 'behaviour'
 
 
 # ═══════════════════════════════════════════════════════════════

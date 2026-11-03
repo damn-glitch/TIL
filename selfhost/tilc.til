@@ -730,22 +730,28 @@ bn_low_bits_nonzero(a, s)
     return false
 
 # the IEEE 754 double nearest to D * 10^E (round half to even), as 8 bytes
+# the IEEE 754 double nearest to D * 10^E (round half to even), as 8 bytes
 float_bits_dec(D, E, ndig)
-    var bytes = [0, 0, 0, 0, 0, 0, 0, 0]
     if len(D) == 0
-        return bytes_to_str(bytes)
+        return float_special(0, 0)
     if ndig - 1 + E > 310
-        bytes[6] = 240
-        bytes[7] = 127
-        return bytes_to_str(bytes)
+        return float_special(2, 0)
     if ndig + E < -330
-        return bytes_to_str(bytes)
-    var num = D
-    var den = [1]
+        return float_special(0, 0)
     if E >= 0
-        num = bn_mul_pow10(D, E)
-    else
-        den = bn_pow10(0 - E)
+        return float_round(bn_mul_pow10(D, E), [1], 0, 0)
+    return float_round(D, bn_pow10(0 - E), 0, 0)
+
+# 8 bytes of +-0 (cls 0) or +-infinity (cls 2)
+float_special(cls, sign)
+    var bytes = [0, 0, 0, 0, 0, 0, 0, sign * 128]
+    if cls == 2
+        bytes[6] = 240
+        bytes[7] = bytes[7] + 127
+    return bytes_to_str(bytes)
+
+# the double nearest to (-1)^sign * num / den * 2^e2 (num > 0), as 8 bytes
+float_round(num, den, e2, sign)
     let k = 55 + bn_bitlen(den) - bn_bitlen(num)
     var A = num
     var B = den
@@ -757,23 +763,19 @@ float_bits_dec(D, E, ndig)
     let q = qr[0]
     let rem = qr[1]
     let L = bn_bitlen(q)
-    var e = L - 1 - k
+    var e = L - 1 - k + e2
     if e > 1023
-        bytes[6] = 240
-        bytes[7] = 127
-        return bytes_to_str(bytes)
+        return float_special(2, sign)
     var s = L - 53
     var normal = true
     if e < -1022
-        s = k - 1074
+        s = k - e2 - 1074
         normal = false
     # m = q >> s, rounded half to even
     var m = []
     var guard = 0
     var sticky = rem
     if s > L + 1
-        m = []
-        guard = 0
         sticky = true
     else
         m = bn_shr(q, s)
@@ -788,24 +790,187 @@ float_bits_dec(D, E, ndig)
             m = bn_shr(m, 1)
             e += 1
             if e > 1023
-                bytes[6] = 240
-                bytes[7] = 127
-                return bytes_to_str(bytes)
+                return float_special(2, sign)
         biased = e + 1023
-    else
-        if bn_bitlen(m) > 52
-            biased = 1
+    elif bn_bitlen(m) > 52
+        biased = 1
     while len(m) < 4
         m.push(0)
-    bytes[0] = m[0] & 255
-    bytes[1] = m[0] >> 8
-    bytes[2] = m[1] & 255
-    bytes[3] = m[1] >> 8
-    bytes[4] = m[2] & 255
-    bytes[5] = m[2] >> 8
+    var bytes = [m[0] & 255, m[0] >> 8, m[1] & 255, m[1] >> 8, m[2] & 255, m[2] >> 8, 0, 0]
     bytes[6] = (m[3] & 15) | ((biased & 15) << 4)
-    bytes[7] = (biased >> 4) & 127
+    bytes[7] = ((biased >> 4) & 127) | (sign * 128)
     return bytes_to_str(bytes)
+
+bn_add(a, b)
+    var out = []
+    var carry = 0
+    var i = 0
+    while i < len(a) or i < len(b) or carry > 0
+        var t = carry
+        if i < len(a)
+            t += a[i]
+        if i < len(b)
+            t += b[i]
+        out.push(t & 65535)
+        carry = t >> 16
+        i += 1
+    return bn_trim(out)
+
+# product of two naturals (16-bit limbs times 8-bit halves: no int32 overflow)
+bn_mul(a, b)
+    var r = []
+    var j = 0
+    while j < len(b)
+        let lo = b[j] & 255
+        let hi = b[j] >> 8
+        if lo > 0
+            r = bn_add(r, bn_shl(bn_muladd(a, lo, 0), 16 * j))
+        if hi > 0
+            r = bn_add(r, bn_shl(bn_muladd(a, hi, 0), 16 * j + 8))
+        j += 1
+    return r
+
+# ── exact double arithmetic for constant folding (const_eval on floats) ────
+# a decoded number: [cls, sign, M, E] = (-1)^sign * M * 2^E;
+# cls 0 zero, 1 finite, 2 infinity, 3 nan
+fdecode(b8)
+    let sign = b8[7] >> 7
+    let biased = ((b8[7] & 127) << 4) | (b8[6] >> 4)
+    var M = bn_trim([b8[0] + b8[1] * 256, b8[2] + b8[3] * 256, b8[4] + b8[5] * 256, b8[6] & 15])
+    if biased == 2047
+        if len(M) == 0
+            return [2, sign, [], 0]
+        return [3, sign, [], 0]
+    if biased == 0
+        if len(M) == 0
+            return [0, sign, [], 0]
+        return [1, sign, M, -1074]
+    while len(M) < 4
+        M.push(0)
+    M[3] = M[3] + 16
+    return [1, sign, M, biased - 1075]
+
+# an integer constant, exactly
+idecode(v)
+    var a = i64_of(v)
+    var sign = 0
+    if i64_isneg(a)
+        sign = 1
+        a = i64_negl(a)
+    let M = bn_trim([a[0], a[1], a[2], a[3]])
+    if len(M) == 0
+        return [0, 0, [], 0]
+    return [1, sign, M, 0]
+
+# a numeric constant (int, bool or float) decoded exactly
+ndecode(c)
+    if c.ty == 1
+        return fdecode(c.v)
+    if c.ty == 3
+        if c.v
+            return [1, 0, [1], 0]
+        return [0, 0, [], 0]
+    return idecode(c.v)
+
+fencode(x)
+    if x[0] == 1
+        return float_round(x[2], [1], x[3], x[1])
+    return float_special(x[0], x[1])
+
+# float(c): an int is rounded to the nearest double first (Python semantics)
+fvalue(c)
+    if c.ty == 1
+        return fdecode(c.v)
+    return fdecode(fencode(idecode(c.v)))
+
+fsign(x)
+    if x[0] == 0
+        return 0
+    if x[1] == 1
+        return -1
+    return 1
+
+# exact comparison of two decoded numbers (not nan): -1, 0, 1
+fcmp(x, y)
+    let sx = fsign(x)
+    let sy = fsign(y)
+    if sx != sy
+        if sx < sy
+            return -1
+        return 1
+    if sx == 0
+        return 0
+    var mag = 0
+    if x[0] == 2 or y[0] == 2
+        if x[0] == y[0]
+            mag = 0
+        elif x[0] == 2
+            mag = 1
+        else
+            mag = -1
+    else
+        var E = x[3]
+        if y[3] < E
+            E = y[3]
+        mag = bn_cmp(bn_shl(x[2], x[3] - E), bn_shl(y[2], y[3] - E))
+    return mag * sx
+
+# x + y of decoded doubles -> 8 bytes, or None for a nan result
+fadd(x, y)
+    if x[0] == 3 or y[0] == 3
+        return None
+    if x[0] == 2 or y[0] == 2
+        if x[0] == 2 and y[0] == 2 and x[1] != y[1]
+            return None
+        if x[0] == 2
+            return float_special(2, x[1])
+        return float_special(2, y[1])
+    if x[0] == 0 and y[0] == 0
+        return float_special(0, x[1] * y[1])
+    if x[0] == 0
+        return fencode(y)
+    if y[0] == 0
+        return fencode(x)
+    var E = x[3]
+    if y[3] < E
+        E = y[3]
+    var mx = bn_shl(x[2], x[3] - E)
+    var my = bn_shl(y[2], y[3] - E)
+    if x[1] == y[1]
+        return float_round(bn_add(mx, my), [1], E, x[1])
+    let c = bn_cmp(mx, my)
+    if c == 0
+        return float_special(0, 0)
+    if c > 0
+        bn_subi(mx, my)
+        return float_round(mx, [1], E, x[1])
+    bn_subi(my, mx)
+    return float_round(my, [1], E, y[1])
+
+fmul(x, y)
+    if x[0] == 3 or y[0] == 3
+        return None
+    let sign = (x[1] + y[1]) % 2
+    if x[0] == 2 or y[0] == 2
+        if x[0] == 0 or y[0] == 0
+            return None
+        return float_special(2, sign)
+    if x[0] == 0 or y[0] == 0
+        return float_special(0, sign)
+    return float_round(bn_mul(x[2], y[2]), [1], x[3] + y[3], sign)
+
+# x / y (y is not zero)
+fdiv(x, y)
+    if x[0] == 3 or y[0] == 3
+        return None
+    let sign = (x[1] + y[1]) % 2
+    if x[0] == 2
+        if y[0] == 2
+            return None
+        return float_special(2, sign)
+    if y[0] == 2 or x[0] == 0
+        return float_special(0, sign)
+    return float_round(x[2], y[2], x[3] - y[3], sign)
 
 bn_mul_pow10(D, E)
     var r = D
@@ -3172,7 +3337,15 @@ cv_truthy(c)
 # Python equality of two constants: 1 equal, 0 different, -1 unknown
 cv_equal(a, b)
     if a.ty == 1 or b.ty == 1
-        return -1
+        if a.ty == 2 or b.ty == 2
+            return 0
+        let x = ndecode(a)
+        let y = ndecode(b)
+        if x[0] == 3 or y[0] == 3
+            return 0
+        if fcmp(x, y) == 0
+            return 1
+        return 0
     if a.ty == 2 or b.ty == 2
         if a.ty == 2 and b.ty == 2 and a.v == b.v
             return 1
@@ -3250,6 +3423,38 @@ const_eval(node, env)
             if e < 0
                 return None
             return CV { ty: 3, v: (e == 1) == (op == "==") }
+        if (a.ty == 1 or b.ty == 1) and a.ty != 2 and b.ty != 2 and a.ty != 3 and b.ty != 3
+            # int/float mix: comparisons are exact, arithmetic converts to float
+            if op == "<" or op == ">" or op == "<=" or op == ">="
+                let x = ndecode(a)
+                let y = ndecode(b)
+                if x[0] == 3 or y[0] == 3
+                    return CV { ty: 3, v: false }
+                let c = fcmp(x, y)
+                var r = c >= 0
+                if op == "<"
+                    r = c < 0
+                elif op == ">"
+                    r = c > 0
+                elif op == "<="
+                    r = c <= 0
+                return CV { ty: 3, v: r }
+            var res = None
+            let x = fvalue(a)
+            let y = fvalue(b)
+            if op == "+"
+                res = fadd(x, y)
+            elif op == "-"
+                res = fadd(x, [y[0], 1 - y[1], y[2], y[3]])
+            elif op == "*"
+                res = fmul(x, y)
+            elif op == "/"
+                if fsign(ndecode(b)) == 0
+                    return None
+                res = fdiv(x, y)
+            if res == None
+                return None
+            return CV { ty: 1, v: res }
         if a.ty == 1 or b.ty == 1
             return None
         if a.ty == 0 and b.ty == 0
