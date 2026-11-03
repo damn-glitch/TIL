@@ -223,6 +223,8 @@
             this.inputClosed = false;
             this.decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
             this.errorText = '';
+            this.pending = [];               /* output of the current run(): [{stream, parts}] in order */
+            this.pendingBytes = 0;
         }
 
         load(bytes) {
@@ -322,9 +324,15 @@
             return n;
         }
 
+        /* Output is collected as bytes and decoded once per run() (a program
+         * may print thousands of short pieces per time slice). */
         _emit(stream, bytes) {
-            const text = this.decoders[stream === 2 ? 2 : 1].decode(bytes, { stream: true });
-            this._emitText(stream, text);
+            const s = stream === 2 ? 2 : 1;
+            const last = this.pending[this.pending.length - 1];
+            if (last && last.stream === s) last.parts.push(bytes.slice());
+            else this.pending.push({ stream: s, parts: [bytes.slice()] });
+            this.pendingBytes += bytes.length;
+            if (this.pendingBytes > 1 << 20) this._flush();
         }
 
         _emitText(stream, text) {
@@ -334,9 +342,17 @@
         }
 
         _flush() {
-            for (const s of [1, 2]) {
-                const text = this.decoders[s].decode(new Uint8Array(0), { stream: true });
-                this._emitText(s, text);
+            const runs = this.pending;
+            this.pending = [];
+            this.pendingBytes = 0;
+            for (const { stream, parts } of runs) {
+                let bytes = parts[0];
+                if (parts.length > 1) {
+                    bytes = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+                    let pos = 0;
+                    for (const p of parts) { bytes.set(p, pos); pos += p.length; }
+                }
+                this._emitText(stream, this.decoders[stream].decode(bytes, { stream: true }));
             }
         }
     }

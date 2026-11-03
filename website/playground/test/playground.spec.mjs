@@ -139,9 +139,11 @@ async function checkStop(page, marker) {
         { timeout: 15000 });
     await page.waitForTimeout(400);
     assert.equal(await state(page), 'running', 'still running');
-    const t0 = Date.now();
     // the page answers while the program runs
+    const t1 = Date.now();
     assert.equal(await page.evaluate(() => 6 * 7), 42);
+    assert.ok(Date.now() - t1 < 1000, `the page stays responsive (${Date.now() - t1} ms)`);
+    const t0 = Date.now();
     await page.click('#stop');
     assert.equal(await waitState(page, ['stopped'], 5000), 'stopped');
     assert.ok(Date.now() - t0 < 5000, 'Stop reacts quickly');
@@ -276,6 +278,10 @@ describe('playground as built', () => {
         }
     });
 
+    it('hides the on-screen key bar with a mouse and keyboard', async () => {
+        assert.equal(await page.isVisible('#keybar'), false);
+    });
+
     it('draws on the canvas', async (t) => {
         if (mode === 'tilc') await setSource(page, program('graphics').source);
         else await loadExample(page, 'graphics');
@@ -332,6 +338,12 @@ describe('compile pipeline (mock tilc.tbc)', { skip: HAS_MOCK ? false : 'TEST_AS
             const exp = prog.expect;
             await setSource(page, prog.source);
             if (prog.name === 'infinite') { await checkStop(page, 'spinning'); return; }
+            if (prog.name === 'flood') {
+                await checkStop(page, 'xxxxxxxxxx\nline ');      /* line 1 is trimmed away quickly */
+                const kept = await page.evaluate(() => document.getElementById('output').textContent.length);
+                assert.ok(kept > 1000 && kept < 500000, `the output panel keeps the newest lines (${kept} chars)`);
+                return;
+            }
             if (prog.name === 'input') {
                 await page.click('#run');
                 await checkInput(page);
@@ -377,6 +389,30 @@ describe('compile pipeline (mock tilc.tbc)', { skip: HAS_MOCK ? false : 'TEST_AS
             }
         });
     }
+
+    it('takes keys from the on-screen key bar on a touch screen', async (t) => {
+        const mobile = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+        try {
+            await mobile.goto(`${BASE}/playground/?compiler=/__test__/mock-tilc.tbc`);
+            await mobile.waitForFunction(() => document.body.dataset.state === 'idle');
+            await mobile.fill('#code', program('keys').source);
+            await mobile.click('#run');
+            const st = await waitState(mobile, ['waiting-key', ...FINAL]);
+            if (st === 'error' && notAvailable(await output(mobile)) && !GRAPHICS) {
+                t.skip('no key natives in this VM build');
+                return;
+            }
+            assert.equal(st, 'waiting-key');
+            assert.equal(await mobile.isVisible('#keybar'), true, 'the key bar is shown on touch screens');
+            await mobile.tap('#keybar button[data-key="4"]');
+            await mobile.waitForFunction(() => document.getElementById('output').textContent.includes('key 4'));
+            await mobile.tap('#keybar button[data-key="27"]');
+            assert.equal(await waitState(mobile, FINAL), 'done');
+            assert.equal(await output(mobile), 'key 4\nbye\n');
+        } finally {
+            await mobile.close();
+        }
+    });
 
     it('reports a program the compiler rejects', async () => {
         await setSource(page, 'print("a program the mock compiler does not know")\n');

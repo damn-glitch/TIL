@@ -30,7 +30,9 @@
     const SLICE_MIN = 1000;
     const SLICE_MAX = 4000000;
     const FRAME_MS = 10;                /* VM time per animation frame */
-    const OUTPUT_MAX = 1000000;         /* characters kept in the output panel */
+    const OUTPUT_MAX = 400000;          /* characters kept in the output panel */
+    const OUTPUT_CHUNK = 8192;          /* characters per output block */
+    const FRAME_OUTPUT = 100000;        /* stop a frame's slices early after this much output */
     const INDENT = '    ';
 
     const app = {
@@ -48,6 +50,10 @@
         outChars: 0,
         trimmed: false,
         pending: [],
+        pendingChars: 0,
+        chunk: null,
+        chunkLen: 0,
+        chunkEndsLine: true,
     };
 
     const encoder = new TextEncoder();
@@ -71,59 +77,110 @@
     }
 
     /* ───────────────────────────── output panel ────────────────────────── */
+    /* Output goes into block-level chunks of about OUTPUT_CHUNK characters
+     * (split after a newline), so appending only lays out the newest chunk and
+     * trimming removes whole old chunks. */
     function appendOutput(text, cls) {
-        if (text) app.pending.push([text, cls || '']);
+        if (!text) return;
+        app.pending.push([text, cls || '']);
+        app.pendingChars += text.length;
+    }
+
+    function newChunk() {
+        const div = document.createElement('div');
+        ui.output.appendChild(div);
+        app.chunk = div;
+        app.chunkLen = 0;
+    }
+
+    function addToChunk(text, cls) {
+        const chunk = app.chunk;
+        const last = chunk.lastChild;
+        const lastCls = last ? (last.nodeType === 3 ? '' : last.className) : null;
+        if (last && lastCls === cls) {
+            (last.nodeType === 3 ? last : last.firstChild).appendData(text);
+        } else if (cls) {
+            const span = document.createElement('span');
+            span.className = cls;
+            span.textContent = text;
+            chunk.appendChild(span);
+        } else {
+            chunk.appendChild(document.createTextNode(text));
+        }
+        app.chunkLen += text.length;
+        app.outChars += text.length;
+    }
+
+    function appendToDom(text, cls) {
+        while (text.length) {
+            if (!app.chunk || (app.chunkLen >= OUTPUT_CHUNK && app.chunkEndsLine)) newChunk();
+            let piece = text;
+            if (app.chunkLen + text.length > OUTPUT_CHUNK) {
+                const nl = text.indexOf('\n', Math.max(0, OUTPUT_CHUNK - app.chunkLen - 1));
+                if (nl >= 0) piece = text.slice(0, nl + 1);
+            }
+            addToChunk(piece, cls);
+            app.chunkEndsLine = piece.endsWith('\n');
+            text = text.slice(piece.length);
+        }
     }
 
     function flushOutput() {
-        const items = app.pending;
+        let items = app.pending;
         if (!items.length) return;
         app.pending = [];
+        app.pendingChars = 0;
+        const total = items.reduce((n, it) => n + it[0].length, 0);
+        if (total > OUTPUT_MAX) {               /* only the newest output can stay anyway */
+            const kept = [];
+            let n = 0;
+            for (let i = items.length - 1; i >= 0 && n < OUTPUT_MAX; i--) {
+                const [text, cls] = items[i];
+                const piece = text.length > OUTPUT_MAX - n ? text.slice(text.length - (OUTPUT_MAX - n)) : text;
+                kept.push([piece, cls]);
+                n += piece.length;
+            }
+            items = kept.reverse();
+            clearOutput();
+            noteTrimmed();
+        }
         const out = ui.output;
         const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 48;
-        for (const [text, cls] of items) {
-            const last = out.lastChild;
-            const lastCls = last ? (last.nodeType === 3 ? '' : last.className) : null;
-            if (last && lastCls === cls) {
-                (last.nodeType === 3 ? last : last.firstChild).appendData(text);
-            } else if (cls) {
-                const span = document.createElement('span');
-                span.className = cls;
-                span.textContent = text;
-                out.appendChild(span);
-            } else {
-                out.appendChild(document.createTextNode(text));
-            }
-            app.outChars += text.length;
-        }
+        for (const [text, cls] of items) appendToDom(text, cls);
         if (app.outChars > OUTPUT_MAX) trimOutput();
         if (atBottom) out.scrollTop = out.scrollHeight;
     }
 
     function trimOutput() {
         const out = ui.output;
-        while (app.outChars > OUTPUT_MAX * 0.75 && out.firstChild) {
+        while (app.outChars > OUTPUT_MAX * 0.75 && out.firstChild && out.firstChild !== app.chunk) {
             app.outChars -= out.firstChild.textContent.length;
             out.removeChild(out.firstChild);
         }
+        noteTrimmed();
+    }
+
+    function noteTrimmed() {
         if (!app.trimmed) {
             app.trimmed = true;
-            toast('Long output: the oldest lines were removed');
+            toast('Long output: only the newest lines are kept');
         }
     }
 
     function clearOutput() {
         app.pending = [];
+        app.pendingChars = 0;
         ui.output.textContent = '';
         app.outChars = 0;
-        app.trimmed = false;
+        app.chunk = null;
+        app.chunkLen = 0;
+        app.chunkEndsLine = true;
     }
 
     function note(text) {
-        const out = ui.output;
-        const needsNewline = out.textContent.length && !out.textContent.endsWith('\n') &&
-            !(app.pending.length && app.pending[app.pending.length - 1][0].endsWith('\n'));
-        appendOutput((needsNewline ? '\n' : '') + text + '\n', 'o-note');
+        const last = app.pending.length ? app.pending[app.pending.length - 1][0]
+            : (ui.output.lastChild ? ui.output.lastChild.textContent : '\n');
+        appendOutput((last.endsWith('\n') ? '' : '\n') + text + '\n', 'o-note');
     }
 
     function fmtMs(ms) {
@@ -664,7 +721,7 @@
                 if (st !== STATUS.YIELD) break;
                 if (dt < 2 && this.slice < SLICE_MAX) this.slice *= 2;
                 else if (dt > 8 && this.slice > SLICE_MIN) this.slice = Math.max(SLICE_MIN, this.slice >> 1);
-                if (performance.now() - start >= FRAME_MS) break;
+                if (performance.now() - start >= FRAME_MS || app.pendingChars > FRAME_OUTPUT) break;
             }
             flushOutput();
             if (this.phase === 'run') presentScreen();
@@ -683,7 +740,9 @@
             }
             case STATUS.WAIT_KEY:
                 if (vm.keys.length) { this.schedule(0); return; }
-                setState('waiting-key', 'Waiting for a key: click the screen (or the output) and press a key');
+                setState('waiting-key', finePointer()
+                    ? 'Waiting for a key: click the screen (or the output) and press a key'
+                    : 'Waiting for a key: use the keys under the screen');
                 focusKeyTarget();
                 return;
             case STATUS.WAIT_LINE:
@@ -742,6 +801,10 @@
         ui.stats.textContent = parts.join(' · ');
     }
 
+    function finePointer() {
+        return !window.matchMedia || window.matchMedia('(hover: hover) and (pointer: fine)').matches;
+    }
+
     function focusKeyTarget() {
         const target = ui.screenWrap.hidden ? ui.output : ui.screen;
         if (document.activeElement !== target && document.activeElement !== ui.stdinText) {
@@ -763,6 +826,7 @@
         if (app.run) app.run.stop();
         flushOutput();
         clearOutput();
+        app.trimmed = false;
         clearErrorLine();
         closeScreen();
         if (app.runtime.broken) await resetRuntime();
@@ -792,15 +856,24 @@
         app.programVM = app.runtime.createVM();
     }
 
-    function onProgramKey(e) {
+    function sendKey(k) {
         const run = app.run;
-        if (!run || run.done || run.stopped || run.phase !== 'run') return;
-        if (e.ctrlKey || e.metaKey || e.altKey) return;
-        const k = keyCode(e.key);
-        if (!k) return;
-        e.preventDefault();
+        if (!k || !run || run.done || run.stopped || run.phase !== 'run') return false;
         run.vm.pushKey(k);
         if (document.body.dataset.state === 'waiting-key') run.resume();
+        return true;
+    }
+
+    function onProgramKey(e) {
+        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        if (sendKey(keyCode(e.key))) e.preventDefault();
+    }
+
+    function onKeybar(e) {
+        const button = e.target.closest('button[data-key]');
+        if (!button) return;
+        e.preventDefault();                     /* keep the focus where it is */
+        sendKey(parseInt(button.dataset.key, 10));
     }
 
     function onStdinSubmit(e) {
@@ -891,6 +964,7 @@
         ui.screen.addEventListener('focus', () => ui.screenWrap.classList.add('focused'));
         ui.screen.addEventListener('blur', () => ui.screenWrap.classList.remove('focused'));
         ui.screen.addEventListener('pointerdown', () => ui.screen.focus({ preventScroll: true }));
+        $('keybar').addEventListener('pointerdown', onKeybar);
         ui.stdin.addEventListener('submit', onStdinSubmit);
         ui.stdinText.addEventListener('keydown', onStdinKey);
         window.addEventListener('resize', () => { fitScreen(); positionErrorLine(); });

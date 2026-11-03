@@ -38,6 +38,13 @@
     }
   },
   {
+    "name": "flood",
+    "source": "var i = 0\nloop\n    i += 1\n    print(f\"line {i}: \" + \"x\".repeat(60))\n",
+    "expect": {
+      "state": "running"
+    }
+  },
+  {
     "name": "input",
     "source": "let name = input(\"Name? \")\nprint(f\"Hi, {name}!\")\nlet more = input()\nprint(f\"[{more}]\")\n",
     "expect": {

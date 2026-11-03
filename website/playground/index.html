@@ -66,13 +66,25 @@
             <div class="screen-wrap" id="screen-wrap" hidden>
                 <canvas id="screen" width="160" height="120" tabindex="0"
                         aria-label="Program screen: click it to send keys to the program"></canvas>
-                <div class="screen-note" id="screen-note">Click the screen to send keys: arrows, Enter, Esc, letters</div>
+                <div class="screen-note" id="screen-note">
+                    <span class="for-mouse">Click the screen to send keys: arrows, Enter, Esc, letters</span>
+                    <span class="for-touch">Use these keys for the program:</span>
+                </div>
+                <div class="keybar" id="keybar" aria-label="Keys for the program">
+                    <button type="button" data-key="3" aria-label="Left">←</button>
+                    <button type="button" data-key="1" aria-label="Up">↑</button>
+                    <button type="button" data-key="2" aria-label="Down">↓</button>
+                    <button type="button" data-key="4" aria-label="Right">→</button>
+                    <button type="button" data-key="32">Space</button>
+                    <button type="button" data-key="13">Enter</button>
+                    <button type="button" data-key="27">Esc</button>
+                </div>
             </div>
             <div class="pane-head">
                 <span>Output</span>
                 <button id="clear" class="btn small" type="button" title="Clear the output">Clear</button>
             </div>
-            <pre class="output" id="output" tabindex="0" aria-label="Program output"></pre>
+            <div class="output" id="output" tabindex="0" role="log" aria-label="Program output"></div>
             <form class="stdin" id="stdin" hidden autocomplete="off">
                 <label for="stdin-text" class="stdin-label">input()</label>
                 <input id="stdin-text" type="text" spellcheck="false" placeholder="type a line and press Enter (Ctrl+D: end of input)">

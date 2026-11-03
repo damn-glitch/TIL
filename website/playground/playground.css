@@ -274,6 +274,26 @@ body {
 }
 
 .screen-note { color: #8b95a3; font-size: 11px; }
+
+/* on-screen keys for touch screens (no keyboard for wait_key/key_pressed) */
+.keybar { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+.keybar button {
+    min-width: 44px;
+    height: 36px;
+    padding: 0 10px;
+    border: 1px solid #3a4452;
+    border-radius: 7px;
+    background: #1b222b;
+    color: #e6edf3;
+    font: 600 14px var(--sans);
+    touch-action: manipulation;
+}
+.keybar button:active { background: #2a3442; }
+.for-mouse { display: none; }
+@media (hover: hover) and (pointer: fine) {
+    .keybar, .for-touch { display: none; }
+    .for-mouse { display: inline; }
+}
 .screen-wrap.focused .screen-note { color: #5fd3f5; }
 
 .output {
@@ -294,7 +314,7 @@ body {
 .output .o-echo { color: var(--echo); }
 .output .o-note { color: var(--muted); font-style: italic; }
 
-.output:empty::before {
+body[data-state="idle"] .output:empty::before {
     content: "Press Run to compile and run the program.";
     color: var(--muted);
 }
