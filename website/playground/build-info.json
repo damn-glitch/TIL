@@ -9,10 +9,10 @@
     "website/playground/shim/libc.c": "a79f1175710dfdc5fe798a05d4c5a0f695a91b4ff475b3b9487b08bd6e2baa91",
     "website/playground/shim/math.h": "6e0291dbc493b72d5172970f45b2b19dc31e41c92950d43cf4631e8dd0cbfa9a",
     "website/playground/shim/string.h": "647a00744378e7348b10421232e12dcac1f96dbca75fb3b5f4a58662067ca064",
-    "website/playground/wasm_host.c": "5318623f32dd784d3b894418f86321e8d1ed62e096a5ce84eceee0d799e69a56"
+    "website/playground/wasm_host.c": "3452fcefa886ac13e9540abdc88dd1ce9995728c64ff46eb656137d1e27f89a3"
   },
   "outputs": {
-    "tilvm.wasm": "2281c48b5b957b56167d82669b68b9237522b95d8e7f134591205427db55af9e"
+    "tilvm.wasm": "bd3f10a19e11ec28ba966152afc45cf36f9b7ed037bc5b2c35528a29ab01dbba"
   },
   "vms": 2
 }

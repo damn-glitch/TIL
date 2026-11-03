@@ -20,34 +20,26 @@
  * Never blocking the browser
  *   JavaScript calls wh_run(id, budget) for a few milliseconds per animation
  *   frame; each call runs at most `budget` steps (loop iterations + calls) and
- *   returns a status. Three natives would block a desktop VM; here they pause
- *   the program:
+ *   returns a status. Three natives would block a desktop VM; here they pause:
  *
- *   wait_key(), input()  The hook asks JavaScript for a key / line. If none is
- *       queued, the hook rewinds the current frame's pc to the start of the
- *       NATIVE instruction (the VM saved the pc after the instruction's
- *       operands in the frame before calling the native) and calls the
- *       import `suspend`, which throws a JavaScript exception. The exception
- *       unwinds the WebAssembly frames back to tilvm.js, which restores
- *       __stack_pointer and reports WH_WAIT_KEY / WH_WAIT_LINE. Nothing of
- *       the VM state was changed by the native yet (no allocation, stack
- *       untouched), so when a key/line arrives the next wh_run executes the
- *       NATIVE instruction again and this time the hook returns the value.
+ *   wait_key(), input(), sleep_ms()  When the program would have to wait (no
+ *       key / line queued yet; the busy-wait of sleep_ms), the hook moves the
+ *       current frame's pc back to the start of the native-call instruction
+ *       (the VM saved the pc after the instruction's operands in the frame
+ *       before calling the native) and calls the import `suspend`, which
+ *       throws a JavaScript exception. The exception unwinds the WebAssembly
+ *       frames back to tilvm.js, which restores __stack_pointer and reports
+ *       WH_WAIT_KEY / WH_WAIT_LINE / WH_SLEEP. The native had not changed the
+ *       VM state yet (no allocation, stack untouched), so the next wh_run
+ *       simply executes the instruction again: now the key or line is there,
+ *       or the sleep is over (its clock reads return the original deadline).
  *       input("prompt") prints its prompt before reading: the repeated print
  *       is swallowed (`swallow`) until the hook is reached again.
- *   sleep_ms(ms)  The VM busy-waits on the clock hook. When the clock hook is
- *       read inside a sleep_ms native it lets the wait end at once (the clock
- *       jumps to the wake-up time for the rest of that native) and asks the VM
- *       to stop right after the native by setting st.halted = 2, the same
- *       flag exit() sets: the VM returns TILVM_EXIT, wh_run clears the flag
- *       and reports WH_SLEEP; JavaScript waits wh_sleep_ms() real
- *       milliseconds before calling wh_run again. The clock never goes back.
- *       A VM that sleeps through the idle hook is handled the same way.
  *
- *   Both techniques check the bytecode at the saved pc (NATIVE id argc), so a
- *   VM build that does not save the pc before natives is detected: wait_key()
- *   and input() then stop the program with an explicit error, and sleep_ms()
- *   falls back to busy waiting.
+ *   Pausing checks the bytecode at the saved pc (NATIVE or NATIVE_POP with
+ *   the expected native id), so a VM build that does not save the pc before
+ *   natives is detected: wait_key() and input() then stop the program with an
+ *   explicit error, and sleep_ms() busy-waits as on a desktop.
  *
  * Exports (all ids are instance numbers 0..WH_MAX_VMS-1) - see tilvm.js.
  */
@@ -77,8 +69,10 @@
 #define WH_SLEEP 6                          /* sleep_ms(): call wh_run again after wh_sleep_ms() ms */
 #define WH_HOST_ERROR 7                     /* the playground host stopped the program (message on stderr) */
 
-/* Bytecode format constants (src/til.py: Op.NATIVE, NATIVES; append-only) */
+/* Bytecode format constants (src/til.py: Op, NATIVES; append-only). Both
+ * native-call instructions are 3 bytes long: opcode, native id, argc. */
 #define WH_OP_NATIVE 0x55
+#define WH_OP_NATIVE_POP 0x86               /* superinstruction NATIVE + POP (design section 13) */
 #define WH_N_INPUT 18
 #define WH_N_SLEEP_MS 27
 #define WH_N_WAIT_KEY 51
@@ -106,6 +100,13 @@ JS_IMPORT("screen") void js_screen(int vm, int event, int a, int b);
 JS_IMPORT("suspend") __attribute__((noreturn)) void js_suspend(int vm);
 
 /* ─── instances ─────────────────────────────────────────────────────────── */
+/* Where the VM is: two clock reads at the same spot happen only inside one
+ * native call (the frame's saved pc alone may be stale between natives). */
+typedef struct wh_spot {
+    uint32_t pc, steps;
+    uint16_t sp, frames, tries, deadlines;
+} wh_spot;
+
 typedef struct wh_vm {
     tilvm vm;
     int id;
@@ -116,11 +117,13 @@ typedef struct wh_vm {
     int swallow;            /* drop program output until input() reads again */
     double t0;              /* js_now() when the program was loaded */
     uint32_t last_ms;       /* the clock never goes back */
-    /* sleep_ms(): the native being shortened, and when it ends */
-    int sleeping;
-    uint32_t sleep_until, sleep_pc, sleep_steps;
-    uint16_t sleep_frames;
-    int pause_after_native; /* st.halted was set to 2 by the host, not by exit() */
+    /* sleep_ms() (see h_clock): 0 = none, 1 = first clock read inside a sleep_ms
+     * native, 2 = that sleep was paused and its native runs again */
+    int sleep_state;
+    wh_spot sleep_spot;     /* where the native reads the clock */
+    uint32_t sleep_until;   /* its deadline */
+    uint32_t sleep_len;     /* its argument (ms) */
+    uint32_t sleep_reads;   /* clock reads since it runs again */
     /* program arguments */
     int argc;
     const char *argv[WH_ARGC_MAX + 1];
@@ -199,7 +202,8 @@ static int in_native(wh_vm *w, int native_id) {
     if (!fr) return 0;
     pc = fr->pc;
     if (pc < w->vm.code_off + 3 || pc > w->vm.code_off + w->vm.code_size) return 0;
-    return w->vm.bc[pc - 3] == WH_OP_NATIVE && w->vm.bc[pc - 2] == native_id;
+    return (w->vm.bc[pc - 3] == WH_OP_NATIVE || w->vm.bc[pc - 3] == WH_OP_NATIVE_POP) &&
+           w->vm.bc[pc - 2] == native_id;
 }
 
 /* Leave the VM so that the native instruction runs again on the next wh_run. */
@@ -251,55 +255,97 @@ static uint32_t wall_ms(wh_vm *w) {
     return ms;
 }
 
-/* Shorten the running sleep_ms() native: it ends at `until`, then the VM stops
- * (st.halted = 2, like exit()) and wh_run reports WH_SLEEP. */
-static void start_sleep(wh_vm *w, uint32_t now, uint32_t until) {
+static void get_spot(wh_vm *w, wh_spot *p) {
     tv_frame *fr = top_frame(w);
-    w->sleeping = 1;
-    w->sleep_until = until;
-    w->sleep_pc = fr->pc;
-    w->sleep_steps = w->vm.st.steps;
-    w->sleep_frames = w->vm.st.n_frames;
-    if ((int32_t)(until - now) > 0) {
-        w->pause_after_native = 1;
-        w->vm.st.halted = 2;
-    }
+    p->pc = fr ? fr->pc : 0;
+    p->steps = w->vm.st.steps;
+    p->sp = w->vm.st.sp;
+    p->frames = w->vm.st.n_frames;
+    p->tries = w->vm.st.n_try;
+    p->deadlines = w->vm.st.n_deadlines;
 }
 
-static int in_this_sleep(wh_vm *w) {
-    tv_frame *fr = top_frame(w);
-    return w->sleeping && fr && fr->pc == w->sleep_pc && w->vm.st.steps == w->sleep_steps &&
-           w->vm.st.n_frames == w->sleep_frames;
+static int same_spot(const wh_spot *a, const wh_spot *b) {
+    return a->pc == b->pc && a->steps == b->steps && a->sp == b->sp && a->frames == b->frames &&
+           a->tries == b->tries && a->deadlines == b->deadlines;
 }
 
+/* the int argument of the sleep_ms native being executed, or -1 */
+static long sleep_arg(wh_vm *w) {
+    tv_frame *fr = top_frame(w);
+    uint8_t argc;
+    const tv_val *a;
+    if (!in_native(w, WH_N_SLEEP_MS)) return -1;
+    argc = w->vm.bc[fr->pc - 1];
+    if (!argc || w->vm.st.sp < argc) return -1;
+    a = &w->vm.st.stack[w->vm.st.sp - argc];
+    if (a->t != TV_INT || a->u.i <= 0) return -1;
+    return (long)(uint32_t)a->u.i;             /* the VM computes until = now + (uint32_t)ms */
+}
+
+static uint32_t sleep_end(wh_vm *w) {
+    if ((int32_t)(w->sleep_until - w->last_ms) > 0) w->last_ms = w->sleep_until;   /* never back */
+    return w->sleep_until;
+}
+
+/* Leave the VM during the sleep; the native runs again once it is over. */
+static __attribute__((noreturn)) void pause_sleep(wh_vm *w) {
+    w->sleep_state = 2;
+    w->sleep_reads = 0;
+    pause_native(w, WH_N_SLEEP_MS, WH_SLEEP, "sleep_ms");
+}
+
+/* sleep_ms(ms) runs `until = now() + ms; while (now() < until) {}`. The first
+ * clock read at a spot inside a sleep_ms native records the deadline; a second
+ * read at the very same spot is the busy-wait: the program pauses (WH_SLEEP)
+ * and the page waits. When the instruction runs again, its first read returns
+ * the original start (so `until` is the same deadline) and later reads return
+ * at least the deadline, so the wait ends at once. Reads elsewhere (timeouts)
+ * are never taken for a sleep: they happen at another spot. */
 static uint32_t h_clock(void *ctx) {
     wh_vm *w = (wh_vm *)ctx;
+    wh_spot here;
     uint32_t now;
-    if (in_this_sleep(w)) {
-        /* the rest of this sleep_ms() is "already over"; later reads never go back */
-        if ((int32_t)(w->sleep_until - w->last_ms) > 0) w->last_ms = w->sleep_until;
-        return w->sleep_until;
+    long ms;
+    get_spot(w, &here);
+    if (w->sleep_state && same_spot(&here, &w->sleep_spot)) {
+        if (w->sleep_state == 2) {
+            if (!w->sleep_reads++) return w->sleep_until - w->sleep_len;
+            return sleep_end(w);
+        }
+        if ((int32_t)(w->sleep_until - real_ms(w)) > 0) pause_sleep(w);
+        w->sleep_state = 0;
+        return wall_ms(w);
     }
+    w->sleep_state = 0;
     now = wall_ms(w);
-    if (in_native(w, WH_N_SLEEP_MS)) {
-        tv_frame *fr = top_frame(w);
-        uint8_t argc = w->vm.bc[fr->pc - 1];
-        const tv_val *a = argc && w->vm.st.sp >= argc ? &w->vm.st.stack[w->vm.st.sp - argc] : 0;
-        /* same arithmetic as the VM: until = now + (uint32_t)ms */
-        if (a && a->t == TV_INT && a->u.i > 0) start_sleep(w, now, now + (uint32_t)a->u.i);
+    ms = sleep_arg(w);
+    if (ms > 0) {
+        w->sleep_state = 1;
+        w->sleep_spot = here;
+        w->sleep_until = now + (uint32_t)ms;
+        w->sleep_len = (uint32_t)ms;
     }
     return now;
 }
 
-/* Idling: inside sleep_ms() (a VM that sleeps through the idle hook) it is the
- * same pause as above. Energy saving outside sleep_ms() is a no-op: a browser
- * tab gains nothing from idling inside a time slice. */
+/* Idling inside sleep_ms() (a VM that sleeps through the idle hook) is the
+ * same pause. Energy saving elsewhere is a no-op: a browser tab gains
+ * nothing from idling inside a time slice. */
 static void h_idle(void *ctx, unsigned long ms) {
     wh_vm *w = (wh_vm *)ctx;
-    uint32_t now;
-    if (!ms || in_this_sleep(w) || !in_native(w, WH_N_SLEEP_MS)) return;
-    now = wall_ms(w);
-    start_sleep(w, now, now + (uint32_t)ms);
+    wh_spot here;
+    if (!ms) return;
+    get_spot(w, &here);
+    if (w->sleep_state && same_spot(&here, &w->sleep_spot)) {
+        if (w->sleep_state == 1 && (int32_t)(w->sleep_until - real_ms(w)) > 0) pause_sleep(w);
+        return;                                 /* paused before: the wait is over */
+    }
+    if (sleep_arg(w) != (long)ms) return;      /* only an idle(ms) that is the sleep itself */
+    w->sleep_spot = here;
+    w->sleep_until = wall_ms(w) + (uint32_t)ms;
+    w->sleep_len = (uint32_t)ms;
+    pause_sleep(w);
 }
 
 /* ─── files: the virtual file system lives in JavaScript ───────────────── */
@@ -466,8 +512,7 @@ WASM_EXPORT("wh_load") int wh_load(int id, uint32_t size) {
     w->status = WH_YIELD;
     w->host_failed = 0;
     w->swallow = 0;
-    w->sleeping = 0;
-    w->pause_after_native = 0;
+    w->sleep_state = 0;
     w->t0 = js_now();
     w->last_ms = 0;
     w->err_len = 0;
@@ -482,16 +527,8 @@ WASM_EXPORT("wh_run") int wh_run(int id, uint32_t budget) {
     if (!w || !w->loaded) return WH_HOST_ERROR;
     if (w->host_failed) return w->status = WH_HOST_ERROR;
     w->status = WH_YIELD;
-    w->sleeping = 0;
+    if (w->sleep_state == 1) w->sleep_state = 0;    /* a paused sleep (2) is resumed now */
     rc = tilvm_run_steps(&w->vm, budget);
-    w->sleeping = 0;
-    if (w->pause_after_native) {
-        w->pause_after_native = 0;
-        if (rc == TILVM_EXIT || rc == TILVM_YIELD) {
-            if (w->vm.st.halted == 2) w->vm.st.halted = 0;     /* our pause, not exit() */
-            return w->status = WH_SLEEP;
-        }
-    }
     return w->status = rc;
 }
 

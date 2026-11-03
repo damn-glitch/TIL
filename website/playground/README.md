@@ -112,40 +112,47 @@ browser. No change to the page is needed.
 
 A desktop VM blocks inside `wait_key()`, `input()` and `sleep_ms()`; a browser
 must never block. `wasm_host.c` turns these into pauses (status codes of
-`wh_run`: `WAIT_KEY`, `WAIT_LINE`, `SLEEP`):
+`wh_run`: `WAIT_KEY`, `WAIT_LINE`, `SLEEP`), all with one mechanism:
 
-* `wait_key()` / `input()`: when no key/line is queued, the hook moves the
-  current frame's saved pc back to the start of the `NATIVE` instruction and
-  calls the JavaScript import `suspend`, which throws. The exception unwinds
-  the WebAssembly stack back to `tilvm.js`, which restores `__stack_pointer`
-  (exported by the linker for this) and returns the pause status. The native
-  had not changed anything yet, so when the key/line arrives the instruction
-  simply runs again and the hook returns the value. The prompt that
-  `input(prompt)` printed is not printed twice (it is swallowed while the
-  instruction re-runs).
-* `sleep_ms(ms)`: the VM waits by reading the clock hook. Inside a `sleep_ms`
-  native the hook lets the wait end at once and asks the VM to stop right after
-  the native (`st.halted = 2`, the flag `exit()` uses; `wh_run` clears it and
-  reports `SLEEP`); the page then waits `wh_sleep_ms()` real milliseconds. The
-  program's clock never goes back. The `idle` hook (energy saving) is handled
-  the same way inside `sleep_ms` and ignored elsewhere.
+* When the program would have to wait (no key or line queued yet; the
+  busy-wait loop of `sleep_ms`), the hook moves the current frame's saved pc
+  back to the start of the native-call instruction and calls the JavaScript
+  import `suspend`, which throws. The exception unwinds the WebAssembly stack
+  back to `tilvm.js`, which restores `__stack_pointer` (exported by the linker
+  for this) and returns the pause status. The native had not changed anything
+  yet, so the next `wh_run` executes the same instruction again: now the key
+  or line is there, or the sleep is over.
+* `input(prompt)` prints its prompt before it reads; the repeated print is
+  swallowed while the instruction runs again.
+* `sleep_ms(ms)` is recognised by its clock reads: the native computes
+  `until = now() + ms` and then reads the clock again at the very same spot
+  (same frame pc, step count, stack pointer, frames, recovery points). That
+  second read pauses the program; the page waits `wh_sleep_ms()` real
+  milliseconds. When the instruction runs again, its first clock read returns
+  the original start (so `until` is the original deadline) and later reads at
+  least the deadline, so the wait ends at once. The program's clock never goes
+  back. Clock reads elsewhere (`timeout()` set-up, deadline checks) happen at
+  another spot and are never taken for a sleep. An `idle` hook call inside
+  `sleep_ms` (a VM that sleeps through `idle`) pauses the same way; idling
+  outside `sleep_ms` (energy saving) is a no-op.
 
-**Requirements on `vm/tilvm.c`** (true for TIL 3.0/3.1; checked by
+**Requirements on `vm/tilvm.c`** (true for TIL 3.0/3.1, also for the
+computed-goto VM with superinstructions of design section 13; checked by
 `tests/test_playground.py`):
 
-1. Before calling a native, `OP_NATIVE` stores the pc after its operands in the
-   current frame (`fr->pc = pc;`), and a native calls `read_line`/`wait_key`
-   before it changes the stack. If a future VM breaks this, `wait_key()` and
-   `input()` stop the program with "`<name>() cannot pause in this VM build`"
-   (an explicit error, never a wrong value); `sleep_ms()` then busy-waits.
-2. After a native, `st.halted == 2` makes `tilvm_run_steps` return
-   `TILVM_EXIT` (needed by `exit()` anyway).
+1. Before calling a native, the VM stores the pc after the instruction's
+   operands in the current frame (`fr->pc = pc;` / `SAVE_PC()`), and the
+   native calls `read_line`/`wait_key`/the clock before it changes the stack.
+2. Natives are called by `NATIVE id argc` (0x55) or the superinstruction
+   `NATIVE_POP id argc` (0x86), both 3 bytes. A new or renumbered
+   native-call superinstruction must be added to `in_native()` in
+   `wasm_host.c`.
 3. The C library the VM may use is limited to `shim/`; `build.sh` fails with
    the name of any missing function (add it to `shim/`).
 
-The host stores the program's bytecode, so these instructions (`NATIVE id
-argc`, 3 bytes) are checked before pausing; a superinstruction that fuses a
-native call would be detected and reported, not mis-executed.
+If 1 or 2 does not hold, `wait_key()` and `input()` stop the program with
+"`<name>() cannot pause in this VM build`" (an explicit error, never a wrong
+value) and `sleep_ms()` busy-waits as on a desktop.
 
 ## Limits and differences from the desktop VM
 

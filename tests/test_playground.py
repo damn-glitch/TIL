@@ -507,11 +507,24 @@ def drive(wasm, src, actions, tmp_path):
 
 @needs_node
 def test_input_pauses_and_prints_the_prompt_once(builds, tmp_path):
-    log = drive(builds['wasm'], 'let a = input("Name? ")\nprint(f"Hi {a}")\nlet b = input("Age? ")\nprint(b)\n',
-                [{}, {'line': 'Aigerim'}, {}, {'line': '12'}], tmp_path)
-    assert [e['st'] for e in log] == ['wait-line', 'wait-line', 'wait-line', 'done']
-    assert ''.join(e['out'] for e in log) == 'Name? Hi Aigerim\nAge? 12\n'
+    src = ('let a = input("Name? ")\nprint(f"Hi {a}")\ninput("Press Enter ")\n'
+           'let b = input("Age? ")\nprint(b)\n')
+    log = drive(builds['wasm'], src, [{}, {'line': 'Aigerim'}, {'line': ''}, {}, {'line': '12'}], tmp_path)
+    assert [e['st'] for e in log] == ['wait-line', 'wait-line', 'wait-line', 'wait-line', 'done']
+    assert ''.join(e['out'] for e in log) == 'Name? Hi Aigerim\nPress Enter Age? 12\n'
     assert log[0]['ms'] < 1000
+
+
+@needs_node
+def test_timeouts_after_a_sleep_are_not_sleeps(builds, tmp_path):
+    """Clock reads of timeout() setup in a frame whose last native was
+    sleep_ms() must not be taken for that sleep."""
+    src = ('f() -> int\n    sleep_ms(5)\n    let r = 2500 + timeout(1000)\n        10\n    return r\n'
+           'print(f())\n')
+    log = drive(builds['wasm'], src, [{}, {'wait': 10}, {}], tmp_path)
+    assert [e['st'] for e in log[:2]] == ['sleep', 'done'], log
+    assert ''.join(e['out'] for e in log) == '2510\n'
+    assert log[1]['ms'] < 1000
 
 
 @needs_node
@@ -530,9 +543,9 @@ def test_wait_key_pauses(builds, tmp_path):
     if not builds.get('graphics') or not builds.get('site_wasm'):
         pytest.skip("no screen/key natives in this VM build")
     src = ('screen_init(4, 4)\nprint("ready")\nprint(key_pressed())\nlet k = wait_key()\nprint(k)\n'
-           'print(wait_key())\nprint(key_pressed())\n')
-    log = drive(builds['site_wasm'], src, [{}, {}, {'key': 4}, {'key': 27}], tmp_path)
-    assert [e['st'] for e in log] == ['wait-key', 'wait-key', 'wait-key', 'done']
+           'print(wait_key())\nwait_key()\nprint(key_pressed())\n')
+    log = drive(builds['site_wasm'], src, [{}, {}, {'key': 4}, {'key': 27}, {'key': 13}], tmp_path)
+    assert [e['st'] for e in log] == ['wait-key', 'wait-key', 'wait-key', 'wait-key', 'done']
     assert ''.join(e['out'] for e in log) == 'ready\n0\n4\n27\n0\n'
     assert log[0]['ms'] < 1000
 
