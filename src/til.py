@@ -9950,6 +9950,7 @@ Options:
   --target <t>            build: native | vm (.tbc) | c-vm (one C file: VM +
                           program, for calculators/MCUs) | c (generated C)
   --strip                 vm/c-vm: drop line tables (smallest bytecode)
+  --no-fuse               VM bytecode without superinstructions (runs on TIL 3.0 VMs)
   --max-steps <n>         VM sandbox: stop after n loop iterations/calls
   -O0, -O1, -O2, -O3      Optimization level for native builds (default -O2)
   --keep-c                Keep generated C file
