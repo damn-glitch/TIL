@@ -42,7 +42,9 @@ needs `clang` with the wasm32 target and `wasm-ld` (lld), and `python3`. It
 4. writes `build-info.json` (sha256 of every input and output, clang version,
    configuration). `tests/test_playground.py` fails when the committed build no
    longer matches its sources: after changing `vm/tilvm.c`, `vm/tilvm.h`,
-   `selfhost/tilc.til` or this directory, run `build.sh` and commit the outputs.
+   `selfhost/tilc.til`, the build files here, or `src/til.py` in a way that
+   changes the bytecode of tilc or the examples, run `build.sh` and commit the
+   outputs.
 
 Options (environment): `OUT=dir` (build elsewhere), `TILVM_C=path/tilvm.c` (a
 candidate VM; its `tilvm.h` is taken from the same directory), `TILC_TIL=path`
@@ -70,7 +72,7 @@ about 21.5 MB (two VMs with an 8 MB heap each, two 2 MB bytecode buffers, a
   per animation frame (`requestAnimationFrame`, `setTimeout` in background tabs)
   and adapts `n` to the machine, so the page stays responsive and **Stop** takes
   effect immediately. Output is flushed and the screen is presented once per
-  frame.
+  frame; the output panel keeps the newest 400 000 characters.
 * Files: `read_file`/`write_file`/`file_exists` go to an in-memory file system
   shared by both instances (a fresh one per run); the program can read
   `/main.til` and the files it writes. `args()` of the program is empty.
@@ -86,8 +88,9 @@ about 21.5 MB (two VMs with an 8 MB heap each, two 2 MB bytecode buffers, a
   pixelated`.
 * Keys: while the screen (or the output panel) has the focus, key presses are
   queued for `key_pressed()`/`wait_key()`: arrows → 1-4, Enter 13, Esc 27,
-  Backspace 8, Tab 9, other keys their character code. The queue holds 256
-  keys.
+  Backspace 8, Tab 9, other keys their character (Unicode code point). The
+  queue holds 256 keys. Touch screens get on-screen keys under the screen
+  (arrows, Space, Enter, Esc).
 * `input()` shows an input line under the output; the typed line is echoed
   into the output. Ctrl+D in the input line means end of input (`input()` then
   returns `""`). Lines are delivered like `fgets` with the VM's 256-byte
