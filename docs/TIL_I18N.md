@@ -262,7 +262,10 @@ print(til.localize(f"error[E-FIT]: {msg}"), file=sys.stderr)
 ```
 
 `main()` sets `til.MESSAGE_LANG` from `--lang` / `TIL_LANG` before it
-dispatches to a tool; `til.message_language(cli_value, source)` applies the
-full precedence (including a program's pragma) for tools that parse their own
-options. Diagnostics formatted with `til.ErrorReporter` get their frame
-translated automatically; add the messages to the catalog for the rest.
+dispatches to a tool and removes `--lang X` / `--lang=X` (before any `--`)
+from the tool's arguments, so `til pkg --lang ru list` works with any option
+parser. `til.message_language(cli_value, source)` applies the full precedence
+(including a program's pragma) for a tool that reads a program. The reference
+VM's error reports are localized by themselves (`til debug`). Text printed
+with plain `print(..., file=sys.stderr)` stays English until it goes through
+`til.localize()` and its messages are in the catalog.
