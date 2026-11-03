@@ -1,0 +1,89 @@
+# 13_proofs.til
+# TIL 3.1 - contracts proved for ALL inputs, not only the ones you test
+#
+#   til run 13_proofs.til       contracts are checked while the program runs
+#   til prove 13_proofs.til     Z3 proves them for every possible input
+#   til check 13_proofs.til     proves the #[level: 4] functions
+#
+# Ints are 64-bit and wrap around, so the bounds in #[requires] matter:
+# delete one and `til prove` shows an input that breaks the contract.
+
+#[requires: lo <= hi]
+#[ensures: lo <= result and result <= hi]
+clamp(x: int, lo: int, hi: int) -> int
+    if x < lo
+        return lo
+    elif x > hi
+        return hi
+    return x
+
+#[requires: a >= 0 and b > 0]
+#[ensures: result >= 0 and result <= a]
+#[ensures: result * b <= a and a - result * b < b]
+divide(a: int, b: int) -> int
+    return a / b
+
+# (a + b) / 2 wraps around for large a and b; this version cannot.
+# Without `0 <= a`, til prove finds a = -6425787866654150400,
+# b = 8024048470302220032: then b - a does not fit in 64 bits.
+#[requires: 0 <= a and a <= b]
+#[ensures: a <= result and result <= b]
+midpoint(a: int, b: int) -> int
+    return a + (b - a) / 2
+
+# How many pages for `items` lines? The call must satisfy divide's
+# #[requires], and divide's #[ensures] is all the prover knows about it.
+#[requires: 0 <= items and items <= 1000000000]
+#[requires: 0 < per_page and per_page <= 1000000000]
+#[ensures: result >= 0 and result * per_page >= items]
+pages(items: int, per_page: int) -> int
+    return divide(items + per_page - 1, per_page)
+
+# 1 + 2 + ... + n: the loop invariant is what makes it provable.
+#[level: 4]
+#[requires: n >= 0 and n <= 1000000]
+#[ensures: 2 * result == n * (n + 1)]
+sum_to(n: int) -> int
+    var i = 0
+    var s = 0
+    while i < n
+        invariant 0 <= i and i <= n and 2 * s == i * (i + 1)
+        i += 1
+        s += i
+    return s
+
+# Euclid's algorithm: never divides by zero, the result is positive.
+#[level: 4]
+#[requires: a > 0 and b > 0]
+#[ensures: result > 0]
+gcd(a: int, b: int) -> int
+    var x = a
+    var y = b
+    while y != 0
+        invariant x > 0 and y >= 0
+        let t = x % y
+        x = y
+        y = t
+    return x
+
+#[requires: n >= 0 and n <= 100000]
+#[ensures: result == n * n]
+square_by_odds(n: int) -> int
+    var total = 0
+    for i in 0..n
+        invariant total == i * i
+        total += 2 * i + 1
+    return total
+
+main()
+    print(f"clamp(15, 0, 10) = {clamp(15, 0, 10)}")
+    print(f"divide(17, 5) = {divide(17, 5)}")
+    print(f"midpoint(9223372036854775800, 9223372036854775806) = {midpoint(9223372036854775800, 9223372036854775806)}")
+    print(f"pages(101, 25) = {pages(101, 25)}")
+    print(f"sum_to(100) = {sum_to(100)}")
+    print(f"gcd(84, 36) = {gcd(84, 36)}")
+    var checked = 0
+    for n in 0..20
+        assert square_by_odds(n) == n * n
+        checked += 1
+    print(f"square_by_odds: {checked} values tested here, all of them proved by til prove")
