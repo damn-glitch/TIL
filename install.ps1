@@ -40,7 +40,8 @@ try {
         Write-Host "✓ MSVC found" -ForegroundColor Green
         $hasCompiler = $true
     } catch {
-        Write-Host "⚠ No C compiler found. Install MinGW-w64 or Visual Studio for compilation." -ForegroundColor Yellow
+        Write-Host "⚠ No C compiler found - TIL will run programs on the TIL VM." -ForegroundColor Yellow
+        Write-Host "  (install MinGW-w64 for native executables)" -ForegroundColor Yellow
     }
 }
 
@@ -52,8 +53,19 @@ New-Item -ItemType Directory -Force -Path $TIL_BIN | Out-Null
 
 # Download compiler
 Write-Host "Downloading TIL compiler..." -ForegroundColor Blue
-$compilerUrl = "https://raw.githubusercontent.com/damn-glitch/TIL/main/src/til.py"
-Invoke-WebRequest -Uri $compilerUrl -OutFile "$TIL_BIN\til.py"
+$TIL_RAW = "https://raw.githubusercontent.com/damn-glitch/TIL/main"
+Invoke-WebRequest -Uri "$TIL_RAW/src/til.py" -OutFile "$TIL_BIN\til.py"
+
+# Standard library and the portable TIL VM
+Write-Host "Downloading standard library and TIL VM..." -ForegroundColor Blue
+New-Item -ItemType Directory -Force -Path "$TIL_HOME\stdlib" | Out-Null
+New-Item -ItemType Directory -Force -Path "$TIL_HOME\vm" | Out-Null
+foreach ($f in @("math.til", "strings.til")) {
+    Invoke-WebRequest -Uri "$TIL_RAW/stdlib/$f" -OutFile "$TIL_HOME\stdlib\$f"
+}
+foreach ($f in @("tilvm.c", "tilvm.h", "main.c", "Makefile", "README.md")) {
+    Invoke-WebRequest -Uri "$TIL_RAW/vm/$f" -OutFile "$TIL_HOME\vm\$f"
+}
 
 # Create batch wrapper
 @"
@@ -87,7 +99,7 @@ try {
     $version = python "$TIL_BIN\til.py" --version 2>&1
     Write-Host "Version: $version" -ForegroundColor Cyan
 } catch {
-    Write-Host "Version: 2.0.0" -ForegroundColor Cyan
+    Write-Host "Version: 3.0.0" -ForegroundColor Cyan
 }
 
 Write-Host ""
@@ -96,7 +108,7 @@ Write-Host "  1. Restart PowerShell/Terminal"
 Write-Host "  2. Create hello.til:"
 Write-Host "     'main()"
 Write-Host "         print(`"Hello, TIL!`")' | Out-File hello.til"
-Write-Host "  3. Run it: til run hello.til"
+Write-Host "  3. Run it: til run hello.til          (or: til run --vm hello.til)"
 Write-Host ""
 Write-Host "Happy coding with TIL!" -ForegroundColor Cyan
 Write-Host "Author: Alisher Beisembekov" -ForegroundColor Cyan
