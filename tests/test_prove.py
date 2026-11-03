@@ -776,16 +776,39 @@ def _cond(r, names):
 
 
 def _random_function(r, idx, mutate):
+    """A function whose assert/ensures holds (or, mutated, usually does not):
+    branches that assign, early returns, counting loops with exact
+    invariants, `break`, nested `continue`."""
     names = [f"p{i}" for i in range(r.randint(1, 3))]
     head = f"f{idx}({', '.join(n + ': int' for n in names)}) -> int"
     c, e1, e2, e3 = _cond(r, names), _expr(r, names), _expr(r, names), _expr(r, names)
-    if r.random() < 0.5:
+    n = r.randint(0, 6)
+    kind = r.choice(['merge', 'return', 'loop', 'break', 'nested'])
+    if kind == 'merge':
         body = [f"    var v = {e3}", f"    if {c}", f"        v = {e1}", "    else", f"        v = {e2}"]
         fact = f"v == ({e1} if {c} else {e2})" if not mutate else f"v == ({e2} if {c} else {e1})"
         return names, "\n".join([head] + body + [f"    assert {fact}", "    return v"]) + "\n"
-    ens = f"result == ({e1} if {c} else {e2})" if not mutate else f"result == ({e1} if not {c} else {e2})"
-    return names, "\n".join([f"#[ensures: {ens}]", head, f"    if {c}", f"        return {e1}",
-                             f"    return {e2}"]) + "\n"
+    if kind == 'return':
+        ens = f"result == ({e1} if {c} else {e2})" if not mutate else f"result == ({e1} if not {c} else {e2})"
+        return names, "\n".join([f"#[ensures: {ens}]", head, f"    if {c}", f"        return {e1}",
+                                 f"    return {e2}"]) + "\n"
+    if kind == 'loop':
+        k = r.choice(["3", "(-2)", "1000000007"])
+        body = ["    var i = 0", "    var acc = 0", f"    while i < {n}",
+                f"        invariant 0 <= i and i <= {n} and acc == i * {k}", f"        acc += {k}", "        i += 1"]
+        fact = f"acc == {n if not mutate else n + 1} * {k}"
+        return names, "\n".join([head] + body + [f"    assert {fact}", "    return acc"]) + "\n"
+    if kind == 'break':
+        body = ["    var i = 0", "    loop", f"        invariant 0 <= i and i <= {n}", f"        if i >= {n}",
+                "            break", "        i += 1"]
+        return names, "\n".join([head] + body + [f"    assert i == {n if not mutate else n + 1}",
+                                                 "    return i"]) + "\n"
+    body = ["    var cnt = 0", "    var odd = 0", f"    for i in 0..{n}",
+            "        invariant cnt + odd == i and cnt >= 0 and odd >= 0",
+            "        if i % 2 == 1", "            odd += 1", "            continue",
+            f"        if {c}", "            cnt += 1", "        else", "            cnt += 1"]
+    return names, "\n".join([head] + body + [f"    assert cnt + odd == {n if not mutate else n + 1}",
+                                             "    return cnt"]) + "\n"
 
 
 @needs_z3
