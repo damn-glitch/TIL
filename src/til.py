@@ -9476,6 +9476,7 @@ Options:
   --target <t>            build: native | vm (.tbc) | c-vm (one C file: VM +
                           program, for calculators/MCUs) | c (generated C)
   --strip                 vm/c-vm: drop line tables (smallest bytecode)
+  --device <name>         vm/c-vm: fail the build unless it fits the device (til fit)
   --max-steps <n>         VM sandbox: stop after n loop iterations/calls
   -O0, -O1, -O2, -O3      Optimization level for native builds (default -O2)
   --keep-c                Keep generated C file
@@ -9599,6 +9600,19 @@ def run_proofs(program: 'Program', source: str, filename: str, explicit: bool) -
             raise
         return ["til check --prove: the prover (tilprove.py) is not installed"] if explicit else []
     return prover.check_program(program, source, filename, explicit)
+
+
+def run_fit_check(data: bytes, device: str, filename: str) -> bool:
+    """`til build --target vm|c-vm --device NAME`: does the built bytecode fit the
+    device? Prints the result; False = it does not (the build fails)."""
+    try:
+        fit = feature_module('tilfit')
+    except ImportError as e:
+        if getattr(e, 'name', None) != 'tilfit':
+            raise
+        print("Error: --device needs the fit checker (tilfit.py), which is not installed", file=sys.stderr)
+        return False
+    return fit.check_build(data, device, filename)
 
 
 # ── translate ────────────────────────────────────────────────────────────────
@@ -9867,6 +9881,10 @@ def main():
     if not os.path.exists(input_file):
         print(f"Error: File not found: {input_file}", file=sys.stderr)
         return 1
+    if opts.get('device') and (command != 'build' or target not in ('vm', 'tbc', 'c-vm', 'calc', 'embed')):
+        print("Error: --device works with `til build --target vm|c-vm`; for a report on any "
+              "program use `til fit FILE --device NAME`", file=sys.stderr)
+        return 1
 
     try:
         # bytecode files
@@ -9938,6 +9956,9 @@ def main():
             module = compile_to_bytecode(source, input_file, compiler.verify)
             data = module.serialize(strip=strip)
             out = output_file or base + '.tbc'
+            if opts.get('device') and not run_fit_check(data, opts['device'], input_file):
+                print(f"Build failed: {out} not written", file=sys.stderr)
+                return 1
             with open(out, 'wb') as f:
                 f.write(data)
             print(f"Built: {out} ({len(data)} bytes of TIL bytecode)")
@@ -9945,7 +9966,11 @@ def main():
 
         if target in ('c-vm', 'calc', 'embed'):
             module = compile_to_bytecode(source, input_file, compiler.verify)
-            text = amalgamate_c_vm(module.serialize(strip=strip), input_file)
+            data = module.serialize(strip=strip)
+            if opts.get('device') and not run_fit_check(data, opts['device'], input_file):
+                print("Build failed: nothing written", file=sys.stderr)
+                return 1
+            text = amalgamate_c_vm(data, input_file)
             out = output_file or base + '_vm.c'
             with open(out, 'w', encoding='utf-8', newline='\n') as f:
                 f.write(text)

@@ -278,6 +278,15 @@ static void out(tilvm *vm, const char *s, size_t n) {
     if (vm->write && n) vm->write(vm->ctx, s, n);
 }
 
+/* ─── high-water marks (TILVM_STATS, til fit --run) ─────────────────────── */
+#ifdef TILVM_STATS
+#define TV_PAINT 0xA5u          /* tag of value-stack slots never written */
+#define TV_STAT_MAX(field, v) \
+    do { if ((uint32_t)(v) > vm->stats.field) vm->stats.field = (uint32_t)(v); } while (0)
+#else
+#define TV_STAT_MAX(field, v) ((void)0)
+#endif
+
 /* ─── allocation & garbage collection ──────────────────────────────────── */
 static void gc(tilvm *vm);
 
@@ -295,6 +304,7 @@ static tv_ref alloc_obj(tilvm *vm, uint8_t kind, uint32_t size) {
     }
     r = vm->st.heap_top;
     vm->st.heap_top = (tv_size)(vm->st.heap_top + size);
+    TV_STAT_MAX(peak_heap, vm->st.heap_top);
     memset(vm->mem.heap + r, 0, size);
     h = OBJ(vm, r);
     h->kind = kind;
@@ -400,9 +410,24 @@ static void gc(tilvm *vm) {
         scan = (tv_size)(scan + size);
     }
     st->heap_top = free_at;
+    TV_STAT_MAX(peak_live, free_at);
 }
 
 uint32_t tilvm_heap_used(const tilvm *vm) { return vm->st.heap_top; }
+
+#ifdef TILVM_STATS
+void tilvm_get_stats(const tilvm *vm, tilvm_stats *out) {
+    uint32_t k = TILVM_STACK_SIZE;
+    *out = vm->stats;
+    /* tilvm_load painted the free stack slots: the highest slot ever written is
+     * the high-water mark (this also sees temporaries pushed inside builtins) */
+    while (k > vm->st.sp && vm->st.stack[k - 1].t == TV_PAINT) k--;
+    out->peak_stack = k;
+    if (vm->st.n_frames > out->peak_frames) out->peak_frames = vm->st.n_frames;
+    if (vm->st.n_try > out->peak_try) out->peak_try = vm->st.n_try;
+    if (vm->st.heap_top > out->peak_heap) out->peak_heap = vm->st.heap_top;
+}
+#endif
 
 /* ─── strings ───────────────────────────────────────────────────────────── */
 static const uint8_t *const_ptr(tilvm *vm, uint16_t k) { return vm->bc + vm->const_off[k]; }
@@ -2482,6 +2507,15 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
     vm->host.write_file = default_write_file;
 #endif
     reset_state(vm);
+#ifdef TILVM_STATS
+    {   /* paint the free stack slots so tilvm_get_stats() can find the high-water mark */
+        uint32_t k;
+        for (k = vm->st.sp; k < (uint32_t)TILVM_STACK_SIZE; k++) vm->st.stack[k].t = (uint8_t)TV_PAINT;
+        memset(&vm->stats, 0, sizeof(vm->stats));
+        vm->stats.peak_frames = vm->st.n_frames;
+        vm->stats.peak_heap = vm->st.heap_top;
+    }
+#endif
     return 0;
 }
 
@@ -2733,6 +2767,7 @@ static int push_frame(tilvm *vm, uint16_t fidx, uint8_t argc, uint8_t extra, tv_
     for (i = argc; i < FN_NPARAMS(f); i++) { STK[SP].t = TV_UNDEF; STK[SP].u.i = 0; SP++; }
     for (i = FN_NPARAMS(f); i < FN_NLOCALS(f); i++) set_nil(&STK[SP++]);
     fr = &st->frames[st->n_frames++];
+    TV_STAT_MAX(peak_frames, st->n_frames);
     fr->func = fidx;
     fr->base = nb;
     fr->closure = clos;
@@ -2807,6 +2842,7 @@ static int push_try(tilvm *vm, uint8_t op, uint32_t handler) {
     }
     if (st->n_try >= TILVM_MAX_TRY) return fail(vm, "too many nested retry/timeout blocks");
     t = &st->tries[st->n_try++];
+    TV_STAT_MAX(peak_try, st->n_try);
     t->handler = handler;
     t->deadline = deadline;
     t->n_frames = st->n_frames;
