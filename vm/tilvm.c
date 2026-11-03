@@ -1661,7 +1661,11 @@ static int native_write_file(tilvm *vm, uint16_t base) {
 #define TILVM_ROM
 #endif
 
-#define GFX_MAX_SIZE 4096           /* screen_init: 1..4096 pixels per side */
+/* screen_init: 1..TILVM_GFX_MAX_W x 1..TILVM_GFX_MAX_H pixels (tilvm.h); 4096 per
+ * side is the language limit, a device with a fixed display sets its size */
+#if TILVM_GFX_MAX_W < 1 || TILVM_GFX_MAX_W > 4096 || TILVM_GFX_MAX_H < 1 || TILVM_GFX_MAX_H > 4096
+#error "TILVM_GFX_MAX_W and TILVM_GFX_MAX_H must be 1..4096"
+#endif
 #define GFX_COORD_LIM 32768L        /* shape coordinates and sizes: -32768..32767 */
 
 /* 5x7 font: ASCII 32..126, then the replacement glyph used for every other
@@ -1790,24 +1794,6 @@ static tv_int gfx_value(unsigned long rgb) {
 #endif
 }
 
-/* Type name for messages; structs by name, like the reference VM. */
-static const char *gfx_type(tilvm *vm, const tv_val *v, char *buf) {
-    if (v->t == TV_STRUCT) {
-        tv_val nv;
-        uint32_t n;
-        const char *p;
-        nv.t = TV_STRK;
-        nv.u.i = 0;
-        nv.u.k = type_name_const(vm, OBJ(vm, v->u.r)->aux);
-        p = str_data(vm, &nv, &n);
-        if (n > 47) n = 47;
-        memcpy(buf, p, n);
-        buf[n] = 0;
-        return buf;
-    }
-    return type_name(vm, v);
-}
-
 static int gfx_arg_error(tilvm *vm, uint8_t id, uint8_t k, const char *what, const char *got) {
     char num[2];
     num[0] = (char)('1' + k);
@@ -1815,18 +1801,33 @@ static int gfx_arg_error(tilvm *vm, uint8_t id, uint8_t k, const char *what, con
     return failn(vm, NATIVE_NAMES[id], "() argument ", num, what, got, 0);
 }
 
+/* "... must be an int, got <type>". A struct is named by its type, like the
+ * reference VM: the name stays the program's constant string (err_val, printed
+ * after err_msg), so it is never cut, whatever its length. */
+static int gfx_int_error(tilvm *vm, uint8_t id, uint8_t k, const tv_val *v) {
+    gfx_arg_error(vm, id, k, " must be an int, got ", v->t == TV_STRUCT ? 0 : type_name(vm, v));
+    if (v->t == TV_STRUCT) {
+        vm->err_val.t = TV_STRK;
+        vm->err_val.u.i = 0;
+        vm->err_val.u.k = type_name_const(vm, OBJ(vm, v->u.r)->aux);
+    }
+    return 0;
+}
+
 static int gfx_check(tilvm *vm, uint8_t id, uint16_t base, uint8_t argc) {
     const char *kinds = GFX_KINDS[id - N_SCREEN_INIT];
-    char buf[48];
+    char buf[32], lim[32];
     uint8_t k;
     for (k = 0; kinds[k] && k < argc; k++) {
         const tv_val *v = &STK[base + k];
         tv_int i;
         if (kinds[k] == 't') continue;
-        if (v->t != TV_INT) return gfx_arg_error(vm, id, k, " must be an int, got ", gfx_type(vm, v, buf));
+        if (v->t != TV_INT) return gfx_int_error(vm, id, k, v);
         i = v->u.i;
-        if (kinds[k] == 's' && (i < 1 || i > GFX_MAX_SIZE))
-            return gfx_arg_error(vm, id, k, " must be 1..4096, got ", fmt_int(buf, i));
+        if (kinds[k] == 's' && (i < 1 || i > (k ? TILVM_GFX_MAX_H : TILVM_GFX_MAX_W)))   /* screen_init */
+            return failn(vm, k ? "screen_init() argument 2 must be 1.." : "screen_init() argument 1 must be 1..",
+                         fmt_int(lim, (tv_int)(k ? TILVM_GFX_MAX_H : TILVM_GFX_MAX_W)), ", got ",
+                         fmt_int(buf, i), 0, 0);
 #if TILVM_INT_BITS > 16
         if (kinds[k] == 'c' && (i < -GFX_COORD_LIM || i >= GFX_COORD_LIM))
             return gfx_arg_error(vm, id, k, " must be -32768..32767, got ", fmt_int(buf, i));
@@ -3502,6 +3503,14 @@ int tilvm_restore(tilvm *vm, const uint8_t *data, uint32_t size) {
     memcpy(vm->st.stack, data + SNAP_HDR + fixed, stack_bytes);
     memcpy(vm->mem.heap, data + SNAP_HDR + fixed + stack_bytes, vm->st.heap_top);
 #ifndef TILVM_NO_GFX
+    /* a screen this build cannot show (another TILVM_GFX_MAX_W/H) is a different
+     * build; the half-restored program must not run with it */
+    if ((vm->st.scr_w == 0) != (vm->st.scr_h == 0) || vm->st.scr_w > TILVM_GFX_MAX_W ||
+        vm->st.scr_h > TILVM_GFX_MAX_H) {
+        vm->st.scr_w = vm->st.scr_h = 0;
+        vm->st.failed = 1;
+        return -3;
+    }
     if (vm->st.scr_w && vm->host.gfx_pixel) gfx_open(vm);   /* same size, pixels cleared */
 #endif
     return 0;

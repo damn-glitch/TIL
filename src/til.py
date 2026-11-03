@@ -3295,9 +3295,13 @@ class SemanticChecker:
         effects: Set[str] = set()
         edges: List[Tuple[str, ASTNode, bool]] = []
         callee_nodes = set()
+        # a user function or a parameter with a builtin's name is what gets called
+        # (its own effects count through the call edge), not the io builtin
+        shadowing = {p.name for p in fn.params}
         for node in walk(fn.body):
             if isinstance(node, Call):
-                if isinstance(node.func, Identifier) and node.func.name in self.IO_BUILTINS:
+                if isinstance(node.func, Identifier) and node.func.name in self.IO_BUILTINS \
+                        and node.func.name not in self.funcs and node.func.name not in shadowing:
                     effects.add('io')
                     self.effect_origin.setdefault((key, 'io'), node)
                 for callee, precise in self.resolve_call(key, node):
@@ -8026,12 +8030,17 @@ class TILScreen:
     """Framebuffer of the reference VM (the host side of the screen natives):
     w x h pixels, 3 bytes each. With `ansi=True` every screen_show() draws the
     frame into the program's output with 24-bit colour half blocks, byte for
-    byte like `tilvm --screen-ansi`."""
+    byte like `tilvm --screen-ansi`. `max_w` x `max_h` is the largest screen
+    screen_init accepts, like a C VM built with -DTILVM_GFX_MAX_W/H for a
+    device's display (default: the language limit 4096 x 4096)."""
 
-    def __init__(self, ansi: bool = False):
+    def __init__(self, ansi: bool = False, max_w: int = GFX_MAX_SIZE, max_h: int = GFX_MAX_SIZE):
+        if not (1 <= max_w <= GFX_MAX_SIZE and 1 <= max_h <= GFX_MAX_SIZE):
+            raise ValueError(f"TILScreen: max_w and max_h must be 1..{GFX_MAX_SIZE}")
         self.w = self.h = 0
         self.fb = bytearray()
         self.ansi = ansi
+        self.max_w, self.max_h = max_w, max_h
         self.frames = 0                  # ANSI frames since screen_init
 
     def init(self, w: int, h: int):
@@ -8143,28 +8152,37 @@ class KeyScript:
 
 
 class TerminalKeys:
-    """Keys from the terminal (raw mode while the program reads keys, restored
-    by close() and before input()) or, when stdin is not a terminal, from
+    """Keys from the terminal (raw mode while the program reads keys, restored by
+    close(), before input() and on SIGTERM) or, when stdin is not a terminal, from
     stdin's bytes (at the end: key_pressed() -> 0, wait_key() -> 27). Arrows
     (ESC [ A..D) -> 1..4, CR/LF -> 13, DEL -> 8, UTF-8 -> code point: the same
-    decoding as vm/main.c."""
+    decoding as vm/main.c. Keys and input() lines (cooked()) take the same
+    buffered bytes, so they never overtake each other. key_pressed() only takes
+    bytes that are already there, so it never blocks, also with a pipe (Windows
+    cannot poll a pipe: there the read waits); a regular file is always ready."""
 
     def __init__(self):
         self.mode = None            # 'tty' (POSIX terminal), 'win' (Windows console), 'stream'
         self.fd = -1
         self.saved = None           # termios settings to restore
-        self.pending: List[int] = []    # bytes read ahead
+        self.old_sigterm = None     # SIGTERM handler before raw mode
+        self.buf = b""              # bytes read from stdin; buf[pos:] are not used yet
+        self.pos = 0
 
-    def _start(self):
+    def _start_mode(self):
         if self.mode is None:
             try:
                 self.fd = sys.stdin.fileno()
                 tty = os.isatty(self.fd)
             except (AttributeError, OSError, ValueError):
-                tty = False
+                self.fd, tty = -1, False
             self.mode = ('win' if os.name == 'nt' else 'tty') if tty else 'stream'
+
+    def _start(self):
+        self._start_mode()
         if self.mode == 'tty' and self.saved is None:
             import termios
+            self._catch_sigterm()               # before the terminal changes
             try:
                 self.saved = termios.tcgetattr(self.fd)
                 raw = termios.tcgetattr(self.fd)
@@ -8175,6 +8193,22 @@ class TerminalKeys:
             except termios.error:
                 self.saved = None
 
+    def _catch_sigterm(self):
+        """SIGTERM while the terminal is raw: restore it, then end by SIGTERM (as
+        vm/main.c does)."""
+        import signal
+
+        def on_sigterm(signum, frame):
+            self.close()
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        try:
+            old = signal.signal(signal.SIGTERM, on_sigterm)
+        except (ValueError, OSError, AttributeError):     # not the main thread
+            return
+        if self.old_sigterm is None:
+            self.old_sigterm = old
+
     def close(self):
         """Give the terminal back its normal mode (echo, line editing)."""
         if self.saved is not None:
@@ -8184,49 +8218,99 @@ class TerminalKeys:
             except termios.error:
                 pass
             self.saved = None
+        if self.old_sigterm is not None:
+            import signal
+            try:
+                signal.signal(signal.SIGTERM, self.old_sigterm)
+            except (ValueError, OSError):
+                pass
+            self.old_sigterm = None
 
     def cooked(self, read_line):
-        """Wrap input(): the terminal is in normal mode while a line is read."""
+        """Wrap input(): the terminal is in normal mode while a line is read, and
+        the line comes from the same buffered bytes as the keys."""
         def read():
             self.close()
-            return read_line()
+            self._start_mode()
+            if self.mode == 'win':
+                return read_line()
+            try:
+                sys.stdout.flush()
+            except (AttributeError, OSError, ValueError):
+                pass
+            return self.read_line()
         return read
 
-    def _tty_byte(self, timeout) -> int:
-        """Next byte: -1 = none within `timeout` s (None: wait), -2 = end of input."""
-        if self.pending:
-            return self.pending.pop(0)
+    def _read(self, timeout) -> Optional[bytes]:
+        """One read from stdin: None = no data within `timeout` seconds (None:
+        wait), b"" = end of input (or stdin cannot be read)."""
+        if self.fd < 0:             # stdin without a file descriptor (replaced in-process)
+            stdin = sys.stdin
+            try:
+                buf = getattr(stdin, 'buffer', None)
+                if buf is not None:
+                    return buf.read1(4096) if hasattr(buf, 'read1') else buf.read(4096)
+                return stdin.read(4096).encode('utf-8')
+            except (AttributeError, OSError, ValueError):
+                return b""
         import select
-        try:
-            if not select.select([self.fd], [], [], timeout)[0]:
-                return -1
-            data = os.read(self.fd, 1)
-        except (OSError, ValueError):
-            return -1
-        return data[0] if data else -2
+        while True:
+            if timeout is not None:
+                try:
+                    if not select.select([self.fd], [], [], timeout)[0]:
+                        return None
+                except (OSError, ValueError):
+                    pass            # cannot be polled (a pipe on Windows): the read waits
+            try:
+                return os.read(self.fd, 4096)
+            except BlockingIOError:     # a non-blocking stdin
+                if timeout is not None:
+                    return None
+                select.select([self.fd], [], [])
+            except OSError:
+                return b""
 
-    def _stream_byte(self, timeout) -> int:
-        """Next byte of a non-terminal stdin; -2 at its end (or if it cannot be read)."""
-        if self.pending:
-            return self.pending.pop(0)
-        stdin = sys.stdin
-        try:
-            buf = getattr(stdin, 'buffer', None)
-            data = buf.read(1) if buf is not None else stdin.read(1).encode('utf-8')
-        except (AttributeError, OSError, ValueError):
-            return -2
+    def _byte(self, timeout) -> int:
+        """Next byte of stdin: -1 = none within `timeout` seconds (None: wait),
+        -2 = end of input."""
+        if self.pos < len(self.buf):
+            self.pos += 1
+            return self.buf[self.pos - 1]
+        data = self._read(timeout)
+        if data is None:
+            return -1
         if not data:
             return -2
-        self.pending.extend(data[1:])
+        self.buf, self.pos = data, 1
         return data[0]
 
-    def _decode(self, nxt, c: int) -> int:
-        """One key from the byte source `nxt`; -1 = bytes that are not a key."""
+    def read_line(self) -> bytes:
+        """input(): the next line without its newline (b"" at the end of input),
+        like sys.stdin.buffer.readline()."""
+        parts = []
+        while True:
+            if self.pos >= len(self.buf):
+                data = self._read(None)
+                if not data:
+                    return b"".join(parts)
+                self.buf, self.pos = data, 0
+            i = self.buf.find(b"\n", self.pos)
+            if i >= 0:
+                parts.append(self.buf[self.pos:i])
+                self.pos = i + 1
+                return b"".join(parts)
+            parts.append(self.buf[self.pos:])
+            self.pos = len(self.buf)
+
+    def _decode(self, c: int) -> int:
+        """One key, `c` being its first byte; -1 = bytes that are not a key. A lone
+        ESC is one that no '[' or 'O' follows within 30 ms."""
+        nxt = self._byte
         if c == 27:
             c2 = nxt(0.03)
             if c2 not in (0x5B, 0x4F):              # '[' 'O'
                 if c2 >= 0:
-                    self.pending.insert(0, c2)       # a lone ESC
+                    self.pos -= 1                    # a lone ESC: c2 is the next key
                 return 27
             c3 = nxt(0.03)
             if 0x41 <= c3 <= 0x44:                   # A B C D
@@ -8266,11 +8350,10 @@ class TerminalKeys:
         self._start()
         if self.mode == 'win':
             return self._win_key(False)
-        nxt = self._tty_byte if self.mode == 'tty' else self._stream_byte
-        c = nxt(0)
+        c = self._byte(0)
         if c < 0:
             return 0
-        k = self._decode(nxt, c)
+        k = self._decode(c)
         return k if k > 0 else 0
 
     def wait(self) -> int:
@@ -8281,13 +8364,12 @@ class TerminalKeys:
             pass
         if self.mode == 'win':
             return self._win_key(True)
-        nxt = self._tty_byte if self.mode == 'tty' else self._stream_byte
         while True:
-            c = nxt(None)
-            if c == -2 or (c < 0 and self.mode == 'stream'):
+            c = self._byte(None)
+            if c == -2:
                 return 27
             if c >= 0:
-                k = self._decode(nxt, c)
+                k = self._decode(c)
                 if k > 0:
                     return k
 
@@ -8818,8 +8900,10 @@ class TILVM:
                 continue
             if type(v) is not int:
                 self.panic(f"{name}() argument {k + 1} must be an int, got {self.type_name(v).decode()}")
-            if kind == 's' and not 1 <= v <= GFX_MAX_SIZE:
-                self.panic(f"{name}() argument {k + 1} must be 1..4096, got {v}")
+            if kind == 's':                         # screen_init: the device's largest screen
+                most = getattr(scr, 'max_h' if k else 'max_w', GFX_MAX_SIZE)
+                if not 1 <= v <= most:
+                    self.panic(f"{name}() argument {k + 1} must be 1..{most}, got {v}")
             if kind == 'c' and not GFX_COORD_MIN <= v <= GFX_COORD_MAX:
                 self.panic(f"{name}() argument {k + 1} must be -32768..32767, got {v}")
             if kind == 'k' and not 0 <= v <= 0xFFFFFF:
@@ -9985,13 +10069,89 @@ def run_bytecode(module: TBCModule, max_steps: int = 0, argv: Optional[List[str]
     vm = TILVM(module, max_steps=max_steps, argv=argv, screen=screen, keys=keys)
     if isinstance(keys, TerminalKeys):
         vm.read_line = keys.cooked(vm.read_line)
+    ctrl_c = CtrlC()
     try:
-        rc = vm.run()
-    except KeyboardInterrupt:       # Ctrl-C (e.g. in a game): quiet, like the C VM
-        rc = 130
+        try:
+            rc = vm.run()
+            ctrl_c.running = False
+        except KeyboardInterrupt:   # Ctrl-C: the program ends; the cleanup below still runs
+            ctrl_c.running, ctrl_c.hit, rc = False, True, 130
+        keys.close()
+        rc = save_screen(screen, opts.get('screen'), rc)
     finally:
         keys.close()
-    return save_screen(screen, opts.get('screen'), rc)
+        ctrl_c.restore()
+    return end_by_sigint() if ctrl_c.hit else rc
+
+
+class CtrlC:
+    """SIGINT while a program runs raises KeyboardInterrupt (Python's default);
+    after that (`running = False`: terminal, --screen image) it is only
+    remembered in `hit`, as vm/main.c does, so the cleanup always finishes."""
+
+    def __init__(self):
+        import signal
+        self.running, self.hit, self.old = True, False, None
+        try:
+            if signal.getsignal(signal.SIGINT) is not signal.SIG_IGN:
+                self.old = signal.signal(signal.SIGINT, self._handler)
+        except (ValueError, OSError, AttributeError):      # not the main thread
+            self.old = None
+
+    def _handler(self, signum, frame):
+        self.hit = True
+        if self.running:
+            raise KeyboardInterrupt
+
+    def restore(self):
+        if self.old is not None:
+            import signal
+            try:
+                signal.signal(signal.SIGINT, self.old)
+            except (ValueError, OSError):
+                pass
+            self.old = None
+
+
+def end_by_sigint() -> int:
+    """After Ctrl-C and the cleanup: flush the output, then end this process by
+    SIGINT as an uncaught Ctrl-C does - a shell then also stops the script that
+    ran it, and `$?` is 130. Where that cannot be done (Windows, not the main
+    thread) the exit code is 130."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    if os.name == 'posix':
+        import signal
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGINT)
+        except (ValueError, OSError):
+            pass
+    return 130
+
+
+def run_foreground(cmd: List[str]) -> int:
+    """Run a child (the C VM) in the foreground, like system(): a Ctrl-C reaches
+    the child too, so wait for it to finish its own cleanup instead of raising
+    KeyboardInterrupt here. Returns its exit status (-N: ended by signal N)."""
+    ctrl_c = CtrlC()
+    ctrl_c.running = False
+    try:
+        return subprocess.Popen(cmd).wait()
+    finally:
+        ctrl_c.restore()
+
+
+def foreground_exit(rc: int) -> int:
+    """Exit code for a child's status: a child ended by Ctrl-C ends this process
+    the same way (end_by_sigint), one ended by another signal N gives 128 + N."""
+    import signal
+    if rc == -signal.SIGINT:
+        return end_by_sigint()
+    return 128 - rc if rc < 0 else rc
 
 
 # ── graphics run options: --screen FILE.ppm, --screen-ansi, --keys LIST ──────
@@ -10425,9 +10585,10 @@ def main():
                     f.write(module.serialize())
                 cmd = [exe] + (['--max-steps', str(max_steps)] if max_steps else []) + \
                     cvm_screen_flags(opts) + [tbc_path] + prog_args
-                return subprocess.run(cmd).returncode
+                rc = run_foreground(cmd)
             finally:
                 os.unlink(tbc_path)
+            return foreground_exit(rc)
 
         if target in ('vm', 'tbc'):
             module = compile_to_bytecode(source, input_file, compiler.verify)

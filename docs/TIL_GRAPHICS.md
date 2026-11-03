@@ -46,10 +46,11 @@ vm/tilvm --screen out.ppm --keys "UP,ESC" game.tbc
   offscreen framebuffer, `screen_show()` shows nothing and `get_pixel` reads
   the framebuffer — so graphics programs run (and can be tested) in CI.
 * `--screen FILE.ppm` writes the framebuffer as it is when the program ends
-  (normal end, runtime error or `exit()`), whether or not `screen_show()` was
-  called after the last drawing. If the program never called `screen_init`,
-  no file is written and a note goes to stderr. A file that cannot be written
-  is an error (exit code 2 unless the program already failed).
+  (normal end, runtime error, `exit()` or Ctrl-C), whether or not
+  `screen_show()` was called after the last drawing. If the program never
+  called `screen_init`, no file is written and a note goes to stderr. A file
+  that cannot be written is an error (exit code 2 unless the program already
+  failed).
 * `--screen-ansi` draws the screen in the terminal on every `screen_show()`:
   each character cell shows two pixels with the upper half block `▀`
   (foreground = upper pixel, background = lower pixel) in 24-bit colour. The
@@ -61,13 +62,21 @@ vm/tilvm --screen out.ppm --keys "UP,ESC" game.tbc
 * `til run game.til` (native backend) runs graphics programs on the VM: the
   native C backend has no screen, so the program falls back to the VM, and any
   of `--screen`, `--screen-ansi`, `--keys` selects the VM directly.
-* Ctrl-C ends a program; the terminal is restored (exit code 130).
+* **Ctrl-C** ends the program, then the VM writes out the program's pending
+  output and the `--screen` image, restores the terminal and ends by the
+  signal, as an uncaught Ctrl-C does — a shell then also stops a script that
+  runs it, and `$?` is 130. On the C VM a native that is running finishes
+  first (a `sleep_ms(5000)` sleeps on); a second Ctrl-C ends it at once.
+  Through `til run --cvm` the Ctrl-C reaches the C VM, and `til` ends the
+  same way after it. `kill` (SIGTERM) ends the program at once — no image —
+  and also restores the terminal. (POSIX; on Windows Ctrl-C ends the C VM
+  at once.)
 
 ## Reference
 
 | function | result | arguments |
 |---|---|---|
-| `screen_init(w, h)` | nil | open (or resize) a `w`×`h` screen, all black; `w`, `h` in 1..4096 |
+| `screen_init(w, h)` | nil | open (or resize) a `w`×`h` screen, all black; `w`, `h` in 1..4096 (a device: up to its display size) |
 | `screen_clear()` / `screen_clear(color)` | nil | fill the screen (default black) |
 | `draw_pixel(x, y, color)` | nil | one pixel; any int coordinates (off-screen: nothing) |
 | `draw_line(x0, y0, x1, y1, color)` | nil | Bresenham line, both end points included |
@@ -229,18 +238,26 @@ ESC SPACE TAB BACKSPACE COMMA NONE` — or exactly one character (`a`, `A`, `5`,
   runs: `bad --keys entry 'JUMP' ...`, exit code 2.
 
 **The terminal** (no `--keys`, stdin is a terminal) — while the program reads
-keys, the terminal is in raw mode (no echo, no Enter needed); it is restored at
-exit, on Ctrl-C and while `input()` reads a line. Arrow keys (`ESC [ A..D`,
-`ESC O A..D`) give 1..4, a lone ESC gives 27 (after 30 ms without a following
-byte), Enter 13, Backspace 8, UTF-8 characters their code point; other escape
-sequences (function keys) are ignored. Windows consoles use `_kbhit/_getwch`
-(arrows are scan codes 72/80/75/77).
+keys, the terminal is in raw mode (no echo, no Enter needed); it is restored
+at exit, on Ctrl-C, on `kill` (SIGTERM) and while `input()` reads a line.
+Arrow keys (`ESC [ A..D`, `ESC O A..D`) give 1..4, a lone ESC gives 27 (no
+`[` or `O` within 30 ms), Enter 13, Backspace 8, UTF-8 characters their code
+point; other escape sequences (function keys) are ignored. Windows consoles
+use `_kbhit/_getwch` (arrows are scan codes 72/80/75/77).
 
 **Standard input that is not a terminal** (a file or a pipe) — its bytes are
-decoded the same way, which makes `til run --vm game.til < keys.txt`
-reproducible: `key_pressed()` and `wait_key()` both take the next key (they
-wait for data from a pipe), a NUL byte is "no key", and at the end of the input
-`key_pressed()` returns 0 and `wait_key()` 27.
+decoded the same way. `key_pressed()` takes a key whose bytes have already
+arrived and never waits: a file has all its bytes there, so
+`til run --vm game.til < keys.txt` is reproducible (every call takes the next
+key), while a pipe delivers keys as the other program writes them (0 until
+then). `wait_key()` waits for the next key. A NUL byte is "no key", and at the
+end of the input `key_pressed()` returns 0 and `wait_key()` 27. (Windows
+cannot poll a pipe without waiting, so there `key_pressed()` waits for the
+next byte of a pipe.)
+
+Keys and `input()` read the same bytes in order, from the terminal or from
+standard input: in `"\x1bxyz\nAB"` a `wait_key()` gives ESC (27), the next
+`input()` gives `"xyz"` and two more `wait_key()` give 65 and 66.
 
 An interactive example (run it with `--screen-ansi`; it is also run by the
 test-suite with scripted keys):
@@ -298,7 +315,7 @@ errors can be caught with `retry`/`else` like any runtime error):
 |---|---|
 | drawing before `screen_init` | `screen not initialized (call screen_init)` |
 | not an int | `draw_line() argument 3 must be an int, got float` |
-| screen size | `screen_init() argument 1 must be 1..4096, got 5000` |
+| screen size (a device built for a 320×240 display: `1..320`) | `screen_init() argument 1 must be 1..4096, got 5000` |
 | shape coordinate/size | `draw_rect() argument 1 must be -32768..32767, got 40000` |
 | colour (32/64-bit builds) | `fill_rect() argument 5 must be a color 0..0xFFFFFF, got -1` |
 | key hook returned a negative code (or > 32767 on 16-bit builds) | `key code out of range` |
@@ -322,22 +339,34 @@ Code size of `vm/tilvm.c` (`TILVM_NO_STDIO`, object file code, KB = 1024 bytes):
 
 | target | without graphics | with graphics | difference |
 |---|---|---|---|
-| ARM Cortex-M0, `-Os`, int32, no floats | 25.7 KB | 28.2 KB | +2.5 KB |
-| same, `TILVM_LEAN` | 19.5 KB | 22.0 KB | +2.5 KB |
-| same, `TILVM_LEAN`, int16 | 19.5 KB | 22.1 KB | +2.6 KB |
-| AVR ATmega1284P, `-Os`, int32, float (AVR port flags) | 54.4 KB | 61.3 KB | +6.9 KB |
-| Z80, SDCC 4.2 `--opt-code-size`, int32, `TILVM_LEAN` (Z80 port flags) | 69.0 KB | 76.5 KB | +7.5 KB |
+| ARM Cortex-M0, `-Os`, int32, no floats | 25.7 KB | 28.4 KB | +2.7 KB |
+| same, `TILVM_LEAN` | 19.5 KB | 22.2 KB | +2.7 KB |
+| same, `TILVM_LEAN`, int16 | 19.5 KB | 22.3 KB | +2.8 KB |
+| AVR ATmega1284P, `-Os`, int32, float (AVR port flags) | 54.4 KB | 61.5 KB | +7.1 KB |
+| Z80, SDCC 4.2 `--opt-code-size`, int32, `TILVM_LEAN` (Z80 port flags) | 69.0 KB | 76.6 KB | +7.6 KB |
 
-The +2.5 KB on ARM include the 480-byte font; 8-bit CPUs need more code for
+The +2.7 KB on ARM include the 480-byte font; 8-bit CPUs need more code for
 the 32-bit arithmetic of the clipping. Where every byte counts (the classic
 Z80 calculators, whose whole address space is 64 KB), build with
 `-DTILVM_NO_GFX`.
 
 ## Writing a host (C API)
 
-A host fills in `vm->host` after `tilvm_load` (see `vm/tilvm.h`). The VM calls
-the screen hooks only with on-screen coordinates, so a host never needs to
-clip:
+A host fills in `vm->host` after `tilvm_load` (see `vm/tilvm.h`).
+
+**Screen size.** A program chooses its screen size with `screen_init(w, h)`;
+the VM accepts `w` ≤ `TILVM_GFX_MAX_W` and `h` ≤ `TILVM_GFX_MAX_H`, two build
+options that default to the language limit 4096. A device with a fixed
+display builds the VM with the display's size — e.g.
+`-DTILVM_GFX_MAX_W=320 -DTILVM_GFX_MAX_H=240` — and `screen_init(400, 300)` is
+then the runtime error `screen_init() argument 1 must be 1..320, got 400`
+(catchable like any runtime error) instead of a write past the end of the
+display memory. The VM calls the screen hooks only with on-screen coordinates
+— `0 <= x < w`, `0 <= y < h` of the last `gfx_init(w, h)` — so a host built
+this way never needs to clip. (A host that learns its display size only at
+run time either allocates its framebuffer in `gfx_init`, as `vm/main.c` does,
+or checks `x`, `y` in its hooks. A raw snapshot whose screen is larger than
+the build allows is refused by `tilvm_restore`.)
 
 | hook | needed for | contract |
 |---|---|---|
@@ -354,22 +383,26 @@ saved program and calls `gfx_init` again (the pixels are not part of a
 snapshot), so install the hooks before restoring; programs that redraw every
 frame continue seamlessly.
 
-A complete host with an in-memory framebuffer — for a device, replace the
-array accesses with the display driver:
+A complete host with an in-memory framebuffer for a 320×240 display — for a
+device, replace the array accesses with the display driver. Compile it and
+`tilvm.c` (or the `til build --target c-vm` file) with
+`-DTILVM_GFX_MAX_W=320 -DTILVM_GFX_MAX_H=240`; the `#error` stops a build
+without them:
 
 ```c
 /* host example (tested by tests/test_graphics.py) */
 #include "tilvm.h"
 
-#define MAX_W 320
+#define MAX_W 320                                    /* the display */
 #define MAX_H 240
+#if TILVM_GFX_MAX_W > MAX_W || TILVM_GFX_MAX_H > MAX_H
+#error "build with -DTILVM_GFX_MAX_W=320 -DTILVM_GFX_MAX_H=240 (the display size)"
+#endif
 static uint8_t screen_rgb[MAX_H][MAX_W][3];
-static int screen_w;
 
-static void my_init(void *ctx, int w, int h) {
+static void my_init(void *ctx, int w, int h) {      /* w <= MAX_W, h <= MAX_H */
     int x, y;
     (void)ctx;
-    screen_w = w;                                     /* a real host checks w <= MAX_W, h <= MAX_H */
     for (y = 0; y < h; y++)
         for (x = 0; x < w; x++)
             screen_rgb[y][x][0] = screen_rgb[y][x][1] = screen_rgb[y][x][2] = 0;
@@ -410,7 +443,8 @@ offscreen screen and no keys, so `wait_key()` returns 27 at once):
 ```python
 import til
 module = til.compile_to_bytecode(source, "game.til")
-screen = til.TILScreen(ansi=False)            # w, h, fb (bytearray, RGB), ppm(), ansi_frame()
+screen = til.TILScreen(ansi=False)            # w, h, fb (bytearray, RGB), ppm(), ansi_frame();
+                                              # max_w=320, max_h=240: a device's screen limit
 vm = til.TILVM(module, screen=screen, keys="RIGHT,RIGHT,ESC")   # or a list of codes,
 rc = vm.run()                                 # or an object with pressed() / wait()
 open("game.ppm", "wb").write(screen.ppm())
@@ -424,6 +458,9 @@ pixels of a shape (before clipping).
 
 The VM core is verified in simulators and on the desktop; the snippets below
 are starting points for real devices and have not been run on the hardware.
+Build the VM for a fixed display with its size, e.g.
+`-DTILVM_GFX_MAX_W=320 -DTILVM_GFX_MAX_H=240` (see [writing a host](#writing-a-host-c-api)),
+so that the hooks below never get coordinates outside the display.
 Colour conversion from the VM's `0xRRGGBB`:
 
 ```c
@@ -443,10 +480,11 @@ Colour conversion from the VM's `0xRRGGBB`:
 (`for (i = 0; i < 256; i++) gfx_palette[i] = gfx_RGBTo1555(i & 0xE0, (i << 3) & 0xE0, (i << 6) & 0xC0);`),
 then `gfx_pixel` = `gfx_SetColor(TO_RGB332(rgb)); gfx_SetPixel(x, y);`,
 `gfx_get` = expand `gfx_GetPixel(x, y)` (RGB332 → 0xRRGGBB, quantized),
-`gfx_init` = `gfx_Begin(); gfx_SetDrawBuffer(); gfx_FillScreen(0)` (keep
-`w, h` ≤ 320×240), `gfx_show` = `gfx_SwapDraw()`. Keys: `kb_Scan()` and
-`kb_Data[7] & kb_Up` … for arrows, `os_GetCSC()` for the others
-(`sk_Enter` → 13, `sk_Clear` → 27). Use `TILVM_INT_BITS=32`, `TILVM_FLOAT=1`.
+`gfx_init` = `gfx_Begin(); gfx_SetDrawBuffer(); gfx_FillScreen(0)`,
+`gfx_show` = `gfx_SwapDraw()`. Keys: `kb_Scan()` and `kb_Data[7] & kb_Up` …
+for arrows, `os_GetCSC()` for the others (`sk_Enter` → 13, `sk_Clear` → 27).
+Use `TILVM_INT_BITS=32`, `TILVM_FLOAT=1`,
+`TILVM_GFX_MAX_W=320`, `TILVM_GFX_MAX_H=240`.
 A 24-bit shadow buffer does not fit in RAM (230 KB), so `get_pixel` returns
 the quantized colour.
 
@@ -458,27 +496,35 @@ Drawing goes straight to the LCD, so `gfx_show` can stay NULL. Keys:
 `eadk_keyboard_scan()` + `eadk_keyboard_key_down(state, eadk_key_up)` …
 (`eadk_key_ok`/`eadk_key_exe` → 13, `eadk_key_back` → 27), remembering the
 previous state to report each press once. `eadk_timing_msleep(1)` as `idle`.
+Build with `-DTILVM_GFX_MAX_W=320 -DTILVM_GFX_MAX_H=240`.
 
-**Casio fx-CG50 / Graph 90+E** (SH4, gint, 396×224, RGB565 VRAM):
-`gfx_pixel` = `dpixel(x, y, TO_RGB565(rgb))`, `gfx_get` =
+**Casio fx-CG50 / Graph 90+E** (SH4, gint, 396×224, RGB565 VRAM, build with
+`-DTILVM_GFX_MAX_W=396 -DTILVM_GFX_MAX_H=224`): `gfx_pixel` =
+`dpixel(x, y, TO_RGB565(rgb))`, `gfx_get` =
 `FROM_RGB565(gint_vram[y * DWIDTH + x])`, `gfx_init` = `dclear(C_BLACK)`,
 `gfx_show` = `dupdate()`. Keys: `pollevent()` (non-blocking) / `getkey()`
 (blocking); `KEY_UP/DOWN/LEFT/RIGHT` → 1..4, `KEY_EXE` → 13, `KEY_EXIT` → 27.
-**fx-9860G** (monochrome 128×64): `dpixel(x, y, LUMA(rgb) >= 128 ? C_WHITE : C_BLACK)`;
-`gfx_get` returns `0xFFFFFF` or `0`.
+**fx-9860G** (monochrome 128×64, `-DTILVM_GFX_MAX_W=128 -DTILVM_GFX_MAX_H=64`):
+`dpixel(x, y, LUMA(rgb) >= 128 ? C_WHITE : C_BLACK)`; `gfx_get` returns
+`0xFFFFFF` or `0`.
 
-**SDL2** (desktops, Raspberry Pi): a `uint32_t fb[w*h]` with
+**SDL2** (desktops, Raspberry Pi): a `uint32_t fb[w*h]` allocated in
+`gfx_init` (any size; or a fixed window and the `TILVM_GFX_MAX_*` options) with
 `SDL_PIXELFORMAT_RGB888` needs no conversion (`fb[y*w+x] = rgb`); `gfx_show` =
 `SDL_UpdateTexture` + `SDL_RenderCopy` + `SDL_RenderPresent`, and pump
 `SDL_PollEvent` there into a key queue (`SDLK_UP` → 1, `SDLK_RETURN` → 13,
 `SDLK_ESCAPE` → 27, text input → code points) that `key_pressed` pops.
 
 **Linux framebuffer** (`/dev/fb0`, typically 32 bpp XRGB): `mmap` it and write
-`rgb` (or `TO_RGB565(rgb)` for 16 bpp) at `y * line_length + x * bytes_per_pixel`;
-read keys from the terminal (as `vm/main.c` does) or `/dev/input/event*`.
+`rgb` (or `TO_RGB565(rgb)` for 16 bpp) at `y * line_length + x * bytes_per_pixel`.
+The panel size (`xres`, `yres`) is only known at run time, so check
+`x < xres`, `y < yres` in `gfx_pixel`/`gfx_get` (or build for the smallest
+panel). Read keys from the terminal (as `vm/main.c` does) or
+`/dev/input/event*`.
 
-**Browser canvas** (WebAssembly build): keep an `ImageData` (RGBA) and write
-`R8, G8, B8, 255` in `gfx_pixel`; `gfx_show` = `ctx.putImageData(img, 0, 0)`.
+**Browser canvas** (WebAssembly build): create an `ImageData` (RGBA) of
+`w`×`h` in `gfx_init` and write `R8, G8, B8, 255` in `gfx_pixel`;
+`gfx_show` = `ctx.putImageData(img, 0, 0)`.
 Run the VM in slices (`tilvm_run_steps`) from `requestAnimationFrame` so the
 page can paint between frames, and feed `keydown` events (`ArrowUp` → 1,
 `Enter` → 13, `Escape` → 27, `event.key` → code point) into a queue for
@@ -487,5 +533,6 @@ NULL and run the VM in a Web Worker (the VM polls `key_pressed`; block with
 `Atomics.wait` on a shared key queue), or ask programs to poll with
 `key_pressed()`.
 
-**Monochrome LCDs** (SSD1306, Nokia 5110, TI-83/84 Plus 96×64): store
-`LUMA(rgb) >= 128` as one bit per pixel; return `0xFFFFFF`/`0` from `gfx_get`.
+**Monochrome LCDs** (SSD1306 128×64, Nokia 5110 84×48, TI-83/84 Plus 96×64 —
+build with that size): store `LUMA(rgb) >= 128` as one bit per pixel; return
+`0xFFFFFF`/`0` from `gfx_get`.

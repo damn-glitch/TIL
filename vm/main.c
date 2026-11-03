@@ -16,6 +16,8 @@
 #define _POSIX_C_SOURCE 200809L         /* termios, select, isatty: keys from the terminal */
 #endif
 #include "tilvm.h"
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +25,6 @@
 #include <conio.h>
 #include <io.h>
 #else
-#include <signal.h>
 #include <sys/select.h>
 #include <sys/time.h>
 #include <termios.h>
@@ -121,7 +122,7 @@ static int save_screen(const char *path, int rc) {
  * character's code point. */
 static int *keys;                       /* --keys script (NULL: keyboard / stdin) */
 static size_t n_keys, key_pos;
-static int key_source = -1, pending = -1;
+static int key_source = -1;
 
 static const struct { const char *name; int code; } KEY_NAMES[] = {
     {"UP", 1}, {"DOWN", 2}, {"LEFT", 3}, {"RIGHT", 4}, {"ENTER", 13}, {"ESC", 27},
@@ -192,18 +193,23 @@ static int parse_keys(const char *spec) {
     }
 }
 
-/* Next byte of stdin when it is not a terminal (a file or a pipe): -2 at the end. */
-static int stream_byte(int ms) {
-    int c;
-    (void)ms;
-    if (pending >= 0) { c = pending; pending = -1; return c; }
-    c = getchar();
-    return c == EOF ? -2 : c;
+/* Ctrl-C (POSIX): the program ends after its current step - a native that is
+ * running, e.g. sleep_ms(), finishes first - then main() flushes the output,
+ * writes the --screen image, restores the terminal and ends the process by
+ * SIGINT, as the reference VM does (`til run --vm`). A second Ctrl-C ends it at
+ * once. The hooks below notice the flag; run_slices() covers loops that call
+ * no hook. */
+static volatile sig_atomic_t interrupted;
+
+static int stop_program(void) {         /* in a hook: end the program like exit(130) */
+    vm.st.halted = 2;
+    vm.st.exit_code = 130;
+    return 0;
 }
 
 #ifndef _WIN32
 static struct termios saved_tio;
-static int raw_mode;
+static volatile sig_atomic_t raw_mode;
 
 static void term_restore(void) {
     if (raw_mode) {
@@ -212,45 +218,34 @@ static void term_restore(void) {
     }
 }
 
-static void term_signal(int sig) {
+static void term_signal(int sig) {      /* SIGTERM: restore the terminal, then end */
     term_restore();
     signal(sig, SIG_DFL);
     raise(sig);
 }
 
+static void on_sigint(int sig) {
+    if (interrupted) term_signal(sig);  /* the second Ctrl-C */
+    interrupted = 1;
+}
+
 /* Keys arrive without Enter and without echo while the program reads them;
- * the terminal is restored at exit, on Ctrl-C and before input(). */
+ * the terminal is restored at exit, on Ctrl-C, on SIGTERM and before input(). */
 static void term_raw(void) {
     static int hooked;
     struct termios t;
     if (raw_mode || tcgetattr(0, &saved_tio) != 0) return;
+    if (!hooked) {                      /* before the terminal changes */
+        hooked = 1;
+        atexit(term_restore);
+        signal(SIGTERM, term_signal);
+    }
     t = saved_tio;
     t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
     t.c_cc[VMIN] = 1;
     t.c_cc[VTIME] = 0;
-    if (tcsetattr(0, TCSANOW, &t) != 0) return;
-    raw_mode = 1;
-    if (!hooked) {
-        hooked = 1;
-        atexit(term_restore);
-        signal(SIGINT, term_signal);
-        signal(SIGTERM, term_signal);
-    }
-}
-
-/* Next byte of the terminal: -1 = none within `ms` milliseconds (ms < 0: wait),
- * -2 = end of input. */
-static int term_byte(int ms) {
-    fd_set set;
-    struct timeval tv;
-    unsigned char c;
-    if (pending >= 0) { int p = pending; pending = -1; return p; }
-    FD_ZERO(&set);
-    FD_SET(0, &set);
-    tv.tv_sec = ms / 1000;
-    tv.tv_usec = (ms % 1000) * 1000L;
-    if (select(1, &set, NULL, NULL, ms < 0 ? NULL : &tv) <= 0) return -1;
-    return read(0, &c, 1) == 1 ? c : -2;
+    raw_mode = 1;                       /* (restoring saved_tio early is harmless) */
+    if (tcsetattr(0, TCSANOW, &t) != 0) raw_mode = 0;
 }
 #else
 /* Windows console: arrows come as 0 / 0xE0 followed by a scan code. */
@@ -273,26 +268,69 @@ static int win_key(int block) {
 }
 #endif
 
-/* One key from a byte source: ESC [ A..D (or ESC O A..D) -> UP DOWN RIGHT LEFT,
- * UTF-8 -> code point, CR and LF -> ENTER (13), DEL -> BACKSPACE (8).
- * -1 = bytes that are not a key (other escape sequences, broken UTF-8). */
-static int decode_key(int (*next)(int ms), int c) {
+/* stdin: keys and input() lines are taken from one buffer, so they never
+ * overtake each other. key_pressed() only takes bytes that are already there
+ * (POSIX: select() without waiting): it never blocks, also with a pipe; a
+ * regular file is always ready, so `tilvm game.tbc < keys.txt` is reproducible.
+ * (Windows cannot poll a pipe: there the read waits.) */
+static unsigned char in_buf[4096];
+static size_t in_pos, in_len;
+
+/* Next byte of stdin: -1 = none within `ms` milliseconds (ms < 0: wait) or
+ * Ctrl-C, -2 = end of input (or stdin cannot be read). */
+static int in_byte(int ms) {
+    if (in_pos < in_len) return in_buf[in_pos++];
+    for (;;) {
+#ifndef _WIN32
+        fd_set set;
+        struct timeval tv;
+        ssize_t n;
+        int r;
+        if (interrupted) return -1;
+        FD_ZERO(&set);
+        FD_SET(0, &set);
+        tv.tv_sec = ms / 1000;
+        tv.tv_usec = (ms % 1000) * 1000L;
+        r = select(1, &set, NULL, NULL, ms < 0 ? NULL : &tv);
+        if (r == 0) return -1;
+        if (r < 0 && errno != EINTR) return -2;
+        n = r < 0 ? -1 : read(0, in_buf, sizeof in_buf);
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+            if (ms < 0) continue;              /* waiting: only Ctrl-C stops it */
+            return -1;
+        }
+#else
+        int n = _read(0, in_buf, (unsigned)sizeof in_buf);
+        (void)ms;
+#endif
+        if (n <= 0) return -2;
+        in_len = (size_t)n;
+        in_pos = 1;
+        return in_buf[0];
+    }
+}
+
+/* One key from stdin, `c` being its first byte: ESC [ A..D (or ESC O A..D) ->
+ * UP DOWN RIGHT LEFT, UTF-8 -> code point, CR and LF -> ENTER (13), DEL ->
+ * BACKSPACE (8). -1 = bytes that are not a key (other escape sequences, broken
+ * UTF-8). A lone ESC is one that no '[' or 'O' follows within 30 ms. */
+static int decode_key(int c) {
     if (c == 27) {
-        int c2 = next(30), c3;
+        int c2 = in_byte(30), c3;
         if (c2 != '[' && c2 != 'O') {
-            if (c2 >= 0) pending = c2;          /* a lone ESC */
+            if (c2 >= 0) in_pos--;              /* a lone ESC: c2 is the next key */
             return 27;
         }
-        c3 = next(30);
+        c3 = in_byte(30);
         if (c3 >= 'A' && c3 <= 'D') return "\1\2\4\3"[c3 - 'A'];
-        while (c3 >= 0 && (c3 < 0x40 || c3 > 0x7E)) c3 = next(30);
+        while (c3 >= 0 && (c3 < 0x40 || c3 > 0x7E)) c3 = in_byte(30);
         return -1;
     }
     if (c >= 0xC0 && c < 0xF8) {
         int extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1, i;
         long cp = c & (0x3F >> extra);
         for (i = 0; i < extra; i++) {
-            int b = next(30);
+            int b = in_byte(30);
             if (b < 0x80 || b > 0xBF) return -1;
             cp = (cp << 6) | (b & 0x3F);
         }
@@ -319,24 +357,17 @@ static int pick_key_source(void) {        /* 0 script, 1 terminal, 2 stdin bytes
 static int host_key_pressed(void *ctx) {
     int c, k;
     (void)ctx;
-    switch (pick_key_source()) {
-    case 0: return key_pos < n_keys ? keys[key_pos++] : 0;
+    if (interrupted) return stop_program();
+    if (pick_key_source() == 0) return key_pos < n_keys ? keys[key_pos++] : 0;
 #ifdef _WIN32
-    case 1: return win_key(0);
+    if (key_source == 1) return win_key(0);
 #else
-    case 1:
-        term_raw();
-        c = term_byte(0);
-        if (c < 0) return 0;
-        k = decode_key(term_byte, c);
-        return k < 0 ? 0 : k;
+    if (key_source == 1) term_raw();
 #endif
-    default:
-        c = stream_byte(0);
-        if (c < 0) return 0;
-        k = decode_key(stream_byte, c);
-        return k < 0 ? 0 : k;
-    }
+    c = in_byte(0);
+    k = c < 0 ? 0 : decode_key(c);
+    if (interrupted) return stop_program();
+    return k < 0 ? 0 : k;
 }
 
 /* wait_key(): the next key (scripted NONE entries are skipped); 27 (ESC) when
@@ -344,6 +375,7 @@ static int host_key_pressed(void *ctx) {
 static int host_wait_key(void *ctx) {
     int c, k;
     (void)ctx;
+    if (interrupted) return stop_program();
     if (pick_key_source() == 0) {
         while (key_pos < n_keys)
             if (keys[key_pos++]) return keys[key_pos - 1];
@@ -353,34 +385,49 @@ static int host_wait_key(void *ctx) {
 #ifdef _WIN32
     if (key_source == 1) return win_key(1);
 #else
-    if (key_source == 1) {
-        term_raw();
-        for (;;) {
-            c = term_byte(-1);
-            if (c == -2) return 27;
-            if (c >= 0 && (k = decode_key(term_byte, c)) > 0) return k;
-        }
-    }
+    if (key_source == 1) term_raw();
 #endif
     for (;;) {
-        c = stream_byte(-1);
-        if (c < 0) return 27;
-        if ((k = decode_key(stream_byte, c)) > 0) return k;
+        c = in_byte(-1);
+        k = c < 0 ? 0 : decode_key(c);
+        if (interrupted) return stop_program();
+        if (c == -2) return 27;
+        if (k > 0) return k;
     }
 }
 
-/* input(): same as the VM's default, but with the terminal back in normal mode. */
+/* input(): at most cap - 1 bytes, up to and without the newline (NUL bytes are
+ * kept, as in the reference VM), from the same buffer as the keys, with the
+ * terminal back in normal mode. */
 static int read_line_cooked(void *ctx, char *buf, size_t cap) {
-    size_t n;
+    size_t n = 0;
     (void)ctx;
 #ifndef _WIN32
     term_restore();
 #endif
     fflush(stdout);
-    if (!fgets(buf, (int)cap, stdin)) return -1;
-    n = strlen(buf);
-    if (n && buf[n - 1] == '\n') buf[--n] = 0;
+    while (n + 1 < cap) {
+        int c = in_byte(-1);
+        if (c < 0) break;
+        buf[n++] = (char)c;
+        if (c == '\n') break;
+    }
+    if (interrupted) {
+        stop_program();
+        return -1;
+    }
+    if (!n) return -1;                          /* end of input */
+    if (buf[n - 1] == '\n') n--;
+    buf[n] = 0;
     return (int)n;
+}
+
+/* sleep_ms() waits on the clock: Ctrl-C ends the program when the sleep is over. */
+static tilvm_clock_fn vm_clock;
+
+static uint32_t clock_hook(void *ctx) {
+    if (interrupted) stop_program();
+    return vm_clock(ctx);
 }
 
 static void install_screen_and_keys(tilvm *v) {
@@ -391,6 +438,23 @@ static void install_screen_and_keys(tilvm *v) {
     v->host.key_pressed = host_key_pressed;
     v->host.wait_key = host_wait_key;
     v->read_line = read_line_cooked;
+    if (v->clock_ms) {
+        vm_clock = v->clock_ms;
+        v->clock_ms = clock_hook;
+    }
+}
+
+/* Run up to `steps` steps (0: to the end) in slices, so that Ctrl-C also stops a
+ * loop that calls no host function. Returns a TILVM_ status. */
+#define RUN_SLICE 65536u
+
+static int run_slices(uint32_t steps) {
+    for (;;) {
+        uint32_t n = steps && steps < RUN_SLICE ? steps : RUN_SLICE;
+        int st = tilvm_run_steps(&vm, n);
+        if (st != TILVM_YIELD || interrupted) return st;
+        if (steps && !(steps -= n)) return TILVM_YIELD;
+    }
 }
 
 static unsigned char *read_file(const char *path, long *size) {
@@ -467,10 +531,23 @@ int main(int argc, char **argv) {
         free(snap);
     }
 
+#ifndef _WIN32
+    {                                   /* Ctrl-C: see on_sigint (unless it is ignored) */
+        struct sigaction sa, old;
+        if (sigaction(SIGINT, NULL, &old) == 0 && old.sa_handler != SIG_IGN) {
+            memset(&sa, 0, sizeof sa);
+            sa.sa_handler = on_sigint;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = 0;            /* no SA_RESTART: a waiting select() returns */
+            sigaction(SIGINT, &sa, NULL);
+        }
+    }
+#endif
+
     if (snap_out) {
-        rc = tilvm_run_steps(&vm, (uint32_t)snap_after);
+        rc = run_slices((uint32_t)snap_after);
         fflush(stdout);
-        if (rc == TILVM_YIELD) {
+        if (rc == TILVM_YIELD && !interrupted) {
             uint32_t n = tilvm_snapshot_size(&vm);
             unsigned char *buf = (unsigned char *)malloc(n);
             FILE *f = fopen(snap_out, "wb");
@@ -484,10 +561,10 @@ int main(int argc, char **argv) {
                     snap_after, snap_out, (unsigned long)n);
             return save_screen(screen_out, 3);
         }
-        rc = rc == TILVM_EXIT ? vm.st.exit_code : rc == TILVM_DONE ? 0 : 1;
     } else {
-        rc = tilvm_run(&vm);
+        rc = run_slices(0);
     }
+    rc = interrupted ? 130 : rc == TILVM_EXIT ? vm.st.exit_code : rc == TILVM_DONE ? 0 : 1;
     fflush(stdout);
     if (stats) {
         fprintf(stderr, "[tilvm] steps=%lu gc=%lu heap=%lu/%ld bytes\n",
@@ -498,5 +575,11 @@ int main(int argc, char **argv) {
     free(code);
     free(fb);
     free(keys);
+#ifndef _WIN32
+    if (interrupted) {                  /* Ctrl-C: end as an uncaught SIGINT does, so */
+        fflush(stdout);                 /* that a shell also stops the script it runs */
+        term_signal(SIGINT);
+    }
+#endif
     return rc;
 }

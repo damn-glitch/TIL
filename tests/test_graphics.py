@@ -21,7 +21,7 @@ import tempfile
 import pytest
 
 from tilhelpers import (CC, PROFILES, ROOT, VM_DIR, cli, cvm_binary, expect_compile_error, needs_cc,
-                        run_cvm, tbc_bytes, til)
+                        run_both, run_cvm, tbc_bytes, til)
 
 C_SOURCE = open(os.path.join(VM_DIR, 'tilvm.c'), encoding='utf-8').read()
 STRICT = ['-std=c99', '-Wall', '-Wextra', '-pedantic', '-Werror']
@@ -53,12 +53,12 @@ def vm_exe(profile):
     return cvm_binary(profile) if profile in ("host", "int32") else quick_vm(*PROFILES[profile])
 
 
-def py_run(src, keys="", ansi=False):
+def py_run(src, keys="", ansi=False, screen=None):
     """Reference VM -> (exit code, stdout bytes, PPM bytes or None)."""
     data = src if isinstance(src, (bytes, bytearray)) else tbc_bytes(src)
     module = til.TBCModule.from_bytes(bytes(data))
     out = []
-    screen = til.TILScreen(ansi=ansi)
+    screen = screen or til.TILScreen(ansi=ansi)
     rc = til.TILVM(module, write=out.append, screen=screen, keys=keys).run()
     return rc, b"".join(out), (screen.ppm() if screen.w else None)
 
@@ -860,6 +860,9 @@ int main(void) {
 """
 
 
+DOC_DISPLAY = ['-DTILVM_GFX_MAX_W=320', '-DTILVM_GFX_MAX_H=240']     # the doc host's display
+
+
 @needs_cc
 def test_doc_host_example_draws_the_same_pixels(tmp_path):
     """The C host of docs/TIL_GRAPHICS.md, built into a `til build --target c-vm`
@@ -869,12 +872,481 @@ def test_doc_host_example_draws_the_same_pixels(tmp_path):
     assert cli("build", "--target", "c-vm", prog, "-o", str(tmp_path / "prog_vm.c")).returncode == 0
     (tmp_path / "main.c").write_text(DOC_HOST_MAIN % host)
     exe = str(tmp_path / "doc_host")
-    b = subprocess.run([CC, *STRICT, '-O0', '-I', str(tmp_path), '-I', VM_DIR, '-o', exe,
+    b = subprocess.run([CC, *STRICT, '-O0', *DOC_DISPLAY, '-I', str(tmp_path), '-I', VM_DIR, '-o', exe,
                         str(tmp_path / "main.c"), '-lm'], capture_output=True, text=True)
     assert b.returncode == 0, b.stderr
     r = subprocess.run([exe], capture_output=True, timeout=30)
     assert r.returncode == 0
     assert r.stdout == py_run(SHAPES)[2]
+
+
+# ═══════════════════════════════════════════════════════════════
+# A DEVICE'S SCREEN LIMIT (TILVM_GFX_MAX_W/H): the hooks never get
+# coordinates outside the display
+# ═══════════════════════════════════════════════════════════════
+
+DOC_HOST_RUN = r"""
+#include "tilvm.c"
+#include <stdio.h>
+%s
+int main(int argc, char **argv) {        /* doc_host program.tbc: runs it, then writes screen.ppm */
+    static tilvm vm;
+    static uint8_t prog[1 << 16];
+    size_t n;
+    int y, rc;
+    FILE *f = argc > 1 ? fopen(argv[1], "rb") : NULL;
+    if (!f) return 9;
+    n = fread(prog, 1, sizeof prog, f);
+    fclose(f);
+    if (tilvm_load(&vm, prog, (uint32_t)n) != 0) return 9;
+    install_screen(&vm);
+    rc = tilvm_run(&vm);
+    fflush(stdout);
+    if (vm.st.scr_w && (f = fopen("screen.ppm", "wb")) != NULL) {
+        fprintf(f, "P6\n%%d %%d\n255\n", (int)vm.st.scr_w, (int)vm.st.scr_h);
+        for (y = 0; y < vm.st.scr_h; y++) fwrite(screen_rgb[y], 3, vm.st.scr_w, f);
+        fclose(f);
+    }
+    return rc;
+}
+"""
+
+_SANITIZE = {}
+
+
+def sanitizer_flags():
+    """AddressSanitizer + UBSan flags if the compiler builds and runs with them, else []."""
+    if 'flags' not in _SANITIZE:
+        flags = ['-fsanitize=address,undefined', '-fno-sanitize-recover=all', '-fno-omit-frame-pointer']
+        work = tempfile.mkdtemp(prefix='tilgfx-san-')
+        try:
+            src, exe = os.path.join(work, 't.c'), os.path.join(work, 't')
+            with open(src, 'w') as f:
+                f.write('int main(void) { return 0; }\n')
+            ok = subprocess.run([CC, *flags, '-o', exe, src], capture_output=True).returncode == 0 and \
+                subprocess.run([exe], capture_output=True).returncode == 0
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        _SANITIZE['flags'] = flags if ok else []
+    return _SANITIZE['flags']
+
+
+def build_doc_host(tmp_path, flags=()):
+    """The C host of docs/TIL_GRAPHICS.md with a main() that runs a .tbc file
+    -> (executable, compiler result)."""
+    host = doc_block('c', 'host example (tested by tests/test_graphics.py)')
+    (tmp_path / "main.c").write_text(DOC_HOST_RUN % host)
+    exe = str(tmp_path / "doc_host")
+    b = subprocess.run([CC, *STRICT, '-O0', *flags, '-I', VM_DIR, '-o', exe, str(tmp_path / "main.c"), '-lm'],
+                       capture_output=True, text=True)
+    return exe, b
+
+
+def run_doc_host(exe, tmp_path, src):
+    tbc = tmp_path / "prog.tbc"
+    tbc.write_bytes(tbc_bytes(src))
+    return subprocess.run([exe, str(tbc)], capture_output=True, timeout=60, cwd=str(tmp_path))
+
+
+LIMIT_PROGRAM = '''
+attempt(f)
+    let r = retry(1)
+        f()
+        "ok"
+    else
+        error
+    print(r)
+
+attempt(|| screen_init(400, 300))
+attempt(|| screen_init(320, 241))
+attempt(|| screen_init(321, 1))
+print(screen_width(), screen_height())
+attempt(|| screen_init(320, 240))
+draw_line(-100, -100, 500, 400, 0xFFFFFF)
+draw_circle(319, 239, 30, 0x00FF00)
+fill_rect(300, 220, 100, 100, 0x0000FF)
+draw_rect(-5, -5, 330, 250, 0xFFFF00)
+draw_text(300, 233, "edge!", 0xFF0000)
+draw_pixel(320, 240, 0xFFFFFF)
+print(get_pixel(319, 239), get_pixel(320, 0), get_pixel(0, 0))
+'''
+LIMIT_ERRORS = ("screen_init() argument 1 must be 1..320, got 400\n"
+                "screen_init() argument 2 must be 1..240, got 241\n"
+                "screen_init() argument 1 must be 1..320, got 321\n0\n0\nok\n")
+
+
+@needs_cc
+def test_doc_host_needs_the_display_size(tmp_path):
+    """Without -DTILVM_GFX_MAX_W/H the doc's fixed-size host does not compile:
+    its #error names the options its display needs."""
+    _exe, b = build_doc_host(tmp_path)
+    assert b.returncode != 0
+    assert "build with -DTILVM_GFX_MAX_W=320 -DTILVM_GFX_MAX_H=240" in b.stderr
+
+
+@needs_cc
+def test_doc_host_refuses_screens_larger_than_its_display(tmp_path):
+    """Review finding: screen_init(400, 300) made the doc's 320x240 host write
+    past its framebuffer. Built for its display, the VM refuses such screens
+    (a catchable runtime error, same text as the reference VM with the same
+    limit) and draws everything else clipped to 320x240 - checked with
+    AddressSanitizer + UBSan where the compiler has them."""
+    exe, b = build_doc_host(tmp_path, DOC_DISPLAY + sanitizer_flags())
+    assert b.returncode == 0, b.stderr
+    r = run_doc_host(exe, tmp_path, LIMIT_PROGRAM)
+    assert r.returncode == 0, r.stderr.decode('utf-8', 'replace')
+    rc, out, ppm = py_run(LIMIT_PROGRAM, screen=til.TILScreen(max_w=320, max_h=240))
+    assert rc == 0 and out.decode().startswith(LIMIT_ERRORS)
+    assert r.stdout == out
+    assert (tmp_path / "screen.ppm").read_bytes() == ppm and pixels(ppm)[:2] == (320, 240)
+    assert py_run(LIMIT_PROGRAM)[1].startswith(b"ok\nok\nok\n")   # the desktop default: 4096 x 4096
+    # the reviewer's program: refused (exit 1), nothing written out of bounds
+    r = run_doc_host(exe, tmp_path, 'screen_init(400, 300)\ndraw_pixel(399, 299, 0xFFFFFF)\n')
+    assert r.returncode == 1
+    assert r.stderr.decode().startswith("runtime error: screen_init() argument 1 must be 1..320, got 400\n")
+
+
+DEVICE_LIMIT = '''
+attempt(f)
+    let r = retry(1)
+        f()
+        "ok"
+    else
+        error
+    print(r)
+
+attempt(|| screen_init(41, 30))
+attempt(|| screen_init(40, 31))
+attempt(|| screen_init(40, 30))
+draw_line(0, 0, 100, 100, 0xFFFFFF)
+draw_text(30, 25, "TIL", 0xFF8000)
+print(screen_width(), screen_height(), get_pixel(29, 29))
+'''
+
+
+@needs_cc
+def test_device_screen_limit_same_in_both_vms():
+    """A C VM built with -DTILVM_GFX_MAX_W=40 -DTILVM_GFX_MAX_H=30 and the
+    reference VM with TILScreen(max_w=40, max_h=30): same errors, same pixels."""
+    rc, out, ppm = py_run(DEVICE_LIMIT, screen=til.TILScreen(max_w=40, max_h=30))
+    assert rc == 0
+    assert out == (b"screen_init() argument 1 must be 1..40, got 41\n"
+                   b"screen_init() argument 2 must be 1..30, got 31\nok\n40\n30\n16777215\n")
+    crc, cout, cerr, cppm = c_run(DEVICE_LIMIT, exe=quick_vm('-DTILVM_GFX_MAX_W=40', '-DTILVM_GFX_MAX_H=30'))
+    assert (crc, cout, cppm) == (0, out, ppm), cerr
+
+
+def test_tilscreen_limit_is_checked():
+    assert til.TILScreen(max_w=1, max_h=4096).max_h == 4096
+    for kw in ({'max_w': 0}, {'max_h': 4097}):
+        with pytest.raises(ValueError, match="max_w and max_h must be 1..4096"):
+            til.TILScreen(**kw)
+
+
+@needs_cc
+def test_screen_limit_options_are_checked(tmp_path):
+    for flag in ('-DTILVM_GFX_MAX_W=0', '-DTILVM_GFX_MAX_H=4097'):
+        r = subprocess.run([CC, '-std=c99', flag, '-c', '-o', str(tmp_path / 'x.o'),
+                            os.path.join(VM_DIR, 'tilvm.c')], capture_output=True, text=True)
+        assert r.returncode != 0 and "TILVM_GFX_MAX_W and TILVM_GFX_MAX_H must be 1..4096" in r.stderr
+
+
+@needs_cc
+def test_snapshot_with_a_screen_the_build_cannot_show(tmp_path):
+    """tilvm_restore refuses a raw snapshot whose screen is larger than the
+    build's TILVM_GFX_MAX_W/H (its hooks would get coordinates outside the
+    display); a screen that fits is restored."""
+    big = quick_vm()
+    small = quick_vm('-DTILVM_GFX_MAX_W=40', '-DTILVM_GFX_MAX_H=30')
+    for w, h, fits in ((100, 50, False), (40, 30, True)):
+        src = f'screen_init({w}, {h})\nvar i = 0\nwhile i < 500\n    draw_pixel(i % {w}, 0, 0xFFFFFF)\n' \
+              f'    i += 1\nprint(i, screen_width())\n'
+        tbc = tmp_path / f"s{w}.tbc"
+        tbc.write_bytes(tbc_bytes(src))
+        snap = str(tmp_path / f"s{w}.snap")
+        r = subprocess.run([big, '--snapshot-after', '100', snap, str(tbc)], capture_output=True, text=True,
+                           timeout=60)
+        assert r.returncode == 3, r.stderr
+        for exe, ok in ((big, True), (small, fits)):
+            r = subprocess.run([exe, '--resume', snap, str(tbc)], capture_output=True, text=True, timeout=60)
+            if ok:
+                assert (r.returncode, r.stdout) == (0, f"500\n{w}\n"), r.stderr
+            else:
+                assert r.returncode == 2 and "cannot restore snapshot" in r.stderr, r.stderr
+
+
+# ═══════════════════════════════════════════════════════════════
+# STRUCT NAMES IN ERRORS, USER FUNCTIONS NAMED LIKE BUILTINS
+# ═══════════════════════════════════════════════════════════════
+
+LONG_NAMES = ["Point" + "X" * 65, "ТочкаНаЭкранеКалькулятора", "Ж" * 80]    # 70, 50, 160 bytes
+
+
+@pytest.mark.parametrize("name", LONG_NAMES, ids=["ascii70", "cyrillic50", "cyrillic160"])
+def test_long_struct_names_in_argument_errors(name):
+    """Review finding: the C VM cut struct names in argument errors at 47 bytes
+    (even inside a UTF-8 character); both VMs now print the whole name."""
+    src = (f'struct {name}\n    x: int\n\ncheck(f)\n    let r = retry(1)\n        f()\n        "ok"\n'
+           f'    else\n        error\n    print(r)\n\nscreen_init(4, 4)\n'
+           f'check(|| draw_pixel({name} {{ x: 1 }}, 0, 0))\n'
+           f'check(|| fill_rect(0, 0, 1, {name} {{ x: 2 }}, 0))\n')
+    out, _ = both(src)
+    assert out == (f"draw_pixel() argument 1 must be an int, got {name}\n"
+                   f"fill_rect() argument 4 must be an int, got {name}\n")
+
+
+@needs_cc
+def test_long_struct_name_in_an_uncaught_error(tmp_path):
+    name = LONG_NAMES[2]
+    src = f"struct {name}\n    x: int\n\nscreen_init(4, 4)\ndraw_circle(0, 0, {name} {{ x: 1 }}, 0)\n"
+    path = tmp_path / "e.tbc"
+    path.write_bytes(tbc_bytes(src))
+    r = cli("exec", str(path))
+    crc, _out, cerr = run_cvm(tbc_bytes(src))
+    assert r.returncode == crc == 1
+    assert r.stderr == cerr
+    assert cerr.startswith(f"runtime error: draw_circle() argument 3 must be an int, got {name}\n")
+
+
+SHADOW_PURE = '''
+screen_width() -> int
+    return 80
+
+#[pure]
+half() -> int
+    return screen_width() / 2
+
+main()
+    print(half())
+'''
+
+
+def test_user_function_named_like_a_screen_builtin(tmp_path):
+    """Review finding: a program's own screen_width() made a #[pure] caller fail
+    with E-EFFECT. The call goes to the user function, so only its own effects
+    count (through the call edge); a parameter with a builtin's name is not io."""
+    assert run_both(SHADOW_PURE) == "40\n"
+    r = cli("check", _write(tmp_path, SHADOW_PURE))
+    assert r.returncode == 0, r.stderr
+    printing = SHADOW_PURE.replace("    return 80", '    print("side effect")\n    return 80')
+    expect_compile_error(printing, "E-EFFECT", "through the call to 'screen_width'")
+    param = ('#[pure]\napply(draw_pixel, x: int) -> int\n    return draw_pixel(x)\n\n'
+             '#[pure]\ntwice(x: int) -> int\n    return x * 2\n\nmain()\n    print(apply(twice, 21))\n')
+    assert run_both(param) == "42\n"
+    expect_compile_error('#[pure]\nf() -> int\n    return screen_height()\n\nmain()\n    print(f())\n',
+                         "E-EFFECT")                               # the builtin itself is still io
+
+
+# ═══════════════════════════════════════════════════════════════
+# STDIN, CTRL-C AND SIGTERM (POSIX: real pipes, signals, a pty)
+# ═══════════════════════════════════════════════════════════════
+
+def vm_commands(tmp_path, src, *flags):
+    """`til exec` and the C runner for one program (with the run options `flags`)."""
+    tbc = tmp_path / "p.tbc"
+    tbc.write_bytes(tbc_bytes(src))
+    cmds = [[sys.executable, os.path.join(ROOT, 'src', 'til.py'), 'exec', str(tbc), *flags]]
+    if CC:
+        cmds.append([cvm_binary(), *flags, str(tbc)])
+    return cmds
+
+
+def read_until(fd, marker: bytes, timeout: float = 60.0) -> bytes:
+    """Read a child's output until `marker` appears (or EOF / the timeout)."""
+    import select
+    import time
+    data, end = b"", time.time() + timeout
+    while marker not in data and time.time() < end:
+        if select.select([fd], [], [], 0.05)[0]:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:             # a pty whose child has ended
+                break
+            if not chunk:
+                break
+            data += chunk
+    return data
+
+
+@pytest.mark.skipif(os.name != 'posix', reason="POSIX pipes")
+def test_key_pressed_does_not_wait_for_a_pipe(tmp_path):
+    """Review finding / spec section 1: key_pressed() is non-blocking, also when
+    stdin is a pipe without data: it returns 0 at once. wait_key() then waits
+    for the byte the test writes only after it has read that 0."""
+    for cmd in vm_commands(tmp_path, 'print(key_pressed())\nprint(wait_key())\nprint(key_pressed())\n'):
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            first = read_until(p.stdout.fileno(), b"\n")
+            assert first == b"0\n", cmd
+            rest, err = p.communicate(b"x", timeout=60)             # writes "x", then closes stdin
+        finally:
+            if p.poll() is None:
+                p.kill()
+        assert (p.returncode, first + rest) == (0, b"0\n120\n0\n"), err
+
+
+STDIN_MIX = '''
+print(wait_key())
+print(input("name? "))
+print(wait_key())
+print(wait_key())
+print(input())
+print(key_pressed(), wait_key())
+'''
+
+
+def test_keys_and_input_take_stdin_in_order(tmp_path):
+    """Keys and input() read the same buffered bytes: the byte after a lone ESC
+    starts the next line, nothing is lost or reordered (docs example)."""
+    for cmd in vm_commands(tmp_path, STDIN_MIX):
+        r = subprocess.run(cmd, input=b"\x1bxyz\nAB\nrest", capture_output=True, timeout=60)
+        assert (r.returncode, r.stdout) == (0, b"27\nname? xyz\n65\n66\n\n114\n101\n"), r.stderr
+
+
+KEY_PIECES = [b"\x1b[A", b"\x1b[B", b"\x1bOC", b"\x1bOD", b"\x1b", b"\x1b[1;5A", b"\x1b[", b"\x1bO", b"a",
+              b"Z", b"\r", b"\r\n", b"\x7f", b"\x00", b"\xd3\x99", b"\xe2\x9c\x93", b"\xf0\x9f\x98\x80",
+              b"\xc3", b"\x80", b"\xff", b"\xe2\x9c", b" ", b"line of text\n", b"\x1b\x1b", b"\t"]
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_stdin_keys_and_lines_fuzz(tmp_path, seed):
+    """Random byte streams (escape sequences, broken UTF-8, NUL, CR/LF, DEL)
+    read by a random mix of key_pressed(), wait_key() and input(), from a
+    regular file: both VMs see the same keys and lines (NUL bytes stay in a
+    line). Lines stay below the C VM's 255-byte input() buffer."""
+    rnd = random.Random(seed)
+    ops = [rnd.choice(["key_pressed()", "wait_key()", "wait_key()", "input()", "key_pressed()"])
+           for _ in range(150)]
+    src = "var got = []\n" + "".join(f"got.push({op})\n" for op in ops) + "print(got)\n"
+    data = b"".join(b"".join(rnd.choice(KEY_PIECES) for _ in range(rnd.randint(0, 20))) + b"\n"
+                    for _ in range(40))
+    stdin = tmp_path / "keys.bin"
+    stdin.write_bytes(data)
+    outputs = []
+    for cmd in vm_commands(tmp_path, src):
+        with open(stdin, 'rb') as f:
+            r = subprocess.run(cmd, stdin=f, capture_output=True, timeout=120)
+        assert r.returncode == 0, r.stderr
+        outputs.append(r.stdout)
+    assert len(set(outputs)) == 1, outputs
+    if seed == 1:
+        assert b"\x00" in outputs[0]                   # a NUL byte inside a line: kept by both VMs
+
+
+CTRL_C_PROGRAM = '''
+screen_init(8, 4)
+fill_rect(0, 0, 4, 4, 0xFF0000)
+print("ready")
+loop
+    let k = wait_key()
+    draw_pixel(7, 3, 0x00FF00)
+'''
+CTRL_C_IMAGE = b"P6\n8 4\n255\n" + (b"\xff\x00\x00" * 4 + b"\x00\x00\x00" * 4) * 4
+
+
+@pytest.mark.skipif(os.name != 'posix', reason="POSIX signals")
+def test_ctrl_c_writes_the_image_and_ends_by_sigint(tmp_path):
+    """Review finding: on Ctrl-C the reference VM wrote the --screen image and
+    exited 130, the C VM wrote none, and `til run --cvm` printed a traceback.
+    Now all of them write the image, print no traceback and end by SIGINT, as an
+    uncaught Ctrl-C does (a shell shows 130). For `til run --cvm` the signal goes
+    to the process group, as a terminal sends it."""
+    import signal
+    prog = _write(tmp_path, CTRL_C_PROGRAM)
+    image = str(tmp_path / "out.ppm")
+    runs = [(cmd, False) for cmd in vm_commands(tmp_path, CTRL_C_PROGRAM, '--screen', image)]
+    if CC:
+        runs.append(([sys.executable, os.path.join(ROOT, 'src', 'til.py'), 'run', '--cvm', prog,
+                      '--screen', image], True))
+    for cmd, group in runs:
+        if os.path.exists(image):
+            os.remove(image)
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             start_new_session=group)
+        try:
+            assert read_until(p.stdout.fileno(), b"ready\n") == b"ready\n", cmd
+            if group:
+                os.killpg(p.pid, signal.SIGINT)
+            else:
+                p.send_signal(signal.SIGINT)
+            _out, err = p.communicate(timeout=60)
+        finally:
+            if p.poll() is None:
+                p.kill()
+        assert p.returncode == -signal.SIGINT, (cmd, err)
+        assert b"Traceback" not in err, err
+        with open(image, 'rb') as f:
+            assert f.read() == CTRL_C_IMAGE, cmd
+
+
+BUSY = {
+    'loop': 'print("ready")\nvar x = 0\nwhile true\n    x += 1\n',
+    'sleep': 'print("ready")\nloop\n    sleep_ms(20)\n',
+    'input': 'print("ready")\nprint(input())\n',
+}
+
+
+@pytest.mark.skipif(os.name != 'posix', reason="POSIX signals and terminals")
+@pytest.mark.parametrize("kind", sorted(BUSY))
+def test_ctrl_c_stops_loops_sleeps_and_input(tmp_path, kind):
+    """Ctrl-C also stops a program that calls no key function: a busy loop (the
+    C runner runs the VM in slices), a sleep_ms() loop (its clock hook) and a
+    waiting input(); the image is written in both VMs. (The output is a pty, so
+    that "ready" is not held in a pipe buffer.)"""
+    import pty
+    import signal
+    src = 'screen_init(4, 2)\nfill_rect(0, 0, 2, 2, 0x00FF00)\n' + BUSY[kind]
+    image = str(tmp_path / "out.ppm")
+    cmds = vm_commands(tmp_path, src, '--screen', image)
+    for cmd in (cmds if kind == 'loop' else cmds[1:]):    # one reference run is enough
+        if os.path.exists(image):
+            os.remove(image)
+        master, slave = pty.openpty()
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=slave, stderr=slave)
+        try:
+            assert b"ready" in read_until(master, b"ready"), cmd
+            p.send_signal(signal.SIGINT)
+            p.wait(timeout=60)
+        finally:
+            if p.poll() is None:
+                p.kill()
+            p.stdin.close()
+            os.close(master)
+            os.close(slave)
+        assert p.returncode == -signal.SIGINT, cmd
+        with open(image, 'rb') as f:
+            assert f.read() == b"P6\n4 2\n255\n" + (b"\x00\xff\x00" * 2 + b"\x00" * 6) * 2
+
+
+@pytest.mark.skipif(os.name != 'posix', reason="POSIX terminals")
+def test_sigterm_restores_the_terminal(tmp_path):
+    """Review finding: SIGTERM left the terminal in raw mode after the reference
+    VM (the C runner restored it). Both now restore it and end by SIGTERM,
+    without an image."""
+    import pty
+    import signal
+    import termios
+    import time
+    image = str(tmp_path / "out.ppm")
+    for cmd in vm_commands(tmp_path, CTRL_C_PROGRAM, '--screen', image):
+        master, slave = pty.openpty()
+        p = subprocess.Popen(cmd, stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
+        try:
+            end = time.time() + 60
+            while termios.tcgetattr(slave)[3] & termios.ICANON and time.time() < end:
+                read_until(master, b"\0", 0.02)                    # keep the pty drained
+            assert not termios.tcgetattr(slave)[3] & termios.ICANON, cmd    # raw mode
+            p.send_signal(signal.SIGTERM)
+            p.wait(timeout=60)
+            lflag = termios.tcgetattr(slave)[3]
+        finally:
+            if p.poll() is None:
+                p.kill()
+            os.close(master)
+            os.close(slave)
+        assert p.returncode == -signal.SIGTERM, cmd
+        assert lflag & termios.ICANON and lflag & termios.ECHO, cmd
+        assert not os.path.exists(image)
 
 
 # ═══════════════════════════════════════════════════════════════

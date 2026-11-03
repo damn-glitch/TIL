@@ -37,6 +37,10 @@
  *                      the screen/keys natives ARE included
  *   TILVM_NO_GFX       leave out the screen/keys natives (screen_init ... wait_key
  *                      report "not available in this VM build")
+ *   TILVM_GFX_MAX_W    largest screen the device can show (default 4096 x 4096, the
+ *   TILVM_GFX_MAX_H    language limit): a host with a fixed display sets its size;
+ *                      screen_init(w, h) beyond it is then a runtime error, and the
+ *                      screen hooks never see x >= TILVM_GFX_MAX_W, y >= TILVM_GFX_MAX_H
  *   TILVM_ROM          storage qualifier for the 5x7 font table, e.g. __flash with
  *                      avr-gcc (gnu99) to keep it out of RAM (default: empty)
  */
@@ -76,6 +80,12 @@
 #endif
 #ifndef TILVM_MARK_STACK
 #define TILVM_MARK_STACK 64
+#endif
+#ifndef TILVM_GFX_MAX_W
+#define TILVM_GFX_MAX_W 4096            /* screen_init: width 1..TILVM_GFX_MAX_W */
+#endif
+#ifndef TILVM_GFX_MAX_H
+#define TILVM_GFX_MAX_H 4096            /* screen_init: height 1..TILVM_GFX_MAX_H */
 #endif
 
 #if TILVM_INT_BITS == 16
@@ -178,7 +188,9 @@ typedef struct tilvm_host {
     long (*read_file)(void *ctx, const char *path, char *buf, unsigned long cap);
     int (*write_file)(void *ctx, const char *path, const char *data, unsigned long len);
     /* screen: pixels are 0xRRGGBB; the VM rasterizes lines, shapes and text and
-     * clips them, so gfx_pixel/gfx_get only ever see 0 <= x < w, 0 <= y < h.
+     * clips them, so gfx_pixel/gfx_get only ever see 0 <= x < w, 0 <= y < h of the
+     * last gfx_init(w, h), where w <= TILVM_GFX_MAX_W and h <= TILVM_GFX_MAX_H
+     * (screen_init refuses larger screens: build the VM with the display's size).
      * gfx_pixel is required for a screen (gfx_get for get_pixel); gfx_init
      * (create or resize a w x h screen, all black) and gfx_show (present the
      * frame) are optional: without gfx_init the VM clears the screen pixel by
