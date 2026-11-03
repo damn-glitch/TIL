@@ -806,7 +806,7 @@ class TestCalculator:
     def test_examples_on_calculator_vm(self, tilc):
         vm = cvm_binary("host", CALC_FLAGS)
         for name in ('01_hello.til', '03_functions.til', '04_structs.til', '05_control_flow.til',
-                     '07_multilevel.til', 'basic/control_flow.til'):
+                     '07_multilevel.til', '09_v3_features.til', 'basic/control_flow.til'):
             path = os.path.join(EXAMPLES, name)
             rc, out, data = tilc.compile_file(path, os.path.join(tilc.dir, 'calc_out.tbc'), vm=vm)
             assert rc == 0, (name, out)

@@ -138,28 +138,9 @@ var KW_KK = {"егер": T_IF, "әйтпесе": T_ELSE, "үшін": T_FOR, "к�
     "қасиет": T_TRAIT, "сәйкестік": T_MATCH, "импорт": T_IMPORT, "бастап": T_FROM,
     "ретінде": T_AS, "тип": T_TYPE, "өзін": T_SELF, "және": T_AND, "немесе": T_OR, "емес": T_NOT,
     "ақиқат": T_BOOL, "жалған": T_BOOL, "тексеру": T_ASSERT, "қайталау": T_RETRY, "ниет": T_INTENT}
-var KW_KKL = {"eger": T_IF, "aitpese": T_ELSE, "ushin": T_FOR, "kezinde": T_WHILE, "tsikl": T_LOOP,
-    "ishinde": T_IN, "qaitaru": T_RETURN, "toqtatu": T_BREAK, "zhalgastyru": T_CONTINUE,
-    "funktsiya": T_FN, "turaqty": T_LET, "aynymaly": T_VAR, "turaqtama": T_CONST,
-    "ozgermeli": T_MUT, "ashyq": T_PUB, "qurylym": T_STRUCT, "sanaq": T_ENUM, "iske": T_IMPL,
-    "qasiet": T_TRAIT, "saikestik": T_MATCH, "bastap": T_FROM, "retinde": T_AS, "ozin": T_SELF,
-    "zhane": T_AND, "nemese": T_OR, "emes": T_NOT, "aqiqat": T_BOOL, "zhalgan": T_BOOL,
-    "tekseru": T_ASSERT, "qaitalau": T_RETRY, "niet": T_INTENT}
-var KW_RU = {"если": T_IF, "иначе": T_ELSE, "для": T_FOR, "пока": T_WHILE, "цикл": T_LOOP,
-    "в": T_IN, "вернуть": T_RETURN, "прервать": T_BREAK, "продолжить": T_CONTINUE,
-    "функция": T_FN, "пусть": T_LET, "перем": T_VAR, "конст": T_CONST, "изм": T_MUT,
-    "публ": T_PUB, "структура": T_STRUCT, "перечисление": T_ENUM, "реализация": T_IMPL,
-    "типаж": T_TRAIT, "выбор": T_MATCH, "импорт": T_IMPORT, "из": T_FROM, "как": T_AS,
-    "тип": T_TYPE, "сам": T_SELF, "и": T_AND, "или": T_OR, "не": T_NOT, "истина": T_BOOL,
-    "ложь": T_BOOL, "проверить": T_ASSERT, "инвариант": T_INVARIANT, "повторить": T_RETRY,
-    "таймаут": T_TIMEOUT, "намерение": T_INTENT}
 var TRUE_WORDS = {"true": 1, "True": 1, "ақиқат": 1, "aqiqat": 1, "истина": 1}
 var AL_KK = {"басып_шығару": "print", "шығару": "print", "негізгі": "main", "ұзындық": "len",
     "енгізу": "input"}
-var AL_KKL = {"basyp_shygaru": "print", "shygaru": "print", "negizgi": "main", "uzyndyq": "len",
-    "engizu": "input"}
-var AL_RU = {"печать": "print", "вывод": "print", "главная": "main", "длина": "len",
-    "ввод": "input"}
 
 # a source file: its text and its keyword / alias tables (indexed by the
 # first byte of a word; the keyword languages depend on the file's pragmas)
@@ -168,6 +149,26 @@ struct SrcFile
     kwb: any
     alb: any
     name: str
+
+# keywords of `#[lang: kk-latn]` and `#[lang: ru]` (built on demand)
+kw_kk_latn()
+    return {"eger": T_IF, "aitpese": T_ELSE, "ushin": T_FOR, "kezinde": T_WHILE, "tsikl": T_LOOP,
+        "ishinde": T_IN, "qaitaru": T_RETURN, "toqtatu": T_BREAK, "zhalgastyru": T_CONTINUE,
+        "funktsiya": T_FN, "turaqty": T_LET, "aynymaly": T_VAR, "turaqtama": T_CONST,
+        "ozgermeli": T_MUT, "ashyq": T_PUB, "qurylym": T_STRUCT, "sanaq": T_ENUM, "iske": T_IMPL,
+        "qasiet": T_TRAIT, "saikestik": T_MATCH, "bastap": T_FROM, "retinde": T_AS, "ozin": T_SELF,
+        "zhane": T_AND, "nemese": T_OR, "emes": T_NOT, "aqiqat": T_BOOL, "zhalgan": T_BOOL,
+        "tekseru": T_ASSERT, "qaitalau": T_RETRY, "niet": T_INTENT}
+
+kw_ru()
+    return {"если": T_IF, "иначе": T_ELSE, "для": T_FOR, "пока": T_WHILE, "цикл": T_LOOP,
+        "в": T_IN, "вернуть": T_RETURN, "прервать": T_BREAK, "продолжить": T_CONTINUE,
+        "функция": T_FN, "пусть": T_LET, "перем": T_VAR, "конст": T_CONST, "изм": T_MUT,
+        "публ": T_PUB, "структура": T_STRUCT, "перечисление": T_ENUM, "реализация": T_IMPL,
+        "типаж": T_TRAIT, "выбор": T_MATCH, "импорт": T_IMPORT, "из": T_FROM, "как": T_AS,
+        "тип": T_TYPE, "сам": T_SELF, "и": T_AND, "или": T_OR, "не": T_NOT, "истина": T_BOOL,
+        "ложь": T_BOOL, "проверить": T_ASSERT, "инвариант": T_INVARIANT, "повторить": T_RETRY,
+        "таймаут": T_TIMEOUT, "намерение": T_INTENT}
 
 # ── opcodes (class Op) ───────────────────────────────────────────────────────
 const OP_PUSH_NIL = 1
@@ -285,10 +286,8 @@ var INT_TYPES = {"int": 1, "i8": 1, "i16": 1, "i32": 1, "i64": 1, "uint": 1, "u8
     "u32": 1, "u64": 1}
 var FLOAT_TYPES = {"float": 1, "f32": 1, "f64": 1}
 
-# one-byte strings, BYTE[i] == bytes_to_str([i])
-var BYTE = []
-# single-character operator token types by byte (-1: none)
-var ONE_CHAR = []
+# single-character operator token types by byte
+var ONE_CHAR = {}
 
 var FNAME = "<input>"
 
@@ -309,19 +308,11 @@ unsupported(ln, what)
 # ═══════════════════════════════════════════════════════════════════════════
 
 init_tables()
-    var i = 0
-    while i < 256
-        BYTE.push(bytes_to_str([i]))
-        i += 1
-    i = 0
-    while i < 128
-        ONE_CHAR.push(-1)
-        i += 1
     let ops = "+-*/%=<>()[]{},:;.&|^~?@"
     let types = [T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT, T_EQ, T_LT, T_GT, T_LPAREN, T_RPAREN,
         T_LBRACKET, T_RBRACKET, T_LBRACE, T_RBRACE, T_COMMA, T_COLON, T_SEMICOLON, T_DOT, T_AMP,
         T_PIPE, T_CARET, T_TILDE, T_QUESTION, T_AT]
-    i = 0
+    var i = 0
     while i < len(ops)
         ONE_CHAR[ops[i]] = types[i]
         i += 1
@@ -335,15 +326,15 @@ init_tables()
         i += 1
 
 u16s(v)
-    return BYTE[v & 255] + BYTE[(v >> 8) & 255]
+    return bytes_to_str([v & 255, (v >> 8) & 255])
 
 u32s(v)
-    return BYTE[v & 255] + BYTE[(v >> 8) & 255] + BYTE[(v >> 16) & 255] + BYTE[(v >> 24) & 255]
+    return bytes_to_str([v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >> 24) & 255])
 
 # UTF-8 encoding of a code point
 utf8(cp)
     if cp < 128
-        return BYTE[cp]
+        return bytes_to_str([cp])
     if cp < 2048
         return bytes_to_str([192 + (cp >> 6), 128 + (cp & 63)])
     if cp < 65536
@@ -1069,15 +1060,10 @@ pragma_at(src, j0, langs)
             langs.push(code)
 
 setup_languages(src, name)
-    var sf = SrcFile { text: src, kwb: [], alb: [], name: name }
-    var i = 0
-    while i < 256
-        sf.kwb.push(None)
-        sf.alb.push(None)
-        i += 1
+    var sf = SrcFile { text: src, kwb: {}, alb: {}, name: name }
     var langs = ["en", "kk"]
     let n = len(src)
-    i = 0
+    var i = 0
     while i < n
         var j = i
         while j < n and (src[j] == 32 or src[j] == 9)
@@ -1092,21 +1078,23 @@ setup_languages(src, name)
         if code == "kk"
             add_keywords(sf, KW_KK, AL_KK)
         elif code == "kk-latn"
-            add_keywords(sf, KW_KKL, AL_KKL)
+            add_keywords(sf, kw_kk_latn(), {"basyp_shygaru": "print", "shygaru": "print",
+                "negizgi": "main", "uzyndyq": "len", "engizu": "input"})
         elif code == "ru"
-            add_keywords(sf, KW_RU, AL_RU)
+            add_keywords(sf, kw_ru(), {"печать": "print", "вывод": "print", "главная": "main",
+                "длина": "len", "ввод": "input"})
     return sf
 
 add_keywords(sf, kw, al)
     for k in kw
         let b = k[0]
-        if sf.kwb[b] == None
+        if not sf.kwb.has(b)
             sf.kwb[b] = {}
         sf.kwb[b][k] = kw[k]
     if al != None
         for k in al
             let b = k[0]
-            if sf.alb[b] == None
+            if not sf.alb.has(b)
                 sf.alb[b] = {}
             sf.alb[b][k] = al[k]
 
@@ -1196,7 +1184,7 @@ lex_step(lx)
         return
     if lex_op(lx, c)
         return
-    lex_err(lx, "Unexpected character: '" + BYTE[c] + "'")
+    lex_err(lx, "Unexpected character: '" + src.slice(p, p + 1) + "'")
 
 lex_indent(lx)
     let src = lx.src
@@ -1314,7 +1302,7 @@ lex_escape(lx)
     let p = lx.pos + 1
     if p >= n
         lx.pos = p + 1
-        return BYTE[0]
+        return "\0"
     let e = src[p]
     if e == 120
         if p + 2 >= n or hex_val(src[p + 1]) < 0 or hex_val(src[p + 2]) < 0
@@ -1350,15 +1338,15 @@ lex_escape(lx)
     if e == 114
         return "\r"
     if e == 48
-        return BYTE[0]
+        return "\0"
     if e == 97
-        return BYTE[7]
+        return "\a"
     if e == 98
-        return BYTE[8]
+        return "\b"
     if e == 101
-        return BYTE[27]
+        return "\e"
     if e < 128
-        return BYTE[e]
+        return src.slice(p, p + 1)
     # any other character stands for itself (whole UTF-8 sequence)
     var k = 1
     if e >= 240
@@ -1594,7 +1582,7 @@ lex_ident(lx)
     lx.pos = p
     let text = src.slice(st, p)
     let b = src[st]
-    let km = lx.sf.kwb[b]
+    let km = lx.sf.kwb.get_or(b, None)
     if km != None
         let kt = km.get_or(text, -1)
         if kt >= 0
@@ -1603,7 +1591,7 @@ lex_ident(lx)
             else
                 add_tok(lx, kt, text)
             return
-    let am = lx.sf.alb[b]
+    let am = lx.sf.alb.get_or(b, None)
     if am != None
         add_tok(lx, T_IDENT, am.get_or(text, text))
         return
@@ -1675,9 +1663,7 @@ lex_op(lx, c)
         lx.pos = p + 2
         add_tok(lx, t, v)
         return true
-    if c >= 128
-        return false
-    let t1 = ONE_CHAR[c]
+    let t1 = ONE_CHAR.get_or(c, -1)
     if t1 < 0
         return false
     if c == 40 or c == 91 or c == 123
@@ -1686,7 +1672,7 @@ lex_op(lx, c)
         if lx.paren > 0
             lx.paren -= 1
     lx.pos = p + 1
-    add_tok(lx, t1, BYTE[c])
+    add_tok(lx, t1, src.slice(p, p + 1))
     return true
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3710,7 +3696,7 @@ i64_dec(v)
     var digits = []
     while a[0] != 0 or a[1] != 0 or a[2] != 0 or a[3] != 0
         let qr = i64_divmodu(a, [10, 0, 0, 0])
-        digits.push(BYTE[48 + qr[1][0]])
+        digits.push(str(qr[1][0]))
         a = qr[0]
     digits.reverse()
     if neg
@@ -3719,20 +3705,20 @@ i64_dec(v)
 
 hex2(c)
     let h = "0123456789abcdef"
-    return BYTE[h[c >> 4]] + BYTE[h[c & 15]]
+    return h.slice(c >> 4, (c >> 4) + 1) + h.slice(c & 15, (c & 15) + 1)
 
 py_str_repr(s)
-    var q = 39
+    var q = "'"
     if s.contains("'") and not s.contains("\"")
-        q = 34
-    var out = [BYTE[q]]
+        q = "\""
+    var out = [q]
     var i = 0
     while i < len(s)
         let c = s[i]
         if c == 92
             out.push("\\\\")
-        elif c == q
-            out.push("\\" + BYTE[q])
+        elif c == q[0]
+            out.push("\\" + q)
         elif c == 10
             out.push("\\n")
         elif c == 13
@@ -3742,9 +3728,9 @@ py_str_repr(s)
         elif c < 32 or c == 127
             out.push("\\x" + hex2(c))
         else
-            out.push(BYTE[c])
+            out.push(s.slice(i, i + 1))
         i += 1
-    out.push(BYTE[q])
+    out.push(q)
     return out.join("")
 
 # quotient and remainder of a natural by a small number
@@ -5562,7 +5548,7 @@ serialize()
     var flags = 2
     if USES_FLOAT
         flags = 3
-    radd(out, "TILB" + BYTE[2] + BYTE[flags])
+    radd(out, "TILB" + bytes_to_str([2, flags]))
     radd(out, u16s(len(GLOBALS)) + u16s(ENTRY))
     radd(out, u16s(len(CONSTS)))
     for c in CONSTS
@@ -5572,7 +5558,7 @@ serialize()
         radd(out, u16s(const_str(f.name)) + bytes_to_str([f.np, f.nreq, f.nloc, f.nup, f.flags]) + u32s(f.off))
     radd(out, u16s(len(TYPES)))
     for t in TYPES
-        var rec = u16s(const_str(t[0])) + BYTE[len(t[1])]
+        var rec = u16s(const_str(t[0])) + bytes_to_str([len(t[1])])
         for fld in t[1]
             rec = rec + u16s(const_str(fld))
         radd(out, rec)
@@ -5592,9 +5578,9 @@ serialize()
     for mid in PRELUDE
         mids.push(mid)
     mids.sort()
-    radd(out, BYTE[len(mids)])
+    radd(out, bytes_to_str([len(mids)]))
     for mid in mids
-        radd(out, BYTE[mid] + u16s(PRELUDE[mid]))
+        radd(out, bytes_to_str([mid]) + u16s(PRELUDE[mid]))
     radd(out, u32s(off))
     for f in FUNCS
         radd(out, f.code)
