@@ -10,17 +10,23 @@ registry index file, and a fake urlopen for the https:// code path.
 Run: python3 -m pytest tests/test_pkg.py -v
 """
 
+import gzip
 import hashlib
+import http.server
 import io
 import json
 import os
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
+import threading
 import urllib.error
+import urllib.request
 import zipfile
+import zlib
 
 import pytest
 
@@ -864,7 +870,7 @@ class TestArchives:
                 raise urllib.error.HTTPError(request.full_url, 404, 'Not Found', {}, None)
             return Response(index if request.full_url.endswith('.json') else data)
 
-        monkeypatch.setattr(tilpkg.urllib.request, 'urlopen', fake_urlopen)
+        monkeypatch.setattr(tilpkg, '_urlopen', fake_urlopen)           # urlopen with https-only redirects
         proj = make_project(tmp_path / 'app')
         url = "https://pkgs.example/mathx-1.0.tar.gz"
         rc, _out, err = tilpkg_run(proj, 'add', 'mathx', f"{url}#sha256={sha256_file(tgz)}")
@@ -1213,3 +1219,654 @@ class TestCli:
         r = cli('pkg', 'install', 'geo', cwd=str(tmp_path))
         assert r.returncode == 1
         assert tilpkg.main(['-C', str(tmp_path / 'missing'), 'list']) == 1
+
+
+# ═══════════════════════════════════════════════════════════════
+# REGRESSIONS FROM REVIEW ROUND 1
+# ═══════════════════════════════════════════════════════════════
+
+needs_symlinks = pytest.mark.skipif(not hasattr(os, 'symlink') or sys.platform == 'win32', reason="needs symlinks")
+needs_posix_modes = pytest.mark.skipif(sys.platform == 'win32', reason="POSIX permissions")
+
+
+def listing(directory):
+    """{relative path: file bytes or None for a directory/link} of everything
+    below `directory` - to prove that nothing there was touched."""
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(directory):
+        for name in dirnames:
+            out[os.path.relpath(os.path.join(dirpath, name), directory)] = None
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if os.path.islink(path):
+                out[os.path.relpath(path, directory)] = None
+                continue
+            with open(path, 'rb') as f:
+                out[os.path.relpath(path, directory)] = f.read()
+    return out
+
+
+def mode_of(path):
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def read_bytes(path):
+    with open(os.fspath(path), 'rb') as f:
+        return f.read()
+
+
+@needs_symlinks
+class TestSymlinkedModulesDirectory:
+    """critical: a til_modules that is a symbolic link (e.g. committed to a
+    repository) made install/add/remove delete everything it pointed to."""
+
+    @pytest.fixture
+    def victim(self, tmp_path):
+        v = tmp_path / 'victim'
+        write(v / 'Documents' / 'notes.txt', 'notes')
+        write(v / 'projects' / 'thesis' / 'chapter1.tex', 'my thesis')
+        write(v / 'todo.txt', 'todo')
+        os.chmod(v / 'todo.txt', 0o444)
+        return v
+
+    @pytest.mark.parametrize("link", ["absolute", "relative"])
+    def test_every_command_refuses_and_nothing_is_deleted(self, tmp_path, libs, victim, tilpkg_run, link):
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        shutil.rmtree(proj / 'til_modules')
+        os.symlink(str(victim) if link == "absolute" else os.path.join('..', 'victim'), proj / 'til_modules')
+        before = listing(victim)
+        project_before = (read(proj / 'til.json'), read(proj / 'til.lock'))
+        for args in (('install',), ('install', '--frozen'), ('install', '--update'), ('install', '--update', 'geo'),
+                     ('add', 'extra', '../libs/extra'), ('remove', 'geo'), ('verify',), ('list',)):
+            rc, out, err = tilpkg_run(proj, *args)
+            assert rc == 1, (args, out, err)
+            assert "til_modules is a symbolic link" in err and "remove the link" in err, (args, err)
+            assert listing(victim) == before, args
+        assert (read(proj / 'til.json'), read(proj / 'til.lock')) == project_before
+        assert os.path.islink(proj / 'til_modules')
+        os.unlink(proj / 'til_modules')                 # the remedy: remove the link, not its target
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0, err
+        assert (proj / 'til_modules' / 'geo').is_dir() and not os.path.islink(proj / 'til_modules')
+        assert listing(victim) == before
+
+    @needs_git
+    def test_link_committed_to_a_cloned_repository(self, tmp_path, tilpkg_run):
+        """The scenario of the review: til_modules -> ../.. in a repository, then
+        `git clone ... && til pkg install` with no dependencies at all."""
+        ws = tmp_path / 'ws'
+        write(ws / 'keep' / 'precious.txt', 'precious')
+        repo = GitRepo(str(tmp_path / 'attacker'))
+        write(os.path.join(repo.path, 'til.json'), json.dumps({"name": "cool_app", "dependencies": {}}))
+        os.symlink(os.path.join('..', '..'), os.path.join(repo.path, 'til_modules'))
+        repo.git('add', '-A')
+        repo.git('commit', '-q', '-m', 'app')
+        r = subprocess.run(GIT + ['clone', '-q', repo.path, str(ws / 'cloned')], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr
+        clone = ws / 'cloned'
+        assert os.path.islink(clone / 'til_modules')
+        before = listing(tmp_path)
+        rc, _out, err = tilpkg_run(clone, 'install')
+        assert rc == 1 and "symbolic link" in err
+        assert listing(tmp_path) == before
+
+    def test_dangling_link_and_a_file_named_til_modules(self, tmp_path, libs, tilpkg_run):
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        os.symlink(str(tmp_path / 'nowhere'), proj / 'til_modules')
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 1 and "symbolic link" in err and not (tmp_path / 'nowhere').exists()
+        os.unlink(proj / 'til_modules')
+        write(proj / 'til_modules', 'a file')
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 1 and "is not a directory" in err and read(proj / 'til_modules') == 'a file'
+        assert not (proj / 'til.lock').exists()
+
+    def test_rmtree_never_follows_links(self, tmp_path, victim):
+        d = tmp_path / 'd'
+        write(d / 'a' / 'f.txt', 'x')
+        os.symlink(str(victim), d / 'a' / 'dir_link')
+        os.symlink(str(victim / 'todo.txt'), d / 'file_link')
+        before = listing(victim)
+        tilpkg.rmtree(str(d))
+        assert not os.path.lexists(d) and listing(victim) == before
+        os.symlink(str(victim), tmp_path / 'top_link')
+        tilpkg.rmtree(str(tmp_path / 'top_link'))
+        assert not os.path.lexists(tmp_path / 'top_link') and listing(victim) == before
+        deep = tmp_path / 'deep'
+        write(os.path.join(str(deep), *(['d'] * 300), 'f.til'), 'x')          # no recursion limit
+        tilpkg.rmtree(str(deep))
+        assert not deep.exists()
+
+
+class TestInstalledCopies:
+    """major: til_modules/ directories that hashes, list and verify ignored were
+    still used by imports (a package named til_modules; a nested til_modules/)."""
+
+    def test_til_pkg_does_not_run_inside_an_installed_package(self, tmp_path, libs, tilpkg_run):
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        geo = proj / 'til_modules' / 'geo'
+        os.makedirs(geo / 'sub')
+        for where, args in ((geo, ('install',)), (geo, ('list',)), (geo, ('verify',)),
+                            (geo, ('add', 'extra', '../../../libs/extra')), (geo / 'sub', ('install',)),
+                            (geo / 'sub', ('init',)), (proj / 'til_modules', ('init',))):
+            rc, _out, err = tilpkg_run(where, *args)
+            assert rc == 1 and "inside an installed package" in err, (where, args, err)
+        assert not (geo / 'til_modules').exists() and not (geo / 'sub' / 'til.json').exists()
+        assert not (proj / 'til_modules' / 'til.json').exists()
+        assert tilpkg_run(proj, 'verify')[0] == 0
+
+    def test_nested_til_modules_are_never_imported_and_are_reported(self, tmp_path, libs, tilpkg_run):
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        main = proj / 'main.til'
+        write(main, 'import geo\nprint(area(2, 3))\n')
+        assert run_file_both(read(main), str(main)) == "60\n"
+        fake = 'const SCALE = 999\nscaled(x: int) -> int\n    return x * 999\n'
+        write(proj / 'til_modules' / 'geo' / 'til_modules' / 'units' / 'units.til', fake)
+        write(proj / 'til_modules' / 'til_modules' / 'units' / 'units.til', fake)
+        write(proj / 'til_modules' / 'units' / '.git' / 'HEAD', 'ref: refs/heads/main\n')
+        assert run_file_both(read(main), str(main)) == "60\n"
+        rc, out, _err = tilpkg_run(proj, 'verify')
+        assert rc == 1
+        assert "MODIFIED geo" in out and "'til_modules' was added after installation" in out
+        assert "MODIFIED units" in out and "'.git' was added" in out
+        assert "EXTRA    til_modules/til_modules" in out
+        rc, out, err = tilpkg_run(proj, 'install')
+        assert rc == 0 and "~ geo" in out and "~ units" in out and "- til_modules" in out, err
+        assert not (proj / 'til_modules' / 'geo' / 'til_modules').exists()
+        assert not (proj / 'til_modules' / 'til_modules').exists()
+        assert tilpkg_run(proj, 'verify')[0] == 0
+
+    def test_til_modules_is_a_reserved_package_name(self, tmp_path, tilpkg_run):
+        for name in ('til_modules', 'Til_Modules'):
+            with pytest.raises(tilpkg.PkgError, match="reserved"):
+                tilpkg.check_name(name)
+        libs = tmp_path / 'libs'
+        make_pkg(libs / 'sneaky', 'til_modules')
+        make_pkg(libs / 'carrier', 'carrier', deps={'til_modules': '../sneaky'})
+        proj = make_project(tmp_path / 'app')
+        rc, _out, err = tilpkg_run(proj, 'add', 'til_modules', '../libs/sneaky')
+        assert rc == 1 and "reserved" in err
+        rc, _out, err = tilpkg_run(proj, 'add', 'carrier', '../libs/carrier')
+        assert rc == 1 and "reserved" in err
+        assert manifest_of(proj)["dependencies"] == {} and not (proj / 'til_modules').exists()
+
+
+class TestPackageImportsArePinned:
+    """major: inside a package, the current directory and $TIL_PATH shadowed the
+    package's own locked dependencies (the result depended on where `til` ran)."""
+
+    def test_current_directory_and_til_path_cannot_replace_package_dependencies(self, tmp_path, libs, tilpkg_run,
+                                                                                monkeypatch):
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        decoy = 'const SCALE = 1000\nscaled(x: int) -> int\n    return x * 1000\n'
+        write(proj / 'units.til', decoy)                   # the project's own, unrelated module
+        tilpath = tmp_path / 'tilpath'
+        write(tilpath / 'units.til', decoy)
+        main = proj / 'src' / 'main.til'
+        write(main, 'import geo\nprint(area(2, 3))\n')
+        monkeypatch.setenv('TIL_PATH', str(tilpath))
+        for cwd in (proj, proj / 'src', tilpath):
+            monkeypatch.chdir(cwd)
+            assert run_file_both(read(main), str(main)) == "60\n", cwd
+        for cwd in (proj, proj / 'src'):
+            r = cli('run', '--vm', str(main), cwd=str(cwd), env={'TIL_PATH': str(tilpath)})
+            assert (r.returncode, r.stdout) == (0, "60\n"), r.stderr
+        # programs (not packages) still search the current directory and $TIL_PATH first
+        write(tilpath / 'helper.til', 'helper() -> int\n    return 7\n')
+        write(main, 'import geo\nimport helper\nprint(area(2, 3) + helper())\n')
+        assert run_file_both(read(main), str(main)) == "67\n"
+
+    def test_packages_still_import_the_standard_library(self, tmp_path, tilpkg_run):
+        make_pkg(tmp_path / 'libs' / 'calc', 'calc', '1.0.0', body='import math\ncalc_gcd(a: int, b: int) -> int\n'
+                                                                    '    return gcd(a, b)\n')
+        proj = make_project(tmp_path / 'app', {"calc": "../libs/calc"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        main = proj / 'main.til'
+        write(main, 'import calc\nprint(calc_gcd(12, 18))\n')
+        assert run_file_both(read(main), str(main)) == "6\n"
+
+    def test_lookup_stops_at_the_project_root(self, tmp_path):
+        write(tmp_path / 'shared' / 'til_modules' / 'geo' / 'geo.til', 'v() -> str\n    return "ancestor"\n')
+        proj = make_project(tmp_path / 'shared' / 'proj', {"geo": "../../libs/geo"})
+        main = proj / 'main.til'
+        write(main, 'import geo\nprint(v())\n')
+        assert til.find_package_module('geo', str(main)) is None
+        r = cli('run', '--vm', str(main))
+        assert "ancestor" not in r.stdout
+        assert "hint: 'geo' is a dependency in" in r.stderr and "run `til pkg install` in" in r.stderr
+        # a script that belongs to no project still finds til_modules/ in parent directories
+        loose = tmp_path / 'shared' / 'loose' / 'main.til'
+        write(loose, 'import geo\nprint(v())\n')
+        assert run_file_both(read(loose), str(loose)) == "ancestor\n"
+
+    def test_main_may_use_backslashes(self, tmp_path, tilpkg_run):
+        libs = tmp_path / 'libs'
+        write(libs / 'geo' / 'til.json', json.dumps({"name": "geo", "version": "1.0.0", "main": "src\\geo.til"}))
+        write(libs / 'geo' / 'src' / 'geo.til', 'area() -> int\n    return 6\n')
+        write(libs / 'geo' / 'src' / 'shapes.til', 'side() -> int\n    return 4\n')
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0 and "warning" not in err, err
+        main = proj / 'main.til'
+        write(main, 'import geo\nimport geo.shapes\nprint(area() + shapes.side())\n')
+        assert run_file_both(read(main), str(main)) == "10\n"
+
+    def test_hints(self, tmp_path, libs, tilpkg_run):
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        write(proj / 'sub.til', 'import geo.shapes\nprint(1)\n')
+        r = cli('run', '--vm', str(proj / 'sub.til'))
+        assert "hint: the package 'geo'" in r.stderr and "has no module 'shapes'" in r.stderr
+        assert "not installed" not in r.stderr
+        # a dependency of a package that is missing from til_modules/
+        shutil.rmtree(proj / 'til_modules' / 'units')
+        write(proj / 'main.til', 'import geo\nprint(area(1, 1))\n')
+        r = cli('run', '--vm', str(proj / 'main.til'))
+        assert "hint: 'units' is a dependency in" in r.stderr and os.path.join('geo', 'til.json') in r.stderr
+        assert "run `til pkg install` in" in r.stderr
+        # an installed directory without an entry file
+        other = tmp_path / 'other'
+        write(other / 'til_modules' / 'odd' / 'notes.til', 'n() -> int\n    return 1\n')
+        write(other / 'main.til', 'import odd\nprint(1)\n')
+        r = cli('run', '--vm', str(other / 'main.til'))
+        assert "hint: the package 'odd'" in r.stderr and "has no entry file" in r.stderr
+
+
+@needs_git
+class TestGitPackagesAreExact:
+    """major: tree hashes of git packages depended on the machine's git
+    configuration (core.eol, filters): a til.lock from Linux failed on Windows."""
+
+    def test_independent_of_line_ending_and_filter_configuration(self, tmp_path, tilpkg_run, monkeypatch):
+        text = 'red() -> int\n    return 1\n'
+        repo = GitRepo(str(tmp_path / 'colors'))
+        repo.commit({'.gitattributes': '* text=auto\n*.til filter=shout\n',
+                     'til.json': json.dumps({"name": "colors", "version": "1.0.0"}), 'colors.til': text})
+        repo.git('tag', 'v1')
+        proj = make_project(tmp_path / 'app', {"colors": repo.spec('v1')})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0, err
+        locked = lock_of(proj)["packages"]["colors"]["sha256"]
+        # the same project where git converts line endings (Windows: core.eol = native = crlf)
+        # and has a smudge filter; both apply to `git checkout`, which til pkg does not use
+        home = tmp_path / 'home'
+        write(home / '.gitconfig', '[core]\n\teol = crlf\n\tautocrlf = true\n'
+                                   '[filter "shout"]\n\tsmudge = tr a-z A-Z\n\tclean = cat\n')
+        monkeypatch.setenv('HOME', str(home))
+        monkeypatch.setenv('XDG_CONFIG_HOME', str(home / '.config'))
+        monkeypatch.delenv('GIT_CONFIG_GLOBAL', raising=False)
+        shutil.rmtree(proj / 'til_modules')
+        rc, _out, err = tilpkg_run(proj, 'install', '--frozen')
+        assert rc == 0, err
+        assert read_bytes(proj / 'til_modules' / 'colors' / 'colors.til') == text.encode()
+        assert read_bytes(proj / 'til_modules' / 'colors' / '.gitattributes') == b'* text=auto\n*.til filter=shout\n'
+        assert tilpkg.tree_hash(str(proj / 'til_modules' / 'colors')) == locked
+        assert tilpkg_run(proj, 'verify')[0] == 0
+
+    @needs_symlinks
+    def test_symbolic_links_in_the_repository_are_refused(self, tmp_path, tilpkg_run):
+        repo = GitRepo(str(tmp_path / 'linky'))
+        write(os.path.join(repo.path, 'linky.til'), 'x() -> int\n    return 1\n')
+        os.symlink('/etc/passwd', os.path.join(repo.path, 'passwd'))
+        repo.git('add', '-A')
+        repo.git('commit', '-q', '-m', 'link')
+        proj = make_project(tmp_path / 'app', {"linky": repo.spec()})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 1 and "'passwd' is a symbolic link" in err and not (proj / 'til_modules').exists()
+
+    def test_unportable_file_names_are_refused(self, tmp_path, tilpkg_run):
+        repo = GitRepo(str(tmp_path / 'odd'))
+        repo.commit({'odd.til': 'x() -> int\n    return 1\n', 'notes:2024.txt': 'x'})
+        proj = make_project(tmp_path / 'app', {"odd": repo.spec()})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 1 and "cannot be installed on every OS" in err
+
+    def test_submodules_are_reported_not_fetched(self, tmp_path, tilpkg_run):
+        repo = GitRepo(str(tmp_path / 'withsub'))
+        repo.commit({'withsub.til': 'w() -> int\n    return 1\n', 'docs/readme.txt': 'r'})
+        repo.git('update-index', '--add', '--cacheinfo', f"160000,{'a' * 40},vendor/lib")
+        repo.git('commit', '-q', '-m', 'submodule')
+        proj = make_project(tmp_path / 'app', {"withsub": repo.spec()})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0 and "git submodules are not fetched" in err and "vendor/lib" in err
+        assert sorted(os.listdir(proj / 'til_modules' / 'withsub')) == ['docs', 'withsub.til']
+
+
+@needs_git
+class TestGitRequirementsFromTheLock:
+    """major: a second requirement for a git package was re-resolved against the
+    live remote on every install (an upstream push broke install and --frozen;
+    installing offline failed)."""
+
+    def test_a_second_requirement_is_pinned_like_the_package(self, tmp_path, colors_repo, tilpkg_run):
+        make_pkg(tmp_path / 'libs' / 'a', 'a', deps={'colors': colors_repo.spec()})        # the remote HEAD
+        proj = make_project(tmp_path / 'app', {"a": "../libs/a", "colors": colors_repo.spec('v2.0.0')})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0, err
+        lock_before = read(proj / 'til.lock')
+        colors_repo.commit(colors_release("3.0.0", 3), "v3")                     # upstream moves on
+        for args in (('install',), ('install', '--frozen')):
+            rc, out, err = tilpkg_run(proj, *args)
+            assert rc == 0 and "up to date" in out, (args, err)
+        offline = tmp_path / 'colors.offline'
+        shutil.move(colors_repo.path, str(offline))                              # no remote at all
+        for args in (('install',), ('install', '--frozen'), ('verify',)):
+            rc, _out, err = tilpkg_run(proj, *args)
+            assert rc == 0, (args, err)
+        assert read(proj / 'til.lock') == lock_before
+        # a new requirement naming the locked commit by its full SHA needs no remote either
+        make_pkg(tmp_path / 'libs' / 'b', 'b', deps={'colors': colors_repo.spec(colors_repo.v2)})
+        rc, _out, err = tilpkg_run(proj, 'add', 'b', '../libs/b')
+        assert rc == 0, err
+        # ... but a new floating requirement must be checked against the repository
+        make_pkg(tmp_path / 'libs' / 'c', 'c', deps={'colors': colors_repo.spec('main')})
+        rc, _out, err = tilpkg_run(proj, 'add', 'c', '../libs/c')
+        assert rc == 1 and "git clone failed" in err
+        # re-resolving checks every requirement against the repository again
+        shutil.move(str(offline), colors_repo.path)
+        rc, _out, err = tilpkg_run(proj, 'install', '--update')
+        assert rc == 1 and "conflicting requirements for package 'colors'" in err
+
+    def test_local_repository_paths_in_the_lock(self, tmp_path, colors_repo, tilpkg_run):
+        proj = make_project(tmp_path / 'deep' / 'er' / 'app', {"colors": f"git+{colors_repo.path}#v1.0.0"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        resolved = lock_of(proj)["packages"]["colors"]["resolved"]
+        assert resolved == f"git+{os.path.realpath(colors_repo.path)}#{colors_repo.v1}".replace(os.sep, '/')
+        ci = tmp_path / 'ci'
+        os.makedirs(ci)
+        for name in ('til.json', 'til.lock'):
+            shutil.copy(proj / name, ci / name)
+        rc, _out, err = tilpkg_run(ci, 'install', '--frozen')
+        assert rc == 0, err
+
+
+class TestFilePermissions:
+    """minor: til.json/til.lock became 0600 and package directories 0700."""
+
+    @needs_posix_modes
+    def test_permissions_follow_the_umask(self, tmp_path, libs, tilpkg_run):
+        old = os.umask(0o022)
+        try:
+            proj = tmp_path / 'app'
+            os.makedirs(proj)
+            assert tilpkg_run(proj, 'init', 'app')[0] == 0
+            assert mode_of(proj / 'til.json') == 0o644
+            assert tilpkg_run(proj, 'add', 'geo', '../libs/geo')[0] == 0
+            assert mode_of(proj / 'til.json') == 0o644 and mode_of(proj / 'til.lock') == 0o644
+            for d in ('til_modules', 'til_modules/geo', 'til_modules/units'):
+                assert mode_of(proj / d) == 0o755, d
+            assert mode_of(proj / 'til_modules' / 'geo' / 'geo.til') == 0o644
+            os.chmod(proj / 'til.json', 0o640)                     # an existing file keeps its mode
+            assert tilpkg_run(proj, 'add', 'extra', '../libs/extra')[0] == 0
+            assert mode_of(proj / 'til.json') == 0o640 and mode_of(proj / 'til_modules' / 'extra') == 0o755
+        finally:
+            os.umask(old)
+
+
+def _tar_bytes(files):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode='w', format=tarfile.USTAR_FORMAT) as tf:
+        for name, data in files:
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+class TestDamagedArchives:
+    """minor: zlib.error escaped as a traceback; a .tar.gz with a bad gzip CRC
+    was installed with corrupted contents."""
+
+    GEO = [('geo/til.json', b'{"name": "geo", "version": "1.0.0"}'),
+           ('geo/geo.til', b'area() -> int\n    return 6\n'), ('geo/data.txt', b'x' * 5000)]
+
+    @pytest.mark.parametrize("field", ["crc", "length"])
+    def test_bad_gzip_trailer(self, tmp_path, tilpkg_run, field):
+        raw = _tar_bytes(self.GEO)
+        blob = bytearray(gzip.compress(raw))
+        if field == "crc":
+            blob[-8:-4] = struct.pack('<I', zlib.crc32(raw) ^ 0xFFFFFFFF)
+        else:
+            blob[-4:] = struct.pack('<I', len(raw) + 1)
+        archive = tmp_path / 'geo.tar.gz'
+        archive.write_bytes(bytes(blob))
+        proj = make_project(tmp_path / 'app')
+        rc, _out, err = tilpkg_run(proj, 'add', 'geo', archive_spec(archive))
+        assert rc == 1 and "the archive is damaged" in err, err
+        assert not (proj / 'til_modules').exists() and manifest_of(proj)["dependencies"] == {}
+
+    def test_corrupt_deflate_data_in_a_tar_gz(self, tmp_path, tilpkg_run):
+        # a stored deflate block with the first 20000 bytes of the tar, then an invalid block:
+        # tarfile reads the header fine and fails (zlib.error) inside the member's data
+        first = _tar_bytes([('geo.til', b'x' * 40000)])[:20000]
+        n = len(first)
+        blob = (b'\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff' + b'\x00' + struct.pack('<HH', n, n ^ 0xFFFF) + first
+                + b'\xff' + b'\x00' * 8)
+        archive = tmp_path / 'geo.tar.gz'
+        archive.write_bytes(blob)
+        proj = make_project(tmp_path / 'app')
+        rc, _out, err = tilpkg_run(proj, 'add', 'geo', archive_spec(archive))
+        assert rc == 1 and "the archive is damaged" in err and "Traceback" not in err, err
+        assert not (proj / 'til_modules').exists()
+
+    def test_corrupt_deflate_data_in_a_zip(self, tmp_path, tilpkg_run):
+        archive = tmp_path / 'geo.zip'
+        with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('geo.til', 'area() -> int\n    return 6\n' * 50)
+        data = bytearray(archive.read_bytes())
+        data[30 + len('geo.til')] = 0xFF            # first byte of the member data: an invalid deflate block
+        archive.write_bytes(bytes(data))
+        proj = make_project(tmp_path / 'app')
+        rc, _out, err = tilpkg_run(proj, 'add', 'geo', archive_spec(archive))
+        assert rc == 1 and "the archive is damaged" in err and "Traceback" not in err, err
+        assert not (proj / 'til_modules').exists()
+
+
+class TestHttpsOnly:
+    """minor: urllib followed https -> http redirects (the registry index has no hash)."""
+
+    @pytest.mark.parametrize("target", ["http://pkgs.example/index.json", "ftp://pkgs.example/index.json",
+                                        "file:///etc/passwd"])
+    def test_redirects_off_https_are_refused(self, target):
+        handler = tilpkg._HttpsOnlyRedirects()
+        request = urllib.request.Request('https://pkgs.example/index.json')
+        with pytest.raises(tilpkg.PkgError, match="only https:// is allowed"):
+            handler.redirect_request(request, io.BytesIO(b''), 302, 'Found', {}, target)
+
+    def test_redirects_to_https_are_followed(self):
+        handler = tilpkg._HttpsOnlyRedirects()
+        request = urllib.request.Request('https://pkgs.example/index.json')
+        new = handler.redirect_request(request, io.BytesIO(b''), 302, 'Found', {}, 'https://mirror.example/i.json')
+        assert new.full_url == 'https://mirror.example/i.json'
+
+    def test_download_checks_the_final_url(self, tmp_path, monkeypatch):
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.close()
+
+            def geturl(self):
+                return 'http://evil.example/index.json'
+
+        monkeypatch.setattr(tilpkg, '_urlopen', lambda request, timeout=None: Response(b'{}'))
+        with pytest.raises(tilpkg.PkgError, match="only https:// is allowed"):
+            tilpkg.download('https://pkgs.example/index.json', str(tmp_path / 'out'))
+
+    def test_the_opener_does_not_follow_a_plain_http_redirect(self, monkeypatch):
+        hits = []
+
+        class Redirect(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                self.send_response(302)
+                self.send_header('Location', f'http://127.0.0.1:{self.server.server_port}/plain')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        for var in ('HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy'):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv('NO_PROXY', '127.0.0.1,localhost')
+        monkeypatch.setenv('no_proxy', '127.0.0.1,localhost')
+        server = http.server.HTTPServer(('127.0.0.1', 0), Redirect)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            url = f'http://127.0.0.1:{server.server_port}/index.json'
+            with pytest.raises(tilpkg.PkgError, match="only https:// is allowed"):
+                tilpkg._urlopen(urllib.request.Request(url), timeout=10)
+            assert hits == ['/index.json']                 # the redirect target was never requested
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(10)
+
+
+class TestCommandLine:
+    """minor: CLI and til.lock portability."""
+
+    def test_help_is_the_package_managers(self):
+        for args in (('pkg', '--help'), ('pkg', '-h'), ('pkg', 'add', '-h'), ('pkg', 'install', '--help')):
+            r = cli(*args)
+            assert r.returncode == 0 and r.stdout.startswith('usage: til pkg'), (args, r.stdout[:200])
+        r = cli('--help')
+        assert r.returncode == 0 and not r.stdout.startswith('usage: til pkg')
+
+    def test_add_takes_relative_paths_from_where_it_runs(self, tmp_path, tilpkg_run):
+        make_pkg(tmp_path / 'proj' / 'vendor' / 'geo', 'geo', '2.0.0')
+        make_pkg(tmp_path / 'vendor' / 'geo', 'geo', '9.9.9')        # what ../vendor/geo means from the root
+        proj = make_project(tmp_path / 'proj')
+        os.makedirs(proj / 'src')
+        rc, out, err = tilpkg_run(proj / 'src', 'add', 'geo', '../vendor/geo')
+        assert rc == 0, err
+        assert manifest_of(proj)["dependencies"] == {"geo": "./vendor/geo"}
+        assert "+ geo 2.0.0" in out and lock_of(proj)["packages"]["geo"]["version"] == "2.0.0"
+        rc, out, err = tilpkg_run(proj, 'add', 'geo', '../vendor/geo')              # in the root: as written
+        assert rc == 0 and manifest_of(proj)["dependencies"] == {"geo": "../vendor/geo"} and "9.9.9" in out
+        r = cli('pkg', 'add', 'geo', '../vendor/geo', cwd=str(proj / 'src'))        # a shell in src/
+        assert r.returncode == 0, r.stderr
+        assert manifest_of(proj)["dependencies"] == {"geo": "./vendor/geo"}
+
+    @needs_git
+    def test_add_git_path_from_a_subdirectory(self, tmp_path, colors_repo, tilpkg_run):
+        proj = make_project(tmp_path / 'app')
+        os.makedirs(proj / 'src')
+        rc, _out, err = tilpkg_run(proj / 'src', 'add', 'colors', 'git+../../colors#v1.0.0')
+        assert rc == 0, err
+        assert manifest_of(proj)["dependencies"] == {"colors": "git+../colors#v1.0.0"}
+
+    def test_relative_registry_is_relative_to_the_command_directory(self, tmp_path, registry, tilpkg_run,
+                                                                   monkeypatch):
+        proj = make_project(tmp_path / 'app')
+        elsewhere = tmp_path / 'x' / 'y'
+        os.makedirs(elsewhere)
+        monkeypatch.chdir(elsewhere)
+        monkeypatch.setenv('TIL_REGISTRY', os.path.join('..', 'reg'))          # relative to -C app
+        rc, _out, err = tilpkg_run(proj, 'add', 'geo', '^1.2')
+        assert rc == 0, err
+        assert installed_geo(proj) == "1.5.0"
+        rc, _out, err = tilpkg_run(proj, 'add', 'geo')
+        assert rc == 0 and manifest_of(proj)["dependencies"] == {"geo": "^2.0.0"}, err
+        r = cli('pkg', '-C', str(proj), 'install', '--update', cwd=str(elsewhere),
+                env={'TIL_REGISTRY': os.path.join('..', 'reg')})
+        assert r.returncode == 0, r.stderr
+
+    def test_absolute_and_home_paths_stay_valid_at_another_depth(self, tmp_path, libs, tilpkg_run, monkeypatch):
+        geo = os.path.realpath(libs / 'geo')
+        proj = make_project(tmp_path / 'home' / 'me' / 'app', {"geo": geo})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0, err
+        lock = lock_of(proj)["packages"]
+        assert lock["geo"]["resolved"] == geo.replace(os.sep, '/')
+        assert lock["units"]["resolved"] == os.path.realpath(libs / 'units').replace(os.sep, '/')   # inherited
+        ci = tmp_path / 'ci' / 'build' / 'x'
+        os.makedirs(ci)
+        for name in ('til.json', 'til.lock'):
+            shutil.copy(proj / name, ci / name)
+        rc, _out, err = tilpkg_run(ci, 'install', '--frozen')
+        assert rc == 0, err
+        monkeypatch.setenv('HOME', str(tmp_path))
+        monkeypatch.setenv('USERPROFILE', str(tmp_path))
+        proj2 = make_project(tmp_path / 'work' / 'app2', {"geo": "~/libs/geo"})
+        rc, _out, err = tilpkg_run(proj2, 'install')
+        assert rc == 0, err
+        lock = lock_of(proj2)["packages"]
+        assert lock["geo"]["resolved"] == "~/libs/geo" and lock["units"]["resolved"] == "~/libs/units"
+        deeper = tmp_path / 'a' / 'b' / 'c'
+        os.makedirs(deeper)
+        for name in ('til.json', 'til.lock'):
+            shutil.copy(proj2 / name, deeper / name)
+        rc, _out, err = tilpkg_run(deeper, 'install', '--frozen')
+        assert rc == 0, err
+
+    def test_verify_reports_lock_entries_nothing_requires(self, tmp_path, libs, tilpkg_run):
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        write(proj / 'til.json', json.dumps({"name": "app", "dependencies": {}}))
+        rc, out, _err = tilpkg_run(proj, 'verify')
+        assert rc == 1
+        assert "OUTDATED geo: in til.lock, but nothing in til.json requires it any more" in out
+        assert "OUTDATED units: in til.lock" in out
+        assert tilpkg_run(proj, 'install', '--frozen')[0] == 1                 # agrees with verify
+        assert tilpkg_run(proj, 'install')[0] == 0 and tilpkg_run(proj, 'verify')[0] == 0
+
+    def test_usage_errors_exit_2(self, tmp_path, libs, tilpkg_run):
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        for args in (('install', 'geo'), ('install', '--update', '--frozen')):
+            rc, _out, err = tilpkg_run(proj, *args)
+            assert rc == 2 and "til pkg: error:" in err, args
+        assert cli('pkg', 'install', 'geo', cwd=str(proj)).returncode == 2
+
+
+class TestNamesAndLimits:
+    """minor: claims without tests - names differing only in case, size limits."""
+
+    def test_package_names_that_differ_only_in_case(self, tmp_path, tilpkg_run):
+        libs = tmp_path / 'libs'
+        make_pkg(libs / 'upper', 'Geo')
+        make_pkg(libs / 'lower', 'geo')
+        proj = make_project(tmp_path / 'app', {"Geo": "../libs/upper", "geo": "../libs/lower"})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 1 and "packages 'Geo' and 'geo' differ only in case" in err
+        assert not (proj / 'til_modules').exists() and not (proj / 'til.lock').exists()
+
+    @pytest.mark.parametrize("kind", ["path", "archive", pytest.param("git", marks=needs_git)])
+    def test_file_count_and_size_limits(self, tmp_path, tilpkg_run, monkeypatch, kind):
+        files = {'big.til': 'x' * 3000, 'a.til': 'a', 'b.til': 'b'}
+        if kind == 'git':
+            repo = GitRepo(str(tmp_path / 'big'))
+            repo.commit(files)
+            spec = repo.spec()
+        elif kind == 'archive':
+            spec = archive_spec(make_tar(str(tmp_path / 'big.tar.gz'),
+                                         [(rel, 'file', text) for rel, text in files.items()]))
+        else:
+            for rel, text in files.items():
+                write(tmp_path / 'big' / rel, text)
+            spec = '../big'
+        proj = make_project(tmp_path / 'app', {"big": spec})
+        monkeypatch.setattr(tilpkg, 'MAX_PACKAGE_FILES', 2)
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 1 and "more than 2 files" in err, err
+        monkeypatch.setattr(tilpkg, 'MAX_PACKAGE_FILES', 100)
+        monkeypatch.setattr(tilpkg, 'MAX_PACKAGE_BYTES', 2000)
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 1 and "2000 bytes" in err, err
+        assert not (proj / 'til_modules').exists() and not (proj / 'til.lock').exists()
+        monkeypatch.setattr(tilpkg, 'MAX_PACKAGE_BYTES', 1 << 20)
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0, err
+
+    def test_download_limit(self, tmp_path, monkeypatch):
+        write(tmp_path / 'f.tar.gz', 'x' * 5000)
+        monkeypatch.setattr(tilpkg, 'MAX_DOWNLOAD_BYTES', 1000)
+        with pytest.raises(tilpkg.PkgError, match="download larger than 1000 bytes"):
+            tilpkg.download(_uri(tmp_path / 'f.tar.gz'), str(tmp_path / 'out'))

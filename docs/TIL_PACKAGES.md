@@ -30,24 +30,31 @@ only files.
 | Command | What it does |
 |---|---|
 | `til pkg init [NAME]` | Create `til.json` in the current directory: `{"name", "version": "0.1.0", "dependencies": {}}`. `NAME` defaults to the directory name (made an identifier: `my-app` → `my_app`). Refuses to overwrite an existing `til.json`. |
-| `til pkg add NAME SPEC` | Record `NAME: SPEC` in `til.json` and install it (re-resolving that package; the rest stays as locked). Replaces an existing spec for `NAME`. |
+| `til pkg add NAME SPEC` | Record `NAME: SPEC` in `til.json` and install it (re-resolving that package; the rest stays as locked). Replaces an existing spec for `NAME`. A relative path is relative to the directory the command runs in, as in any shell command, and is stored relative to the project root: `til pkg add geo ../vendor/geo` in `proj/src/` records `"./vendor/geo"`. |
 | `til pkg add NAME@REQ` / `til pkg add NAME` | Registry forms: `add geo@^1.2`; without a spec the newest release in the registry is recorded as `^X.Y.Z`. |
 | `til pkg install` | Install everything in `til.json` (recursively). Packages already in `til.lock` with an unchanged spec are reproduced exactly; new or changed ones are resolved. Writes `til.lock`. |
 | `til pkg install --update [NAME...]` | Ignore `til.lock` and resolve again (everything, or only the named packages). |
 | `til pkg install --frozen` | For CI: install exactly `til.lock`; fail if it is missing or does not match `til.json`. Never writes `til.lock`. |
 | `til pkg remove NAME` (`rm`) | Drop `NAME` from `til.json`, remove packages nothing needs any more. |
 | `til pkg list` (`ls`) | Dependency tree from `til.lock` (see below). |
-| `til pkg verify` | Re-hash every directory in `til_modules/` and compare with `til.lock`; exit code 1 on any difference. |
-| `til pkg help` | Usage. |
+| `til pkg verify` | Re-hash every directory in `til_modules/` and compare with `til.lock`; also check that `til.lock` matches `til.json`. Exit code 1 on any difference. |
+| `til pkg help` | Usage (also `til pkg --help`, `til pkg COMMAND -h`). |
 
 All commands except `init` find the project by looking for `til.json` in the
 current directory and then in its parents, so they work from any subdirectory.
-`-C DIR` runs as if started in `DIR` (`til pkg -C ../app list`).
+`-C DIR` runs as if started in `DIR` (`til pkg -C ../app list`): the project is
+searched from `DIR`, and relative paths on the command line and a relative
+`TIL_REGISTRY` are relative to `DIR`.
+
+`til pkg` refuses to run inside an installed package (`PROJECT/til_modules/NAME/`
+or below): installed copies are only ever replaced as a whole, and their own
+dependencies live in `PROJECT/til_modules/`.
 
 Exit codes: `0` success, `1` error (message on stderr, prefixed `til pkg:
-error:`), `2` command-line usage error. When resolution or fetching fails,
-nothing in the project is changed — not `til.json`, not `til.lock`, not
-`til_modules/`.
+error:`), `2` command-line usage error (unknown command or option,
+`install NAME` without `--update`, `--update` with `--frozen`). When
+resolution or fetching fails, nothing in the project is changed — not
+`til.json`, not `til.lock`, not `til_modules/`.
 
 ### `til pkg list`
 
@@ -70,13 +77,16 @@ til_modules/: ...)``, ``(til.lock has ...: run `til pkg install`)``.
 ```
 ok       geo 1.2.0
 MODIFIED units: sha256 0be2..., til.lock has 8155...
+MODIFIED shapes: /app/til_modules/shapes: 'til_modules' was added after installation (til pkg never installs til_modules directories)
 MISSING  colors: til_modules/colors does not exist
 EXTRA    til_modules/intruder is not in til.lock
 OUTDATED extra: til.json requires ../libs/extra, til.lock does not have it
+OUTDATED old: in til.lock, but nothing in til.json requires it any more
 ```
 
 `til pkg install` repairs all of these: it restores every package from the
-locked source and removes extra directories.
+locked source and removes extra directories. (`OUTDATED` means `til.lock`
+must be rewritten, which `install --frozen` refuses to do.)
 
 ---
 
@@ -99,10 +109,10 @@ locked source and removes extra directories.
 
 | Field | Meaning |
 |---|---|
-| `name` | Package name — the name programs `import`. Must be an identifier: letters (any script, e.g. `геометрия`), digits and `_`, not starting with a digit, at most 64 characters, not a TIL keyword or a Windows device name (`con`, `nul`, `com1`...). So a name can never contain `/`, `\`, `.` or `..`. |
+| `name` | Package name — the name programs `import`. Must be an identifier: letters (any script, e.g. `геометрия`), digits and `_`, not starting with a digit, at most 64 characters, not a TIL keyword or a Windows device name (`con`, `nul`, `com1`...), and not `til_modules` in any letter case (that is the directory packages are installed in). So a name can never contain `/`, `\`, `.` or `..`. |
 | `version` | Semantic version `MAJOR.MINOR.PATCH[-pre][+build]`. |
 | `dependencies` | `{"name": "spec"}`; see §3. |
-| `main` | (packages) The file `import NAME` loads: a relative path inside the package ending in `.til` (no `..`). Default: `NAME.til`, then `lib.til`, then `mod.til`. |
+| `main` | (packages) The file `import NAME` loads: a relative path inside the package ending in `.til` (no `..`; `/` and `\` both separate directories, on every OS). Default: `NAME.til`, then `lib.til`, then `mod.til`. |
 | `registry` | (projects) Path or URL of a registry index (§5). Relative paths are relative to this `til.json`. |
 
 All fields are optional for a *dependency*: a directory or repository without
@@ -119,8 +129,8 @@ dependencies sorted by name; other fields are kept as they are.
 
 | Spec | Kind |
 |---|---|
-| `./libs/geo`, `../geo`, `/abs/geo`, `~/geo` | **Local directory.** Relative to the directory of the `til.json` that declares it. Use `/` (also on Windows) so projects stay portable. |
-| `git+URL` / `git+URL#REV` | **Git repository.** `URL` is any git URL: `https://`, `ssh://`, `git://`, `file://`, `user@host:path`, or a local repository path (relative paths as for directories). `REV` is a tag, a branch (also non-default branches) or a full or abbreviated commit SHA; without `#REV` the remote's default branch (`HEAD`). The resolved **commit SHA** is recorded in `til.lock`. |
+| `./libs/geo`, `../geo`, `/abs/geo`, `~/geo` | **Local directory.** Relative to the directory of the `til.json` that declares it. Use `/` (also on Windows) so projects stay portable. `til.lock` records the directory in the form it was written — relative to the project root, absolute, or `~/...` (a relative path declared by such a package inherits its form) — so the lock stays valid wherever the project is checked out. |
+| `git+URL` / `git+URL#REV` | **Git repository.** `URL` is any git URL: `https://`, `ssh://`, `git://`, `file://`, `user@host:path`, or a local repository path (relative paths as for directories). `REV` is a tag, a branch (also non-default branches) or a full or abbreviated commit SHA; without `#REV` the remote's default branch (`HEAD`). The resolved **commit SHA** is recorded in `til.lock`. The package is the files of that commit **exactly as committed** (see "Git packages" below). |
 | `https://host/p.tar.gz#sha256=HEX` | **Archive**: `.tar.gz`, `.tgz` or `.zip`, also `file:///path/p.zip#sha256=...`. The sha256 of the archive file is **required** and is checked *before* anything is extracted. Leave it out and the error message prints the current hash for you to paste. Plain `http://` is refused. If the archive holds exactly one top-level directory (as GitHub release archives do), that directory is the package. |
 | `^1.2`, `~1.2.3`, `1.x`, `1.2`, `*`, `1.2.3`, `>=1.2 <2`, `^1 \|\| ^3`, `NAME@^1.2` | **Version requirement**, resolved through the registry (§5). |
 
@@ -148,6 +158,16 @@ such a path would point into whatever machine installs the package — and are
 rejected with an explicit error. They can use git, archive and registry
 dependencies.
 
+**Git packages.** `til pkg` never runs `git checkout`: it reads the blobs of
+the commit (`git ls-tree`, `git cat-file`) and writes the files itself. So
+nothing that depends on the installing machine's git configuration changes
+them — no line-ending conversion (`core.eol`, `core.autocrlf`, `text` /
+`eol` attributes in `.gitattributes`), no smudge filters (Git LFS files stay
+pointer files), no `ident` expansion — and the tree hash in `til.lock` is the
+same on Linux, macOS and Windows. File names follow the rules for archives
+(§7): no `..`, no `\`, `:` or control characters, UTF-8. A symbolic link in
+the repository is an error, a submodule is skipped with a warning.
+
 ---
 
 ## 4. `til_modules/` and `til.lock`
@@ -155,7 +175,16 @@ dependencies.
 Packages are installed **flat**: every package, direct or transitive, gets one
 directory `til_modules/NAME/` next to `til.json`. Consequently each package
 name has exactly one version in a project. Installed copies never contain
-`.git`, `.hg`, `.svn` or nested `til_modules/` directories.
+`.git`, `.hg`, `.svn` or nested `til_modules/` directories; `verify` reports
+one that appears later as a modification and `install` replaces that copy.
+
+`til_modules/` belongs to `til pkg`: it removes whatever it did not install
+there. It must be a real directory inside the project. If `til_modules` is a
+symbolic link (or a Windows junction) — for example one committed to a
+repository you cloned — every command refuses to run instead of deleting the
+files the link points to; remove the link (not its target). Files are created
+with the usual permissions (0666/0777 minus the umask), so other users can
+read installed packages; `til.json` keeps the permissions it had.
 
 Commit `til.json` and `til.lock`; add `til_modules/` to `.gitignore`.
 
@@ -171,6 +200,12 @@ in name order, so **your project's own declarations are seen first**.
   source that has a matching `version`, so declaring `geo` as a local
   directory in your project also satisfies a dependency's `geo: ^1.2` when
   the directory's version is in range.
+* A second git requirement is checked without the network when it can be: a
+  full commit SHA is compared directly, and a requirement that `til.lock`
+  already records for that package (the requiring package's `dependencies`)
+  is pinned by the lock like the package itself — a branch or `HEAD`
+  requirement does not follow upstream pushes until `til pkg install
+  --update`. Any other git requirement is resolved in the repository.
 * Otherwise it is a **conflict** and nothing is installed:
 
   ```
@@ -222,7 +257,7 @@ the file is byte-for-byte reproducible (UTF-8, `\n`, 2-space indentation).
 | Field | Meaning |
 |---|---|
 | `spec` | The spec the package was first required with (your project's, if you declare it). |
-| `resolved` | The concrete source: a directory relative to the project (`./x`, `../x`), `git+URL#<full commit SHA>`, or `URL#sha256=<archive hash>`. For registry packages, the source the index named for the chosen version. |
+| `resolved` | The concrete source: a directory (relative to the project — `./x`, `../x` — or, when it was declared that way, absolute or `~/x`), `git+URL#<full commit SHA>`, or `URL#sha256=<archive hash>`. For registry packages, the source the index named for the chosen version. |
 | `version` | The package's version (`null` if it has none). |
 | `sha256` | The **tree hash** of the installed files (below). |
 | `dependencies` | The package's own `til.json` dependencies. |
@@ -232,7 +267,8 @@ spec is unchanged: the same resolved source (git: the same commit even if the
 branch or tag moved; registry: the same version even if newer ones were
 published; the registry is not even read), and the result must have the same
 tree hash. If `til_modules/NAME` already holds exactly those files it is kept
-as it is, so a repeated install needs neither the network nor the sources.
+as it is, so a repeated install needs neither the network nor the sources
+(this includes git packages required by several packages, see Resolution).
 When a source changed under the lock — a directory was edited, an archive
 replaced at the same URL — the install stops with a hash error that names the
 package and the remedy (`til pkg install --update NAME`). Local directories
@@ -258,8 +294,8 @@ find . -type f | sed 's|^\./||' | LC_ALL=C sort |
 ```
 
 A package consists of regular files and directories only: symbolic links,
-devices and similar entries are refused (in local directories and in
-archives), so an installed package can never point outside itself.
+devices and similar entries are refused (in local directories, archives and
+git repositories), so an installed package can never point outside itself.
 
 ---
 
@@ -287,9 +323,10 @@ A registry is a JSON index that maps names to versions to sources:
 * If the package has a `til.json` version, it must equal the index version.
 * The index is found through the `TIL_REGISTRY` environment variable (which
   wins) or `"registry"` in the project's `til.json`; a path (a directory means
-  `DIR/index.json`), a `file://` URL or an `https://` URL. Only the project's
-  registry is used, also for the dependencies of dependencies. It is read only
-  when a version requirement has to be resolved.
+  `DIR/index.json`), a `file://` URL or an `https://` URL. A relative
+  `TIL_REGISTRY` is relative to the directory the command runs in (`-C DIR`).
+  Only the project's registry is used, also for the dependencies of
+  dependencies. It is read only when a version requirement has to be resolved.
 
 `til pkg add NAME` (no spec) records `^` + the newest release in the index.
 
@@ -304,17 +341,36 @@ from geo import area, Rect
 import geo.shapes.square        # til_modules/geo/shapes/square.til (or .../square/mod.til)
 ```
 
+**In your program** (any file that is not inside `til_modules/`):
+
 * `import NAME` first searches everything it searched before TIL 3.1 — the
   importing file's directory, the current directory, `$TIL_PATH`, the
   standard library — and only then installed packages. A local `geo.til` next
   to your program therefore shadows the package `geo`, and a package cannot
   replace a standard-library module (`math`, `strings`).
 * Packages are looked up in `til_modules/` of the importing file's directory,
-  then of its parent, grandparent, ... (nearest first). The nearest
-  `til_modules/NAME` wins. This is what makes the flat layout work: the
-  package `til_modules/geo` importing `units` finds `til_modules/units` one
-  level up. It also means programs in subdirectories of a project (`src/`,
-  `tests/`) find the project's packages, wherever `til` is run from.
+  then of its parent, grandparent, ... (nearest first), **up to the nearest
+  project root** — the first directory with a `til.json` (or `til.lock`) —
+  and never above it, so an unrelated `til_modules/` in a parent directory
+  (say `/tmp/til_modules`) is never used by a project. Programs in
+  subdirectories of a project (`src/`, `tests/`) find the project's packages,
+  wherever `til` is run from. (A script that belongs to no project searches
+  up to the file-system root.)
+
+**In a package** (a file in `PROJECT/til_modules/PKG/`, where `PROJECT` has a
+`til.json` or `til.lock`):
+
+* `import NAME` searches the importing file's directory (the package's own
+  modules: `import helper` finds its `helper.til`), the standard library, and
+  then **only `PROJECT/til_modules/`** — the flat directory that `til.lock`
+  describes. The current directory and `$TIL_PATH` are not searched, and a
+  `til_modules/` inside an installed package is never used. So a package
+  always gets exactly the dependencies `til.lock` pins, wherever `til` runs
+  and whatever modules your project has: a `units.til` of your own does not
+  replace the package `units` that `geo` depends on.
+
+**Both:**
+
 * Entry file of `import NAME`: `til.json` `"main"` if present (if that file
   does not exist the import fails — it never falls back), else `NAME.til`,
   `lib.til`, `mod.til`.
@@ -322,17 +378,23 @@ import geo.shapes.square        # til_modules/geo/shapes/square.til (or .../squa
   package root and then in the directory of the entry file (so a package with
   `"main": "src/geo.til"` can keep sub-modules in `src/`). Qualified calls use
   the last component: `b.f()`.
-* Inside a package, `import helper` finds the package's own `helper.til`
-  next to the importing file first, as for any program.
-* If an import is not found and a `til.json` above the program declares that
-  dependency, the compiler adds a hint:
-  ``hint: 'geo' is a dependency in /path/til.json but is not installed - run `til pkg install` ``
+* If an import is not found, the compiler adds a hint when it can tell why:
+  ``hint: 'geo' is a dependency in /path/til.json but is not installed - run `til pkg install` in /path``,
+  or ``hint: the package 'geo' (/path/til_modules/geo) has no module 'shapes' (shapes.til or shapes/mod.til)``.
 
 Imported definitions are merged into the program at compile time, so a program
 that uses packages builds and runs the same way natively (`til run`,
 `til build`), on the Python VM (`til run --vm`) and on the C VM (`til run
 --cvm`, `til build --target vm` / `c-vm` — the `.tbc` file contains the
 package code, the device needs no `til_modules/`).
+
+**One namespace.** TIL has no module-private names yet: the top-level
+definitions of your program, of its modules and of every package it imports
+(directly or through other packages) share one namespace. Two packages that
+both define the same top-level name — even an internal `helper()` — cannot be
+used in one program; the compiler reports `function 'helper' is defined twice`
+(at the first `import`, without naming the packages). Package authors should
+prefix internal names with the package name (`geo_helper`).
 
 ---
 
@@ -341,11 +403,17 @@ package code, the device needs no `til_modules/`).
 * Package names are identifiers, so they cannot contain path separators or
   `..`; names from `til.json` files of dependencies and from `til.lock` are
   validated the same way before they are used as directory names.
+* `til_modules/` is never used through a symbolic link or junction (§4):
+  `til pkg` deletes what it did not install there, and a link committed to a
+  repository would otherwise make `til pkg install` delete the files it points
+  to. Links inside `til_modules/` are removed themselves, never followed.
 * Archives: the sha256 is verified before extraction. Extraction writes only
   new regular files and directories below a fresh directory; absolute paths,
   drive letters, `..`, `:` in names, symbolic links, hard links, devices,
   duplicate entries and entries colliding with each other are refused (Python's
-  `tarfile`/`zipfile` extraction functions are not used). Size limits:
+  `tarfile`/`zipfile` extraction functions are not used). A damaged archive is
+  an error: zip members are checked against their CRC-32, a `.tar.gz` against
+  the gzip trailer (CRC-32 and length of the whole stream). Size limits:
   256 MB per download and per package, 100 000 files — exceeding them is an
   error, never a silent truncation.
 * Git: always run without a shell; `--` separates options from the user's
@@ -354,9 +422,13 @@ package code, the device needs no `til_modules/`).
   transport is disabled and URLs containing `::` are refused; credential
   prompts are disabled (`GIT_TERMINAL_PROMPT=0`); `GIT_DIR`,
   `GIT_WORK_TREE`, `GIT_INDEX_FILE` and similar variables of the caller (for
-  example inside git hooks) are not passed on. Line endings are never
-  converted (`core.autocrlf=false`), so tree hashes match across OSes.
-* Downloads only over `https://` (or `file://`).
+  example inside git hooks) are not passed on. Files are written from the
+  committed blobs by `til pkg` itself (§3, "Git packages"): no checkout, so no
+  filter command configured on the machine runs, and the tree hash does not
+  depend on any git setting.
+* Downloads only over `https://` (or `file://`), and every redirect must stay
+  on `https://` (the registry index has no hash of its own; its integrity
+  rests on TLS).
 * Nothing a package contains is executed by `til pkg`.
 
 ---
@@ -366,8 +438,12 @@ package code, the device needs no `til_modules/`).
 * One version per package name in a project (flat `til_modules/`); there is
   no nesting of conflicting versions.
 * Installing a package under a different name (aliases) is not supported.
-* Git submodules are not fetched (a warning is printed when a package has
-  `.gitmodules`); Git LFS content depends on your git configuration.
+* All packages share the program's single namespace (§6, "One namespace").
+* Git submodules are not fetched (a warning names them); Git LFS files are
+  installed as the pointer files that are committed, never as their content.
+  Repositories with symbolic links, or file names with `\`, `:` or control
+  characters, cannot be installed (they would not install the same way on
+  every OS).
 * Path dependencies inside non-local packages are rejected (§3).
 * No publishing command and no hosted registry: a registry is any JSON index
   you serve (or keep in a directory).

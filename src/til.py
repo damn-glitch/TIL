@@ -9247,10 +9247,13 @@ class ModuleResolver:
         search_dirs = []
         if from_file and not from_file.startswith("<"):
             search_dirs.append(os.path.dirname(os.path.abspath(from_file)))
-        search_dirs.append(self.base_path)
-        for extra in os.environ.get('TIL_PATH', '').split(os.pathsep):
-            if extra:
-                search_dirs.append(extra)
+        # a file of an installed package never searches the current directory or
+        # $TIL_PATH: its imports must not depend on where `til` runs (til.lock pins them)
+        if installed_package_dirs(from_file) is None:
+            search_dirs.append(self.base_path)
+            for extra in os.environ.get('TIL_PATH', '').split(os.pathsep):
+                if extra:
+                    search_dirs.append(extra)
         for home in til_home_dirs():
             stdlib_dir = os.path.join(home, 'stdlib')
             if os.path.isdir(stdlib_dir):
@@ -9289,9 +9292,15 @@ class ModuleResolver:
 
 
 # ── packages: til_modules/ (installed by `til pkg`, see docs/TIL_PACKAGES.md) ──
-# `import NAME` / `from NAME import x` look for til_modules/NAME/ in the
-# importing file's directory and then in each parent directory (nearest
-# first), after all the search paths above. Inside a package:
+# After all the search paths above, `import NAME` / `from NAME import x` look
+# for til_modules/NAME/:
+#   * from a program: in the importing file's directory, then each parent
+#     directory (nearest first), up to the nearest project root (the first
+#     directory with a til.json or til.lock) - never above it;
+#   * from a file of an installed package (PROJECT/til_modules/PKG/...): only
+#     in PROJECT/til_modules/ - the flat directory til.lock describes; never a
+#     til_modules/ nested inside an installed package.
+# Inside a package:
 #   import NAME      -> til.json "main", else NAME.til, lib.til, mod.til
 #   import NAME.a.b  -> a/b.til or a/b/mod.til (package root first, then the
 #                       directory of the entry file)
@@ -9317,12 +9326,15 @@ def _package_start_dir(from_file: str, base_path: str) -> str:
 
 def package_entry_file(pkg_dir: str, name: str) -> Optional[str]:
     """The file `import NAME` loads from a package directory: til.json "main"
-    (a relative path inside the package), else NAME.til, lib.til, mod.til."""
+    (a relative path inside the package; '/' or '\\' separate directories on
+    every OS, as `til pkg` checks it), else NAME.til, lib.til, mod.til."""
     main = _package_manifest(pkg_dir).get('main')
     if isinstance(main, str) and main:
         root = os.path.abspath(pkg_dir)
-        path = os.path.abspath(os.path.join(root, main))
-        if os.path.isabs(main) or not path.startswith(root + os.sep) or not os.path.isfile(path):
+        parts = main.replace('\\', '/').split('/')
+        path = os.path.abspath(os.path.join(root, *parts))
+        if (os.path.isabs(main) or main.startswith(('/', '\\')) or ':' in parts[0]
+                or not path.startswith(root + os.sep) or not os.path.isfile(path)):
             return None             # `til pkg` rejects such packages; never look elsewhere
         return path
     for candidate in (name + ".til", "lib.til", "mod.til"):
@@ -9332,13 +9344,48 @@ def package_entry_file(pkg_dir: str, name: str) -> Optional[str]:
     return None
 
 
-def find_package_module(module_name: str, from_file: str = "", base_path: str = ".") -> Optional[str]:
-    """Resolve `import NAME[.sub...]` against installed packages: the nearest
-    til_modules/NAME/ directory, walking up from the importing file."""
-    parts = module_name.split(".")
+def _is_project_root(directory: str) -> bool:
+    return os.path.isfile(os.path.join(directory, 'til.json')) or \
+        os.path.isfile(os.path.join(directory, 'til.lock'))
+
+
+def installed_package_dirs(from_file: str) -> Optional[Tuple[str, str]]:
+    """(package directory, project til_modules/) when `from_file` belongs to an
+    installed package - it lies in PROJECT/til_modules/PKG/ and PROJECT has a
+    til.json or til.lock - else None."""
+    if not from_file or from_file.startswith("<"):
+        return None
+    d = os.path.dirname(os.path.abspath(from_file))
+    while True:
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        if os.path.basename(parent) == PACKAGE_DIR and _is_project_root(os.path.dirname(parent)):
+            return d, parent
+        d = parent
+
+
+def package_search_dirs(from_file: str = "", base_path: str = ".") -> List[str]:
+    """The til_modules/ directories `import NAME` looks in, nearest first."""
+    owner = installed_package_dirs(from_file)
+    if owner is not None:
+        return [owner[1]]           # a package's dependencies: the project's flat til_modules/ only
+    dirs = []
     d = _package_start_dir(from_file, base_path)
     while True:
-        pkg_dir = os.path.join(d, PACKAGE_DIR, parts[0])
+        dirs.append(os.path.join(d, PACKAGE_DIR))
+        parent = os.path.dirname(d)
+        if _is_project_root(d) or parent == d:
+            return dirs             # never above the nearest project root
+        d = parent
+
+
+def find_package_module(module_name: str, from_file: str = "", base_path: str = ".") -> Optional[str]:
+    """Resolve `import NAME[.sub...]` against installed packages: the first
+    til_modules/NAME/ directory of package_search_dirs()."""
+    parts = module_name.split(".")
+    for modules in package_search_dirs(from_file, base_path):
+        pkg_dir = os.path.join(modules, parts[0])
         if os.path.isdir(pkg_dir):
             entry = package_entry_file(pkg_dir, parts[0])
             if len(parts) == 1:
@@ -9352,25 +9399,37 @@ def find_package_module(module_name: str, from_file: str = "", base_path: str = 
                     if os.path.isfile(candidate):
                         return candidate
             return None             # the nearest package of that name wins
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
+    return None
 
 
 def package_install_hint(module_name: str, from_file: str = "", base_path: str = ".") -> Optional[str]:
-    """A hint when a missing module is a dependency declared in a til.json
-    above the importing file (i.e. `til pkg install` was not run)."""
-    name = module_name.split(".")[0]
-    d = _package_start_dir(from_file, base_path)
+    """A hint for a module that was not found: an installed package lacks that
+    (sub)module, or the nearest til.json declares it as a dependency that was
+    never installed (`til pkg install` was not run)."""
+    parts = module_name.split(".")
+    name = parts[0]
+    for modules in package_search_dirs(from_file, base_path):
+        pkg_dir = os.path.join(modules, name)
+        if os.path.isdir(pkg_dir):
+            if len(parts) > 1:
+                sub = "/".join(parts[1:])
+                return (f"hint: the package '{name}' ({pkg_dir}) has no module '{'.'.join(parts[1:])}' "
+                        f"({sub}.til or {sub}/mod.til)")
+            return (f"hint: the package '{name}' ({pkg_dir}) has no entry file: til.json \"main\" if it is "
+                    f"set, else {name}.til, lib.til or mod.til")
+    owner = installed_package_dirs(from_file)
+    d = owner[0] if owner is not None else _package_start_dir(from_file, base_path)
     while True:
-        deps = _package_manifest(d).get('dependencies')
-        if isinstance(deps, dict) and name in deps:
+        if _is_project_root(d):
+            deps = _package_manifest(d).get('dependencies')
+            if not (isinstance(deps, dict) and name in deps):
+                return None
+            project = os.path.dirname(owner[1]) if owner is not None else d
             return (f"hint: '{name}' is a dependency in {os.path.join(d, 'til.json')} but is not "
-                    f"installed - run `til pkg install`")
+                    f"installed - run `til pkg install` in {project}")
         parent = os.path.dirname(d)
-        if parent == d:
-            return None
+        if parent == d or owner is not None:
+            return None             # a package's own til.json is at its root
         d = parent
 
 
@@ -9853,6 +9912,9 @@ def run_repl():
 def main():
     args = sys.argv[1:]
 
+    if args and args[0] in EXTRA_COMMANDS:      # before -h/--help: `til pkg --help` is the tool's own help
+        return run_extra_command(args[0], args[1:])
+
     if not args or '-h' in args or '--help' in args:
         print_help()
         return 0
@@ -9862,9 +9924,6 @@ def main():
         print("Author: Alisher Beisembekov")
         print("Backends: native (C via gcc/clang), TIL VM (bytecode: Python, C99 / calculators)")
         return 0
-
-    if args[0] in EXTRA_COMMANDS:
-        return run_extra_command(args[0], args[1:])
 
     command = None
     if args and args[0] in ('run', 'build', 'check', 'repl', 'exec', 'dis', 'translate'):
