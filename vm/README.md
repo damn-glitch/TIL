@@ -42,11 +42,13 @@ output of every example is compared with the reference VM.
 |---|---|---|---|---|---|---|
 | ARM Cortex-M (NumWorks/STM32 class) | Cortex-M3, 64 KB RAM | QEMU `lm3s6965evb` | int32, float32, 16 KB heap | 44.7 KB | 24 KB | 17/17 programs identical¹ |
 | 8-bit AVR (Arduino Mega class) | ATmega1284P, 16 KB RAM | simavr | int32, float32, 5 KB heap | 53.8 KB | 10.5 KB | 17/17 programs identical |
-| Z80 (TI-83/84 class) | Z80, 64 KB address space | ucsim `sz80` | int32, lean | 70.7 KB (SDCC) | ~7 KB | **does not fit** the 64 KB address space yet — see `ports/z80/RESULTS.md` |
+| Z80 (TI-83/84 class) | Z80, 64 KB address space | ucsim `sz80` | int16, lean, 16-bit offsets, 4 KB heap | 46.6 KB (SDCC 4.2), ends below 0xC000 | 5.7 KB + ≤1.4 KB C stack | 10/10 int16-compatible examples + test corpus identical² — see `ports/z80/RESULTS.md` |
 | Desktop | x86-64 | native | int64, double, 256 KB heap | 80 KB | ~400 KB | all 255 + 81 tests |
 
 ¹ Single-precision builds print the last digit of some floats differently
 (`78.5397` vs `78.5398`), as expected for `float`.
+² 8 examples use floats and 2 compute values beyond 16 bits (`10!`); they are
+rejected at load or wrap, as documented for 16-bit builds.
 
 Reproduce:
 
@@ -71,6 +73,7 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_NO_STDIO` | off | no `<stdio.h>`: built-in number formatting, host sets `write` |
 | `TILVM_NO_TIME` | off | no `<time.h>`: `clock_ms()`/`timeout` count 1 ms per 1000 steps |
 | `TILVM_NO_MATH` | off | no `<math.h>`: built-in `sqrt`/`floor`/`pow` (integer powers) |
+| `TILVM_ADDR16` | off | 16-bit address space (Z80, AVR): bytecode offsets and object lengths are 16-bit (needs heap ≤ 65535; programs above 64 KB are rejected with load error -10). Much smaller code on 8-bit CPUs |
 | `TILVM_LEAN` | off | smallest code for 8-bit CPUs: the whole language core, without format specs, snapshots, `input/chr/ord/type_of/clock_ms/random/sleep_ms`, str `split/replace/trim/repeat/count`, array `insert/remove/sort/reverse/slice/copy/join/sum/min/max`, map `values/copy/clear` (calling them reports "not available"). ~20% smaller |
 
 Profiles in the `Makefile`: `make` (desktop), `make small` (32-bit, float,
@@ -139,13 +142,14 @@ vm/tilvm --stats prog.tbc                           # GC / heap statistics
 Integration notes for common platforms (the core is verified in simulators;
 these glue snippets are starting points and have not been run on hardware):
 
-* **TI-84 Plus CE** (eZ80, CE C toolchain): `vm.write` → `os_PutStrFull` /
-  `os_NewLine`; keep `TILVM_HEAP_SIZE` ≤ 32 KB; `tilvm_run_steps` +
-  `os_GetCSC()` between slices lets [ON] stop a program. Use `TILVM_FLOAT=1`.
-* **TI-83 Plus / TI-84 Plus** (Z80): not yet — with SDCC the VM is ~70 KB of
-  code, more than the Z80's 64 KB address space; it needs a banked Flash
-  application or a 16-bit build (see `ports/z80/RESULTS.md`). Output would use
-  the `_PutC`/`_PutS` bcalls.
+* **TI-84 Plus CE** (eZ80, CE C toolchain): a complete port is in
+  `ports/ti84ce/` (programs in AppVars, home-screen console, keys, graphx
+  screen hooks, [on] = break); its host code is tested on the desktop, the
+  `.8xp` build itself is not verified yet — see `ports/ti84ce/README.md`.
+* **TI-83 Plus / TI-84 Plus** (Z80): the 16-bit lean VM fits below 0xC000 and
+  runs on a simulated Z80 (`ports/z80/`); on the calculators it needs a
+  three-page Flash application (not done, see `ports/z80/RESULTS.md`). Output
+  would use the `_PutC`/`_PutS` bcalls.
 * **Casio fx-CG50 / fx-9860G** (SH4, gint SDK): `vm.write` → `dtext` into a
   scrolling console buffer + `dupdate`; `clock_ms` from `rtc_ticks`.
 * **NumWorks** (Cortex-M7, external apps / `eadk`): `vm.write` →
