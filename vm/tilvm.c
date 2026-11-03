@@ -86,6 +86,14 @@ enum {
 #define TV_STR_MAX 0xFFFFFFul
 #endif
 
+/* Length / index of a string, array or map (see TILVM_ADDR16 in tilvm.h).
+ * Sums and products of lengths are computed in uint32_t before they are checked. */
+#ifdef TILVM_ADDR16
+typedef uint16_t tv_len;
+#else
+typedef uint32_t tv_len;
+#endif
+
 /* ─── heap objects ──────────────────────────────────────────────────────── */
 enum { OBJ_STR = 1, OBJ_ARRAY, OBJ_MAP, OBJ_VALS, OBJ_STRUCT, OBJ_CLOSURE, OBJ_CELL };
 
@@ -118,8 +126,16 @@ struct tv_align_probe { char c; tv_val v; };
 #define IS_HEAP(t) ((t) == TV_STR || (t) == TV_ARRAY || (t) == TV_MAP || (t) == TV_STRUCT || \
                     (t) == TV_CLOSURE || (t) == TV_CELL)
 
+#ifdef TILVM_LEAN
+/* 8-bit CPUs: one call instead of ~40 bytes of inline shifts per use */
+static uint16_t rd16(const uint8_t *p) { return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8)); }
+static uint32_t rd32(const uint8_t *p) { return (uint32_t)rd16(p) | ((uint32_t)rd16(p + 2) << 16); }
+#define RD16(p) rd16(p)
+#define RD32(p) rd32(p)
+#else
 #define RD16(p) ((uint16_t)((uint16_t)(p)[0] | ((uint16_t)(p)[1] << 8)))
 #define RD32(p) ((uint32_t)RD16(p) | ((uint32_t)RD16((p) + 2) << 16))
+#endif
 
 #define SP (vm->st.sp)
 #define STK (vm->st.stack)
@@ -156,6 +172,12 @@ static void set_int(tv_val *v, tv_int i) { v->t = TV_INT; v->u.i = i; }
 static void set_float(tv_val *v, tv_float f) { v->t = TV_FLOAT; v->u.f = f; }
 #endif
 static void set_ref(tv_val *v, uint8_t t, tv_ref r) { v->t = t; v->u.i = 0; v->u.r = r; }
+
+/* messages used in many places: a single copy in ROM on 8-bit targets */
+static const char E_STACK[] = "stack overflow";
+static const char E_STR_LONG[] = "string too long";
+static const char E_INDEX_INT[] = "index must be an integer";
+static const char E_NO_METHOD[] = "no method '";
 
 static int fail(tilvm *vm, const char *msg) {
     vm->err_msg = msg;
@@ -317,12 +339,12 @@ static void mark_val(tilvm *vm, const tv_val *v) {
     if (IS_HEAP(v->t)) mark_ref(vm, v->u.r);
 }
 
-static uint32_t obj_nvals(tilvm *vm, tv_ref r, tv_val **vals) {
+static tv_len obj_nvals(tilvm *vm, tv_ref r, tv_val **vals) {
     tv_hdr *h = OBJ(vm, r);
     switch (h->kind) {
     case OBJ_VALS: *vals = VALSOBJ(vm, r)->v; return h->aux;
     case OBJ_STRUCT: *vals = STRUCTOBJ(vm, r)->v;
-        return (uint32_t)((h->size - offsetof(tv_structobj, v)) / sizeof(tv_val));
+        return (tv_len)((h->size - offsetof(tv_structobj, v)) / sizeof(tv_val));
     case OBJ_CLOSURE: *vals = CLOSOBJ(vm, r)->v; return h->aux;
     case OBJ_CELL: *vals = &CELLOBJ(vm, r)->v; return 1;
     default: *vals = 0; return 0;
@@ -332,7 +354,7 @@ static uint32_t obj_nvals(tilvm *vm, tv_ref r, tv_val **vals) {
 static void scan_children(tilvm *vm, tv_ref r) {
     tv_hdr *h = OBJ(vm, r);
     tv_val *vals;
-    uint32_t n, i;
+    tv_len n, i;
     if (h->kind == OBJ_ARRAY || h->kind == OBJ_MAP) {
         mark_ref(vm, ARROBJ(vm, r)->buf);
         return;
@@ -351,7 +373,7 @@ static void fix_val(tilvm *vm, tv_val *v) {
 static void gc(tilvm *vm) {
     tilvm_state *st = &vm->st;
     tv_size start = (tv_size)ALIGN_UP(1), top = st->heap_top, scan, free_at;
-    uint32_t i;
+    tv_len i;
     st->gc_count++;
     /* 1. mark */
     vm->mark_sp = 0;
@@ -379,7 +401,7 @@ static void gc(tilvm *vm) {
     for (scan = start; scan < top; scan = (tv_size)(scan + OBJ(vm, scan)->size)) {
         tv_hdr *h = OBJ(vm, scan);
         tv_val *vals;
-        uint32_t n, k;
+        tv_len n, k;
         if (!h->mark) continue;
         if (h->kind == OBJ_ARRAY || h->kind == OBJ_MAP) {
             ARROBJ(vm, scan)->buf = fwd(vm, ARROBJ(vm, scan)->buf);
@@ -409,7 +431,7 @@ static const uint8_t *const_ptr(tilvm *vm, uint16_t k) { return vm->bc + vm->con
 
 static int is_str(const tv_val *v) { return v->t == TV_STR || v->t == TV_STRK; }
 
-static const char *str_data(tilvm *vm, const tv_val *v, uint32_t *len) {
+static const char *str_data(tilvm *vm, const tv_val *v, tv_len *len) {
     if (v->t == TV_STRK) {
         const uint8_t *p = const_ptr(vm, v->u.k);
         *len = RD16(p);
@@ -434,7 +456,7 @@ static tv_ref new_str(tilvm *vm, uint32_t len) {
 #ifndef TILVM_LEAN
 static int make_str(tilvm *vm, tv_val *dst, const char *s, uint32_t len) {
     tv_ref r;
-    if (len > TV_STR_MAX) return fail(vm, "string too long");
+    if (len > TV_STR_MAX) return fail(vm, E_STR_LONG);
     r = new_str(vm, len);
     if (!r) return 0;
     memcpy(STROBJ(vm, r)->data, s, len);
@@ -444,13 +466,13 @@ static int make_str(tilvm *vm, tv_val *dst, const char *s, uint32_t len) {
 #endif
 
 static int str_eq(tilvm *vm, const tv_val *a, const tv_val *b) {
-    uint32_t la, lb;
+    tv_len la, lb;
     const char *pa = str_data(vm, a, &la), *pb = str_data(vm, b, &lb);
     return la == lb && memcmp(pa, pb, la) == 0;
 }
 
 static int str_cmp(tilvm *vm, const tv_val *a, const tv_val *b) {
-    uint32_t la, lb, n;
+    tv_len la, lb, n;
     const char *pa = str_data(vm, a, &la), *pb = str_data(vm, b, &lb);
     int c;
     n = la < lb ? la : lb;
@@ -488,13 +510,13 @@ typedef struct sink {
     uint32_t len;
 } sink;
 
-static void sink_put(sink *s, const char *p, uint32_t n) {
+static void sink_put(sink *s, const char *p, tv_len n) {
     if (s->mode == 1) memcpy(s->dst + s->len, p, n);
     else if (s->mode == 2) out(s->vm, p, n);
     s->len += n;
 }
 
-static void sink_cstr(sink *s, const char *p) { sink_put(s, p, (uint32_t)strlen(p)); }
+static void sink_cstr(sink *s, const char *p) { sink_put(s, p, (tv_len)strlen(p)); }
 
 #if TILVM_FLOAT
 #if !defined(TILVM_NO_STDIO)
@@ -638,7 +660,7 @@ static void fmt_exp(char *buf, tv_float x, int prec) {
 static void emit_value(sink *s, const tv_val *v, int depth, int quote);
 
 static void emit_type_name(sink *s, uint16_t t) {
-    uint32_t n;
+    tv_len n;
     tv_val name;
     const char *p;
     name.t = TV_STRK;
@@ -649,7 +671,7 @@ static void emit_type_name(sink *s, uint16_t t) {
 
 static void emit_const_str(sink *s, uint16_t k) {
     tv_val v;
-    uint32_t n;
+    tv_len n;
     const char *p;
     v.t = TV_STRK;
     v.u.k = k;
@@ -660,7 +682,7 @@ static void emit_const_str(sink *s, uint16_t k) {
 static void emit_value(sink *s, const tv_val *v, int depth, int quote) {
     tilvm *vm = s->vm;
     char buf[48];
-    uint32_t n, i;
+    tv_len n, i;
     switch (v->t) {
     case TV_NIL: sink_cstr(s, "None"); return;
     case TV_BOOL: sink_cstr(s, v->u.i ? "true" : "false"); return;
@@ -689,7 +711,7 @@ static void emit_value(sink *s, const tv_val *v, int depth, int quote) {
     if (depth > 16) { sink_cstr(s, "..."); return; }
     if (v->t == TV_ARRAY || v->t == TV_MAP) {
         tv_arrobj *a = ARROBJ(vm, v->u.r);
-        uint32_t len = a->len;
+        tv_len len = a->len;
         tv_ref buf_ref = a->buf;
         sink_cstr(s, v->t == TV_ARRAY ? "[" : "{");
         for (i = 0; i < len; i++) {
@@ -736,7 +758,7 @@ static int to_str_slot(tilvm *vm, uint16_t slot) {
     if (is_str(v)) return 1;
     s.vm = vm; s.mode = 0; s.dst = 0; s.len = 0;
     emit_value(&s, v, 0, 0);
-    if (s.len > TV_STR_MAX) return fail(vm, "string too long");
+    if (s.len > TV_STR_MAX) return fail(vm, E_STR_LONG);
     r = new_str(vm, s.len);           /* GC may move objects: re-read the slot */
     if (!r) return 0;
     s.mode = 1; s.dst = STROBJ(vm, r)->data; s.len = 0;
@@ -753,7 +775,7 @@ static void print_value(tilvm *vm, const tv_val *v) {
 
 /* ─── equality / comparison / truthiness ───────────────────────────────── */
 static int truthy(tilvm *vm, const tv_val *v) {
-    uint32_t n;
+    tv_len n;
     switch (v->t) {
     case TV_NIL: return 0;
     case TV_BOOL: return v->u.i != 0;
@@ -779,8 +801,10 @@ static int is_num(const tv_val *v) {
 static tv_float as_float(const tv_val *v) { return v->t == TV_INT ? (tv_float)v->u.i : v->u.f; }
 #endif
 
+static int map_find(tilvm *vm, tv_ref map, const tv_val *key);
+
 static int equal(tilvm *vm, const tv_val *a, const tv_val *b, int depth) {
-    uint32_t i, n;
+    tv_len i, n;
     if (is_num(a) && is_num(b)) {
 #if TILVM_FLOAT
         if (a->t == TV_FLOAT || b->t == TV_FLOAT) return as_float(a) == as_float(b);
@@ -807,26 +831,17 @@ static int equal(tilvm *vm, const tv_val *a, const tv_val *b, int depth) {
                 if (!equal(vm, &VALS(vm, x->buf)[i], &VALS(vm, y->buf)[i], depth + 1)) return 0;
             return 1;
         }
-        for (i = 0; i < n; i++) {     /* maps: same keys, equal values */
-            tv_val *k = &VALS(vm, x->buf)[2 * i];
-            uint32_t j;
-            int found = 0;
-            for (j = 0; j < n; j++) {
-                if (equal(vm, k, &VALS(vm, y->buf)[2 * j], depth + 1)) {
-                    if (!equal(vm, &VALS(vm, x->buf)[2 * i + 1], &VALS(vm, y->buf)[2 * j + 1], depth + 1))
-                        return 0;
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found) return 0;
+        for (i = 0; i < n; i++) {     /* maps: same keys (scalars), equal values */
+            int j = map_find(vm, b->u.r, &VALS(vm, x->buf)[2 * i]);
+            if (j < 0 || !equal(vm, &VALS(vm, x->buf)[2 * i + 1], &VALS(vm, y->buf)[2 * j + 1], depth + 1))
+                return 0;
         }
         return 1;
     }
     if (a->t == TV_STRUCT) {
         tv_hdr *ha = OBJ(vm, a->u.r), *hb = OBJ(vm, b->u.r);
         if (ha->aux != hb->aux) return 0;
-        n = (uint32_t)((ha->size - offsetof(tv_structobj, v)) / sizeof(tv_val));
+        n = (tv_len)((ha->size - offsetof(tv_structobj, v)) / sizeof(tv_val));
         for (i = 0; i < n; i++)
             if (!equal(vm, &STRUCTOBJ(vm, a->u.r)->v[i], &STRUCTOBJ(vm, b->u.r)->v[i], depth + 1)) return 0;
         return 1;
@@ -979,13 +994,13 @@ static int arith(tilvm *vm, int op) {
     }
 #endif
     if (op == OP_ADD && (is_str(a) || is_str(b))) {
-        uint32_t la, lb;
+        tv_len la, lb;
         tv_ref r;
         if (!to_str_slot(vm, (uint16_t)(SP - 2)) || !to_str_slot(vm, (uint16_t)(SP - 1))) return 0;
         str_data(vm, &STK[SP - 2], &la);
         str_data(vm, &STK[SP - 1], &lb);
-        if (la + lb > TV_STR_MAX) return fail(vm, "string too long");
-        r = new_str(vm, la + lb);
+        if ((uint32_t)la + lb > TV_STR_MAX) return fail(vm, E_STR_LONG);
+        r = new_str(vm, (uint32_t)la + lb);
         if (!r) return 0;
         {
             const char *pa = str_data(vm, &STK[SP - 2], &la);
@@ -998,15 +1013,23 @@ static int arith(tilvm *vm, int op) {
         return 1;
     }
     if (op == OP_MUL && is_str(a) && b->t == TV_INT) {
-        uint32_t la, k, times = b->u.i > 0 ? (uint32_t)b->u.i : 0;
+        tv_len la;
+        uint32_t k, times = b->u.i > 0 ? (uint32_t)b->u.i : 0;
         tv_ref r;
         str_data(vm, a, &la);
-        if (times && la > TV_STR_MAX / times) return fail(vm, "string too long");
+#ifdef TILVM_ADDR16     /* 16-bit lengths: no 32-bit multiply / divide routines */
+        if (times > TV_STR_MAX ? la != 0 : times && la > (tv_len)0xFFFFu / (tv_len)times)
+            return fail(vm, E_STR_LONG);
+        r = new_str(vm, (tv_len)(la * (tv_len)times));
+#else
+        if (times && la > TV_STR_MAX / times) return fail(vm, E_STR_LONG);
         r = new_str(vm, la * times);
+#endif
         if (!r) return 0;
         {
             const char *pa = str_data(vm, &STK[SP - 2], &la);
-            for (k = 0; k < times; k++) memcpy(STROBJ(vm, r)->data + k * la, pa, la);
+            char *d = STROBJ(vm, r)->data;
+            for (k = 0; k < times; k++, d += la) memcpy(d, pa, la);
         }
         set_ref(&STK[SP - 2], TV_STR, r);
         SP--;
@@ -1036,7 +1059,12 @@ static tv_ref new_vals(tilvm *vm, uint32_t cap) {
     tv_ref r;
     uint32_t i;
     if (cap > 0xFFFF) { fail(vm, "array too large"); return 0; }
+#ifdef TILVM_ADDR16     /* larger than the heap anyway; the product then fits 16 bits */
+    if (cap > TILVM_HEAP_SIZE / sizeof(tv_val)) { fail(vm, "out of memory"); return 0; }
+    r = alloc_obj(vm, OBJ_VALS, (uint32_t)offsetof(tv_valsobj, v) + (uint32_t)((tv_len)cap * sizeof(tv_val)));
+#else
     r = alloc_obj(vm, OBJ_VALS, (uint32_t)offsetof(tv_valsobj, v) + cap * (uint32_t)sizeof(tv_val));
+#endif
     if (!r) return 0;
     OBJ(vm, r)->aux = (uint16_t)cap;
     for (i = 0; i < cap; i++) set_nil(&VALS(vm, r)[i]);
@@ -1047,7 +1075,7 @@ static tv_ref new_vals(tilvm *vm, uint32_t cap) {
 static int make_array(tilvm *vm, uint8_t kind, uint32_t n) {
     uint32_t nvals = kind == OBJ_MAP ? 2 * n : n, cap = nvals < 4 ? 4 : nvals, i;
     tv_ref buf, arr;
-    if (SP + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+    if (SP + 2 > TILVM_STACK_SIZE) return fail(vm, E_STACK);
     buf = new_vals(vm, cap);
     if (!buf) return 0;
     set_ref(&STK[SP], TV_CELL, buf);          /* keep the buffer rooted */
@@ -1097,10 +1125,10 @@ static int array_push(tilvm *vm, uint16_t arr_slot, uint16_t val_slot) {
 #ifndef TILVM_LEAN
 static int tv_array_concat(tilvm *vm) {    /* [.., a, b] -> [.., a+b] */
     uint32_t la = ARROBJ(vm, STK[SP - 2].u.r)->len, lb = ARROBJ(vm, STK[SP - 1].u.r)->len, i;
-    if (SP + 1 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+    if (SP + 1 > TILVM_STACK_SIZE) return fail(vm, E_STACK);
     for (i = 0; i < la + lb; i++) {           /* push copies of all elements */
         tv_val v;
-        if (SP >= TILVM_STACK_SIZE - 2) return fail(vm, "stack overflow");
+        if (SP >= TILVM_STACK_SIZE - 2) return fail(vm, E_STACK);
         v = i < la ? VALS(vm, ARROBJ(vm, STK[SP - 2 - i].u.r)->buf)[i]
                    : VALS(vm, ARROBJ(vm, STK[SP - 1 - i].u.r)->buf)[i - la];
         STK[SP++] = v;
@@ -1124,7 +1152,7 @@ static void map_key(tv_val *k) {
 
 static int map_find(tilvm *vm, tv_ref map, const tv_val *key) {
     tv_arrobj *m = ARROBJ(vm, map);
-    uint32_t i, n = m->len;
+    tv_len i, n = m->len;
     for (i = 0; i < n; i++)
         if (equal(vm, &VALS(vm, m->buf)[2 * i], key, 0)) return (int)i;
     return -1;
@@ -1162,22 +1190,22 @@ static int map_set(tilvm *vm, uint16_t map_slot, uint16_t key_slot, uint16_t val
 
 static void map_delete(tilvm *vm, tv_ref map, int i) {
     tv_arrobj *m = ARROBJ(vm, map);
-    uint32_t j, n = m->len;
+    tv_len j, n = m->len;
     tv_val *v = VALS(vm, m->buf);
-    for (j = (uint32_t)i; j + 1 < n; j++) { v[2 * j] = v[2 * j + 2]; v[2 * j + 1] = v[2 * j + 3]; }
+    for (j = (tv_len)i; j + 1 < n; j++) { v[2 * j] = v[2 * j + 2]; v[2 * j + 1] = v[2 * j + 3]; }
     set_nil(&v[2 * (n - 1)]);
     set_nil(&v[2 * (n - 1) + 1]);
     m->len = (tv_size)(n - 1);
 }
 
 static int key_not_found(tilvm *vm, uint16_t key_slot) {
-    uint32_t pos = 0, cap = sizeof(vm->errbuf) - 1;
+    tv_len pos = 0, cap = sizeof(vm->errbuf) - 1;
     sink s;
     const char *pre = "key not found: ";
     while (*pre && pos < cap) vm->errbuf[pos++] = *pre++;
     s.vm = vm; s.mode = 0; s.dst = 0; s.len = 0;
     emit_value(&s, &STK[key_slot], 0, 0);
-    if (s.len <= cap - pos) {
+    if (s.len <= (uint32_t)(cap - pos)) {
         s.mode = 1; s.dst = vm->errbuf + pos; s.len = 0;
         emit_value(&s, &STK[key_slot], 0, 0);
         pos += s.len;
@@ -1186,7 +1214,7 @@ static int key_not_found(tilvm *vm, uint16_t key_slot) {
     return fail(vm, vm->errbuf);
 }
 
-static int bounds_error(tilvm *vm, tv_int idx, uint32_t len) {
+static int bounds_error(tilvm *vm, tv_int idx, tv_len len) {
     return failf(vm, "index out of bounds: index ", idx, ", length ", (tv_int)len, "");
 }
 
@@ -1194,9 +1222,9 @@ static int bounds_error(tilvm *vm, tv_int idx, uint32_t len) {
 static int get_index(tilvm *vm) {
     tv_val *o = &STK[SP - 2], *ix = &STK[SP - 1];
     if (o->t == TV_ARRAY || is_str(o)) {
-        uint32_t len;
+        tv_len len;
         const char *p = 0;
-        if (ix->t != TV_INT) return fail(vm, "index must be an integer");
+        if (ix->t != TV_INT) return fail(vm, E_INDEX_INT);
         if (o->t == TV_ARRAY) len = ARROBJ(vm, o->u.r)->len;
         else p = str_data(vm, o, &len);
         if (ix->u.i < 0 || (tv_uint)ix->u.i >= len) return bounds_error(vm, ix->u.i, len);
@@ -1216,7 +1244,7 @@ static int get_index(tilvm *vm) {
     }
     if (o->t == TV_STRUCT && ix->t == TV_INT) {
         tv_hdr *h = OBJ(vm, o->u.r);
-        uint32_t n = (uint32_t)((h->size - offsetof(tv_structobj, v)) / sizeof(tv_val));
+        tv_len n = (tv_len)((h->size - offsetof(tv_structobj, v)) / sizeof(tv_val));
         if (ix->u.i >= 0 && (tv_uint)ix->u.i < n) {
             *o = STRUCTOBJ(vm, o->u.r)->v[ix->u.i];
             SP--;
@@ -1237,8 +1265,8 @@ static int get_index(tilvm *vm) {
 static int set_index(tilvm *vm) {
     tv_val *o = &STK[SP - 3], *ix = &STK[SP - 2];
     if (o->t == TV_ARRAY) {
-        uint32_t len = ARROBJ(vm, o->u.r)->len;
-        if (ix->t != TV_INT) return fail(vm, "index must be an integer");
+        tv_len len = ARROBJ(vm, o->u.r)->len;
+        if (ix->t != TV_INT) return fail(vm, E_INDEX_INT);
         if (ix->u.i < 0 || (tv_uint)ix->u.i >= len) return bounds_error(vm, ix->u.i, len);
         VALS(vm, ARROBJ(vm, o->u.r)->buf)[ix->u.i] = STK[SP - 1];
         SP -= 3;
@@ -1272,7 +1300,7 @@ static int no_field(tilvm *vm, uint16_t name_const, const tv_val *obj) {
     const uint8_t *p = const_ptr(vm, name_const);
     uint16_t len = RD16(p), pos = 0;
     const char *pre = "no field '", *mid = "' on ", *tn = type_name(vm, obj);
-    uint32_t tl = (uint32_t)strlen(tn);
+    tv_len tl = (tv_len)strlen(tn);
     if (obj->t == TV_STRUCT) {
         tv_val nv;
         nv.t = TV_STRK;
@@ -1292,7 +1320,7 @@ static int no_field(tilvm *vm, uint16_t name_const, const tv_val *obj) {
 }
 
 static int new_struct(tilvm *vm, uint16_t t, uint8_t n) {
-    tv_ref r = alloc_obj(vm, OBJ_STRUCT, (uint32_t)offsetof(tv_structobj, v) + n * (uint32_t)sizeof(tv_val));
+    tv_ref r = alloc_obj(vm, OBJ_STRUCT, (uint32_t)offsetof(tv_structobj, v) + (uint32_t)(n * sizeof(tv_val)));
     uint8_t i;
     if (!r) return 0;
     OBJ(vm, r)->aux = t;
@@ -1304,8 +1332,8 @@ static int new_struct(tilvm *vm, uint16_t t, uint8_t n) {
 }
 
 /* ─── casts ─────────────────────────────────────────────────────────────── */
-static int parse_int(const char *p, uint32_t n, tv_int *out_i) {
-    uint32_t i = 0;
+static int parse_int(const char *p, tv_len n, tv_int *out_i) {
+    tv_len i = 0;
     int neg = 0, any = 0;
     tv_uint v = 0;
     while (i < n && (p[i] == ' ' || p[i] == '\t' || p[i] == '\n' || p[i] == '\r')) i++;
@@ -1323,7 +1351,7 @@ static int parse_int(const char *p, uint32_t n, tv_int *out_i) {
 }
 
 #if TILVM_FLOAT
-static int parse_float(const char *p, uint32_t n, tv_float *out_f) {
+static int parse_float(const char *p, tv_len n, tv_float *out_f) {
     char buf[64];
     if (n == 0 || n >= sizeof(buf)) return 0;
     memcpy(buf, p, n);
@@ -1361,7 +1389,7 @@ static int parse_float(const char *p, uint32_t n, tv_float *out_f) {
 #endif
 
 static int invalid_number(tilvm *vm, uint16_t slot, const char *what) {
-    uint32_t n, pos = 0, cap = sizeof(vm->errbuf) - 4;
+    tv_len n, pos = 0, cap = sizeof(vm->errbuf) - 4;
     const char *p = str_data(vm, &STK[slot], &n);
     while (*what && pos < cap) vm->errbuf[pos++] = *what++;
     vm->errbuf[pos++] = '"';
@@ -1398,7 +1426,7 @@ static int cast_slot(tilvm *vm, uint16_t slot, int kind) {
         }
 #endif
         case TV_STR: case TV_STRK: {
-            uint32_t n;
+            tv_len n;
             const char *p = str_data(vm, v, &n);
             tv_int i;
             if (!parse_int(p, n, &i)) return invalid_number(vm, slot, "invalid integer: ");
@@ -1414,7 +1442,7 @@ static int cast_slot(tilvm *vm, uint16_t slot, int kind) {
     case TV_INT: case TV_BOOL: set_float(v, (tv_float)v->u.i); return 1;
     case TV_NIL: set_float(v, 0); return 1;
     case TV_STR: case TV_STRK: {
-        uint32_t n;
+        tv_len n;
         const char *p = str_data(vm, v, &n);
         tv_float f;
         if (!parse_float(p, n, &f)) return invalid_number(vm, slot, "invalid number: ");
@@ -1433,7 +1461,8 @@ static int cast_slot(tilvm *vm, uint16_t slot, int kind) {
 static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
     /* [<>^][0][width][.prec][fdxXobe%] - same rules as til_format_spec() */
     char body[96], *b = body;
-    uint32_t slen, blen, pad, i, width = 0;
+    tv_len slen, blen;
+    uint32_t pad, i, width = 0;
     const char *sp = str_data(vm, &STK[spec_slot], &slen);
     char align = 0, kind = 0;
     int zero = 0, prec = -1, ok = 1, explicit_align;
@@ -1511,7 +1540,7 @@ static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
         uint32_t total;
         tv_ref r;
         int numeric = is_num(&STK[vslot]) && b != 0;
-        if (b) { src = body; blen = (uint32_t)strlen(body); }
+        if (b) { src = body; blen = (tv_len)strlen(body); }
         else src = str_data(vm, &STK[vslot], &blen);
         total = blen < width ? width : blen;
         r = new_str(vm, total);
@@ -1590,7 +1619,7 @@ typedef char tv_check_native_tables[(sizeof(NATIVE_MIN_ARGS) == N_NATIVES) ? 1 :
 
 /* Copy a string value into a NUL-terminated C path. */
 static int c_path(tilvm *vm, const tv_val *v, char *buf, const char *who) {
-    uint32_t n;
+    tv_len n;
     const char *p;
     if (!is_str(v)) return failn(vm, who, "() expects a path string, got ", type_name(vm, v), 0, 0, 0);
     p = str_data(vm, v, &n);
@@ -1604,7 +1633,7 @@ static int c_path(tilvm *vm, const tv_val *v, char *buf, const char *who) {
 static int push_new_array(tilvm *vm, uint32_t n) {
     tv_ref buf, arr;
     if (n > 0xFFFF) return fail(vm, "array too large");
-    if (SP + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+    if (SP + 2 > TILVM_STACK_SIZE) return fail(vm, E_STACK);
     buf = new_vals(vm, n < 4 ? 4 : n);
     if (!buf) return 0;
     set_ref(&STK[SP], TV_CELL, buf);          /* keep the buffer rooted */
@@ -1638,7 +1667,7 @@ static int native_read_file(tilvm *vm, uint16_t base, tv_val *res) {
 
 static int native_write_file(tilvm *vm, uint16_t base) {
     char path[TV_PATH_MAX];
-    uint32_t n;
+    tv_len n;
     const char *d;
     if (!c_path(vm, &STK[base], path, "write_file")) return 0;
     if (!vm->host.write_file) return fail(vm, "write_file() is not available on this device");
@@ -1668,8 +1697,8 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     case N_ITER:
         if (a->t == TV_MAP) {
             /* keys snapshot: push keys, make array */
-            uint32_t n = ARROBJ(vm, a->u.r)->len, i;
-            if (SP + n + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+            tv_len n = ARROBJ(vm, a->u.r)->len, i;
+            if ((uint32_t)SP + n + 2 > TILVM_STACK_SIZE) return fail(vm, E_STACK);
             for (i = 0; i < n; i++) STK[SP++] = VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[2 * i];
             if (!make_array(vm, OBJ_ARRAY, n)) return 0;
             STK[base] = STK[SP - 1];
@@ -1680,7 +1709,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         res = *a;
         break;
     case N_LEN: {
-        uint32_t n;
+        tv_len n;
         if (is_str(a)) str_data(vm, a, &n);
         else if (a->t == TV_ARRAY || a->t == TV_MAP) n = ARROBJ(vm, a->u.r)->len;
         else return failn(vm, "len() of ", type_name(vm, a), 0, 0, 0, 0);
@@ -1730,7 +1759,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     case N_MIN: case N_MAX: case N_SUM: {
         /* over the arguments, or over a single array argument */
         tv_val *vals = a;
-        uint32_t n = argc, i;
+        tv_len n = argc, i;
         int r;
         tv_val best;
         if (argc == 1 && a->t == TV_ARRAY) {
@@ -1739,7 +1768,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         }
         if (id == N_SUM) {
             /* push 0, then add each element (arith works on stack slots) */
-            if (SP + 3 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+            if (SP + 3 > TILVM_STACK_SIZE) return fail(vm, E_STACK);
             set_int(&STK[SP++], 0);
             for (i = 0; i < n; i++) {
                 if (argc == 1 && STK[base].t == TV_ARRAY)
@@ -1788,7 +1817,8 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         break;
     }
     case N_ORD: {
-        uint32_t n, c;
+        tv_len n;
+        uint32_t c;
         const uint8_t *p;
         if (!is_str(a)) return fail(vm, "ord() expects a non-empty string");
         p = (const uint8_t *)str_data(vm, a, &n);
@@ -1877,7 +1907,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     case N_ARGS: {
         int i, n = vm->host.argv ? vm->host.argc : 0;
         if (n < 0) n = 0;
-        if ((uint32_t)SP + (uint32_t)n + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+        if ((uint32_t)SP + (uint32_t)n + 2 > TILVM_STACK_SIZE) return fail(vm, E_STACK);
         SP = base;
         for (i = 0; i < n; i++) {
             const char *s = vm->host.argv[i] ? vm->host.argv[i] : "";
@@ -1887,7 +1917,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         return make_array(vm, OBJ_ARRAY, (uint32_t)n);
     }
     case N_BYTES_TO_STR: {
-        uint32_t n, i;
+        tv_len n, i;
         tv_ref r;
         if (a->t != TV_ARRAY) return fail(vm, "bytes_to_str() expects an array of ints 0..255");
         n = ARROBJ(vm, a->u.r)->len;
@@ -1904,7 +1934,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         break;
     }
     case N_STR_BYTES: {
-        uint32_t n, i;
+        tv_len n, i;
         const uint8_t *p;
         tv_ref buf;
         if (!is_str(a)) return failn(vm, "str_bytes() expects a string, got ", type_name(vm, a), 0, 0, 0, 0);
@@ -1942,23 +1972,26 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
 }
 
 /* ─── builtin methods ───────────────────────────────────────────────────── */
-static int find_bytes(const char *h, uint32_t hl, const char *n, uint32_t nl, uint32_t from) {
-    uint32_t i;
+static int find_bytes(const char *h, tv_len hl, const char *n, tv_len nl, tv_len from) {
+    tv_len i;
     if (nl == 0) return (int)from;
-    for (i = from; i + nl <= hl; i++)
+    for (i = from; (uint32_t)i + nl <= hl; i++)
         if (memcmp(h + i, n, nl) == 0) return (int)i;
     return -1;
 }
 
 static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_val *res) {
-    uint32_t n, m = 0;
+    tv_len n, m = 0;
     const char *s = str_data(vm, &STK[base], &n);
     tv_val *a1 = &STK[base + 1];
     switch (mid) {
     case M_LEN: set_int(res, (tv_int)n); return 1;
     case M_IS_EMPTY: set_bool(res, n == 0); return 1;
     case M_CONTAINS: case M_STARTS_WITH: case M_ENDS_WITH: case M_FIND: case M_INDEX_OF:
-    case M_COUNT: case M_EQ: {
+#ifndef TILVM_LEAN
+    case M_COUNT:
+#endif
+    case M_EQ: {
         const char *t;
         if (!argc || !is_str(a1)) return failn(vm, "str.", METHOD_NAMES[mid], " expects a string argument", 0, 0, 0);
         t = str_data(vm, a1, &m);
@@ -1966,16 +1999,19 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         else if (mid == M_STARTS_WITH) set_bool(res, m <= n && memcmp(s, t, m) == 0);
         else if (mid == M_ENDS_WITH) set_bool(res, m <= n && memcmp(s + n - m, t, m) == 0);
         else if (mid == M_EQ) set_bool(res, m == n && memcmp(s, t, m) == 0);
+#ifndef TILVM_LEAN
         else if (mid == M_COUNT) {
             tv_int c = 0;
             int at = 0;
-            if (m) while ((at = find_bytes(s, n, t, m, (uint32_t)at)) >= 0) { c++; at += (int)m; }
+            if (m) while ((at = find_bytes(s, n, t, m, (tv_len)at)) >= 0) { c++; at += (int)m; }
             set_int(res, c);
-        } else set_int(res, find_bytes(s, n, t, m, 0));
+        }
+#endif
+        else set_int(res, find_bytes(s, n, t, m, 0));
         return 1;
     }
     case M_GET:
-        if (!argc || a1->t != TV_INT) return fail(vm, "index must be an integer");
+        if (!argc || a1->t != TV_INT) return fail(vm, E_INDEX_INT);
         if (a1->u.i < 0 || (tv_uint)a1->u.i >= n) return bounds_error(vm, a1->u.i, n);
         set_int(res, (tv_int)(uint8_t)s[a1->u.i]);
         return 1;
@@ -1983,32 +2019,44 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
     case M_TRIM: case M_REPEAT:
 #endif
     case M_TO_UPPER: case M_TO_LOWER: case M_SLICE: {
-        uint32_t lo = 0, hi = n, i, times = 1;
+        tv_len lo = 0, hi = n;
+        uint32_t i, times = 1;
         tv_ref r;
+#ifndef TILVM_LEAN
         if (mid == M_TRIM) {
             while (lo < hi && (s[lo] == ' ' || s[lo] == '\t' || s[lo] == '\r' || s[lo] == '\n')) lo++;
             while (hi > lo && (s[hi - 1] == ' ' || s[hi - 1] == '\t' || s[hi - 1] == '\r' || s[hi - 1] == '\n')) hi--;
-        } else if (mid == M_SLICE) {
+        } else
+#endif
+        if (mid == M_SLICE) {
             tv_int x = argc && a1->t == TV_INT ? a1->u.i : 0;
             tv_int y = argc > 1 && STK[base + 2].t == TV_INT ? STK[base + 2].u.i : (tv_int)n;
             if (x < 0) x = 0;
             if (y > (tv_int)n) y = (tv_int)n;
             if (x > (tv_int)n) x = (tv_int)n;
             if (y < 0) y = 0;
-            lo = (uint32_t)x;
-            hi = (uint32_t)(y > x ? y : x);
-        } else if (mid == M_REPEAT) {
+            lo = (tv_len)x;
+            hi = (tv_len)(y > x ? y : x);
+        }
+#ifndef TILVM_LEAN
+        else if (mid == M_REPEAT) {
             if (!argc || a1->t != TV_INT) return fail(vm, "repeat() needs an integer");
             times = a1->u.i > 0 ? (uint32_t)a1->u.i : 0;
-            if (times && n > TV_STR_MAX / times) return fail(vm, "string too long");
+            if (times && n > TV_STR_MAX / times) return fail(vm, E_STR_LONG);
         }
-        r = new_str(vm, (hi - lo) * times);
+        r = new_str(vm, (uint32_t)(hi - lo) * times);
+#else
+        r = new_str(vm, (uint32_t)(hi - lo));
+#endif
         if (!r) return 0;
         s = str_data(vm, &STK[base], &n);
-        for (i = 0; i < times; i++) memcpy(STROBJ(vm, r)->data + i * (hi - lo), s + lo, hi - lo);
+        {
+            char *d = STROBJ(vm, r)->data;
+            for (i = 0; i < times; i++, d += hi - lo) memcpy(d, s + lo, hi - lo);
+        }
         if (mid == M_TO_UPPER || mid == M_TO_LOWER) {
             char *d = STROBJ(vm, r)->data;
-            for (i = 0; i < hi - lo; i++) {
+            for (i = 0; i < (uint32_t)(hi - lo); i++) {
                 if (mid == M_TO_UPPER && d[i] >= 'a' && d[i] <= 'z') d[i] = (char)(d[i] - 32);
                 if (mid == M_TO_LOWER && d[i] >= 'A' && d[i] <= 'Z') d[i] = (char)(d[i] + 32);
             }
@@ -2019,7 +2067,8 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
 #ifndef TILVM_LEAN
     case M_REPLACE: {
         const char *t, *u;
-        uint32_t ul, count = 0, i, w;
+        tv_len ul;
+        uint32_t count = 0, i, w;
         int at;
         tv_ref r;
         if (argc < 2 || !is_str(a1)) return fail(vm, "replace() needs two strings");
@@ -2029,9 +2078,9 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         if (!m) { *res = STK[base]; return 1; }
         str_data(vm, &STK[base + 2], &ul);
         at = 0;
-        while ((at = find_bytes(s, n, t, m, (uint32_t)at)) >= 0) { count++; at += (int)m; }
-        if (ul > m && (uint32_t)count > (TV_STR_MAX - n) / (ul - m)) return fail(vm, "string too long");
-        r = new_str(vm, n + count * ul - count * m);
+        while ((at = find_bytes(s, n, t, m, (tv_len)at)) >= 0) { count++; at += (int)m; }
+        if (ul > m && (uint32_t)count > (TV_STR_MAX - n) / (ul - m)) return fail(vm, E_STR_LONG);
+        r = new_str(vm, (uint32_t)n + count * ul - count * m);
         if (!r) return 0;
         s = str_data(vm, &STK[base], &n);
         t = str_data(vm, &STK[base + 1], &m);
@@ -2070,9 +2119,9 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
             } else {
                 at = find_bytes(s, n, t, m, start);
                 pend = at < 0 ? n : (uint32_t)at;
-                next = at < 0 ? n + 1 : (uint32_t)at + m;
+                next = at < 0 ? (uint32_t)n + 1 : (uint32_t)at + m;
             }
-            if (SP + 3 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+            if (SP + 3 > TILVM_STACK_SIZE) return fail(vm, E_STACK);
             {
                 tv_ref r = new_str(vm, pend - start);
                 if (!r) return 0;
@@ -2093,7 +2142,7 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
 #ifndef TILVM_LEAN
     case M_TO_FLOAT: if (!cast_slot(vm, base, 1)) return 0; *res = STK[base]; return 1;
 #endif
-    default: return failn(vm, "no method '", mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on str", 0, 0, 0);
+    default: return failn(vm, E_NO_METHOD, mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on str", 0, 0, 0);
     }
 }
 
@@ -2101,7 +2150,7 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
 static void sort_array(tilvm *vm, tv_ref arr, int *err) {
     /* stable insertion sort (small, no recursion, no malloc) */
     tv_arrobj *a = ARROBJ(vm, arr);
-    uint32_t n = a->len, i, j;
+    tv_len n = a->len, i, j;
     tv_val *v = VALS(vm, a->buf), key;
     int lt;
     for (i = 0; i < n; i++) {
@@ -2127,7 +2176,7 @@ static void sort_array(tilvm *vm, tv_ref arr, int *err) {
 
 static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_val *res) {
     tv_arrobj *a = ARROBJ(vm, STK[base].u.r);
-    uint32_t n = a->len, i;
+    tv_len n = a->len, i;
     tv_val *v = VALS(vm, a->buf), *a1 = &STK[base + 1];
     switch (mid) {
     case M_LEN: set_int(res, (tv_int)n); return 1;
@@ -2146,15 +2195,15 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
 #endif
     case M_GET: case M_SET: {
         tv_int k;
-        if (!argc || a1->t != TV_INT) return fail(vm, "index must be an integer");
+        if (!argc || a1->t != TV_INT) return fail(vm, E_INDEX_INT);
         k = a1->u.i;
         if (mid == M_INSERT) {
             if (k < 0 || (tv_uint)k > n) return failf(vm, "insert index out of bounds: ", k, 0, 0, "");
             if (argc < 2) return fail(vm, "insert() needs an index and a value");
-            if (!reserve(vm, base, n + 1)) return 0;
+            if (!reserve(vm, base, (uint32_t)n + 1)) return 0;
             a = ARROBJ(vm, STK[base].u.r);
             v = VALS(vm, a->buf);
-            for (i = n; i > (uint32_t)k; i--) v[i] = v[i - 1];
+            for (i = n; i > (tv_len)k; i--) v[i] = v[i - 1];
             v[k] = STK[base + 2];
             a->len = (tv_size)(n + 1);
             return 1;
@@ -2166,7 +2215,7 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
         if (mid == M_GET) { *res = v[k]; return 1; }
         if (mid == M_SET) { if (argc < 2) return fail(vm, "set() needs an index and a value"); v[k] = STK[base + 2]; return 1; }
         *res = v[k];
-        for (i = (uint32_t)k; i + 1 < n; i++) v[i] = v[i + 1];
+        for (i = (tv_len)k; i + 1 < n; i++) v[i] = v[i + 1];
         set_nil(&v[n - 1]);
         a->len = (tv_size)(n - 1);
         return 1;
@@ -2218,29 +2267,30 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
             if (hi > (tv_int)n) hi = (tv_int)n;
             if (lo > hi) lo = hi;
         }
-        if (SP + (uint32_t)(hi - lo) + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
-        for (i = (uint32_t)lo; i < (uint32_t)hi; i++) STK[SP++] = VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[i];
+        if (SP + (uint32_t)(hi - lo) + 2 > TILVM_STACK_SIZE) return fail(vm, E_STACK);
+        for (i = (tv_len)lo; i < (tv_len)hi; i++) STK[SP++] = VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[i];
         if (!make_array(vm, OBJ_ARRAY, (uint32_t)(hi - lo))) return 0;
         *res = STK[--SP];
         return 1;
     }
     case M_JOIN: {
         /* convert every element to a string on the stack, then concatenate */
-        uint32_t total = 0, sl = 0, k;
+        uint32_t total = 0, k;
+        tv_len sl = 0;
         tv_ref r;
-        if (SP + n + 3 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+        if ((uint32_t)SP + n + 3 > TILVM_STACK_SIZE) return fail(vm, E_STACK);
         if (argc) { if (!to_str_slot(vm, (uint16_t)(base + 1))) return 0; str_data(vm, &STK[base + 1], &sl); }
         for (i = 0; i < n; i++) {
             STK[SP++] = VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[i];
             if (!to_str_slot(vm, (uint16_t)(SP - 1))) return 0;
-            { uint32_t l; str_data(vm, &STK[SP - 1], &l); total += l; }
+            { tv_len l; str_data(vm, &STK[SP - 1], &l); total += l; }
         }
-        if (n) total += sl * (n - 1);
-        if (total > TV_STR_MAX) return fail(vm, "string too long");
+        if (n) total += (uint32_t)sl * (n - 1);
+        if (total > TV_STR_MAX) return fail(vm, E_STR_LONG);
         r = new_str(vm, total);
         if (!r) return 0;
         for (i = 0, k = 0; i < n; i++) {
-            uint32_t l;
+            tv_len l;
             const char *p;
             if (i && sl) { p = str_data(vm, &STK[base + 1], &l); memcpy(STROBJ(vm, r)->data + k, p, l); k += l; }
             p = str_data(vm, &STK[SP - n + i], &l);
@@ -2252,13 +2302,13 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
         return 1;
     }
 #endif
-    default: return failn(vm, "no method '", mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on array", 0, 0, 0);
+    default: return failn(vm, E_NO_METHOD, mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on array", 0, 0, 0);
     }
 }
 
 static int map_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_val *res) {
     tv_ref m = STK[base].u.r;
-    uint32_t n = ARROBJ(vm, m)->len, i;
+    tv_len n = ARROBJ(vm, m)->len, i;
     int k;
     switch (mid) {
     case M_LEN: set_int(res, (tv_int)n); return 1;
@@ -2279,8 +2329,8 @@ static int map_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
     case M_VALUES: case M_COPY:
 #endif
     case M_KEYS: {
-        uint32_t per = mid == M_COPY ? 2 : 1;
-        if (SP + per * n + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+        uint32_t need = mid == M_COPY ? 2u * (uint32_t)n : (uint32_t)n;
+        if (SP + need + 2 > TILVM_STACK_SIZE) return fail(vm, E_STACK);
         for (i = 0; i < n; i++) {
             tv_val *v = VALS(vm, ARROBJ(vm, STK[base].u.r)->buf);
             if (mid != M_VALUES) STK[SP++] = v[2 * i];
@@ -2298,7 +2348,7 @@ static int map_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         return 1;
     }
 #endif
-    default: return failn(vm, "no method '", mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on map", 0, 0, 0);
+    default: return failn(vm, E_NO_METHOD, mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on map", 0, 0, 0);
     }
 }
 
@@ -2331,7 +2381,7 @@ static int variant_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, t
     case M_ERROR:
         if (kind == TYPE_ERR) *res = STRUCTOBJ(vm, r->u.r)->v[0];
         return 1;
-    default: return failn(vm, "no method '", mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on ",
+    default: return failn(vm, E_NO_METHOD, mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on ",
                           r->t == TV_NIL ? "nil" : kind == TYPE_SOME ? "Some" : kind == TYPE_OK ? "Ok" : "Err", 0, 0);
     }
 }
@@ -2352,7 +2402,7 @@ static int call_method(tilvm *vm, uint8_t mid, uint8_t argc) {
     else if (r->t == TV_MAP) ok = map_method(vm, mid, base, argc, &res);
     else if (r->t == TV_NIL || (r->t == TV_STRUCT && OBJ(vm, r->u.r)->aux <= TYPE_ERR))
         ok = variant_method(vm, mid, base, argc, &res);
-    else ok = failn(vm, "no method '", mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on ", type_name(vm, r), 0, 0);
+    else ok = failn(vm, E_NO_METHOD, mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on ", type_name(vm, r), 0, 0);
     if (!ok) return 0;
     STK[base] = res;
     SP = (uint16_t)(base + 1);
@@ -2362,7 +2412,11 @@ static int call_method(tilvm *vm, uint8_t mid, uint8_t argc) {
 /* ─── loading ───────────────────────────────────────────────────────────── */
 static uint32_t fnv1a(const uint8_t *p, uint32_t n) {
     uint32_t h = 2166136261u, i;
+#ifdef TILVM_LEAN       /* h *= 16777619 (2^24 + 2^8 + 0x93) without a multiply routine */
+    for (i = 0; i < n; i++) { h ^= p[i]; h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24); }
+#else
     for (i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+#endif
     return h;
 }
 
@@ -2370,18 +2424,9 @@ static void reset_state(tilvm *vm) {
     tilvm_state *st = &vm->st;
     const uint8_t *f;
     uint16_t i;
+    memset(st, 0, offsetof(tilvm_state, frames));     /* counters, flags, sp = 0 */
     st->magic = 0x54494C53u;   /* "TILS" */
-    st->sp = 0;
-    st->n_frames = 0;
-    st->n_try = 0;
-    st->n_deadlines = 0;
     st->heap_top = (tv_size)ALIGN_UP(1);
-    st->halted = 0;
-    st->exit_code = 0;
-    st->failed = 0;
-    st->steps = 0;
-    st->gc_count = 0;
-    st->tick = 0;
     st->rng = 0x9E3779B9u;
 #if TILVM_INT_BITS == 64
     st->rng = 0x9E3779B97F4A7C15ULL;
@@ -2390,7 +2435,7 @@ static void reset_state(tilvm *vm) {
     f = func_rec(vm, vm->entry);
     st->frames[0].func = vm->entry;
     st->frames[0].base = st->sp;
-    st->frames[0].pc = vm->code_off + FN_OFFSET(f);
+    st->frames[0].pc = (tv_off)(vm->code_off + FN_OFFSET(f));
     st->frames[0].ret_pc = 0;
     st->frames[0].closure = 0;
     st->frames[0].extra = 0;
@@ -2405,6 +2450,9 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
     uint16_t n;
     if (size < 16 || bc[0] != 'T' || bc[1] != 'I' || bc[2] != 'L' || bc[3] != 'B') return -1;
     if (bc[4] < TILVM_BYTECODE_MIN_VERSION || bc[4] > TILVM_BYTECODE_VERSION) return -2;
+#ifdef TILVM_ADDR16
+    if (size > 0xFFFFu) return -10;        /* offsets are 16-bit */
+#endif
     vm->bc = bc;
     vm->bc_size = size;
     vm->flags = bc[5];
@@ -2486,13 +2534,13 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
 }
 
 /* ─── errors ────────────────────────────────────────────────────────────── */
-static uint16_t line_for(tilvm *vm, uint32_t pc) {
-    uint32_t lo = 0, hi = vm->n_lines, best = 0;
-    pc -= vm->code_off;
+static uint16_t line_for(tilvm *vm, tv_off pc) {
+    uint16_t lo = 0, hi = vm->n_lines, best = 0;
+    pc = (tv_off)(pc - vm->code_off);
     while (lo < hi) {
-        uint32_t mid = (lo + hi) / 2;
+        uint16_t mid = (uint16_t)(((uint32_t)lo + hi) / 2);
         const uint8_t *e = vm->bc + vm->lines_off + 6u * mid;
-        if (RD32(e) <= pc) { best = RD16(e + 4); lo = mid + 1; }
+        if (RD32(e) <= pc) { best = RD16(e + 4); lo = (uint16_t)(mid + 1); }
         else hi = mid;
     }
     return (uint16_t)best;
@@ -2505,21 +2553,21 @@ static void err_out(tilvm *vm, const char *s, size_t n) {
 
 static void err_cstr(tilvm *vm, const char *s) { err_out(vm, s, strlen(s)); }
 
-static void report(tilvm *vm, uint32_t pc, const char *prefix) {
+static void report(tilvm *vm, tv_off pc, const char *prefix) {
     char num[32];
     uint16_t i, line;
     err_cstr(vm, prefix);
     if (vm->err_msg) err_cstr(vm, vm->err_msg);
     if (is_str(&vm->err_val)) {
-        uint32_t n;
+        tv_len n;
         const char *p = str_data(vm, &vm->err_val, &n);
         err_out(vm, p, n);
     }
     err_cstr(vm, "\n");
     for (i = vm->st.n_frames; i > 0 && vm->st.n_frames - i < 8; i--) {
         tv_frame *fr = &vm->st.frames[i - 1];
-        uint32_t at = (i == vm->st.n_frames) ? pc : fr->pc - 1;
-        uint32_t nlen;
+        tv_off at = (tv_off)((i == vm->st.n_frames) ? pc : fr->pc - 1);
+        tv_len nlen;
         tv_val name;
         const char *p;
         name.t = TV_STRK;
@@ -2558,10 +2606,10 @@ static int recover(tilvm *vm, int target) {
     if (vm->err_val.t != TV_NIL && is_str(&vm->err_val) && (!vm->err_msg || !*vm->err_msg)) {
         st->stack[st->sp++] = vm->err_val;
     } else {
-        uint32_t ml = vm->err_msg ? (uint32_t)strlen(vm->err_msg) : 0, vl = 0;
+        tv_len ml = vm->err_msg ? (tv_len)strlen(vm->err_msg) : 0, vl = 0;
         if (is_str(&vm->err_val)) str_data(vm, &vm->err_val, &vl);
         st->stack[st->sp++] = vm->err_val;          /* keep it rooted during allocation */
-        r = new_str(vm, ml + vl);
+        r = new_str(vm, (uint32_t)ml + vl);
         if (!r) { set_nil(&st->stack[st->sp - 1]); }
         else {
             const char *p;
@@ -2616,7 +2664,7 @@ static void push_const(tilvm *vm, uint16_t k) {
 
 static int no_method_error(tilvm *vm, uint16_t name_c, const tv_val *recv) {
     char nm[64], tn[64];
-    uint32_t len;
+    tv_len len;
     tv_val nv;
     const char *np;
     nv.t = TV_STRK;
@@ -2632,7 +2680,7 @@ static int no_method_error(tilvm *vm, uint16_t name_c, const tv_val *recv) {
         memcpy(tn, np, len);
         tn[len] = 0;
     } else strcpy(tn, type_name(vm, recv));
-    return failn(vm, "no method '", nm, "' on ", tn, 0, 0);
+    return failn(vm, E_NO_METHOD, nm, "' on ", tn, 0, 0);
 }
 
 static uint16_t find_method(tilvm *vm, uint16_t t, uint16_t name_c, int *found) {
@@ -2653,7 +2701,7 @@ static uint16_t find_method(tilvm *vm, uint16_t t, uint16_t name_c, int *found) 
 /* Decode CALL / CALL_VALUE / INVOKE. Returns 1 when a bytecode function must be
  * entered (outputs set), 2 when a builtin method already left its result on the
  * stack, 0 on error. */
-static int prepare_call(tilvm *vm, uint8_t op, uint32_t *pc, uint16_t *fidx, uint8_t *argc,
+static int prepare_call(tilvm *vm, uint8_t op, tv_off *pc, uint16_t *fidx, uint8_t *argc,
                         uint8_t *extra, tv_ref *clos) {
     const uint8_t *code = vm->bc;
     if (op == OP_CALL) {
@@ -2715,7 +2763,7 @@ static int push_frame(tilvm *vm, uint16_t fidx, uint8_t argc, uint8_t extra, tv_
     uint8_t i;
     if (argc > FN_NPARAMS(f) || argc < FN_NREQ(f)) {
         char name[48], n1[32], n2[32];
-        uint32_t nl;
+        tv_len nl;
         tv_val nv;
         const char *np;
         nv.t = TV_STRK;
@@ -2728,7 +2776,7 @@ static int push_frame(tilvm *vm, uint16_t fidx, uint8_t argc, uint8_t extra, tv_
                      fmt_int(n2, (tv_int)argc), 0);
     }
     if (st->n_frames >= TILVM_MAX_FRAMES) { fail(vm, "stack overflow (recursion too deep)"); return -1; }
-    if (SP + (FN_NLOCALS(f) - argc) + 4 > TILVM_STACK_SIZE) { fail(vm, "stack overflow"); return -1; }
+    if (SP + (FN_NLOCALS(f) - argc) + 4 > TILVM_STACK_SIZE) { fail(vm, E_STACK); return -1; }
     nb = (uint16_t)(SP - argc);
     for (i = argc; i < FN_NPARAMS(f); i++) { STK[SP].t = TV_UNDEF; STK[SP].u.i = 0; SP++; }
     for (i = FN_NPARAMS(f); i < FN_NLOCALS(f); i++) set_nil(&STK[SP++]);
@@ -2738,7 +2786,7 @@ static int push_frame(tilvm *vm, uint16_t fidx, uint8_t argc, uint8_t extra, tv_
     fr->closure = clos;
     fr->extra = extra;
     fr->ret_pc = 0;
-    fr->pc = vm->code_off + FN_OFFSET(f);
+    fr->pc = (tv_off)(vm->code_off + FN_OFFSET(f));
     return 1;
 }
 
@@ -2771,7 +2819,8 @@ static int map_literal_fixup(tilvm *vm) {
 /* replace the top n values by one string (f-strings) */
 static int concat_values(tilvm *vm, uint8_t n) {
     uint8_t i;
-    uint32_t total = 0, k = 0, l;
+    uint32_t total = 0, k = 0;
+    tv_len l;
     uint16_t first = (uint16_t)(SP - n);
     tv_ref r;
     for (i = 0; i < n; i++) {
@@ -2779,7 +2828,7 @@ static int concat_values(tilvm *vm, uint8_t n) {
         str_data(vm, &STK[first + i], &l);
         total += l;
     }
-    if (total > TV_STR_MAX) return fail(vm, "string too long");
+    if (total > TV_STR_MAX) return fail(vm, E_STR_LONG);
     r = new_str(vm, total);
     if (!r) return 0;
     for (i = 0; i < n; i++) {
@@ -2793,7 +2842,7 @@ static int concat_values(tilvm *vm, uint8_t n) {
 }
 
 /* retry / timeout / intent recovery point */
-static int push_try(tilvm *vm, uint8_t op, uint32_t handler) {
+static int push_try(tilvm *vm, uint8_t op, tv_off handler) {
     tilvm_state *st = &vm->st;
     tv_try *t;
     uint32_t deadline = 0;
@@ -2830,13 +2879,226 @@ static int expired_try(tilvm *vm) {
 #define READ16() (pc += 2, RD16(code + pc - 2))
 #define READS16() ((int16_t)READ16())
 #define PANIC_IF(c) do { if (c) goto panic; } while (0)
-#define CHECK_STACK(n) PANIC_IF(SP + (n) > TILVM_STACK_SIZE && fail(vm, "stack overflow") == 0)
+#ifdef TILVM_ADDR16
+#define PC_REL(rel) ((tv_off)(pc + (tv_off)(rel)))          /* wraps modulo 64 KB */
+#else
+#define PC_REL(rel) ((uint32_t)((int32_t)pc + (rel)))
+#endif
+#define CHECK_STACK(n) PANIC_IF(SP + (n) > TILVM_STACK_SIZE && fail(vm, E_STACK) == 0)
 
+#ifdef TILVM_LEAN
+/* ─── data opcodes of lean builds ───────────────────────────────────────────
+ * TILVM_LEAN (8-bit CPUs): the stack and data opcodes run in this function and
+ * tilvm_run_steps keeps only the control flow. SDCC allocates registers far
+ * better in two medium-sized functions than in one huge one, and the shared
+ * push/pop tails below save more: the Z80 build is several KB smaller. Desktop
+ * builds keep the single loop (one dispatch per instruction).
+ * Same semantics as the cases in tilvm_run_steps - keep both in sync (tests run
+ * every program on a lean build too). Returns 1 ok, 0 runtime error, 2 bad opcode. */
+static int lean_op(tilvm *vm, uint8_t op, tv_off *pcp, uint16_t base, tv_frame *fr) {
+    const uint8_t *code = vm->bc;
+    tv_off pc = *pcp;
+    tv_val v, *sp = &STK[SP];                  /* sp[-1] is the top of the stack */
+    switch (op) {
+    case OP_NOP: break;
+    case OP_PUSH_NIL: set_nil(&v); goto push;
+    case OP_PUSH_TRUE: case OP_PUSH_FALSE: set_bool(&v, op == OP_PUSH_TRUE); goto push;
+    case OP_PUSH_I8: set_int(&v, (tv_int)(int8_t)READ8()); goto push;
+    case OP_PUSH_I16: set_int(&v, (tv_int)READS16()); goto push;
+    case OP_PUSH_CONST: CHECK_STACK(1); push_const(vm, READ16()); break;
+    case OP_POP: goto pop;
+    case OP_DUP: v = sp[-1]; goto push;
+    case OP_DUP2: CHECK_STACK(2); sp[0] = sp[-2]; sp[1] = sp[-1]; SP += 2; break;
+    case OP_SWAP: v = sp[-1]; sp[-1] = sp[-2]; sp[-2] = v; break;
+    case OP_LOAD_LOCAL: v = STK[base + READ8()]; goto push;
+    case OP_STORE_LOCAL: STK[base + READ8()] = sp[-1]; goto pop;
+    case OP_LOAD_GLOBAL: v = STK[READ16()]; goto push;
+    case OP_STORE_GLOBAL: STK[READ16()] = sp[-1]; goto pop;
+    case OP_LOAD_CELL: v = CELLOBJ(vm, STK[base + READ8()].u.r)->v; goto push;
+    case OP_STORE_CELL: CELLOBJ(vm, STK[base + READ8()].u.r)->v = sp[-1]; goto pop;
+    case OP_MAKE_CELL: {
+        uint8_t slot = READ8();
+        tv_ref r = alloc_obj(vm, OBJ_CELL, sizeof(tv_cellobj));
+        PANIC_IF(!r);
+        CELLOBJ(vm, r)->v = STK[base + slot];
+        set_ref(&STK[base + slot], TV_CELL, r);
+        break;
+    }
+    case OP_LOAD_UPVAL: v = CELLOBJ(vm, CLOSOBJ(vm, fr->closure)->v[READ8()].u.r)->v; goto push;
+    case OP_STORE_UPVAL: CELLOBJ(vm, CLOSOBJ(vm, fr->closure)->v[READ8()].u.r)->v = sp[-1]; goto pop;
+    case OP_LOAD_UPVAL_RAW: v = CLOSOBJ(vm, fr->closure)->v[READ8()]; goto push;
+    case OP_ARG_DEFAULT: {
+        uint8_t slot = READ8();
+        int16_t rel = READS16();
+        if (STK[base + slot].t != TV_UNDEF) pc = PC_REL(rel);
+        break;
+    }
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD: case OP_POW:
+        PANIC_IF(!arith(vm, op));               /* arith() has the int fast path too */
+        break;
+    case OP_NEG:
+        if (sp[-1].t == TV_INT) sp[-1].u.i = (tv_int)((tv_uint)0 - (tv_uint)sp[-1].u.i);
+#if TILVM_FLOAT
+        else if (sp[-1].t == TV_FLOAT) sp[-1].u.f = -sp[-1].u.f;
+#endif
+        else PANIC_IF(!fail(vm, "cannot negate a non-number"));
+        break;
+    case OP_NOT: set_bool(&sp[-1], !truthy(vm, &sp[-1])); break;
+    case OP_BNOT:
+        PANIC_IF(sp[-1].t != TV_INT && !fail(vm, "~ needs an integer"));
+        sp[-1].u.i = ~sp[-1].u.i;
+        break;
+    case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR: {
+        tv_int x = sp[-2].u.i, y = sp[-1].u.i, r;
+        PANIC_IF((sp[-2].t != TV_INT || sp[-1].t != TV_INT) && !fail(vm, "bitwise operators need integers"));
+        switch (op) {
+        case OP_BAND: r = x & y; break;
+        case OP_BOR: r = x | y; break;
+        case OP_BXOR: r = x ^ y; break;
+        case OP_SHL: r = (tv_int)((tv_uint)x << ((unsigned)y & (TILVM_INT_BITS - 1))); break;
+        default: r = ishr(x, (unsigned)y & (TILVM_INT_BITS - 1)); break;
+        }
+        set_int(&sp[-2], r);
+        goto pop;
+    }
+    case OP_EQ: case OP_NE: {
+        int e = equal(vm, &sp[-2], &sp[-1], 0);
+        set_bool(&sp[-2], op == OP_EQ ? e : !e);
+        goto pop;
+    }
+    case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
+        int r;
+        PANIC_IF(!compare(vm, op, &sp[-2], &sp[-1], &r));
+        set_bool(&sp[-2], r);
+        goto pop;
+    }
+    case OP_NEW_ARRAY: case OP_NEW_MAP: {
+        uint16_t n = READ16();
+        CHECK_STACK(2);
+        PANIC_IF(!make_array(vm, op == OP_NEW_MAP ? OBJ_MAP : OBJ_ARRAY, n));
+        break;
+    }
+    case OP_NEW_STRUCT: {
+        uint16_t t = READ16();
+        uint8_t n = READ8();
+        PANIC_IF(!new_struct(vm, t, n));
+        break;
+    }
+    case OP_GET_INDEX: PANIC_IF(!get_index(vm)); break;
+    case OP_SET_INDEX: PANIC_IF(!set_index(vm)); break;
+    case OP_GET_FIELD: case OP_SET_FIELD: {
+        uint16_t name_c = READ16();
+        tv_val *o = op == OP_GET_FIELD ? &sp[-1] : &sp[-2];
+        int slot = -1;
+        if (o->t == TV_STRUCT) slot = field_slot(vm, OBJ(vm, o->u.r)->aux, name_c);
+        if (slot < 0) { no_field(vm, name_c, o); goto panic; }
+        if (op == OP_GET_FIELD) *o = STRUCTOBJ(vm, o->u.r)->v[slot];
+        else { STRUCTOBJ(vm, o->u.r)->v[slot] = sp[-1]; SP -= 2; }
+        break;
+    }
+    case OP_GET_SLOT: {
+        uint8_t i = READ8();
+        tv_val *t = &sp[-1];
+        if (t->t == TV_STRUCT && i < (OBJ(vm, t->u.r)->size - offsetof(tv_structobj, v)) / sizeof(tv_val))
+            *t = STRUCTOBJ(vm, t->u.r)->v[i];
+        else if (t->t == TV_ARRAY && i < ARROBJ(vm, t->u.r)->len)
+            *t = VALS(vm, ARROBJ(vm, t->u.r)->buf)[i];
+        else { fail(vm, "pattern slot out of range"); goto panic; }
+        break;
+    }
+    case OP_MAKE_CLOSURE: {
+        uint16_t fidx = READ16();
+        uint8_t n = READ8(), i;
+        tv_ref r = alloc_obj(vm, OBJ_CLOSURE, (uint32_t)offsetof(tv_closobj, v) + (uint32_t)(n * sizeof(tv_val)));
+        PANIC_IF(!r);
+        OBJ(vm, r)->aux = n;
+        CLOSOBJ(vm, r)->func = fidx;
+        for (i = 0; i < n; i++) CLOSOBJ(vm, r)->v[i] = STK[SP - n + i];
+        SP = (uint16_t)(SP - n);
+        set_ref(&STK[SP++], TV_CLOSURE, r);
+        break;
+    }
+    case OP_PUSH_FUNC: v.t = TV_FUNC; v.u.i = 0; v.u.k = READ16(); goto push;
+    case OP_CONCAT: PANIC_IF(!concat_values(vm, READ8())); break;
+    case OP_FOR_ITER: {
+        uint8_t slot = READ8();
+        int16_t rel = READS16();
+        tv_val *c = &STK[base + slot], *ix = c + 1;
+        tv_len len = 0;
+        const char *p = 0;
+        if (c->t == TV_ARRAY) len = ARROBJ(vm, c->u.r)->len;
+        else p = str_data(vm, c, &len);
+        if ((tv_uint)ix->u.i >= len) { pc = PC_REL(rel); break; }
+        CHECK_STACK(1);
+        if (c->t == TV_ARRAY) *sp = VALS(vm, ARROBJ(vm, c->u.r)->buf)[ix->u.i];
+        else set_int(sp, (tv_int)(uint8_t)p[ix->u.i]);
+        SP++;
+        ix->u.i++;
+        break;
+    }
+    case OP_MATCH_TYPE: {
+        uint16_t t = READ16();
+        set_bool(&sp[-1], sp[-1].t == TV_STRUCT && OBJ(vm, sp[-1].u.r)->aux == t);
+        break;
+    }
+    case OP_IS_ARRAY_LEN: {
+        uint16_t n = READ16();
+        set_bool(&sp[-1], sp[-1].t == TV_ARRAY && ARROBJ(vm, sp[-1].u.r)->len == n);
+        break;
+    }
+    case OP_CAST: PANIC_IF(!cast_slot(vm, (uint16_t)(SP - 1), READ8())); break;
+    default: return 2;
+    }
+    *pcp = pc;
+    return 1;
+push:                                          /* push v (the cases above leave SP alone) */
+    CHECK_STACK(1);
+    *sp = v;
+    SP++;
+    *pcp = pc;
+    return 1;
+pop:
+    SP--;
+    *pcp = pc;
+    return 1;
+panic:
+    *pcp = pc;
+    return 0;
+}
+
+/* The ? operator on the top of the stack (same as the case in tilvm_run_steps):
+ * 1 = done (unwrapped in place, or not an Option/Result), 0 = return the top
+ * value from the function, -1 = runtime error. */
+static int lean_unwrap(tilvm *vm, uint8_t op) {
+    tv_val *v = &TOP;
+    uint16_t kind = v->t == TV_STRUCT ? OBJ(vm, v->u.r)->aux : 0xFFFF;
+    if (kind == TYPE_SOME || kind == TYPE_OK) { *v = STRUCTOBJ(vm, v->u.r)->v[0]; return 1; }
+    if (v->t != TV_NIL && kind != TYPE_ERR) return 1;
+    if (op == OP_UNWRAP_OR_RETURN) return 0;
+    if (v->t == TV_NIL) { fail(vm, "? applied to None"); return -1; }
+    *v = STRUCTOBJ(vm, v->u.r)->v[0];
+    if (!to_str_slot(vm, (uint16_t)(SP - 1))) return -1;
+    vm->err_val = TOP;
+    vm->err_msg = "? applied to Err: ";
+    return -1;
+}
+#endif /* TILVM_LEAN */
+
+/* SDCC (Z80): global CSE keeps dozens of temporaries alive across the whole
+ * interpreter loop, so the stack frame grows beyond the reach of IX (-128..127).
+ * SDCC 4.2's register allocator costs such "extended stack" operands as if they
+ * were IX-relative, and code generation then fails in genPlus ("Unimplemented",
+ * gen.c:7476/7884). Without GCSE the frame stays small (~80 bytes): keep it
+ * below 128 bytes when adding opcodes (tests/test_z80.py checks it). */
+#ifdef __SDCC
+#pragma save
+#pragma nogcse
+#endif
 int tilvm_run_steps(tilvm *vm, uint32_t budget) {
     const uint8_t *code = vm->bc;
     tilvm_state *st = &vm->st;
     tv_frame *fr;
-    uint32_t pc, op_pc = 0;
+    tv_off pc, op_pc = 0;
     uint16_t base;
     int target = -1;
     uint8_t op;
@@ -2853,6 +3115,7 @@ resume:
         op_pc = pc;
         op = code[pc++];
         switch (op) {
+#ifndef TILVM_LEAN      /* lean builds run the data opcodes in lean_op() */
         case OP_NOP: break;
         case OP_PUSH_NIL: CHECK_STACK(1); set_nil(&STK[SP++]); break;
         case OP_PUSH_TRUE: CHECK_STACK(1); set_bool(&STK[SP++], 1); break;
@@ -2893,7 +3156,7 @@ resume:
         case OP_ARG_DEFAULT: {
             uint8_t slot = READ8();
             int16_t rel = READS16();
-            if (STK[base + slot].t != TV_UNDEF) pc = (uint32_t)((int32_t)pc + rel);
+            if (STK[base + slot].t != TV_UNDEF) pc = PC_REL(rel);
             break;
         }
         case OP_ADD: case OP_SUB: case OP_MUL:
@@ -2950,9 +3213,10 @@ resume:
             SP--;
             break;
         }
+#endif
         case OP_JUMP: {
             int16_t rel = READS16();
-            pc = (uint32_t)((int32_t)pc + rel);
+            pc = PC_REL(rel);
             if (rel < 0) goto backedge;
             break;
         }
@@ -2961,7 +3225,7 @@ resume:
             tv_val *v = &STK[--SP];
             int t = v->t == TV_BOOL ? (int)v->u.i : truthy(vm, v);
             if (t == (op == OP_JUMP_IF_TRUE)) {
-                pc = (uint32_t)((int32_t)pc + rel);
+                pc = PC_REL(rel);
                 if (rel < 0) goto backedge;
             }
             break;
@@ -3001,6 +3265,11 @@ resume:
             base = fr->base;
             break;
         case OP_UNWRAP_OR_RETURN: case OP_UNWRAP_OR_PANIC: {
+#ifdef TILVM_LEAN
+            int u = lean_unwrap(vm, op);
+            if (u > 0) break;
+            PANIC_IF(u < 0);
+#else
             tv_val *v = &TOP;
             int ok = v->t == TV_STRUCT && (OBJ(vm, v->u.r)->aux == TYPE_SOME || OBJ(vm, v->u.r)->aux == TYPE_OK);
             int bad = v->t == TV_NIL || (v->t == TV_STRUCT && OBJ(vm, v->u.r)->aux == TYPE_ERR);
@@ -3014,6 +3283,7 @@ resume:
                 vm->err_msg = "? applied to Err: ";
                 goto panic;
             }
+#endif
             result = STK[--SP];
             goto do_return;
         }
@@ -3025,6 +3295,7 @@ resume:
             if (st->halted == 2) return TILVM_EXIT;
             break;
         }
+#ifndef TILVM_LEAN
         case OP_NEW_ARRAY: case OP_NEW_MAP: {
             uint16_t n = READ16();
             CHECK_STACK(2);
@@ -3080,7 +3351,7 @@ resume:
             uint8_t slot = READ8();
             int16_t rel = READS16();
             tv_val *c = &STK[base + slot], *ix = &STK[base + slot + 1];
-            uint32_t len = 0;
+            tv_len len = 0;
             const char *p = 0;
             if (c->t == TV_ARRAY) len = ARROBJ(vm, c->u.r)->len;
             else p = str_data(vm, c, &len);
@@ -3091,7 +3362,7 @@ resume:
                 SP++;
                 ix->u.i++;
             } else {
-                pc = (uint32_t)((int32_t)pc + rel);
+                pc = PC_REL(rel);
             }
             break;
         }
@@ -3106,9 +3377,10 @@ resume:
             break;
         }
         case OP_CAST: PANIC_IF(!cast_slot(vm, (uint16_t)(SP - 1), READ8())); break;
+#endif
         case OP_TRY: case OP_TRY_TIMEOUT: {
             int16_t rel = READS16();
-            PANIC_IF(!push_try(vm, op, (uint32_t)((int32_t)pc + rel)));
+            PANIC_IF(!push_try(vm, op, PC_REL(rel)));
             break;
         }
         case OP_END_TRY:
@@ -3127,6 +3399,13 @@ resume:
             fr->pc = pc;
             return TILVM_DONE;
         default:
+#ifdef TILVM_LEAN
+            {
+                int r = lean_op(vm, op, &pc, base, fr);
+                if (r == 1) break;
+                if (r == 0) goto panic;
+            }
+#endif
             fail(vm, "bad opcode");
             st->failed = 1;
             goto fatal;
@@ -3164,6 +3443,9 @@ resume:
         return TILVM_ERROR;
     }
 }
+#ifdef __SDCC
+#pragma restore
+#endif
 
 int tilvm_run(tilvm *vm) {
     int rc = tilvm_run_steps(vm, 0);
