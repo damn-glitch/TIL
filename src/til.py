@@ -206,6 +206,8 @@ class TokenType(Enum):
     MINUSEQ = auto()
     STAREQ = auto()
     SLASHEQ = auto()
+    PERCENTEQ = auto()
+    PIPE_GT = auto()   # |>  pipeline
     
     ARROW = auto()
     FAT_ARROW = auto()
@@ -260,7 +262,9 @@ class Token:
     value: Any
     line: int
     col: int
-    
+    start: int = -1   # offset of the first character in the source
+    end: int = -1     # offset just past the last character
+
     def __repr__(self):
         return f"Token({self.type.name}, {self.value!r}, {self.line}:{self.col})"
 
@@ -318,27 +322,126 @@ KAZAKH_KEYWORDS = {
     'тип': TokenType.TYPE,        # type
     'өзін': TokenType.SELF,       # self
     'және': TokenType.AND,        # and
-    'немесе': TokenType.OR,       # or (also elif, last definition wins)
+    'немесе': TokenType.OR,       # or   ("elif" is written "әйтпесе егер")
     'емес': TokenType.NOT,        # not
     'ақиқат': TokenType.BOOL,     # true
     'жалған': TokenType.BOOL,     # false
+    'тексеру': TokenType.ASSERT,  # assert
+    'қайталау': TokenType.RETRY,  # retry
+    'ниет': TokenType.INTENT,     # intent
+}
+# NOTE: 'немесе' used to be registered twice (ELIF and OR) in one dict literal,
+# so it silently became OR and Kazakh `elif` never worked. TIL v3 writes elif
+# as "else if" in every language: `әйтпесе егер`, `иначе если`, `aitpese eger`.
+
+# Kazakh in ASCII Latin transliteration (keyboard / calculator friendly).
+# Enabled per file with the pragma `#[lang: kk-latn]`.
+KAZAKH_LATIN_KEYWORDS = {
+    'eger': TokenType.IF, 'aitpese': TokenType.ELSE, 'ushin': TokenType.FOR,
+    'kezinde': TokenType.WHILE, 'tsikl': TokenType.LOOP, 'ishinde': TokenType.IN,
+    'qaitaru': TokenType.RETURN, 'toqtatu': TokenType.BREAK,
+    'zhalgastyru': TokenType.CONTINUE, 'funktsiya': TokenType.FN,
+    'turaqty': TokenType.LET, 'aynymaly': TokenType.VAR,
+    'turaqtama': TokenType.CONST, 'ozgermeli': TokenType.MUT,
+    'ashyq': TokenType.PUB, 'qurylym': TokenType.STRUCT, 'sanaq': TokenType.ENUM,
+    'iske': TokenType.IMPL, 'qasiet': TokenType.TRAIT,
+    'saikestik': TokenType.MATCH, 'bastap': TokenType.FROM,
+    'retinde': TokenType.AS, 'ozin': TokenType.SELF, 'zhane': TokenType.AND,
+    'nemese': TokenType.OR, 'emes': TokenType.NOT, 'aqiqat': TokenType.BOOL,
+    'zhalgan': TokenType.BOOL, 'tekseru': TokenType.ASSERT,
+    'qaitalau': TokenType.RETRY, 'niet': TokenType.INTENT,
 }
 
-# Merge Kazakh keywords into the main keyword map
+# Russian keywords. Enabled per file with the pragma `#[lang: ru]`
+# (opt-in, because short words like "и"/"в" would otherwise collide with
+# identifiers in Kazakh programs).
+RUSSIAN_KEYWORDS = {
+    'если': TokenType.IF, 'иначе': TokenType.ELSE, 'для': TokenType.FOR,
+    'пока': TokenType.WHILE, 'цикл': TokenType.LOOP, 'в': TokenType.IN,
+    'вернуть': TokenType.RETURN, 'прервать': TokenType.BREAK,
+    'продолжить': TokenType.CONTINUE, 'функция': TokenType.FN,
+    'пусть': TokenType.LET, 'перем': TokenType.VAR, 'конст': TokenType.CONST,
+    'изм': TokenType.MUT, 'публ': TokenType.PUB, 'структура': TokenType.STRUCT,
+    'перечисление': TokenType.ENUM, 'реализация': TokenType.IMPL,
+    'типаж': TokenType.TRAIT, 'выбор': TokenType.MATCH, 'импорт': TokenType.IMPORT,
+    'из': TokenType.FROM, 'как': TokenType.AS, 'тип': TokenType.TYPE,
+    'сам': TokenType.SELF, 'и': TokenType.AND, 'или': TokenType.OR,
+    'не': TokenType.NOT, 'истина': TokenType.BOOL, 'ложь': TokenType.BOOL,
+    'проверить': TokenType.ASSERT, 'инвариант': TokenType.INVARIANT,
+    'повторить': TokenType.RETRY, 'таймаут': TokenType.TIMEOUT,
+    'намерение': TokenType.INTENT,
+}
+
+# Values of localized boolean literals.
+TRUE_WORDS = {'true', 'True', 'ақиқат', 'aqiqat', 'истина'}
+
+# Builtin-name aliases: localized spellings of builtin functions and of the
+# program entry point. The lexer rewrites them to the canonical name, so the
+# rest of the compiler (and both backends) only ever see `print`, `main`, ...
+KAZAKH_ALIASES = {
+    'басып_шығару': 'print', 'шығару': 'print', 'негізгі': 'main',
+    'ұзындық': 'len', 'енгізу': 'input',
+}
+KAZAKH_LATIN_ALIASES = {
+    'basyp_shygaru': 'print', 'shygaru': 'print', 'negizgi': 'main',
+    'uzyndyq': 'len', 'engizu': 'input',
+}
+RUSSIAN_ALIASES = {
+    'печать': 'print', 'вывод': 'print', 'главная': 'main',
+    'длина': 'len', 'ввод': 'input',
+}
+
+# language code -> (keyword table, alias table)
+LANGUAGES = {
+    'en': ({}, {}),
+    'kk': (KAZAKH_KEYWORDS, KAZAKH_ALIASES),
+    'kk-latn': (KAZAKH_LATIN_KEYWORDS, KAZAKH_LATIN_ALIASES),
+    'ru': (RUSSIAN_KEYWORDS, RUSSIAN_ALIASES),
+}
+DEFAULT_LANGUAGES = ('en', 'kk')   # Cyrillic Kazakh is always on (backward compatible)
+
+_LANG_PRAGMA_RE = re.compile(r'^[ \t]*#\[\s*lang\s*:\s*([^\]]*)\]', re.MULTILINE)
+
+def detect_languages(source: str) -> List[str]:
+    """Languages enabled for a source file: defaults + `#[lang: ...]` pragmas."""
+    langs = list(DEFAULT_LANGUAGES)
+    for m in _LANG_PRAGMA_RE.finditer(source):
+        for code in m.group(1).split(','):
+            code = code.strip().lower()
+            if code in LANGUAGES and code not in langs:
+                langs.append(code)
+    return langs
+
+ENGLISH_KEYWORDS = dict(KEYWORDS)
+
+# Merge Kazakh keywords into the main keyword map (backward compatible)
 KEYWORDS.update(KAZAKH_KEYWORDS)
 
 class Lexer:
-    def __init__(self, source: str, filename: str = "<stdin>"):
+    def __init__(self, source: str, filename: str = "<stdin>",
+                 languages: Optional[List[str]] = None, line_offset: int = 0):
         self.source = source
         self.filename = filename
         self.pos = 0
-        self.line = 1
+        self.line = 1 + line_offset
         self.col = 1
         self.tokens: List[Token] = []
         self.indent_stack = [0]
         self.at_line_start = True
         self.paren_depth = 0  # Track () [] {} depth to suppress NEWLINE inside
         self.error_reporter = ErrorReporter(source, filename)
+        # Keyword languages: English + Kazakh by default, more via #[lang: ...]
+        self.languages = list(languages) if languages else detect_languages(source)
+        self.keywords: Dict[str, TokenType] = dict(ENGLISH_KEYWORDS)
+        self.aliases: Dict[str, str] = {}
+        for code in self.languages:
+            kw, al = LANGUAGES.get(code, ({}, {}))
+            self.keywords.update(kw)
+            self.aliases.update(al)
+        # Start of the token currently being read
+        self.tok_start = 0
+        self.tok_line = self.line
+        self.tok_col = 1
 
     def error(self, msg: str):
         hint = get_hint_for_error(msg)
@@ -359,13 +462,24 @@ class Lexer:
         return ch
     
     def add_token(self, type: TokenType, value: Any = None):
-        self.tokens.append(Token(type, value, self.line, self.col))
+        if type in (TokenType.INDENT, TokenType.DEDENT, TokenType.EOF):
+            tok = Token(type, value, self.line, self.col, self.pos, self.pos)
+        else:
+            tok = Token(type, value, self.tok_line, self.tok_col, self.tok_start, self.pos)
+        self.tokens.append(tok)
         self.at_line_start = False
-    
+
+    def mark_token_start(self):
+        self.tok_start = self.pos
+        self.tok_line = self.line
+        self.tok_col = self.col
+
     def tokenize(self) -> List[Token]:
         while self.pos < len(self.source):
             if self.at_line_start and self.paren_depth == 0:
                 self.handle_indentation()
+                if self.pos >= len(self.source):
+                    break  # trailing blank lines / comments at end of file
             elif self.at_line_start and self.paren_depth > 0:
                 # Inside parens: skip whitespace but don't emit INDENT/DEDENT
                 self.at_line_start = False
@@ -373,8 +487,9 @@ class Lexer:
                     self.advance()
                 if self.pos >= len(self.source):
                     break
-            
+
             ch = self.current()
+            self.mark_token_start()
             
             # Whitespace (not newline)
             if ch in ' \t' and not self.at_line_start:
@@ -495,8 +610,11 @@ class Lexer:
                 self.error("Unterminated attribute")
             content.append(ch)
             self.advance()
-        
-        self.add_token(TokenType.ATTRIBUTE, ''.join(content).strip())
+
+        text = ''.join(content).strip()
+        if re.match(r'lang\s*:', text):
+            return  # `#[lang: ru]` is a lexer pragma (see detect_languages), not an attribute
+        self.add_token(TokenType.ATTRIBUTE, text)
     
     def read_string(self, quote: str):
         start_line, start_col = self.line, self.col
@@ -515,19 +633,46 @@ class Lexer:
                     self.add_token(TokenType.STRING, value)
                 return
             elif ch == '\\':
-                self.advance()
-                esc = self.current()
-                escapes = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', 
-                          '"': '"', "'": "'", '0': '\0'}
-                result.append(escapes.get(esc, esc))
-                self.advance()
+                result.append(self.read_escape())
             elif ch == '\n':
                 self.error("Unterminated string")
             else:
                 result.append(ch)
                 self.advance()
-        
+
         self.error("Unterminated string")
+
+    def read_escape(self) -> str:
+        """Read an escape sequence starting at a backslash; return its character.
+        Supports \\n \\t \\r \\0 \\\\ \\" \\' \\{ \\} \\xNN and \\u{XXXX}."""
+        self.advance()  # backslash
+        esc = self.current()
+        simple = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '"': '"',
+                  "'": "'", '0': '\0', '{': '{', '}': '}', 'a': '\a', 'b': '\b',
+                  'e': '\x1b'}
+        if esc == 'x':
+            self.advance()
+            digits = self.source[self.pos:self.pos + 2]
+            if len(digits) < 2 or not all(c in '0123456789abcdefABCDEF' for c in digits):
+                self.error("Invalid \\x escape: expected two hex digits")
+            self.advance()
+            self.advance()
+            return chr(int(digits, 16))
+        if esc == 'u' and self.peek() == '{':
+            self.advance()
+            self.advance()
+            digits = []
+            while self.current() not in '}\n\0':
+                digits.append(self.advance())
+            if self.current() != '}' or not digits:
+                self.error("Invalid \\u{...} escape")
+            self.advance()
+            try:
+                return chr(int(''.join(digits), 16))
+            except ValueError:
+                self.error("Invalid \\u{...} escape")
+        self.advance()
+        return simple.get(esc, esc)
     
     def read_fstring(self, quote: str):
         """Parse f"text {expr} text" into STRING_INTERP token with parts list."""
@@ -543,6 +688,14 @@ class Lexer:
                     parts.append(('str', ''.join(current_str)))
                 self.add_token(TokenType.FSTRING, parts)
                 return
+            elif ch == '{' and self.peek() == '{':
+                current_str.append('{')       # {{ -> literal {
+                self.advance()
+                self.advance()
+            elif ch == '}' and self.peek() == '}':
+                current_str.append('}')       # }} -> literal }
+                self.advance()
+                self.advance()
             elif ch == '{':
                 if current_str:
                     parts.append(('str', ''.join(current_str)))
@@ -552,6 +705,8 @@ class Lexer:
                 depth = 1
                 while self.pos < len(self.source) and depth > 0:
                     c = self.current()
+                    if c == '\n' or c == quote:
+                        self.error("Unterminated '{' in f-string")
                     if c == '{':
                         depth += 1
                     elif c == '}':
@@ -561,13 +716,15 @@ class Lexer:
                             break
                     expr_chars.append(c)
                     self.advance()
-                parts.append(('expr', ''.join(expr_chars)))
+                text = ''.join(expr_chars)
+                # Optional format spec: {value:.2f} {n:5} {n:x}
+                m = re.match(r'^(.*?):([<>^]?\d*(?:\.\d+)?[fdxXobe%]?)$', text, re.S)
+                if m and m.group(1).strip() and m.group(2):
+                    parts.append(('expr', m.group(1), m.group(2)))
+                else:
+                    parts.append(('expr', text))
             elif ch == '\\':
-                self.advance()
-                esc = self.current()
-                escapes = {'n': '\n', 't': '\t', 'r': '\r', '\\': '\\', '"': '"', "'": "'"}
-                current_str.append(escapes.get(esc, esc))
-                self.advance()
+                current_str.append(self.read_escape())
             elif ch == '\n':
                 self.error("Unterminated f-string")
             else:
@@ -579,63 +736,66 @@ class Lexer:
         start = self.pos
         is_float = False
         
-        # Hex
-        if self.current() == '0' and self.peek() in 'xX':
-            self.advance()
-            self.advance()
-            while self.current() in '0123456789abcdefABCDEF_':
+        # Hex / binary / octal
+        for prefixes, digits, base, name in (('xX', '0123456789abcdefABCDEF_', 16, 'hexadecimal'),
+                                             ('bB', '01_', 2, 'binary'),
+                                             ('oO', '01234567_', 8, 'octal')):
+            if self.current() == '0' and self.peek() in prefixes:
                 self.advance()
-            self.add_token(TokenType.INT, int(self.source[start:self.pos].replace('_', ''), 16))
-            return
-        
-        # Binary
-        if self.current() == '0' and self.peek() in 'bB':
-            self.advance()
-            self.advance()
-            while self.current() in '01_':
                 self.advance()
-            self.add_token(TokenType.INT, int(self.source[start:self.pos].replace('_', ''), 2))
-            return
-        
+                while self.current() in digits:
+                    self.advance()
+                text = self.source[start:self.pos]
+                try:
+                    self.add_token(TokenType.INT, int(text[2:].replace('_', ''), base))
+                except ValueError:
+                    self.error(f"Invalid {name} literal: '{text}'")
+                return
+
         # Decimal
         while self.current().isdigit() or self.current() == '_':
             self.advance()
-        
+
         if self.current() == '.' and self.peek().isdigit():
             is_float = True
             self.advance()
             while self.current().isdigit() or self.current() == '_':
                 self.advance()
-        
-        if self.current() in 'eE':
+
+        if self.current() in 'eE' and (self.peek().isdigit() or
+                                       (self.peek() in '+-' and self.peek(2).isdigit())):
             is_float = True
             self.advance()
             if self.current() in '+-':
                 self.advance()
             while self.current().isdigit():
                 self.advance()
-        
+
         text = self.source[start:self.pos].replace('_', '')
-        if is_float:
-            self.add_token(TokenType.FLOAT, float(text))
-        else:
-            self.add_token(TokenType.INT, int(text))
-    
+        try:
+            if is_float:
+                self.add_token(TokenType.FLOAT, float(text))
+            else:
+                self.add_token(TokenType.INT, int(text))
+        except ValueError:
+            self.error(f"Invalid numeric literal: '{self.source[start:self.pos]}'")
+
     def read_identifier(self):
         start = self.pos
         while self.current().isalnum() or self.current() == '_':
             self.advance()
-        
+
         text = self.source[start:self.pos]
-        
-        if text in KEYWORDS:
-            token_type = KEYWORDS[text]
+
+        if text in self.keywords:
+            token_type = self.keywords[text]
             if token_type == TokenType.BOOL:
-                self.add_token(token_type, text in ('true', 'True'))
+                self.add_token(token_type, text in TRUE_WORDS)
             else:
                 self.add_token(token_type, text)
         else:
-            self.add_token(TokenType.IDENT, text)
+            # Localized builtin names (басып_шығару -> print, негізгі -> main, ...)
+            self.add_token(TokenType.IDENT, self.aliases.get(text, text))
     
     def read_operator(self) -> bool:
         ch = self.current()
@@ -650,6 +810,7 @@ class Lexer:
             '*=': TokenType.STAREQ, '/=': TokenType.SLASHEQ,
             '->': TokenType.ARROW, '=>': TokenType.FAT_ARROW,
             '..': TokenType.RANGE, '<<': TokenType.SHL, '>>': TokenType.SHR,
+            '|>': TokenType.PIPE_GT, '%=': TokenType.PERCENTEQ,
         }
         
         # Three-character (..=)
@@ -1045,6 +1206,10 @@ class FuncDef(ASTNode):
     effects: Optional[List[str]] = None
     requires: List[ASTNode] = field(default_factory=list)
     ensures: List[ASTNode] = field(default_factory=list)
+    requires_text: List[str] = field(default_factory=list)
+    ensures_text: List[str] = field(default_factory=list)
+    caps: List[str] = field(default_factory=list)               # #[cap: X] - required capabilities
+    declared_effects: Optional[List[str]] = None                # #[pure] -> [], #[effects: io] -> ['io']
 
 @dataclass
 class StructField:
@@ -1195,18 +1360,33 @@ class IntentBlock(ASTNode):
 class Program(ASTNode):
     statements: List[ASTNode] = field(default_factory=list)
 
+# Top-level nodes that define things (everything else at the top level is a
+# script statement that runs at program start - see Parser.hoist_script_statements).
+DEFINITION_NODES = (FuncDef, StructDef, EnumDef, ImplBlock, TraitDef, Import,
+                    TypeAlias, VarDecl, CapabilityType)
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #                                  PARSER
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Parser:
-    def __init__(self, tokens: List[Token], filename: str = "<stdin>", source: str = ""):
+    def __init__(self, tokens: List[Token], filename: str = "<stdin>", source: str = "",
+                 languages: Optional[List[str]] = None):
         self.tokens = tokens
         self.filename = filename
         self.pos = 0
         self.current_level = 2  # Default level
         self.pending_attributes: List[str] = []
         self.error_reporter = ErrorReporter(source, filename)
+        self.languages = languages
+
+    @staticmethod
+    def _mark(node, tok: Token):
+        """Attach a source position to an AST node (if it has none yet)."""
+        if isinstance(node, ASTNode) and not node.line and tok is not None:
+            node.line = tok.line
+            node.col = tok.col
+        return node
 
     def error(self, msg: str):
         tok = self.current()
@@ -1249,16 +1429,40 @@ class Parser:
     def parse(self) -> Program:
         statements = []
         self.skip_newlines()
-        
+
         while not self.match(TokenType.EOF):
             stmt = self.parse_top_level()
             if stmt:
                 statements.append(stmt)
             self.skip_newlines()
-        
-        return Program(statements=statements)
-    
+
+        return Program(statements=self.hoist_script_statements(statements))
+
+    @staticmethod
+    def hoist_script_statements(statements: List[ASTNode]) -> List[ASTNode]:
+        """Script mode: executable statements written at the top level run first.
+        Without a `main()` they *are* the program (so `print("hi")` is a complete
+        TIL program); with a `main()` they run before its body."""
+        script = [s for s in statements if not isinstance(s, DEFINITION_NODES)]
+        if not script:
+            return statements
+        rest = [s for s in statements if isinstance(s, DEFINITION_NODES)]
+        main = next((s for s in rest if isinstance(s, FuncDef) and s.name == "main"), None)
+        if main is None:
+            main = FuncDef(name="main", params=[], ret_type=T_VOID,
+                           body=Block(statements=script), line=script[0].line)
+            rest.append(main)
+        else:
+            body = main.body if isinstance(main.body, Block) else Block([main.body])
+            main.body = Block(statements=script + body.statements, line=body.line)
+        return rest
+
     def parse_top_level(self) -> Optional[ASTNode]:
+        tok = self.current()
+        node = self._parse_top_level()
+        return self._mark(node, tok)
+
+    def _parse_top_level(self) -> Optional[ASTNode]:
         self.skip_newlines()
         
         # Collect attributes
@@ -1360,10 +1564,15 @@ class Parser:
             elif self.match(TokenType.RPAREN):
                 depth -= 1
             self.advance()
-        
-        # Check for -> or NEWLINE INDENT
-        result = self.match(TokenType.ARROW, TokenType.NEWLINE)
-        
+
+        # A definition is `name(...)` followed by `-> T`, `{`, `=>`, or an
+        # indented body (NEWLINE INDENT). A bare `name(...)` + NEWLINE is a call
+        # statement (script mode), e.g. `print("hi")` at the top level.
+        result = self.match(TokenType.ARROW, TokenType.LBRACE, TokenType.FAT_ARROW)
+        if not result and self.match(TokenType.NEWLINE):
+            self.skip_newlines()
+            result = self.match(TokenType.INDENT)
+
         self.pos = pos
         return result
     
@@ -1377,6 +1586,7 @@ class Parser:
         return self.parse_func_body(name)
     
     def parse_func_body(self, name: str) -> FuncDef:
+        name_tok = self.tokens[self.pos - 1] if self.pos > 0 else self.current()
         self.consume(TokenType.LPAREN)
         params = self.parse_params()
         self.consume(TokenType.RPAREN)
@@ -1395,9 +1605,9 @@ class Parser:
         elif self.match(TokenType.LBRACE):
             body = self.parse_brace_block()
         elif self.match(TokenType.FAT_ARROW):
-            self.advance()
+            fat = self.advance()
             expr = self.parse_expression()
-            body = Block([Return(expr)])
+            body = Block([self._mark(Return(expr), fat)])
         else:
             self.error("Expected function body")
 
@@ -1411,27 +1621,41 @@ class Parser:
         effects = []
         requires_list = []
         ensures_list = []
+        requires_text = []
+        ensures_text = []
+        caps = []
+        declared_effects = None   # None = not declared (gradual: inferred, unchecked)
         remaining_attrs = []
         for attr in attrs:
             if attr == "pure":
                 effects.append("pure")
+                declared_effects = declared_effects or []
             elif attr.startswith("effects:"):
+                declared_effects = declared_effects or []
                 for e in attr[len("effects:"):].strip().split(","):
-                    effects.append(e.strip())
-            elif attr.startswith("requires:"):
-                expr_text = attr[len("requires:"):].strip()
-                sub_tokens = Lexer(expr_text, "<attr>").tokenize()
-                sub_parser = Parser(sub_tokens, "<attr>")
-                requires_list.append(sub_parser.parse_expression())
-            elif attr.startswith("ensures:"):
-                expr_text = attr[len("ensures:"):].strip()
-                sub_tokens = Lexer(expr_text, "<attr>").tokenize()
-                sub_parser = Parser(sub_tokens, "<attr>")
-                ensures_list.append(sub_parser.parse_expression())
+                    if e.strip():
+                        effects.append(e.strip())
+                        declared_effects.append(e.strip())
+            elif attr.startswith("requires:") or attr.startswith("ensures:"):
+                kind, expr_text = attr.split(":", 1)
+                expr_text = expr_text.strip()
+                sub_tokens = Lexer(expr_text, "<attr>", languages=self.languages,
+                                   line_offset=max(name_tok.line - 1, 0)).tokenize()
+                sub_parser = Parser(sub_tokens, "<attr>", languages=self.languages)
+                cexpr = sub_parser.parse_expression()
+                if kind == "requires":
+                    requires_list.append(cexpr)
+                    requires_text.append(expr_text)
+                else:
+                    ensures_list.append(cexpr)
+                    ensures_text.append(expr_text)
             elif attr.startswith("cap:"):
-                # Capability annotation: #[cap: FileRead]
-                cap_name = attr[len("cap:"):].strip()
-                effects.append(f"cap:{cap_name}")
+                # Capability annotation: #[cap: FileRead] or #[cap: A, B]
+                for cap_name in attr[len("cap:"):].split(","):
+                    cap_name = cap_name.strip()
+                    if cap_name:
+                        effects.append(f"cap:{cap_name}")
+                        caps.append(cap_name)
             elif attr.startswith("energy:"):
                 # Energy annotation: #[energy: low|medium|high]
                 energy_level = attr[len("energy:"):].strip()
@@ -1449,8 +1673,11 @@ class Parser:
         return FuncDef(name=name, params=params, ret_type=ret_type, body=body,
                        level=level, attributes=remaining_attrs,
                        effects=effects if effects else None,
-                       requires=requires_list, ensures=ensures_list)
-    
+                       requires=requires_list, ensures=ensures_list,
+                       requires_text=requires_text, ensures_text=ensures_text,
+                       caps=caps, declared_effects=declared_effects,
+                       line=name_tok.line, col=name_tok.col)
+
     def parse_params(self) -> List[FuncParam]:
         params = []
         
@@ -1599,6 +1826,11 @@ class Parser:
     
     def parse_statement(self) -> Optional[ASTNode]:
         self.skip_newlines()
+        tok = self.current()
+        return self._mark(self._parse_statement(), tok)
+
+    def _parse_statement(self) -> Optional[ASTNode]:
+        self.skip_newlines()
         
         if self.match(TokenType.IF):
             return self.parse_if()
@@ -1647,10 +1879,10 @@ class Parser:
         
         # Check for assignment
         if self.match(TokenType.EQ, TokenType.PLUSEQ, TokenType.MINUSEQ,
-                      TokenType.STAREQ, TokenType.SLASHEQ):
-            op = self.advance().value
+                      TokenType.STAREQ, TokenType.SLASHEQ, TokenType.PERCENTEQ):
+            op_tok = self.advance()
             value = self.parse_expression()
-            return Assignment(target=expr, value=value, op=op)
+            return self._mark(Assignment(target=expr, value=value, op=op_tok.value), op_tok)
         
         return ExprStmt(expr=expr)
     
@@ -1690,7 +1922,11 @@ class Parser:
         
         self.skip_newlines()
         
-        while self.match(TokenType.ELIF):
+        # `elif` - or `else if` in any language (әйтпесе егер / иначе если / aitpese eger)
+        while self.match(TokenType.ELIF) or (self.match(TokenType.ELSE) and
+                                            self.peek().type == TokenType.IF):
+            if self.match(TokenType.ELSE):
+                self.advance()
             self.advance()
             elif_cond = self.parse_expression()
             self.skip_newlines()
@@ -2120,152 +2356,147 @@ class Parser:
         
         return VarDecl(name=name, type_ann=type_ann, value=value, mutable=False, is_const=True)
     
-    # Expression parsing with precedence climbing
+    # Expression parsing with precedence climbing.
+    # Every node gets the source position of its operator / first token.
     def parse_expression(self) -> ASTNode:
         return self.parse_ternary()
     
     def parse_ternary(self) -> ASTNode:
-        expr = self.parse_or()
+        expr = self.parse_pipe()
         
         if self.match(TokenType.IF):
-            self.advance()
-            condition = self.parse_or()
+            if_tok = self.advance()
+            condition = self.parse_pipe()
             self.consume(TokenType.ELSE)
             else_expr = self.parse_ternary()
-            return IfExpr(condition=condition, then_expr=expr, else_expr=else_expr)
+            return self._mark(IfExpr(condition=condition, then_expr=expr, else_expr=else_expr), if_tok)
         
         return expr
+
+    def parse_pipe(self) -> ASTNode:
+        """Pipeline operator: `x |> f` == `f(x)`, `x |> f(a)` == `f(x, a)`."""
+        left = self.parse_or()
+        while self.match(TokenType.PIPE_GT):
+            op_tok = self.advance()
+            right = self.parse_or()
+            if isinstance(right, Call):
+                right.args.insert(0, left)
+                left = right
+            else:
+                left = self._mark(Call(func=right, args=[left]), op_tok)
+        return left
     
     def parse_or(self) -> ASTNode:
         left = self.parse_and()
         while self.match(TokenType.OR):
-            self.advance()
+            op_tok = self.advance()
             right = self.parse_and()
-            left = BinaryOp(op="or", left=left, right=right)
+            left = self._mark(BinaryOp(op="or", left=left, right=right), op_tok)
         return left
     
     def parse_and(self) -> ASTNode:
         left = self.parse_not()
         while self.match(TokenType.AND):
-            self.advance()
+            op_tok = self.advance()
             right = self.parse_not()
-            left = BinaryOp(op="and", left=left, right=right)
+            left = self._mark(BinaryOp(op="and", left=left, right=right), op_tok)
         return left
     
     def parse_not(self) -> ASTNode:
         if self.match(TokenType.NOT):
-            self.advance()
-            return UnaryOp(op="not", operand=self.parse_not())
+            op_tok = self.advance()
+            return self._mark(UnaryOp(op="not", operand=self.parse_not()), op_tok)
         return self.parse_comparison()
     
     def parse_comparison(self) -> ASTNode:
+        """Comparisons chain like in Python/math: `0 <= i < n` means
+        `0 <= i and i < n` (it used to silently mean `(0 <= i) < n`)."""
         left = self.parse_bitwise_or()
-        
-        while self.match(TokenType.EQEQ, TokenType.NEQ, TokenType.LT, 
-                        TokenType.GT, TokenType.LTE, TokenType.GTE):
-            op = self.advance().value
+        result = None
+        while self.match(TokenType.EQEQ, TokenType.NEQ, TokenType.LT,
+                         TokenType.GT, TokenType.LTE, TokenType.GTE):
+            op_tok = self.advance()
             right = self.parse_bitwise_or()
-            left = BinaryOp(op=op, left=left, right=right)
-        
-        return left
+            cmp = self._mark(BinaryOp(op=op_tok.value, left=left, right=right), op_tok)
+            result = cmp if result is None else self._mark(
+                BinaryOp(op="and", left=result, right=cmp), op_tok)
+            left = right
+        return left if result is None else result
     
-    def parse_bitwise_or(self) -> ASTNode:
-        left = self.parse_bitwise_xor()
-        while self.match(TokenType.PIPE):
-            self.advance()
-            right = self.parse_bitwise_xor()
-            left = BinaryOp(op="|", left=left, right=right)
+    def _binary_level(self, next_level, ops):
+        left = next_level()
+        while self.match(*ops):
+            op_tok = self.advance()
+            right = next_level()
+            left = self._mark(BinaryOp(op=op_tok.value, left=left, right=right), op_tok)
         return left
+
+    def parse_bitwise_or(self) -> ASTNode:
+        return self._binary_level(self.parse_bitwise_xor, (TokenType.PIPE,))
     
     def parse_bitwise_xor(self) -> ASTNode:
-        left = self.parse_bitwise_and()
-        while self.match(TokenType.CARET):
-            self.advance()
-            right = self.parse_bitwise_and()
-            left = BinaryOp(op="^", left=left, right=right)
-        return left
+        return self._binary_level(self.parse_bitwise_and, (TokenType.CARET,))
     
     def parse_bitwise_and(self) -> ASTNode:
-        left = self.parse_shift()
-        while self.match(TokenType.AMP):
-            self.advance()
-            right = self.parse_shift()
-            left = BinaryOp(op="&", left=left, right=right)
-        return left
+        return self._binary_level(self.parse_shift, (TokenType.AMP,))
     
     def parse_shift(self) -> ASTNode:
-        left = self.parse_range()
-        while self.match(TokenType.SHL, TokenType.SHR):
-            op = self.advance().value
-            right = self.parse_range()
-            left = BinaryOp(op=op, left=left, right=right)
-        return left
+        return self._binary_level(self.parse_range, (TokenType.SHL, TokenType.SHR))
     
     def parse_range(self) -> ASTNode:
         left = self.parse_additive()
         
         if self.match(TokenType.RANGE, TokenType.RANGE_INCL):
-            inclusive = self.current().type == TokenType.RANGE_INCL
+            op_tok = self.current()
+            inclusive = op_tok.type == TokenType.RANGE_INCL
             self.advance()
             right = self.parse_additive()
-            return Range(start=left, end=right, inclusive=inclusive)
+            return self._mark(Range(start=left, end=right, inclusive=inclusive), op_tok)
         
         return left
     
     def parse_additive(self) -> ASTNode:
-        left = self.parse_multiplicative()
-        
-        while self.match(TokenType.PLUS, TokenType.MINUS):
-            op = self.advance().value
-            right = self.parse_multiplicative()
-            left = BinaryOp(op=op, left=left, right=right)
-        
-        return left
+        return self._binary_level(self.parse_multiplicative, (TokenType.PLUS, TokenType.MINUS))
     
     def parse_multiplicative(self) -> ASTNode:
-        left = self.parse_power()
-        
-        while self.match(TokenType.STAR, TokenType.SLASH, TokenType.PERCENT):
-            op = self.advance().value
-            right = self.parse_power()
-            left = BinaryOp(op=op, left=left, right=right)
-        
-        return left
-    
-    def parse_power(self) -> ASTNode:
-        left = self.parse_unary()
-        
-        if self.match(TokenType.POWER):
-            self.advance()
-            right = self.parse_power()  # Right associative
-            left = BinaryOp(op="**", left=left, right=right)
-        
-        return left
+        return self._binary_level(self.parse_unary,
+                                  (TokenType.STAR, TokenType.SLASH, TokenType.PERCENT))
     
     def parse_unary(self) -> ASTNode:
+        # Unary operators bind looser than `**` (like Python): -2 ** 2 == -(2 ** 2)
+        tok = self.current()
         if self.match(TokenType.MINUS):
             self.advance()
-            return UnaryOp(op="-", operand=self.parse_unary())
+            return self._mark(UnaryOp(op="-", operand=self.parse_unary()), tok)
         if self.match(TokenType.TILDE):
             self.advance()
-            return UnaryOp(op="~", operand=self.parse_unary())
+            return self._mark(UnaryOp(op="~", operand=self.parse_unary()), tok)
         if self.match(TokenType.AMP):
             self.advance()
             mutable = False
             if self.match(TokenType.MUT):
                 self.advance()
                 mutable = True
-            return UnaryOp(op="&mut" if mutable else "&", operand=self.parse_unary())
+            return self._mark(UnaryOp(op="&mut" if mutable else "&", operand=self.parse_unary()), tok)
         if self.match(TokenType.STAR):
             self.advance()
-            return UnaryOp(op="*", operand=self.parse_unary())
+            return self._mark(UnaryOp(op="*", operand=self.parse_unary()), tok)
         
-        return self.parse_postfix()
+        return self.parse_power()
+
+    def parse_power(self) -> ASTNode:
+        left = self.parse_postfix()
+        if self.match(TokenType.POWER):
+            op_tok = self.advance()
+            right = self.parse_unary()  # right associative; allows 2 ** -1
+            left = self._mark(BinaryOp(op="**", left=left, right=right), op_tok)
+        return left
     
     def parse_postfix(self) -> ASTNode:
         expr = self.parse_primary()
         
         while True:
+            op_tok = self.current()
             if self.match(TokenType.LPAREN):
                 # Function call
                 self.advance()
@@ -2277,31 +2508,31 @@ class Parser:
                             break
                         self.advance()
                 self.consume(TokenType.RPAREN)
-                expr = Call(func=expr, args=args)
+                expr = self._mark(Call(func=expr, args=args), op_tok)
             
             elif self.match(TokenType.LBRACKET):
                 # Index
                 self.advance()
                 index = self.parse_expression()
                 self.consume(TokenType.RBRACKET)
-                expr = Index(obj=expr, index=index)
+                expr = self._mark(Index(obj=expr, index=index), op_tok)
             
             elif self.match(TokenType.DOT):
-                # Attribute access
+                # Attribute access (`self` and keywords are not valid here, plain names only)
                 self.advance()
                 attr = self.consume(TokenType.IDENT).value
-                expr = Attribute(obj=expr, attr=attr)
+                expr = self._mark(Attribute(obj=expr, attr=attr), op_tok)
             
             elif self.match(TokenType.AS):
                 # Type cast: expr as Type
                 self.advance()
                 target_type = self.parse_type()
-                expr = Cast(expr=expr, target_type=target_type, type=target_type)
+                expr = self._mark(Cast(expr=expr, target_type=target_type, type=target_type), op_tok)
 
             elif self.match(TokenType.QUESTION):
-                # Null check / unwrap
+                # `?` - unwrap Option/Result, propagating None/Err to the caller
                 self.advance()
-                expr = NullCheck(expr)
+                expr = self._mark(NullCheck(expr=expr), op_tok)
 
             else:
                 break
@@ -2309,6 +2540,21 @@ class Parser:
         return expr
     
     def parse_primary(self) -> ASTNode:
+        tok = self.current()
+        return self._mark(self._parse_primary(), tok)
+
+    def _parse_fstring_expr(self, text: str, line: int) -> ASTNode:
+        # Parse with THIS module's Lexer/Parser. (A `from til import ...` here
+        # loaded a second copy of the module when the compiler ran as __main__,
+        # so f-string sub-expressions were AST nodes of a *different* class and
+        # every isinstance() check in the code generator failed: f"Hello {name}"
+        # printed the string's address as an integer.)
+        sub_tokens = Lexer(text, "<fstring>", languages=self.languages,
+                           line_offset=max(line - 1, 0)).tokenize()
+        sub_parser = Parser(sub_tokens, "<fstring>", languages=self.languages)
+        return sub_parser.parse_expression()
+
+    def _parse_primary(self) -> ASTNode:
         # Literals
         if self.match(TokenType.INT):
             return IntLit(value=self.advance().value)
@@ -2326,16 +2572,16 @@ class Parser:
             token = self.advance()
             # Parse expression parts within the f-string
             parts = []
-            for kind, text in token.value:
+            for part in token.value:
+                kind, text = part[0], part[1]
                 if kind == 'str':
-                    parts.append(('str', StringLit(value=text)))
+                    parts.append(('str', StringLit(value=text, line=token.line, col=token.col)))
                 else:
-                    # Parse the expression text
-                    from til import Lexer as SubLexer, Parser as SubParser
-                    sub_tokens = SubLexer(text, "<fstring>").tokenize()
-                    sub_parser = SubParser(sub_tokens, "<fstring>")
-                    expr = sub_parser.parse_expression()
-                    parts.append(('expr', expr))
+                    expr = self._parse_fstring_expr(text, token.line)
+                    if len(part) > 2:
+                        parts.append(('expr', expr, part[2]))   # with format spec
+                    else:
+                        parts.append(('expr', expr))
             return FStringLit(parts=parts)
 
         if self.match(TokenType.BOOL):
@@ -2830,6 +3076,53 @@ class TypeChecker:
 #                              CODE GENERATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def c_string_literal(text: str) -> str:
+    """Encode text as a C string literal. Every byte that is not printable
+    ASCII is emitted as an octal escape, so no input can terminate the literal
+    or inject code (the old escaper missed \\r, \\0 and quote/backslash order)."""
+    out = ['"']
+    for byte in text.encode('utf-8'):
+        ch = chr(byte)
+        if ch == '"':
+            out.append('\\"')
+        elif ch == '\\':
+            out.append('\\\\')
+        elif ch == '\n':
+            out.append('\\n')
+        elif ch == '\t':
+            out.append('\\t')
+        elif 32 <= byte < 127 and ch != '?':   # '?' avoided: no C trigraphs
+            out.append(ch)
+        else:
+            out.append('\\%03o' % byte)
+    out.append('"')
+    return ''.join(out)
+
+
+def c_format_spec(spec: str, ptype: str) -> Tuple[str, str]:
+    """Translate an f-string spec (`.2f`, `5`, `x`, `08.3f`) into a printf format.
+    Returns (format, 'float'|'int')."""
+    m = re.match(r'^([<>^]?)(\d*)(?:\.(\d+))?([fdxXobe%]?)$', spec)
+    if not m:
+        return ("%g", "float") if ptype == "float" else ("%lld", "int")
+    align, width, prec, conv = m.groups()
+    flags = '-' if align == '<' else ''
+    if width.startswith('0') and len(width) > 1:
+        flags += '0'
+    w = width.lstrip('0') if width.startswith('0') else width
+    if conv in ('f', 'e', '%') or (not conv and (prec or ptype == "float")):
+        c = conv if conv in ('f', 'e') else ('f' if prec else 'g')
+        p = f".{prec}" if prec else ""
+        return (f"%{flags}{w}{p}{c}", "float")
+    c = {'x': 'llx', 'X': 'llX', 'o': 'llo', 'b': 'lld'}.get(conv, 'lld')
+    return (f"%{flags}{w}{c}", "int")
+
+
+def c_comment(text: str) -> str:
+    """Make arbitrary text safe inside a /* ... */ C comment."""
+    return '/* ' + text.replace('*/', '* /').replace('\n', ' ').replace('\r', ' ') + ' */'
+
+
 class CCodeGenerator:
     def __init__(self):
         self.output: List[str] = []
@@ -2844,7 +3137,10 @@ class CCodeGenerator:
         self.bool_vars: Set[str] = set()
         self.struct_vars: Dict[str, str] = {}  # var_name -> struct_type_name
         self.array_vars: Dict[str, int] = {}  # name -> length
+        self.array_elem_c: Dict[str, str] = {}  # array name -> C element type
         self._global_string_vars: Set[str] = set()
+        self._global_array_vars: Dict[str, int] = {}
+        self._global_array_elem_c: Dict[str, str] = {}
         self._global_float_vars: Set[str] = set()
         self._global_bool_vars: Set[str] = set()
         self.current_level = 2
@@ -2861,6 +3157,9 @@ class CCodeGenerator:
         self._current_ensures: list = []
         self._current_ensures_ret_type: str = "int64_t"
         self._in_ensures: bool = False
+        self._current_ret_type: Optional[Type] = None   # TIL return type of the function being generated
+        self.optresult_vars: Dict[str, str] = {}        # var -> TIL_Option_x / TIL_Result_x
+        self.module_names: Set[str] = set()             # imported module names (for mod.func())
     
     @staticmethod
     def mangle_name(name: str) -> str:
@@ -2888,6 +3187,7 @@ class CCodeGenerator:
     
     def generate(self, program: Program) -> str:
         self.output = []
+        self.module_names = set(getattr(program, 'module_names', set()) or ())
         
         # First pass: collect definitions
         self._globals: List[VarDecl] = []
@@ -2923,6 +3223,8 @@ class CCodeGenerator:
             for method in methods:
                 self._func_ret_types[f"{type_name}_{method.name}"] = self.type_to_c(method.ret_type)
 
+        self._deferred_global_inits: List[VarDecl] = []
+
         # Initialize lambda storage
         self._lambda_defs = []
         self._lambda_counter = 0
@@ -2931,9 +3233,12 @@ class CCodeGenerator:
         self.emit_header()
         self.emit_types()
         self.emit_enums()
+        # Helpers define Option/Result/Vec/HashMap typedefs, so they must come
+        # before type aliases and function prototypes that mention those types.
+        self.emit_helpers()
+        self.emit_optresult_methods()
         self.emit_type_aliases()
         self.emit_forward_declarations()
-        self.emit_helpers()
         self.emit_lambdas()
         self.emit_structs()
         self.emit_globals()
@@ -3057,6 +3362,45 @@ static double til_floor(double x) { return floor(x); }
 static double til_ceil(double x) { return ceil(x); }
 static double til_round(double x) { return round(x); }
 
+// Integer power (exact, wraps like other int64 arithmetic)
+static int64_t til_ipow(int64_t base, int64_t exp) {
+    if (exp < 0) return (base == 1) ? 1 : (base == -1) ? ((exp & 1) ? -1 : 1) : 0;
+    uint64_t result = 1, b = (uint64_t)base;
+    while (exp > 0) { if (exp & 1) result *= b; b *= b; exp >>= 1; }
+    return (int64_t)result;
+}
+
+// Panic: every runtime error goes through here, so `retry`/`timeout`
+// blocks can recover from it (setjmp/longjmp based recovery points).
+#include <setjmp.h>
+#include <time.h>
+typedef struct TIL_Recover { jmp_buf env; double deadline; struct TIL_Recover* prev; } TIL_Recover;
+static TIL_Recover* til_recover_top = NULL;
+static const char* til_panic_msg = "";
+static char til_panic_buf[256];
+static int til_deadline_active = 0;
+static void til_panic(const char* msg) {
+    til_panic_msg = msg;
+    if (til_recover_top) longjmp(til_recover_top->env, 1);
+    fflush(stdout);
+    fprintf(stderr, "%s\\n", msg);
+    exit(1);
+}
+static double til_now_ms(void) { return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC; }
+// Called at loop back-edges and function entries when the program uses `timeout`
+static void til_check_deadline(void) {
+    if (!til_deadline_active) return;
+    for (TIL_Recover* r = til_recover_top; r; r = r->prev)
+        if (r->deadline > 0 && til_now_ms() > r->deadline) { til_panic("timeout"); return; }
+}
+
+// Value -> string conversions (for "text" + number, f-strings, str())
+static char* til_int_to_str(int64_t x) { char* b = (char*)malloc(24); snprintf(b, 24, "%lld", (long long)x); return b; }
+static char* til_float_to_str(double x) { char* b = (char*)malloc(32); snprintf(b, 32, "%g", x); return b; }
+static const char* til_bool_to_str(bool x) { return x ? "true" : "false"; }
+static char* til_fmt_float(double x, const char* fmt) { char* b = (char*)malloc(64); snprintf(b, 64, fmt, x); return b; }
+static char* til_fmt_int(int64_t x, const char* fmt) { char* b = (char*)malloc(64); snprintf(b, 64, fmt, (long long)x); return b; }
+
 // Min/max
 static int64_t til_min_int(int64_t a, int64_t b) { return a < b ? a : b; }
 static int64_t til_max_int(int64_t a, int64_t b) { return a > b ? a : b; }
@@ -3176,11 +3520,11 @@ static void til_int_array_push(TIL_IntArray* a, int64_t val) {
     a->data[a->len++] = val;
 }
 static int64_t til_int_array_pop(TIL_IntArray* a) {
-    if (a->len == 0) { fprintf(stderr, "Pop from empty array\\n"); exit(1); }
+    if (a->len == 0) { til_panic("Pop from empty array"); }
     return a->data[--a->len];
 }
 static int64_t til_int_array_get(TIL_IntArray* a, size_t i) {
-    if (i >= a->len) { fprintf(stderr, "Array index out of bounds\\n"); exit(1); }
+    if (i >= a->len) { til_panic("Array index out of bounds"); }
     return a->data[i];
 }
 
@@ -3200,15 +3544,15 @@ static TIL_Option_str til_None_str(void) { return (TIL_Option_str){false, NULL};
 static TIL_Option_bool til_None_bool(void) { return (TIL_Option_bool){false, false}; }
 
 static int64_t til_unwrap_int(TIL_Option_int opt, const char* msg) {
-    if (!opt.has_value) { fprintf(stderr, "Unwrap failed: %s\\n", msg); exit(1); }
+    if (!opt.has_value) { snprintf(til_panic_buf, sizeof til_panic_buf, "Unwrap failed: %s", msg); til_panic(til_panic_buf); }
     return opt.value;
 }
 static double til_unwrap_float(TIL_Option_float opt, const char* msg) {
-    if (!opt.has_value) { fprintf(stderr, "Unwrap failed: %s\\n", msg); exit(1); }
+    if (!opt.has_value) { snprintf(til_panic_buf, sizeof til_panic_buf, "Unwrap failed: %s", msg); til_panic(til_panic_buf); }
     return opt.value;
 }
 static const char* til_unwrap_str(TIL_Option_str opt, const char* msg) {
-    if (!opt.has_value) { fprintf(stderr, "Unwrap failed: %s\\n", msg); exit(1); }
+    if (!opt.has_value) { snprintf(til_panic_buf, sizeof til_panic_buf, "Unwrap failed: %s", msg); til_panic(til_panic_buf); }
     return opt.value;
 }
 
@@ -3220,6 +3564,8 @@ typedef struct TIL_Result_str { bool is_ok; const char* value; const char* error
 static TIL_Result_int til_Ok_int(int64_t v) { return (TIL_Result_int){true, v, NULL}; }
 static TIL_Result_float til_Ok_float(double v) { return (TIL_Result_float){true, v, NULL}; }
 static TIL_Result_str til_Ok_str(const char* v) { return (TIL_Result_str){true, v, NULL}; }
+typedef struct TIL_Result_bool { bool is_ok; bool value; const char* error; } TIL_Result_bool;
+static TIL_Result_bool til_Ok_bool(bool v) { return (TIL_Result_bool){true, v, NULL}; }
 static TIL_Result_int til_Err_int(const char* e) { return (TIL_Result_int){false, 0, e}; }
 static TIL_Result_float til_Err_float(const char* e) { return (TIL_Result_float){false, 0.0, e}; }
 static TIL_Result_str til_Err_str(const char* e) { return (TIL_Result_str){false, NULL, e}; }
@@ -3232,8 +3578,8 @@ static void* til_realloc(void* ptr, size_t size) { return realloc(ptr, size); }
 // Bounds checking (Level 2)
 static void til_bounds_check(size_t index, size_t len, const char* msg) {
     if (index >= len) {
-        fprintf(stderr, "Bounds check failed: %s (index %zu, len %zu)\\n", msg, index, len);
-        exit(1);
+        snprintf(til_panic_buf, sizeof til_panic_buf, "Bounds check failed: %s (index %zu, len %zu)", msg, index, len);
+        til_panic(til_panic_buf);
     }
 }
 
@@ -3248,11 +3594,11 @@ static void til_dynarray_int_push(TIL_DynArray_int* a, int64_t val) {
     a->data[a->len++] = val;
 }
 static int64_t til_dynarray_int_pop(TIL_DynArray_int* a) {
-    if (a->len == 0) { fprintf(stderr, "Pop from empty Vec\\n"); exit(1); }
+    if (a->len == 0) { til_panic("Pop from empty Vec"); }
     return a->data[--a->len];
 }
 static int64_t til_dynarray_int_get(TIL_DynArray_int* a, size_t i) {
-    if (i >= a->len) { fprintf(stderr, "Vec index out of bounds\\n"); exit(1); }
+    if (i >= a->len) { til_panic("Vec index out of bounds"); }
     return a->data[i];
 }
 
@@ -3266,11 +3612,11 @@ static void til_dynarray_float_push(TIL_DynArray_float* a, double val) {
     a->data[a->len++] = val;
 }
 static double til_dynarray_float_pop(TIL_DynArray_float* a) {
-    if (a->len == 0) { fprintf(stderr, "Pop from empty Vec\\n"); exit(1); }
+    if (a->len == 0) { til_panic("Pop from empty Vec"); }
     return a->data[--a->len];
 }
 static double til_dynarray_float_get(TIL_DynArray_float* a, size_t i) {
-    if (i >= a->len) { fprintf(stderr, "Vec index out of bounds\\n"); exit(1); }
+    if (i >= a->len) { til_panic("Vec index out of bounds"); }
     return a->data[i];
 }
 
@@ -3284,11 +3630,11 @@ static void til_dynarray_str_push(TIL_DynArray_str* a, const char* val) {
     a->data[a->len++] = val;
 }
 static const char* til_dynarray_str_pop(TIL_DynArray_str* a) {
-    if (a->len == 0) { fprintf(stderr, "Pop from empty Vec\\n"); exit(1); }
+    if (a->len == 0) { til_panic("Pop from empty Vec"); }
     return a->data[--a->len];
 }
 static const char* til_dynarray_str_get(TIL_DynArray_str* a, size_t i) {
-    if (i >= a->len) { fprintf(stderr, "Vec index out of bounds\\n"); exit(1); }
+    if (i >= a->len) { til_panic("Vec index out of bounds"); }
     return a->data[i];
 }
 
@@ -3326,7 +3672,7 @@ static int64_t til_hashmap_str_int_get(TIL_HashMap_str_int* m, const char* key) 
         if (!m->entries[j].occupied) break;
         if (strcmp(m->entries[j].key, key) == 0) return m->entries[j].value;
     }
-    fprintf(stderr, "Key not found: %s\\n", key); exit(1); return 0;
+    snprintf(til_panic_buf, sizeof til_panic_buf, "Key not found: %s", key); til_panic(til_panic_buf); return 0;
 }
 static bool til_hashmap_str_int_has(TIL_HashMap_str_int* m, const char* key) {
     size_t idx = _til_hash_str(key) % m->cap;
@@ -3373,7 +3719,7 @@ static const char* til_hashmap_str_str_get(TIL_HashMap_str_str* m, const char* k
         if (!m->entries[j].occupied) break;
         if (strcmp(m->entries[j].key, key) == 0) return m->entries[j].value;
     }
-    fprintf(stderr, "Key not found: %s\\n", key); exit(1); return NULL;
+    snprintf(til_panic_buf, sizeof til_panic_buf, "Key not found: %s", key); til_panic(til_panic_buf); return NULL;
 }
 static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
     size_t idx = _til_hash_str(key) % m->cap;
@@ -3387,6 +3733,25 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
 """)
         self.emit_raw("")
     
+    def emit_optresult_methods(self):
+        """unwrap / unwrap_or / expect for every Option/Result instantiation."""
+        ctypes = {"int": "int64_t", "float": "double", "str": "const char*", "bool": "bool"}
+        self.emit_raw("// Option/Result methods")
+        for suffix, ct in ctypes.items():
+            self.emit_raw(f"static {ct} til_opt_unwrap_{suffix}(TIL_Option_{suffix} o) "
+                          f"{{ if (!o.has_value) til_panic(\"unwrap() called on None\"); return o.value; }}")
+            self.emit_raw(f"static {ct} til_opt_expect_{suffix}(TIL_Option_{suffix} o, const char* m) "
+                          f"{{ if (!o.has_value) til_panic(m); return o.value; }}")
+            self.emit_raw(f"static {ct} til_opt_unwrap_or_{suffix}(TIL_Option_{suffix} o, {ct} d) "
+                          f"{{ return o.has_value ? o.value : d; }}")
+            self.emit_raw(f"static {ct} til_res_unwrap_{suffix}(TIL_Result_{suffix} r) "
+                          f"{{ if (!r.is_ok) til_panic(r.error); return r.value; }}")
+            self.emit_raw(f"static {ct} til_res_expect_{suffix}(TIL_Result_{suffix} r, const char* m) "
+                          f"{{ if (!r.is_ok) til_panic(m); return r.value; }}")
+            self.emit_raw(f"static {ct} til_res_unwrap_or_{suffix}(TIL_Result_{suffix} r, {ct} d) "
+                          f"{{ return r.is_ok ? r.value : d; }}")
+        self.emit_raw("")
+
     def emit_type_aliases(self):
         """Emit C typedef for type aliases."""
         if not self._type_aliases:
@@ -3409,12 +3774,18 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             self._track_var_type(var, c_type)
             self.declared_vars.add(var.name)
             # Track global type info for print inference across functions
-            if isinstance(var.value, StringLit):
+            if c_type == "const char*":
                 self._global_string_vars.add(var.name)
-            elif isinstance(var.value, FloatLit):
+            elif c_type in ("double", "float"):
                 self._global_float_vars.add(var.name)
-            elif isinstance(var.value, BoolLit):
+            elif c_type == "bool":
                 self._global_bool_vars.add(var.name)
+            if var.value and not self._is_c_constant(var.value):
+                # Not a C constant expression (calls, other globals, string ops):
+                # declare here, initialize at program start (inside main).
+                self.emit_raw(f"static {c_type} {c_name};")
+                self._deferred_global_inits.append(var)
+                continue
             if var.value:
                 val = self.generate_node(var.value)
                 if isinstance(var.value, ArrayLit):
@@ -3423,11 +3794,30 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                     self.emit_raw(f"static {elem_type} {c_name}[{n}] = {val};")
                     self.emit_raw(f"static size_t {c_name}_len = {n};")
                     self.array_vars[var.name] = n
+                    self._global_array_vars[var.name] = n
+                    self._global_array_elem_c[var.name] = elem_type
                 else:
                     self.emit_raw(f"static {c_type} {c_name} = {val};")
             else:
                 self.emit_raw(f"static {c_type} {c_name};")
         self.emit_raw("")
+
+    def _is_c_constant(self, node) -> bool:
+        """Is this TIL expression a valid C static initializer?"""
+        if isinstance(node, (IntLit, FloatLit, StringLit, BoolLit, CharLit)):
+            return True
+        if isinstance(node, UnaryOp) and node.op in ('-', '~', 'not'):
+            return self._is_c_constant(node.operand)
+        if isinstance(node, BinaryOp) and node.op in ('-', '*', '/', '%', '&', '|', '^', '<<', '>>',
+                                                       '==', '!=', '<', '>', '<=', '>=', 'and', 'or'):
+            return self._is_c_constant(node.left) and self._is_c_constant(node.right) \
+                and not (self._is_string_expr(node.left) or self._is_string_expr(node.right))
+        if isinstance(node, BinaryOp) and node.op == '+':
+            return (self._is_c_constant(node.left) and self._is_c_constant(node.right)
+                    and not (self._is_string_expr(node.left) or self._is_string_expr(node.right)))
+        if isinstance(node, ArrayLit):
+            return all(self._is_c_constant(e) for e in node.elements)
+        return False
 
     def emit_capabilities(self):
         """Emit capability type definitions."""
@@ -3549,9 +3939,11 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         self.float_vars = set(self._global_float_vars)
         self.bool_vars = set(self._global_bool_vars)
         self.struct_vars = {}
-        self.array_vars = {}
+        self.array_vars = dict(self._global_array_vars)
+        self.array_elem_c = dict(self._global_array_elem_c)
         self.dynarray_vars = {}
         self.hashmap_vars = {}
+        self.optresult_vars = {}
         self._lambda_var_map = {}
         self.in_method = False
         self.current_struct = None
@@ -3642,23 +4034,31 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         if cross_level_info:
             self.emit(f'// Cross-level contract: {cross_level_info}')
 
+        # Program start: initialize globals whose values are not C constants
+        if func.name == "main":
+            for var in self._deferred_global_inits:
+                self.emit(f"{self.mangle_name(var.name)} = {self.generate_node(var.value)};")
+
         # Emit requires contract checks at function entry
         if func.requires:
             for req_expr in func.requires:
                 req_code = self.generate_node(req_expr)
-                self.emit(f'if (!({req_code})) {{ fprintf(stderr, "Contract violation: requires failed\\n"); exit(1); }}')
+                self.emit(f'if (!({req_code})) {{ til_panic("Contract violation: requires failed"); }}')
 
         # Set up ensures for gen_Return to use
         old_ensures = self._current_ensures
         old_ensures_ret = self._current_ensures_ret_type
+        old_ret_type = self._current_ret_type
         self._current_ensures = func.ensures if func.ensures else []
         self._current_ensures_ret_type = ret
+        self._current_ret_type = func.ret_type
 
         self.generate_node(func.body)
 
         # Restore ensures state
         self._current_ensures = old_ensures
         self._current_ensures_ret_type = old_ensures_ret
+        self._current_ret_type = old_ret_type
         
         # Add default return if needed
         if isinstance(func.ret_type, VoidType) or (isinstance(func.ret_type, PrimitiveType) and func.ret_type.name == "void"):
@@ -3730,7 +4130,8 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 if isinstance(node.value, ArrayLit):
                     elem_type = self.infer_array_elem_type(node.value)
                     n = len(node.value.elements)
-                    self.emit(f"{elem_type} {c_name}[{n}] = {val};")
+                    self.array_elem_c[node.name] = elem_type
+                    self.emit(f"{elem_type} {c_name}[{n if n else 1}] = {val if n else '{0}'};")
                     self.emit(f"size_t {c_name}_len = {n};")
                 elif isinstance(node.value, ListComprehension):
                     # Comprehension already emitted the array; just assign the pointer and len
@@ -3771,6 +4172,8 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         # Track enum types
         if c_type in self.enums:
             pass  # enums are int-like in C
+        if c_type.startswith("TIL_Option_") or c_type.startswith("TIL_Result_"):
+            self.optresult_vars[node.name] = c_type
         # Track Vec<T> dynamic array variables
         if c_type.startswith("TIL_DynArray_"):
             elem_type = c_type[len("TIL_DynArray_"):]
@@ -3784,6 +4187,11 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
     def gen_Assignment(self, node: Assignment) -> str:
         target = self.generate_node(node.target)
         value = self.generate_node(node.value)
+
+        # `s += x` on a string lowers to `s = til_str_concat(s, x)`
+        if node.op == "+=" and self._is_string_expr(node.target):
+            self.emit(f"{target} = til_str_concat({target}, {self._to_c_string(node.value, value)});")
+            return ""
         
         if node.op == "=":
             self.emit(f"{target} = {value};")
@@ -3822,13 +4230,40 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             end = self.generate_node(node.iter.end)
             op = "<=" if node.iter.inclusive else "<"
             self.emit(f"for (int64_t {c_var} = {start}; {c_var} {op} {end}; {c_var}++) {{")
-        elif isinstance(node.iter, Identifier):
-            c_arr = self.mangle_name(node.iter.name)
-            len_var = f"{c_arr}_len"
-            self.emit(f"for (size_t _i_{c_var} = 0; _i_{c_var} < {len_var}; _i_{c_var}++) {{")
+        elif not isinstance(node.iter, Identifier) and self._is_string_expr(node.iter):
+            # for ch in "text" / for ch in s.to_upper() -> byte codes
+            tmp = f"_str_{c_var}"
+            self.emit(f"const char* {tmp} = {self.generate_node(node.iter)};")
+            self.emit(f"for (size_t _i_{c_var} = 0; {tmp}[_i_{c_var}]; _i_{c_var}++) {{")
             self.indent += 1
-            self.emit(f"int64_t {c_var} = {c_arr}[_i_{c_var}];")
+            self.emit(f"int64_t {c_var} = (unsigned char){tmp}[_i_{c_var}];")
             self.indent -= 1
+        elif isinstance(node.iter, Identifier):
+            name = node.iter.name
+            c_arr = self.mangle_name(name)
+            if name in self.dynarray_vars:
+                # for x in vec
+                elem_c = {"int": "int64_t", "float": "double", "str": "const char*"}.get(
+                    self.dynarray_vars[name], "int64_t")
+                self.emit(f"for (size_t _i_{c_var} = 0; _i_{c_var} < {c_arr}.len; _i_{c_var}++) {{")
+                self.indent += 1
+                self.emit(f"{elem_c} {c_var} = {c_arr}.data[_i_{c_var}];")
+                self.indent -= 1
+                self._track_loop_var(node.var, elem_c)
+            elif name in self.string_vars:
+                # for ch in "text" -> byte codes (TIL chars are integers, like C)
+                self.emit(f"for (size_t _i_{c_var} = 0; {c_arr}[_i_{c_var}]; _i_{c_var}++) {{")
+                self.indent += 1
+                self.emit(f"int64_t {c_var} = (unsigned char){c_arr}[_i_{c_var}];")
+                self.indent -= 1
+            else:
+                elem_c = self.array_elem_c.get(name, "int64_t")
+                len_var = f"{c_arr}_len"
+                self.emit(f"for (size_t _i_{c_var} = 0; _i_{c_var} < {len_var}; _i_{c_var}++) {{")
+                self.indent += 1
+                self.emit(f"{elem_c} {c_var} = {c_arr}[_i_{c_var}];")
+                self.indent -= 1
+                self._track_loop_var(node.var, elem_c)
         elif isinstance(node.iter, ArrayLit):
             n = len(node.iter.elements)
             elem_type = self.infer_array_elem_type(node.iter)
@@ -3839,6 +4274,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             self.indent += 1
             self.emit(f"{elem_type} {c_var} = {arr_name}[_i_{c_var}];")
             self.indent -= 1
+            self._track_loop_var(node.var, elem_type)
         elif isinstance(node.iter, Attribute):
             # Iterate over field: for x in obj.items
             iter_expr = self.generate_node(node.iter)
@@ -3867,6 +4303,17 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         self.emit("}")
         return ""
     
+    def _track_loop_var(self, name: str, elem_c: str):
+        """Register a loop variable's C type so print/concat/== treat it right."""
+        for tracked in (self.string_vars, self.float_vars, self.bool_vars):
+            tracked.discard(name)
+        if elem_c == "const char*":
+            self.string_vars.add(name)
+        elif elem_c in ("double", "float"):
+            self.float_vars.add(name)
+        elif elem_c == "bool":
+            self.bool_vars.add(name)
+
     def gen_While(self, node: While) -> str:
         cond = self.generate_node(node.condition)
         self.emit(f"while ({cond}) {{")
@@ -3886,6 +4333,11 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
     
     def gen_Return(self, node: Return) -> str:
         if node.value:
+            if isinstance(node.value, Identifier) and node.value.name == "NULL":
+                suffix = self._optresult_suffix_from_context('None')
+                if suffix:
+                    self.emit(f"return til_None_{suffix}();")
+                    return ""
             val = self.generate_node(node.value)
             # Check if current function has ensures contracts
             if self._current_ensures:
@@ -3895,7 +4347,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 self._in_ensures = True
                 for ens_expr in self._current_ensures:
                     ens_code = self.generate_node(ens_expr)
-                    self.emit(f'  if (!({ens_code})) {{ fprintf(stderr, "Contract violation: ensures\\n"); exit(1); }}')
+                    self.emit(f'  if (!({ens_code})) {{ til_panic("Contract violation: ensures"); }}')
                 self._in_ensures = old_in_ensures
                 self.emit(f"  return _result; }}")
             else:
@@ -4042,6 +4494,17 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                     if method_name == "len":
                         return "int64_t"
 
+            # Option / Result method return types
+            opt_ct = self._optresult_ctype(node.func.obj)
+            if opt_ct:
+                if method_name in ("is_some", "is_none", "is_ok", "is_err"):
+                    return "bool"
+                if method_name in ("unwrap", "expect", "unwrap_or"):
+                    return {"int": "int64_t", "float": "double", "str": "const char*",
+                            "bool": "bool"}.get(opt_ct.split("_")[-1], "int64_t")
+                if method_name == "error":
+                    return "const char*"
+
             # String method return types
             if self._is_string_expr(node.func.obj):
                 str_bool_methods = {'contains', 'starts_with', 'ends_with', 'eq'}
@@ -4053,6 +4516,10 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                     return "const char*"
                 if method_name in str_int_methods:
                     return "int64_t"
+
+            if (isinstance(node.func.obj, Identifier) and node.func.obj.name in self.module_names
+                    and method_name in self._func_ret_types):
+                return self._func_ret_types[method_name]
 
             # obj.method() — resolve struct type of obj, then look up method return type
             stype = self._resolve_expr_struct_type(node.func.obj)
@@ -4115,17 +4582,19 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             if name == 'max':
                 return f"til_max_int({args_str})"
 
-            # Option/Result constructors
-            if name == 'Some':
-                inner_type = self._infer_expr_print_type(node.args[0]) if node.args else "int"
-                type_map = {"int": "int", "float": "float", "str": "str", "bool": "bool"}
-                return f"til_Some_{type_map.get(inner_type, 'int')}({args_str})"
-            if name == 'Ok':
-                inner_type = self._infer_expr_print_type(node.args[0]) if node.args else "int"
-                type_map = {"int": "int", "float": "float", "str": "str", "bool": "bool"}
-                return f"til_Ok_{type_map.get(inner_type, 'int')}({args_str})"
-            if name == 'Err':
-                return f'til_Err_int({args_str})'
+            # Option/Result constructors (typed by the enclosing function's
+            # return type when it is an Option/Result, else by the argument)
+            if name in ('Some', 'Ok', 'Err'):
+                suffix = self._optresult_suffix_from_context(name)
+                if suffix is None:
+                    if name == 'Err':
+                        suffix = "int"
+                    else:
+                        inner_type = self._infer_expr_print_type(node.args[0]) if node.args else "int"
+                        suffix = inner_type if inner_type in ("int", "float", "str", "bool") else "int"
+                if name == 'Err' and suffix == "bool":
+                    suffix = "int"
+                return f"til_{name}_{suffix}({args_str})"
 
             # Struct constructor
             if name in self.structs:
@@ -4194,6 +4663,21 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                     elif method_name == "len":
                         return f"(int64_t){c_obj}.len"
 
+            # Option / Result methods
+            opt_ct = self._optresult_ctype(node.func.obj)
+            if opt_ct:
+                is_opt = opt_ct.startswith("TIL_Option_")
+                suffix = opt_ct.split("_")[-1]
+                kind = "opt" if is_opt else "res"
+                if method_name in ("is_some", "is_ok"):
+                    return f"({obj}).{'has_value' if is_opt else 'is_ok'}"
+                if method_name in ("is_none", "is_err"):
+                    return f"(!({obj}).{'has_value' if is_opt else 'is_ok'})"
+                if method_name in ("unwrap", "expect", "unwrap_or"):
+                    return f"til_{kind}_{method_name}_{suffix}({', '.join([obj] + args)})"
+                if method_name == "error" and not is_opt:
+                    return f"({obj}).error"
+
             # String method calls
             if self._is_string_expr(node.func.obj):
                 str_methods = {
@@ -4238,6 +4722,16 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                     args_str = ", ".join(args)
                 return f"{resolved_type}_{method_name}({args_str})"
 
+            # Module-qualified call: `math_utils.square(5)` (imports are merged,
+            # so this is a call of the imported top-level function)
+            if (isinstance(node.func.obj, Identifier) and node.func.obj.name in self.module_names
+                    and method_name in self.functions):
+                func_def = self.functions[method_name]
+                for i in range(len(node.args), len(func_def.params)):
+                    if func_def.params[i].default:
+                        args.append(self.generate_node(func_def.params[i].default))
+                return f"til_{self.mangle_name(method_name)}({', '.join(args)})"
+
             args_str = ", ".join(args)
             return f"{obj}.{method_name}({args_str})"
         
@@ -4245,6 +4739,26 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         args = [self.generate_node(a) for a in node.args]
         return f"{func}({', '.join(args)})"
     
+    def _optresult_suffix_from_context(self, ctor: str) -> Optional[str]:
+        """Suffix (int/float/str/bool) for Some/None/Ok/Err from the current
+        function's declared Option/Result return type."""
+        rt = self._current_ret_type
+        if ctor in ('Some', 'None') and isinstance(rt, OptionType):
+            return self.type_to_c(rt)[len("TIL_Option_"):]
+        if ctor in ('Ok', 'Err') and isinstance(rt, ResultType):
+            return self.type_to_c(rt)[len("TIL_Result_"):]
+        return None
+
+    def _optresult_ctype(self, node) -> Optional[str]:
+        """C type (TIL_Option_x / TIL_Result_x) of an Option/Result expression."""
+        if isinstance(node, Identifier) and node.name in self.optresult_vars:
+            return self.optresult_vars[node.name]
+        if isinstance(node, Call):
+            ct = self._infer_call_ret_type(node)
+            if ct.startswith("TIL_Option_") or ct.startswith("TIL_Result_"):
+                return ct
+        return None
+
     def gen_BinaryOp(self, node: BinaryOp) -> str:
         left = self.generate_node(node.left)
         right = self.generate_node(node.right)
@@ -4259,15 +4773,35 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         }
         
         if node.op == '**':
+            if (self._infer_expr_print_type(node.left) == "int" and
+                    self._infer_expr_print_type(node.right) == "int"):
+                return f"til_ipow({left}, {right})"     # exact integer power
             return f"pow({left}, {right})"
         
         if node.op == '+':
-            # Check for string concat — works with literals AND variables
+            # String concat - works with literals AND variables; a non-string
+            # operand is converted ("Score: " + 42 == "Score: 42")
             if self._is_string_expr(node.left) or self._is_string_expr(node.right):
-                return f'til_str_concat({left}, {right})'
+                return f'til_str_concat({self._to_c_string(node.left, left)}, {self._to_c_string(node.right, right)})'
+
+        # String equality compares contents, not pointers
+        if node.op in ('==', '!=') and (self._is_string_expr(node.left) or self._is_string_expr(node.right)):
+            eq = f'til_str_eq({left}, {right})'
+            return eq if node.op == '==' else f'(!{eq})'
         
         c_op = op_map.get(node.op, node.op)
         return f"({left} {c_op} {right})"
+
+    def _to_c_string(self, node, code: str) -> str:
+        """C expression converting an already-generated value to a C string."""
+        ptype = self._infer_expr_print_type(node)
+        if ptype == "str":
+            return code
+        if ptype == "float":
+            return f"til_float_to_str({code})"
+        if ptype == "bool":
+            return f"til_bool_to_str({code})"
+        return f"til_int_to_str((int64_t)({code}))"
     
     def _resolve_expr_struct_type(self, node) -> Optional[str]:
         """Resolve the struct type name of an expression, or None."""
@@ -4304,8 +4838,12 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
 
     def _is_string_expr(self, node) -> bool:
         """Check if an expression produces a string value."""
-        if isinstance(node, StringLit):
+        if isinstance(node, (StringLit, FStringLit)):
             return True
+        if isinstance(node, Cast):
+            return self.type_to_c(node.target_type) == "const char*"
+        if isinstance(node, IfExpr):
+            return self._is_string_expr(node.then_expr)
         if isinstance(node, Identifier):
             return node.name in self.string_vars
         if isinstance(node, BinaryOp) and node.op == '+':
@@ -4575,8 +5113,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         return str(node.value)
     
     def gen_StringLit(self, node: StringLit) -> str:
-        escaped = node.value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t')
-        return f'"{escaped}"'
+        return c_string_literal(node.value)
     
     def gen_BoolLit(self, node: BoolLit) -> str:
         return "true" if node.value else "false"
@@ -4619,43 +5156,28 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         return f"({tuple_name}){{{fields}}}"
 
     def gen_FStringLit(self, node: FStringLit) -> str:
-        """Generate f-string as a series of til_str_concat calls."""
+        """Generate an f-string as til_str_concat calls; supports {x:.2f}-style specs."""
         if not node.parts:
             return '""'
 
         result = None
-        for kind, part in node.parts:
+        for part in node.parts:
+            kind, value = part[0], part[1]
+            spec = part[2] if len(part) > 2 else None
             if kind == 'str':
-                val = self.gen_StringLit(part)
+                val = self.gen_StringLit(value)
             else:
-                # Expression — convert to string based on type
-                ptype = self._infer_expr_print_type(part)
-                expr_val = self.generate_node(part)
-                if ptype == "str":
-                    val = expr_val
-                elif ptype == "int":
-                    if not hasattr(self, '_fstr_counter'):
-                        self._fstr_counter = 0
-                    self._fstr_counter += 1
-                    buf = f"_fstr_buf_{self._fstr_counter}"
-                    self.emit(f"char {buf}[32]; snprintf({buf}, 32, \"%lld\", (long long){expr_val});")
-                    val = buf
-                elif ptype == "float":
-                    if not hasattr(self, '_fstr_counter'):
-                        self._fstr_counter = 0
-                    self._fstr_counter += 1
-                    buf = f"_fstr_buf_{self._fstr_counter}"
-                    self.emit(f"char {buf}[32]; snprintf({buf}, 32, \"%g\", {expr_val});")
-                    val = buf
-                elif ptype == "bool":
-                    val = f"({expr_val} ? \"true\" : \"false\")"
+                ptype = self._infer_expr_print_type(value)
+                expr_val = self.generate_node(value)
+                if spec:
+                    cspec = c_format_spec(spec, ptype)
+                    if cspec[1] == "float":
+                        val = f"til_fmt_float((double)({expr_val}), {c_string_literal(cspec[0])})"
+                    else:
+                        val = f"til_fmt_int((int64_t)({expr_val}), {c_string_literal(cspec[0])})"
                 else:
-                    val = expr_val
-
-            if result is None:
-                result = val
-            else:
-                result = f"til_str_concat({result}, {val})"
+                    val = self._to_c_string(value, expr_val)
+            result = val if result is None else f"til_str_concat({result}, {val})"
 
         return result
 
@@ -4664,8 +5186,29 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         return "{" + ", ".join(elements) + "}"
     
     def gen_NullCheck(self, node: NullCheck) -> str:
-        expr = self.generate_node(node.expr)
-        return f"({expr} != NULL ? {expr} : (fprintf(stderr, \"Null unwrap failed\\n\"), exit(1), (void*)0))"
+        """`expr?` - real error propagation: if expr is None/Err, return it from the
+        enclosing function (when that function returns Option/Result), otherwise
+        panic. Evaluates to the unwrapped value."""
+        ct = self._optresult_ctype(node.expr)
+        if ct is None:
+            expr = self.generate_node(node.expr)
+            return f"({expr})"
+        self._q_counter = getattr(self, '_q_counter', 0) + 1
+        q = f"_q_{self._q_counter}"
+        self.emit(f"{ct} {q} = {self.generate_node(node.expr)};")
+        rt = self._current_ret_type
+        if ct.startswith("TIL_Option_"):
+            if isinstance(rt, OptionType):
+                self.emit(f"if (!{q}.has_value) return til_None_{self.type_to_c(rt)[len('TIL_Option_'):]}();")
+            else:
+                self.emit(f'if (!{q}.has_value) til_panic("? applied to None");')
+        else:
+            if isinstance(rt, ResultType):
+                rsuffix = self.type_to_c(rt)[len('TIL_Result_'):]
+                self.emit(f"if (!{q}.is_ok) return til_Err_{'int' if rsuffix == 'bool' else rsuffix}({q}.error);")
+            else:
+                self.emit(f'if (!{q}.is_ok) til_panic({q}.error);')
+        return f"{q}.value"
 
     def gen_DictLit(self, node: DictLit) -> str:
         # Basic dict literal - generate as comment for now (needs hash table impl)
@@ -4727,8 +5270,13 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                           and not isinstance(p, (IntLit, FloatLit, BoolLit, StringLit))
                           for p, _, _ in arms)
 
-        if has_guards or has_wildcard or has_var_bind:
-            return self._gen_match_complex(arms, val, is_expr, result_c_type)
+        subject_c = {"str": "const char*", "float": "double", "bool": "bool"}.get(
+            self._infer_expr_print_type(node.value), "int64_t")
+        has_str_pat = any(isinstance(p, StringLit) for p, _, _ in arms)
+        if subject_c == "const char*" or has_str_pat:
+            subject_c = "const char*"   # strings can't be switch()ed: compare contents
+        if has_guards or has_wildcard or has_var_bind or subject_c != "int64_t":
+            return self._gen_match_complex(arms, val, is_expr, result_c_type, subject_c)
         else:
             return self._gen_match_switch(arms, val, is_expr, result_c_type)
 
@@ -4746,7 +5294,8 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             if result:
                 self.emit(f"{result};")
 
-    def _gen_match_complex(self, arms, val, is_expr=False, result_c_type="int64_t"):
+    def _gen_match_complex(self, arms, val, is_expr=False, result_c_type="int64_t",
+                           subject_c="int64_t"):
         """Generate match as cascading if-else with guards/variable bindings."""
         self._match_counter = getattr(self, '_match_counter', 0) + 1
         result_var = f"_match_result_{self._match_counter}" if is_expr else None
@@ -4760,7 +5309,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
 
         self.emit("{")
         self.indent += 1
-        self.emit(f"int64_t _match_val = {val};")
+        self.emit(f"{subject_c} _match_val = {val};")
         self.emit("bool _matched = false;")
 
         for pat, guard, body in arms:
@@ -4777,9 +5326,10 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             elif is_var_bind and guard:
                 var_name = self.mangle_name(pat.name)
                 self.declared_vars.add(pat.name)
+                self._track_loop_var(pat.name, subject_c)
                 self.emit("if (!_matched) {")
                 self.indent += 1
-                self.emit(f"int64_t {var_name} = _match_val;")
+                self.emit(f"{subject_c} {var_name} = _match_val;")
                 guard_code = self.generate_node(guard)
                 self.emit(f"if ({guard_code}) {{")
                 self.indent += 1
@@ -4792,7 +5342,8 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             else:
                 # Literal pattern (possibly with guard)
                 pat_val = self.generate_node(pat)
-                cond = f"_match_val == {pat_val}"
+                cond = (f"til_str_eq(_match_val, {pat_val})" if subject_c == "const char*"
+                        else f"_match_val == {pat_val}")
                 if guard:
                     guard_code = self.generate_node(guard)
                     cond = f"({cond}) && ({guard_code})"
@@ -4941,12 +5492,17 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 if node.value.op == 'not':
                     return 'bool'
                 return self.infer_c_type(VarDecl(value=node.value.operand))
+            if isinstance(node.value, FStringLit):
+                return 'const char*'
+            if isinstance(node.value, CharLit):
+                return 'int64_t'
             if isinstance(node.value, BinaryOp):
                 if node.value.op in ('==', '!=', '<', '>', '<=', '>=', 'and', 'or'):
                     return 'bool'
-                # If either side is float, result is float
-                lt = self._infer_expr_print_type(node.value.left)
-                if lt == "float":
+                ptype = self._infer_expr_print_type(node.value)
+                if ptype == "str":
+                    return 'const char*'
+                if ptype == "float":
                     return 'double'
             if isinstance(node.value, IfExpr):
                 return self.infer_c_type(VarDecl(value=node.value.then_expr))
@@ -4980,23 +5536,19 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
     # ═══════════════════════════════════════════════════════════════
 
     def gen_AssertStmt(self, node: AssertStmt) -> str:
-        """Generate C assert with message."""
+        """assert cond, "msg" -> recoverable runtime check (via til_panic)."""
         cond = self.generate_node(node.condition)
-        if node.message:
-            msg = node.message.replace('"', '\\"')
-            self.emit(f'if (!({cond})) {{ fprintf(stderr, "Assertion failed: {msg}\\n"); exit(1); }}')
-        else:
-            self.emit(f'if (!({cond})) {{ fprintf(stderr, "Assertion failed at line %d\\n", __LINE__); exit(1); }}')
+        msg = f"Assertion failed: {node.message}" if node.message else "Assertion failed"
+        msg += f" (line {node.line})" if node.line else ""
+        self.emit(f'if (!({cond})) til_panic({c_string_literal(msg)});')
         return ""
 
     def gen_InvariantStmt(self, node: InvariantStmt) -> str:
-        """Generate C invariant check."""
+        """invariant cond, "msg" -> recoverable runtime check (via til_panic)."""
         cond = self.generate_node(node.condition)
-        if node.message:
-            msg = node.message.replace('"', '\\"')
-            self.emit(f'if (!({cond})) {{ fprintf(stderr, "Invariant violated: {msg}\\n"); exit(1); }}')
-        else:
-            self.emit(f'if (!({cond})) {{ fprintf(stderr, "Invariant violated at line %d\\n", __LINE__); exit(1); }}')
+        msg = f"Invariant violated: {node.message}" if node.message else "Invariant violated"
+        msg += f" (line {node.line})" if node.line else ""
+        self.emit(f'if (!({cond})) til_panic({c_string_literal(msg)});')
         return ""
 
     def gen_CapabilityType(self, node: CapabilityType) -> str:
@@ -5081,8 +5633,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
 
     def gen_IntentBlock(self, node: IntentBlock) -> str:
         """Generate intent block as documented code block."""
-        desc = node.description.replace('"', '\\"')
-        self.emit(f'// INTENT: {desc}')
+        self.emit(c_comment(f"INTENT: {node.description}"))
         self.emit("{")
         self.indent += 1
         if isinstance(node.body, Block):
@@ -5145,28 +5696,51 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
 #                                COMPILER
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def parse_source(source: str, filename: str = "<stdin>") -> Program:
+    """Lex + parse a TIL source file (honouring `#[lang: ...]` pragmas)."""
+    lexer = Lexer(source, filename)
+    tokens = lexer.tokenize()
+    parser = Parser(tokens, filename, source=source, languages=lexer.languages)
+    return parser.parse()
+
+
+def til_home_dirs() -> List[str]:
+    """Directories that may hold the TIL distribution (stdlib/, vm/):
+    the repository checkout this compiler lives in, $TIL_HOME, ~/.til."""
+    dirs = []
+    compiler_dir = os.path.dirname(os.path.abspath(__file__))
+    dirs.append(os.path.dirname(compiler_dir))          # repo layout: src/til.py
+    dirs.append(compiler_dir)                           # flat layout
+    if os.environ.get('TIL_HOME'):
+        dirs.append(os.environ['TIL_HOME'])
+    dirs.append(os.path.join(os.path.expanduser('~'), '.til'))
+    return dirs
+
+
 class ModuleResolver:
     """Resolves and loads TIL module files."""
 
     def __init__(self, base_path: str = "."):
         self.base_path = base_path
-        self.loaded: Dict[str, Program] = {}  # module_name -> parsed AST
+        self.loaded: Dict[str, Program] = {}  # module path -> parsed AST
 
     def resolve(self, module_name: str, from_file: str = "") -> Optional[str]:
         """Resolve a module name to a file path."""
         # Convert module.path to file path
         parts = module_name.replace(".", os.sep)
 
-        # Search paths: relative to importing file, then base path, then stdlib
+        # Search: importing file's dir, base path, $TIL_PATH, then stdlib dirs
         search_dirs = []
-        if from_file and from_file != "<stdin>":
+        if from_file and not from_file.startswith("<"):
             search_dirs.append(os.path.dirname(os.path.abspath(from_file)))
         search_dirs.append(self.base_path)
-        # Add stdlib directory (relative to compiler location)
-        compiler_dir = os.path.dirname(os.path.abspath(__file__))
-        stdlib_dir = os.path.join(os.path.dirname(compiler_dir), 'stdlib')
-        if os.path.isdir(stdlib_dir):
-            search_dirs.append(stdlib_dir)
+        for extra in os.environ.get('TIL_PATH', '').split(os.pathsep):
+            if extra:
+                search_dirs.append(extra)
+        for home in til_home_dirs():
+            stdlib_dir = os.path.join(home, 'stdlib')
+            if os.path.isdir(stdlib_dir):
+                search_dirs.append(stdlib_dir)
 
         for d in search_dirs:
             # Try module_name.til
@@ -5180,56 +5754,74 @@ class ModuleResolver:
         return None
 
     def load_module(self, module_name: str, from_file: str = "") -> Optional[Program]:
-        """Load and parse a module, returning its AST."""
-        if module_name in self.loaded:
-            return self.loaded[module_name]
-
+        """Load and parse a module, returning its AST (cached per file)."""
         path = self.resolve(module_name, from_file)
         if not path:
             return None
+        key = os.path.abspath(path)
+        if key in self.loaded:
+            return self.loaded[key]
 
         with open(path, 'r', encoding='utf-8') as f:
             source = f.read()
-
-        lexer = Lexer(source, path)
-        tokens = lexer.tokenize()
-        parser = Parser(tokens, path, source=source)
-        ast = parser.parse()
-
-        self.loaded[module_name] = ast
+        ast = parse_source(source, path)
+        ast.filename = path
+        self.loaded[key] = ast
         return ast
 
 
-def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
-    """Process import statements: load modules and merge their definitions."""
-    resolver = ModuleResolver()
-    new_statements = []
+IMPORTABLE_NODES = (FuncDef, StructDef, EnumDef, ImplBlock, TraitDef, TypeAlias,
+                    VarDecl, CapabilityType)
 
-    for stmt in program.statements:
-        if isinstance(stmt, Import):
-            mod_ast = resolver.load_module(stmt.module, filename)
+def _definition_name(node) -> Optional[str]:
+    if isinstance(node, ImplBlock):
+        return node.type_name
+    return getattr(node, 'name', None)
+
+
+def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
+    """Process import statements: load modules (recursively) and merge their
+    definitions - functions, structs, enums, impls, traits, consts, aliases.
+
+    `import m` / `import m as alias` also enable qualified calls `m.f()`;
+    the module names are recorded in `program.module_names`."""
+    resolver = ModuleResolver()
+    seen_defs: Set[int] = set()
+    module_names: Set[str] = set(getattr(program, 'module_names', set()) or ())
+
+    def merge(prog: Program, fname: str, stack: Tuple[str, ...]) -> List[ASTNode]:
+        out = []
+        for stmt in prog.statements:
+            if not isinstance(stmt, Import):
+                out.append(stmt)
+                continue
+            mod_ast = resolver.load_module(stmt.module, fname)
             if mod_ast is None:
                 print(f"Warning: Could not find module '{stmt.module}'", file=sys.stderr)
                 continue
+            module_names.add(stmt.module.split('.')[-1])
+            if stmt.alias:
+                module_names.add(stmt.alias)
+            mod_path = getattr(mod_ast, 'filename', stmt.module)
+            if mod_path in stack:
+                continue  # import cycle: definitions are already being merged
+            mod_stmts = merge(mod_ast, mod_path, stack + (mod_path,))
+            for mod_stmt in mod_stmts:
+                if not isinstance(mod_stmt, IMPORTABLE_NODES):
+                    continue
+                if isinstance(mod_stmt, FuncDef) and mod_stmt.name == "main":
+                    continue  # a module's own entry point / script code is not imported
+                if stmt.items is not None and _definition_name(mod_stmt) not in stmt.items:
+                    continue
+                if id(mod_stmt) in seen_defs:
+                    continue  # same module imported twice
+                seen_defs.add(id(mod_stmt))
+                out.append(mod_stmt)
+        return out
 
-            # Collect exported definitions from the module
-            for mod_stmt in mod_ast.statements:
-                if isinstance(mod_stmt, (FuncDef, StructDef, EnumDef, ImplBlock)):
-                    if stmt.items is None:
-                        # import all
-                        new_statements.append(mod_stmt)
-                    elif isinstance(mod_stmt, FuncDef) and mod_stmt.name in stmt.items:
-                        new_statements.append(mod_stmt)
-                    elif isinstance(mod_stmt, StructDef) and mod_stmt.name in stmt.items:
-                        new_statements.append(mod_stmt)
-                    elif isinstance(mod_stmt, EnumDef) and mod_stmt.name in stmt.items:
-                        new_statements.append(mod_stmt)
-                    elif isinstance(mod_stmt, ImplBlock) and mod_stmt.type_name in stmt.items:
-                        new_statements.append(mod_stmt)
-        else:
-            new_statements.append(stmt)
-
-    program.statements = new_statements
+    program.statements = merge(program, filename, (os.path.abspath(filename)
+                                                   if not filename.startswith("<") else filename,))
+    program.module_names = module_names
     return program
 
 
@@ -5246,14 +5838,9 @@ class TILCompiler:
         if self.verbose:
             print(f"[TIL] Lexing {filename}...")
 
-        lexer = Lexer(source, filename)
-        tokens = lexer.tokenize()
-
         if self.verbose:
             print(f"[TIL] Parsing...")
-        
-        parser = Parser(tokens, filename, source=source)
-        ast = parser.parse()
+        ast = parse_source(source, filename)
 
         # Resolve imports
         if self.verbose:
@@ -5543,10 +6130,12 @@ def main():
     try:
         # Check command - just syntax check
         if command == 'check':
-            lexer = Lexer(source, input_file)
-            tokens = lexer.tokenize()
-            parser = Parser(tokens, input_file, source=source)
-            parser.parse()
+            ast = resolve_imports(parse_source(source, input_file), input_file)
+            errors = SemanticChecker(source, input_file).check(ast)
+            if errors:
+                for err in errors:
+                    print(err, file=sys.stderr)
+                return 1
             print(f"OK: {input_file}")
             return 0
         
