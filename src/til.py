@@ -1570,6 +1570,15 @@ class Parser:
         # Save position
         pos = self.pos
         self.advance()  # name
+
+        if self.match(TokenType.LT):        # generic parameters: name<T, U>(...)
+            self.advance()
+            while self.match(TokenType.IDENT, TokenType.COMMA):
+                self.advance()
+            if not self.match(TokenType.GT):
+                self.pos = pos
+                return False
+            self.advance()
         
         if not self.match(TokenType.LPAREN):
             self.pos = pos
@@ -1599,11 +1608,28 @@ class Parser:
     def parse_fn(self) -> FuncDef:
         self.consume(TokenType.FN)
         name = self.consume(TokenType.IDENT).value
+        self.parse_type_params()
         return self.parse_func_body(name)
     
     def parse_func_def_simple(self) -> FuncDef:
         name = self.consume(TokenType.IDENT).value
+        self.parse_type_params()
         return self.parse_func_body(name)
+
+    def parse_type_params(self):
+        """`name<T, U>(...)`: same as #[generic: T, U] (TIL 3.1)."""
+        if not self.match(TokenType.LT):
+            return
+        self.advance()
+        names = []
+        while not self.match(TokenType.GT):
+            names.append(self.consume(TokenType.IDENT, "Expected a type parameter name").value)
+            if not self.match(TokenType.COMMA):
+                break
+            self.advance()
+        self.consume(TokenType.GT, "Expected '>' after the type parameters")
+        if names:
+            self.pending_attributes.append("generic:" + ",".join(names))
     
     def parse_func_body(self, name: str, allow_signature: bool = False) -> FuncDef:
         name_tok = self.tokens[self.pos - 1] if self.pos > 0 else self.current()

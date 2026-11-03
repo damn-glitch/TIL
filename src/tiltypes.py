@@ -626,8 +626,8 @@ class IndexC(Constraint):
             else:
                 s.unify(self.r, INT)
         elif o.name == 'map':
-            s.flow(self.idx, o.args[0])
-            if self.store:
+            if self.store:                  # a lookup never changes which keys are stored
+                s.flow(self.idx, o.args[0])
                 s.flow(self.r, o.args[1])
             else:
                 s.unify(self.r, o.args[1])
@@ -2320,8 +2320,10 @@ class TypeInfer:
                 t, mode = structt(info.owner), 'self'
             else:
                 t = self.ann(p.type, tparams)
-                if t is None or isinstance(t, TVar):
-                    t, mode = (TVar() if t is None else t), None
+                if t is None:
+                    t, mode = TVar(), None
+                elif isinstance(t, TVar):
+                    mode = 'tparam'         # annotated with an explicit type parameter
                 else:
                     mode = 'num' if t.name in NUMERIC else 'ann'
             if given is not None and i < len(given):
@@ -2684,6 +2686,8 @@ class TypeInfer:
         s.run()
         self.settle(s)
         inst = Instance(key, info, sig.params, sig.ret, ctx)
+        inst.tparams = {name: deep(v, UNK) for name, v in sig.tparams.items()}
+        inst.modes = list(sig.modes)
         self.instances[ikey] = inst
         return inst
 
@@ -2821,20 +2825,14 @@ def _m_map(infer, s, c, o):
             s.flow(args[1], v)
         s.unify(r, NIL)
     elif name in ('get', 'get_or'):
-        if args:
-            s.flow(args[0], k)
         if name == 'get_or' and len(args) > 1:
             s.flow(v, r)
             s.flow(args[1], r)
         else:
             s.unify(r, v)
     elif name in ('has', 'contains'):
-        if args:
-            s.flow(args[0], k)
         s.unify(r, BOOL)
     elif name in ('delete', 'remove'):
-        if args:
-            s.flow(args[0], k)
         s.unify(r, NIL)
     elif name == 'keys':
         s.unify(r, arr(k))
@@ -2954,6 +2952,21 @@ static int64_t til_mod_i(int64_t a, int64_t b) {
     if (b == -1) return 0;
     return a % b;
 }
+/* int vs float compared exactly (like Python): -1, 0, 1, or 2 when b is NaN */
+static int til_cmp_if(int64_t a, double b) {
+    double t, frac;
+    int64_t bi;
+    if (b != b) return 2;
+    if (b >= 9223372036854775808.0) return -1;
+    if (b < -9223372036854775808.0) return 1;
+    t = trunc(b);
+    bi = (int64_t)t;
+    if (a < bi) return -1;
+    if (a > bi) return 1;
+    frac = b - t;
+    return frac > 0 ? -1 : (frac < 0 ? 1 : 0);
+}
+static int til_cmp_fi(double a, int64_t b) { int c = til_cmp_if(b, a); return c == 2 ? 2 : -c; }
 static int64_t til_shl(int64_t a, int64_t b) { return (int64_t)((uint64_t)a << (b & 63)); }
 static int64_t til_shr(int64_t a, int64_t b) { return a >> (b & 63); }
 static int64_t til_abs_i(int64_t a) { return a < 0 ? (int64_t)(0 - (uint64_t)a) : a; }
@@ -3690,8 +3703,41 @@ class TypedCGen(til.CCodeGenerator):
         if n == 'fn':
             self.unsupported(f"{what} is a function value (closures as values run on the VM)", node)
         if is_adt(t):
-            self.unsupported(f"{what} is an enum with data ({nominal_name(t)}); those run on the VM", node)
+            return self.adt_c(nominal_name(t)) + "*"
         self.unsupported(f"{what} has type {show(t)}", node)
+
+    def adt_c(self, name: str) -> str:
+        return f"TIL_E_{self.mangle_name(name)}"
+
+    def adt_ctor(self, name: str, variant: str, node) -> str:
+        """Constructor function of an enum variant (payload in 8-byte slots)."""
+        info = self.ti.adts[name]
+        vnames = list(info.variants)
+        tag = vnames.index(variant)
+        payload = info.frozen[variant]
+        c = self.adt_c(name)
+        fname = f"til_mk_{self.mangle_name(name)}_{self.mangle_name(variant)}"
+        if fname not in self.helpers:
+            params = []
+            sets = []
+            for i, pt in enumerate(payload):
+                self.check_slot_type(pt, node, f"a payload of {name}.{variant}")
+                params.append(f"{self.ct(pt, node)} p{i}")
+                sets.append(f"v->f[{i}] = {self.slot_make(pt, f'p{i}')};")
+            self.add_helper(fname, f"static {c}* {fname}({', '.join(params) or 'void'})",
+                            "{ " + f"{c}* v = ({c}*)til_alloc_obj(sizeof({c})); v->tag = {tag}; " +
+                            " ".join(sets) + " return v; }")
+        return fname
+
+    def adt_defs(self) -> List[str]:
+        lines = []
+        for name, info in self.ti.adts.items():
+            c = self.adt_c(name)
+            width = max([len(v) for v in info.variants.values()] + [1])
+            lines.append(f"struct {c} {{ int tag; TIL_Slot f[{width}]; }};")
+            names = ", ".join(til.c_string_literal(f"{name}.{v}") for v in info.variants)
+            lines.append(f"static const char* {c}_names[] = {{{names}}};")
+        return lines
 
     def ret_ct(self, t) -> str:
         return "void" if t is NIL else self.ct(t, None, "a return value")
@@ -3888,6 +3934,25 @@ class TypedCGen(til.CCodeGenerator):
                     lines.append(f"    til_buf_add(&b, {til.c_string_literal(sep + fname + ': ')});")
                     lines.append("    " + self.append_quoted("&b", f"x->{fname}", ft, node))
                 lines.append("    til_buf_add(&b, \" }\");")
+        elif is_adt(t):
+            aname = nominal_name(t)
+            info = self.ti.adts[aname]
+            lines += ["    if (!x) return \"None\";", "    if (til_tostr_depth > 16) return \"...\";",
+                      "    til_tostr_depth++;", f"    til_buf_add(&b, {self.adt_c(aname)}_names[x->tag]);",
+                      "    switch (x->tag) {"]
+            for tag, (vname, payload) in enumerate(info.frozen.items()):
+                if not payload:
+                    continue
+                lines.append(f"    case {tag}:")
+                lines.append("        til_buf_add(&b, \"(\");")
+                for i, pt in enumerate(payload):
+                    self.check_slot_type(pt, node, f"a payload of {aname}.{vname}")
+                    if i:
+                        lines.append("        til_buf_add(&b, \", \");")
+                    lines.append("        " + self.append_quoted("&b", self.slot_get(pt, f"x->f[{i}]"), pt, node))
+                lines.append("        til_buf_add(&b, \")\");")
+                lines.append("        break;")
+            lines += ["    default: break;", "    }"]
         elif t.name == 'option':
             inner = t.args[0]
             lines += ["    if (!x.has_value) return \"None\";", "    if (til_tostr_depth > 16) return \"...\";",
@@ -3909,11 +3974,26 @@ class TypedCGen(til.CCodeGenerator):
         self.helpers[name] = proto + " " + "\n".join(lines)
         return name
 
+    @staticmethod
+    def mixed_cmp(a: str, ta, b: str, tb, op: str) -> Optional[str]:
+        """Exact int-vs-float comparison (C would round the int to a double)."""
+        if {ta.name, tb.name} != {'int', 'float'}:
+            return None
+        small = lambda c: c.lstrip('-').isdigit() and abs(int(c)) <= (1 << 53)   # noqa: E731
+        if (ta is INT and small(a)) or (tb is INT and small(b)):
+            return None
+        fn = "til_cmp_if" if ta is INT else "til_cmp_fi"
+        test = {'==': "== 0", '!=': "!= 0", '<': "== -1", '<=': "<= 0", '>': "== 1", '>=': ">= 0"}[op]
+        if op in ('<=', '>='):
+            return f"({{ int _c = {fn}({a}, {b}); _c != 2 && _c {test.split(' ')[0]} {test.split(' ')[1]}; }})"
+        return f"({fn}({a}, {b}) {test})"
+
     def eq_code(self, a: str, ta, b: str, tb, node=None) -> str:
         """C boolean for `a == b` with the VMs' rules (structural equality)."""
         num = ('int', 'float', 'unk')
         if ta.name in num and tb.name in num:
-            return f"({a} == {b})"
+            mixed = self.mixed_cmp(a, ta, b, tb, '==')
+            return mixed if mixed else f"({a} == {b})"
         if ta is BOOL and tb is BOOL:
             return f"({a} == {b})"
         if ta is NIL or tb is NIL:
@@ -3963,6 +4043,15 @@ class TypedCGen(til.CCodeGenerator):
             parts = [self.eq_code(f"a->{f}", info.frozen[f], f"b->{f}", info.frozen[f], node) for f in info.order]
             body = ("{ if (a == b) return true; if (!a || !b) return false; return " +
                     (" && ".join(parts) or "true") + "; }")
+        elif is_adt(t):
+            info = self.ti.adts[nominal_name(t)]
+            cases = []
+            for tag, payload in enumerate(info.frozen.values()):
+                parts = [self.eq_code(self.slot_get(pt, f"a->f[{i}]"), pt, self.slot_get(pt, f"b->f[{i}]"), pt, node)
+                         for i, pt in enumerate(payload)]
+                cases.append(f"case {tag}: return {' && '.join(parts) or 'true'};")
+            body = ("{ if (a == b) return true; if (!a || !b || a->tag != b->tag) return false; switch (a->tag) { " +
+                    " ".join(cases) + " default: return true; } }")
         elif t.name == 'option':
             inner = t.args[0]
             body = ("{ if (a.has_value != b.has_value) return false; if (!a.has_value) return true; return " +
@@ -3998,7 +4087,7 @@ class TypedCGen(til.CCodeGenerator):
             return f"({code}).has_value"
         if t is NIL:
             return f"((void)({code}), false)"
-        if is_struct(t):
+        if is_struct(t) or is_adt(t):
             return f"({code} != NULL)"
         if t.name == 'result':
             return f"((void)({code}), true)"
@@ -4093,6 +4182,11 @@ class TypedCGen(til.CCodeGenerator):
         for name in self.ti.structs:
             c = self.mangle_name(name)
             self.emit_raw(f"typedef struct {c} {c};")
+        for name in self.ti.adts:
+            c = self.adt_c(name)
+            self.emit_raw(f"typedef struct {c} {c};")
+        for line in self.adt_defs():
+            self.emit_raw(line)
         for text in self.typedefs.values():
             self.emit_raw(text)
         self.emit_type_aliases_typed()
@@ -4197,8 +4291,15 @@ class TypedCGen(til.CCodeGenerator):
             else:
                 base = f"{self.mangle_name(info.owner)}_{self.mangle_name(info.name)}"
             if ti.is_generic(key):
-                ps = [canon(p) for p, prm in zip(inst.params, info.fdef.params) if prm.name != 'self']
+                # explicit type parameters name the instance (max_of__int); parameters
+                # without annotation (each its own type variable) are added after them
+                ps = [canon(t) for t in getattr(inst, 'tparams', {}).values()]
+                modes = getattr(inst, 'modes', [None] * len(inst.params))
+                ps += [canon(p) for p, prm, mode in zip(inst.params, info.fdef.params, modes)
+                       if prm.name != 'self' and mode is None]
                 base += "__" + ("_".join(ps) if ps else "0")
+                while base in self.inst_names.values():
+                    base += "_"
             self.inst_names[ikey] = base
 
     def global_decls(self) -> List[str]:
@@ -4900,7 +5001,8 @@ class TypedCGen(til.CCodeGenerator):
         if op in CMP_OPS:
             num = ('int', 'float', 'unk')
             if lt.name in num and rt.name in num:
-                return self.wrap(prelude, f"({a} {op} {b})")
+                mixed = self.mixed_cmp(a, lt, b, rt, op)
+                return self.wrap(prelude, mixed if mixed else f"({a} {op} {b})")
             if lt is STR and rt is STR:
                 return self.wrap(prelude, f"(til_str_cmp({a}, {b}) {op} 0)")
             self.unsupported(f"comparing {show(lt)} with {show(rt)}", n)
@@ -4989,7 +5091,10 @@ class TypedCGen(til.CCodeGenerator):
             if name in self.ti.enums:
                 return f"((int64_t){self.mangle_name(name)}_{self.mangle_name(n.attr)})"
             if name in self.ti.adts:
-                self.unsupported(f"the enum with data '{name}'", n)
+                payload = self.ti.adts[name].frozen.get(n.attr)
+                if payload != []:
+                    self.unsupported(f"'{name}.{n.attr}' without its values", n)
+                return f"{self.adt_ctor(name, n.attr, n)}()"
             if name in self.ti.module_names and name not in self.ti.globals:
                 return self.e_Identifier(til.Identifier(name=n.attr, line=n.line, col=n.col))
         ot = self.T(obj)
@@ -5220,9 +5325,6 @@ class TypedCGen(til.CCodeGenerator):
 
         def body():
             self.emit(f"{c} volatile _iv{k} = {self.none_value(t)};")
-            wrapped = til.IntentBlock(description=n.description, body=None, line=n.line, col=n.col)
-            wrapped.body = n.body
-            self._intent_target = (f"_iv{k}", t)
             self.g_IntentBlock_value(n, f"_iv{k}", t)
         return self.sx(self.capture(body), f"_iv{k}")
 
@@ -5453,6 +5555,17 @@ class TypedCGen(til.CCodeGenerator):
         self.emit(f"_mend{k}: ;")
         self.emit("}")
 
+    def adt_pattern(self, name, variant, args, subj, st, tests, binds, pat):
+        info = self.ti.adts[name]
+        if not (is_adt(st) and nominal_name(st) == name) or variant not in info.variants:
+            tests.append("false")
+            return
+        tag = list(info.variants).index(variant)
+        tests.append(f"({subj}) != NULL && ({subj})->tag == {tag}")
+        payload = info.frozen[variant]
+        for i, (p, pt) in enumerate(zip(args, payload)):
+            self.pattern(p, self.slot_get(pt, f"({subj})->f[{i}]"), pt, tests, binds)
+
     def pattern(self, pat, subj: str, st, tests: List[str], binds: List[str]):
         if isinstance(pat, til.Identifier):
             name = pat.name
@@ -5496,9 +5609,11 @@ class TypedCGen(til.CCodeGenerator):
                     self.pattern(p, f"({subj})->{fname}", info.frozen[fname], tests, binds)
                 return
             if isinstance(f, til.Attribute) and isinstance(f.obj, til.Identifier) and f.obj.name in self.ti.adts:
-                self.unsupported("matching an enum with data", pat)
+                self.adt_pattern(f.obj.name, f.attr, pat.args, subj, st, tests, binds, pat)
+                return
         if isinstance(pat, til.Attribute) and isinstance(pat.obj, til.Identifier) and pat.obj.name in self.ti.adts:
-            self.unsupported("matching an enum with data", pat)
+            self.adt_pattern(pat.obj.name, pat.attr, [], subj, st, tests, binds, pat)
+            return
         if isinstance(pat, (til.TupleLit, til.ArrayLit)):
             if st.name != 'array':
                 tests.append("false")
@@ -5591,7 +5706,14 @@ class TypedCGen(til.CCodeGenerator):
                 if oname in ti.structs:
                     return self.call_user(n, n.args)
                 if oname in ti.adts:
-                    self.unsupported(f"the enum with data '{oname}'", n)
+                    info = ti.adts[oname]
+                    payload = info.frozen.get(f.attr)
+                    if payload is None or len(payload) != len(n.args):
+                        self.unsupported(f"'{oname}.{f.attr}(...)'", n)
+                    ctor = self.adt_ctor(oname, f.attr, n)
+                    prelude, codes = self.seq(n.args, lambda i, nd: (
+                        self.coerce(self.x(nd), self.T(nd), payload[i], nd), payload[i]))
+                    return self.wrap(prelude, f"{ctor}({', '.join(codes)})")
                 if oname in ti.module_names and oname not in ti.globals:
                     return self.call_user(n, n.args)
                 if oname.startswith('__Vec__') and f.attr == 'new':
@@ -5964,6 +6086,8 @@ class TypedCGen(til.CCodeGenerator):
             return f"(({code}).has_value ? \"Some\" : \"nil\")"
         elif t.name == 'result':
             return f"(({code}).is_ok ? \"Ok\" : \"Err\")"
+        elif is_adt(t):
+            return f"(({code}) ? {self.adt_c(nominal_name(t))}_names[({code})->tag] : \"nil\")"
         elif t is STR or t.name in ('array', 'map') or is_struct(t):
             label = {'str': 'str', 'array': 'array', 'map': 'map'}.get(t.name) or nominal_name(t)
             return f"(({code}) ? {til.c_string_literal(label)} : \"nil\")"
