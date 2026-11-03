@@ -4,18 +4,19 @@
 #   til build --target vm selfhost/tilc.til -o tilc.tbc
 #   tilvm tilc.tbc input.til output.tbc          (any TIL VM, e.g. a calculator)
 #
-# Produces .tbc bytecode v2 with the same runtime behaviour as `til build
-# --target vm` (src/til.py). The structure mirrors the Python front end
-# (Lexer, Parser, BytecodeCompiler, TBCModule.to_bytes) so that both accept
-# the same syntax and emit the same instructions and line tables.
+# Produces .tbc bytecode v2 - the same bytes as `til build --target vm`
+# (src/til.py). The structure mirrors the Python front end (Lexer, Parser,
+# SemanticChecker, BytecodeCompiler, TBCModule.to_bytes) so that both accept
+# the same syntax and emit the same instructions, constants and line tables.
 #
 # Memory: tokens are streamed (only a small look-ahead window is kept); the
 # first pass parses the whole file but keeps only declarations; the second
-# pass re-lexes each function body from its saved source position, compiles
-# it and keeps just its bytecode (a string). The output is built from string
-# chunks. Integers are handled as 16-bit limbs so the compiler gives the same
-# result on 32-bit and 64-bit VMs; float literals are converted to IEEE 754
-# bits exactly with integer arithmetic (no host floats are used).
+# pass re-reads each function body from its saved source position. Statements
+# are compiled while they are parsed (only expressions become trees), and a
+# finished function is kept as a string of bytecode. Integers are handled as
+# 16-bit limbs so the compiler gives the same result on 32-bit and 64-bit VMs;
+# float literals and float constant folding use exact integer arithmetic (no
+# host floats are used).
 
 # ── token types (names in TT_NAMES, as in TokenType of src/til.py) ──────────
 const T_INT = 0
