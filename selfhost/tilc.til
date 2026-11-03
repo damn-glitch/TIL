@@ -1815,7 +1815,8 @@ var SEM_CONSTS = {}
 var LAST_STMT = 0
 # SemanticChecker (effects, capabilities): while the first pass parses a
 # function body it records the calls and the names it uses (SCI). Only done
-# when the program has #[pure] / #[effects] / #[cap] attributes.
+# when the main file has #[pure] / #[effects] / #[cap] attributes or imports
+# (decided by parse_program on the tokens).
 var SC_ON = false
 var SC_CUR = None
 var SC_SCRIPT = None
@@ -1868,11 +1869,20 @@ skip_nl()
 # ── top level ───────────────────────────────────────────────────────────────
 parse_program(sf)
     # Lexer.tokenize runs over the whole file before parsing: lexical errors
-    # are reported before syntax errors (tokens are not kept)
+    # are reported before syntax errors (tokens are not kept). The same pass
+    # decides whether the SemanticChecker's call graph is needed: only when
+    # a function can declare effects or capabilities (#[pure], #[effects: ..],
+    # #[cap: ..]) or a module (which may declare them) is imported. This is
+    # decided on the tokens, so every spelling counts (localized keywords,
+    # tabs, several attributes on a line, spaces inside #[ ]).
     let lx = new_lexer(sf, 0, 1, [0], true)
-    while lex_next(lx).t != T_EOF
-        lx.q.clear()
-        lx.qh = 0
+    loop
+        let tok = lex_next(lx)
+        let t = tok.t
+        if t == T_EOF
+            break
+        if t == T_IMPORT or t == T_FROM or (t == T_ATTRIBUTE and sc_attribute(tok.v))
+            SC_ON = true
     if SC_ON
         SC_SCRIPT = SCI { calls: {}, refs: {} }
     DRY = true
@@ -2921,40 +2931,10 @@ hoist()
         main.sc = merged
     ITEMS = rest
 
-# does a line start with `import ` or `from X import`? (modules may use
-# effect attributes, so the call graph is then recorded everywhere)
-has_imports(src)
-    let n = len(src)
-    var i = 0
-    while i < n
-        var j = i
-        while j < n and (src[j] == 32 or src[j] == 9)
-            j += 1
-        let w = src.slice(j, j + 7)
-        if w == "import " or (w.starts_with("from ") and src.slice(j, j + 200).split("\n")[0].contains(" import "))
-            return true
-        while i < n and src[i] != 10
-            i += 1
-        i += 1
-    return false
-
-# does a line start with an effect / capability attribute (pure, effects,
-# cap)? A false positive only costs memory.
-has_effect_attributes(src)
-    let n = len(src)
-    var i = 0
-    while i < n
-        var j = i
-        while j < n and (src[j] == 32 or src[j] == 9)
-            j += 1
-        if j + 1 < n and src[j] == 35 and src[j + 1] == 91
-            let rest = src.slice(skip_ws_any(src, j + 2), j + 12)
-            if rest.starts_with("pure") or rest.starts_with("effects") or rest.starts_with("cap")
-                return true
-        while i < n and src[i] != 10
-            i += 1
-        i += 1
-    return false
+# an attribute that makes a function declare effects or capabilities (the
+# attributes parse_func_body turns into decl / caps)
+sc_attribute(a)
+    return a == "pure" or a.starts_with("effects:") or a.starts_with("cap:")
 
 # ── SemanticChecker.check_effects / check_capabilities ─────────────────────
 sc_check()
@@ -5624,7 +5604,6 @@ main()
     if src.contains("\r")
         src = src.replace("\r\n", "\n").replace("\r", "\n")
     MAIN_SF = setup_languages(src, a[0])
-    SC_ON = has_effect_attributes(src) or has_imports(src)
     parse_program(MAIN_SF)
     hoist()
     resolve_imports()

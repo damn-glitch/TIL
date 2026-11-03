@@ -169,8 +169,12 @@ tables.
   compiled the fork is replayed. A dry pre-scan on another fork finds the last
   statement (`compile_block_value` semantics).
 * **Capture analysis** (`captured_names`) and the **SemanticChecker's call
-  graph** are computed while pass 1 parses a function (the call graph only
-  when the program uses effect/capability attributes or imports).
+  graph** are computed while pass 1 parses a function. The call graph is only
+  recorded when it can matter: when the main file's tokens (from the lexical
+  pass that runs before parsing) contain a `#[pure]` / `#[effects: ...]` /
+  `#[cap: ...]` attribute or an `import` / `from` in any keyword language.
+  Without such a token no function declares effects or capabilities, so
+  E-EFFECT and E-CAP cannot occur.
 * **Integers** are 4 limbs of 16 bits: tilc gives the same output on 32- and
   64-bit VMs and never needs an integer constant outside 32 bits itself.
 * **Floats**: literals are converted to IEEE 754 bits exactly (big-number
