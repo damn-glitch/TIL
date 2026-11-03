@@ -601,3 +601,33 @@ def test_a_failure_while_the_globals_are_initialized_confirms_nothing():
     assert rep.status == 'not proved'
     assert "while the global initializers run" in rep.failures[0].outcome
     fails_on_both_vms(src, "contract violation: f ensures result > -3")
+
+
+class TestRecursiveBoolResults:
+    def test_a_recursive_call_that_passes_an_int_where_the_result_comes_from(self):
+        # h(true, 1) == h(1, 0) == 1: the recursive call passes an int as `b`
+        src = ('h(b: bool, n: int) -> bool\n    if n <= 0\n        return b\n    return h(n, n - 1)\n'
+               't(x: int) -> int\n    let r = h(true, 1)\n    assert r == true or r == false\n    return 0\n'
+               'main()\n    print(t(0))\n')
+        assert prove(src)['t'].status != 'proved'
+        fails_on_both_vms(src, "Assertion failed")
+
+    def test_recursive_predicates_are_still_bools(self):
+        src = ('is_even(n: int) -> bool\n    if n <= 0\n        return true\n    return not is_even(n - 1)\n'
+               'k(b: bool, c: bool, n: int) -> bool\n    if n <= 0\n        return b\n    return k(c, n > 5, n - 1)\n'
+               't(x: int) -> int\n    let e = is_even(x)\n    assert e == true or e == false\n'
+               '    let r = k(true, false, x)\n    assert r == true or r == false\n    return 0\n'
+               'main()\n    print(t(3))\n    print(t(8))\n')
+        assert prove(src)['t'].status == 'proved'
+        assert run_both(src) == "0\n0\n"
+
+
+def test_the_probe_does_not_pass_its_inputs_as_program_arguments():
+    # the probe used to pass the inputs through args(): a program reading its
+    # own arguments then saw them and "confirmed" a failure that a run of the
+    # program without arguments does not have
+    src = ('helper(x: int) -> int\n    var r = 0\n    if len(args()) > 0\n        r = 1\n    return r + x * 0\n'
+           '#[ensures: result == 0]\nf(x: int) -> int\n    return helper(x)\n')
+    rep = prove(src)['f']
+    assert rep.status == 'not proved' and rep.failures[0].confirmed is False
+    assert run_both(src + 'main()\n    print(f(0))\n') == "0\n"

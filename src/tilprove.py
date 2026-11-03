@@ -1876,6 +1876,7 @@ class Prover:
         self._bool: Dict[str, bool] = {}
         self._attr_cache: Dict[int, Dict[Tuple[str, int], Tuple[int, int]]] = {}
         self._probe_cache: Dict[Any, Any] = {}
+        self._uses_args: Optional[bool] = None
 
     # ── program tables ──────────────────────────────────────────────────────
     def _collect(self):
@@ -2181,15 +2182,20 @@ class Prover:
         None when it may return something that is not a bool or end without
         `return`; otherwise the positions of the bool parameters it may return
         unchanged - its result is a bool when those arguments are bools (the
-        VM does not convert bool parameters either)."""
+        VM does not convert bool parameters either).  A direct recursive call
+        counts as a bool when it passes bools in those positions too (by
+        induction); a call into a function whose analysis is still running
+        (mutual recursion) does not."""
         if key in self._bool:
-            return self._bool[key]
-        self._bool[key] = frozenset()        # recursion: assume, the base cases decide
+            r = self._bool[key]
+            return None if r is _PENDING else r
+        self._bool[key] = _PENDING
         f = self.funcs[key]
         shadow = _bound_names(f)
         bool_params = {p.name: i for i, p in enumerate(f.params)
                        if _type_kind(p.type) == 'bool' and p.name not in shadow}
         need: Set[int] = set()
+        self_calls: list = []
 
         def is_bool(e) -> bool:
             if isinstance(e, til.BoolLit):
@@ -2211,18 +2217,35 @@ class Prover:
                 name = e.func.name
                 if name in shadow:
                     return False                     # a local function value
+                if name == key:
+                    self_calls.append(e)             # decided below, once `need` is known
+                    return True
                 if name in self.funcs:
                     g = self.funcs[name]
                     return _type_kind(g.ret_type) == 'bool' and self.bool_result(name) == frozenset()
                 return name == 'bool'
             return False
-        ok = _always_returns(_body_stmts(f.body), self.funcs)
+        ok = _always_returns(_body_stmts(f.body), self.shadowing_names(f))
         for n in til.walk(f.body):
             if isinstance(n, til.Return) and (n.value is None or not is_bool(n.value)):
                 ok = False
+        # a recursive call returns a bool only if it passes bools where `need`
+        # says (checking an argument can grow `need` and find more calls)
+        while ok:
+            n_need, n_calls = len(need), len(self_calls)
+            for call in self_calls[:n_calls]:
+                for i in sorted(need):
+                    if i >= len(call.args) or not is_bool(call.args[i]):
+                        ok = False
+            if len(need) == n_need and len(self_calls) == n_calls:
+                break
         result = frozenset(need) if ok else None
         self._bool[key] = result
         return result
+
+    def shadowing_names(self, f) -> Set[str]:
+        """Names that are not the builtins panic/exit inside function f."""
+        return set(self.funcs) | _bound_names(f) | {p.name for p in f.params} | set(self.globals)
 
     def may_return_nil(self, key: str) -> bool:
         """Can this function return nil to its caller?  Without #[ensures] a
@@ -2231,7 +2254,7 @@ class Prover:
         f = self.funcs[key]
         if f.ensures and not isinstance(f.ret_type, til.VoidType):
             return False
-        if not _always_returns(_body_stmts(f.body), self.funcs):
+        if not _always_returns(_body_stmts(f.body), self.shadowing_names(f)):
             return True
         return any(isinstance(n, til.Return) and n.value is None for n in til.walk(f.body))
 
@@ -2664,6 +2687,14 @@ class Prover:
             self._probe_cache[cache_key] = module
         return module
 
+    def uses_args(self) -> bool:
+        """Does the program read its arguments (args(), or a function named args)?"""
+        if self._uses_args is None:
+            self._uses_args = 'args' in self.funcs or any(
+                isinstance(n, til.Call) and isinstance(n.func, til.Identifier) and n.func.name == 'args'
+                for n in til.walk(self.program))
+        return self._uses_args
+
     def _probe_kinds(self, key: str) -> List[str]:
         """How the probe's main() passes each parameter (from args())."""
         out = []
@@ -2684,7 +2715,8 @@ class Prover:
         global _PROBE_VM
         if _PROBE_VM is None:
             _PROBE_VM = _make_probe_vm_class()
-        if values and ('args' in self.funcs or 'int' in self.funcs or 'float' in self.funcs):
+        if values and (self.uses_args() or 'int' in self.funcs or 'float' in self.funcs):
+            # the arguments as literals (args() stays empty, as in a run without arguments)
             module, argv = self._probe_module(key, len(values), list(values)), []
         else:
             module = self._probe_module(key, len(values), None)
@@ -2759,7 +2791,7 @@ def _matches(failure, expect, in_probe_call: bool = False) -> bool:
 def _always_returns(stmts: list, funcs=()) -> bool:
     """Syntactically, can the statements never finish normally - every path
     ends in `return`, `panic(...)`/`exit(...)` or a loop that is never left?
-    (`funcs`: user function names, which shadow the panic/exit builtins.)"""
+    (`funcs`: names that shadow the panic/exit builtins there.)"""
     for s in stmts:
         if _never_completes(s, funcs):
             return True
