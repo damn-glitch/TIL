@@ -2067,7 +2067,7 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         return 1;
     }
     case M_SPLIT: {
-        /* split(sep) / split() on whitespace; pieces are pushed then gathered */
+        /* split(sep) / split() on whitespace; pieces are appended to the result */
         uint32_t start = 0, i;
         uint16_t arr_slot;
         int ws = !argc;
