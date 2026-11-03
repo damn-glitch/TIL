@@ -41,10 +41,9 @@ SLOW = bool(os.environ.get('TIL_TEST_SLOW'))
 # Constructs outside TIL Core: tilc must reject them with "unsupported: <what>"
 # (see selfhost/README.md). Any other "unsupported" message fails the tests.
 UNSUPPORTED = (
-    "match", "lambda (closures)", "list comprehension", "retry", "timeout", "intent",
-    "handle", "perform", "trait", "impl Trait for Type (traits)", "import (tilc compiles one file)",
-    "capability declaration (cap)", "(effect checking; use til check)", "(capabilities)",
-    "(contracts)",
+    "retry", "timeout", "intent", "handle", "perform", "trait", "impl Trait for Type (traits)",
+    "import (tilc compiles one file)", "capability declaration (cap)",
+    "(effect checking; use til check)", "(capabilities)",
 )
 
 # Bytecode may differ from the Python compiler's only through constant folding
@@ -281,7 +280,7 @@ class TestPrograms:
             stats[key] = stats.get(key, 0) + 1
         print("\n[selfhost] corpus:", stats)
         # most of the test-suite is inside TIL Core and compiles to identical bytes
-        assert stats.get('same', 0) >= 170, stats
+        assert stats.get('same', 0) >= 200, stats
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -413,6 +412,113 @@ main()
     print(arr, c.size, 3.9 as int, 1 as str, -2 ** 2)
     assert c.size == 12, "size"
 """,
+    "match": """
+enum Shape
+    Circle(float)
+    Rect(float, float)
+    Dot
+
+struct P
+    x: int
+    y: int
+
+let ORIGIN = 0
+
+area(s: Shape) -> float
+    return match s
+        Shape.Circle(r) => 3.0 * r * r
+        Shape.Rect(w, h) => w * h
+        Shape.Dot => 0.0
+
+describe(v)
+    match v
+        None => print("none")
+        0 | 1 => print("small")
+        2..=9 => print("digit")
+        ORIGIN => print("never")
+        Some(x) if x > 100 => print(f"big some {x}")
+        Some(x) => print(f"some {x}")
+        Ok(x) => print(f"ok {x}")
+        Err(e) => print(f"err {e}")
+        (a, b) => print(a + b)
+        [a, _, c] => print(a * c)
+        P { x: px, y: 2 } => print(f"P with y=2, x={px}")
+        "text" => print("a string")
+        _ => print("other")
+
+main()
+    for s in [Shape.Circle(1.0), Shape.Rect(2.0, 3.5), Shape.Dot]
+        print(area(s))
+    for v in [None, 1, 5, Some(500), Some(5), Ok(1), Err("bad"), (1, 2), [3, 4, 5], P { x: 7, y: 2 }, "text", 3.5]
+        describe(v)
+    let label = match 3
+        1 => "one"
+        3 => "three"
+    print(label)
+""",
+    "closures": """
+make_counter()
+    var n = 0
+    let inc = |k| n + k
+    n = 10
+    return inc
+
+apply(fun, v) => fun(v)
+
+# (calling a captured parameter directly, |x| f(x), is rejected by both
+# compilers: see selfhost/README.md)
+compose(f, g)
+    return |x| apply(f, apply(g, x))
+
+twice(x) => x * 2
+
+main()
+    let c = make_counter()
+    print(c(5))
+    let add = |a, b| a + b
+    print(add(2, 3))
+    let h = compose(|x| x + 1, twice)
+    print(h(10))
+    let base = 100
+    let nested = |x| |y| x + y + base
+    print(nested(1)(2))
+    let nums = [1, 2, 3, 4, 5, 6]
+    print(nums.map(|n| n * n))
+    print(nums.filter(|n| n % 2 == 0).map(twice))
+    print(nums.reduce(|a, b| a + b, 0))
+    print(nums.any(|n| n > 5), nums.all(|n| n > 0))
+    nums.each(|n| print(n))
+    print([x * 10 for x in nums if x % 2 == 1])
+    print([c for c in "abc"])
+    var fns = []
+    for i in 0..3
+        fns.push(|x| x + i)
+    print(fns[2](1))
+    print((|x: int| -> int { x + 1 })(41))
+""",
+    "contracts": """
+#[requires: b != 0]
+safe_div(a: int, b: int) -> int
+    return a / b
+
+#[ensures: result >= 0]
+abs_diff(a: int, b: int) -> int
+    if a > b
+        return a - b
+    return b - a
+
+#[requires: n >= 0]
+#[ensures: result >= 1]
+fact(n: int) -> int
+    if n <= 1
+        return 1
+    return n * fact(n - 1)
+
+main()
+    print(safe_div(10, 2), abs_diff(3, 8), fact(5))
+    var zero = 0
+    print(safe_div(1, zero))
+""",
 }
 
 
@@ -456,15 +562,24 @@ ERRORS = [
     ("main(x)\n    print(x)\n", 1, "error: main() takes no parameters"),
     ("struct P\n    x: int\nmain()\n    print(P)\n", 4, "error: 'P' is a type, not a value"),
     ("main()\n    [1].frobnicate()\n", 2, "error: unknown method 'frobnicate'"),
+    ("#[requires: b != 0]\nd(a, b)\n    return a / b\nmain()\n    print(d(1, 0))\n", 5,
+     "error: contract violation: call to 'd' (a=1, b=0) breaks #[requires: b != 0]"),
+    ('#[requires: s != "xy" and f > 0.5 and n < 0]\nd(s, f, n)\n    return s\nmain()\n'
+     '    print(d("xy", 1e-7, 12345678901234))\n', 5,
+     "error: contract violation: call to 'd' (s='xy', f=1e-07, n=12345678901234) breaks "
+     '#[requires: s != "xy" and f > 0.5 and n < 0]'),
+    ("main()\n    let f = |x| x\n    let y = 1\n    y = f(2)\n", 4,
+     "error: cannot assign twice to immutable variable 'y'"),
+    ("compose(f)\n    return |x| f(x)\n", 2, "error: unknown function 'f'"),
+    ("enum E\n    A(int)\nmain()\n    match E.A(1)\n        E.B(x) => print(x)\n", 5,
+     "error: enum 'E' has no variant 'B'"),
+    ("main()\n    match Some(1)\n        Some(a, b) => print(a)\n", 3, "error: pattern expects 1 field(s), got 2"),
 ]
 
 UNSUPPORTED_PROGRAMS = [
-    ("main()\n    let f = |x| x + 1\n", 2, "lambda (closures)"),
-    ("main()\n    match 1\n        1 => print(1)\n", 2, "match"),
     ("import math_utils\n", 1, "import (tilc compiles one file)"),
     ("#[pure]\nf(x)\n    return x\n", 2, "#[pure] (effect checking; use til check)"),
     ("main()\n    let r = retry(3)\n        1\n", 2, "retry"),
-    ("main()\n    print([x for x in [1]])\n", 2, "list comprehension"),
 ]
 
 

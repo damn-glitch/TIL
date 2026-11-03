@@ -1549,6 +1549,9 @@ const K_SINIT = 18
 const K_IFX = 19
 const K_CAST = 20
 const K_NULLCHK = 21
+const K_LAMBDA = 22
+const K_MATCH = 23
+const K_LISTCOMP = 24
 const K_VAR = 31
 const K_STMT = 32
 const K_GINIT = 42
@@ -1563,6 +1566,8 @@ const K_TYPEALIAS = 54
 # K_UN s=op a | K_CALL a=callee c=args | K_INDEX a b | K_ATTR a s
 # K_ARRAY/K_TUPLE c | K_DICT c=[k, v, ...] | K_RANGE a b n=inclusive
 # K_SINIT s=name c={field: expr} | K_IFX a b c | K_CAST a s=type | K_NULLCHK a
+# K_LAMBDA a=body c=[param names] | K_MATCH a=value c=[[pattern, guard, expr]]
+# K_LISTCOMP a=expr s=var b=iter c=condition
 # Statements have no tree: they are compiled while they are parsed (stmt_c).
 # Top-level items: K_FUNC a=FI | K_STRUCTDEF s c=[Fld] | K_ENUMDEF s c=[Vnt]
 # K_IMPL s c=[FI] | K_TYPEALIAS | K_VAR (global) s b=type n=flags (1 mutable,
@@ -1587,6 +1592,9 @@ struct FI
     pre: any
     prelude: bool
     synth: bool
+    capt: any
+    req: any
+    ens: any
 
 struct Prm
     name: str
@@ -1619,6 +1627,13 @@ var ITEMS = []
 var SRC = ""
 # first pass: statements are only parsed (no code is generated)
 var DRY = false
+# first pass: names used inside lambdas of the function being parsed (they
+# must live in cells - BytecodeCompiler.captured_names), and the immutable
+# globals that are compile-time constants (SemanticChecker.consts)
+var CAPT = None
+var SCRIPT_CAPT = {}
+var SINIT_DEPTH = 0
+var SEM_CONSTS = {}
 
 new_stream(lx)
     TSG = TS { lx: lx, buf: [], p: 0 }
@@ -1705,7 +1720,9 @@ parse_top_level(src)
         # a script statement: remember where it starts, compile it in main()
         node = mk(K_STMT, TK.ln)
         node.c = [TK.sp, TK.ln]
+        CAPT = SCRIPT_CAPT
         stmt_c()
+        CAPT = None
     if node.ln == 0
         node.ln = tok.ln
     ITEMS.push(node)
@@ -1733,10 +1750,17 @@ parse_global(tok)
         adv()
     else
         return node
-    node.c = [TK.sp, TK.ln]
+    let capt = {}
+    CAPT = capt
+    node.c = [TK.sp, TK.ln, capt]
     let v = parse_expression()
+    CAPT = None
     if is_literal(v)
         node.a = v
+    if node.n != 1
+        let c = const_eval(v, SEM_CONSTS)
+        if c != None
+            SEM_CONSTS[node.s] = c
     return node
 
 parse_pub_item(src)
@@ -1791,18 +1815,29 @@ parse_func_body(name_tok, src, ind)
         ret = parse_type()
     let bpos = TK.sp
     let bline = TK.ln
+    let save_capt = CAPT
+    CAPT = {}
     func_body_c()
     let attrs = PENDING_ATTRS
     PENDING_ATTRS = []
+    var req = []
+    var ens = []
     for a in attrs
         if a == "pure" or a.starts_with("effects:")
             unsupported(name_tok.ln, "#[" + a + "] (effect checking; use til check)")
         if a.starts_with("cap:")
             unsupported(name_tok.ln, "#[" + a + "] (capabilities)")
         if a.starts_with("requires:") or a.starts_with("ensures:")
-            unsupported(name_tok.ln, "#[" + a + "] (contracts)")
+            let colon = a.find(":")
+            let text = strip_ws(a.slice(colon + 1, len(a)))
+            let e = parse_sub_expr(text, name_tok.ln)
+            if a.starts_with("requires:")
+                req.push([e, text])
+            else
+                ens.push([e, text])
     let fi = FI { name: name_tok.v, params: params, ret: ret, ln: name_tok.ln, src: src,
-                  bpos: bpos, bline: bline, bind: ind }
+                  bpos: bpos, bline: bline, bind: ind, capt: CAPT, req: req, ens: ens }
+    CAPT = save_capt
     let node = mk(K_FUNC, name_tok.ln)
     node.a = fi
     return node
@@ -2216,6 +2251,7 @@ parse_primary_inner()
             adv()
             var fields = {}
             if TK.t != T_RBRACE
+                SINIT_DEPTH += 1
                 loop
                     let fname = expect(T_IDENT).v
                     expect(T_COLON)
@@ -2223,6 +2259,7 @@ parse_primary_inner()
                     if TK.t != T_COMMA
                         break
                     adv()
+                SINIT_DEPTH -= 1
             expect(T_RBRACE)
             let node = mk(K_SINIT, 0)
             node.s = name
@@ -2294,7 +2331,17 @@ parse_primary_inner()
         if TK.t != T_RBRACKET
             elems.push(parse_expression())
             if TK.t == T_FOR
-                unsupported(TK.ln, "list comprehension")
+                adv()
+                let lc = mk(K_LISTCOMP, 0)
+                lc.a = elems[0]
+                lc.s = expect(T_IDENT).v
+                expect(T_IN)
+                lc.b = parse_or()
+                if TK.t == T_IF
+                    adv()
+                    lc.c = parse_or()
+                expect(T_RBRACKET)
+                return lc
             while TK.t == T_COMMA
                 adv()
                 if TK.t == T_RBRACKET
@@ -2325,16 +2372,119 @@ parse_primary_inner()
         node.s = "self"
         return node
     if t == T_PIPE
-        unsupported(TK.ln, "lambda (closures)")
+        return parse_lambda()
     if t == T_MATCH
-        unsupported(TK.ln, "match")
+        return parse_match()
     if t == T_RETRY or t == T_TIMEOUT or t == T_HANDLE
         unsupported(TK.ln, TK.v)
     perr("Unexpected token: " + TT_NAMES[t])
 
+# |x, y| expr   or   |x: int| -> int { expr }
+parse_lambda()
+    adv()
+    var params = []
+    if TK.t != T_PIPE
+        loop
+            params.push(expect(T_IDENT).v)
+            if TK.t == T_COLON
+                adv()
+                parse_type()
+            if TK.t != T_COMMA
+                break
+            adv()
+    expect(T_PIPE)
+    if TK.t == T_ARROW
+        adv()
+        parse_type()
+    let node = mk(K_LAMBDA, 0)
+    node.c = params
+    if TK.t == T_LBRACE
+        adv()
+        skip_nl()
+        node.a = parse_expression()
+        skip_nl()
+        expect(T_RBRACE)
+    else
+        node.a = parse_expression()
+    # BytecodeCompiler.captured_names: walk() reaches this lambda unless it
+    # sits in a struct literal (whose fields are a dict, not walked)
+    if CAPT != None and SINIT_DEPTH == 0
+        lambda_names(node, CAPT)
+    return node
+
+# names used in a lambda's body that are not its parameters
+lambda_names(lam, out)
+    var pm = {}
+    for p in lam.c
+        pm[p] = 1
+    walk_idents(lam.a, pm, out)
+
+# every identifier of a tree (as walk() visits them; struct literals are opaque)
+walk_idents(x, params, out)
+    let t = type_of(x)
+    if t == "array"
+        for e in x
+            walk_idents(e, params, out)
+        return
+    if t != "N"
+        return
+    if x.k == K_IDENT
+        if not params.has(x.s)
+            out[x.s] = 1
+        return
+    if x.k == K_SINIT
+        return
+    walk_idents(x.a, params, out)
+    walk_idents(x.b, params, out)
+    walk_idents(x.c, params, out)
+
+# captured_names(tree): names used by the lambdas inside a tree
+lambda_captures(x, out)
+    let t = type_of(x)
+    if t == "array"
+        for e in x
+            lambda_captures(e, out)
+        return
+    if t != "N" or x.k == K_SINIT
+        return
+    if x.k == K_LAMBDA
+        lambda_names(x, out)
+    lambda_captures(x.a, out)
+    lambda_captures(x.b, out)
+    lambda_captures(x.c, out)
+
+parse_match()
+    adv()
+    let node = mk(K_MATCH, 0)
+    node.a = parse_expression()
+    skip_nl()
+    expect(T_INDENT)
+    var arms = []
+    while TK.t != T_DEDENT and TK.t != T_EOF
+        skip_nl()
+        if TK.t == T_DEDENT or TK.t == T_EOF
+            break
+        let pat = parse_or()
+        var guard = None
+        if TK.t == T_IF
+            adv()
+            guard = parse_or()
+        expect(T_FAT_ARROW)
+        arms.push([pat, guard, parse_expression()])
+        skip_nl()
+    if TK.t == T_DEDENT
+        adv()
+    node.c = arms
+    return node
+
 # expression inside an f-string: lexed and parsed on its own, at the line of
 # the f-string (as Parser._parse_fstring_expr)
 parse_fexpr(text, line)
+    return parse_sub_expr(text, line)
+
+# an expression from another text (f-string part, #[requires: ...]) whose
+# tokens all carry `line`
+parse_sub_expr(text, line)
     let save_ts = TSG
     let save_tk = TK
     var l = line
@@ -2385,13 +2535,19 @@ hoist()
         if main == None and it.k == K_FUNC and it.a.name == "main"
             main = it.a
     if main == None
-        let fi = FI { name: "main", params: [], ret: "void", ln: script[0].ln, pre: script,
-                      synth: true }
-        let node = mk(K_FUNC, fi.ln)
-        node.a = fi
+        main = FI { name: "main", params: [], ret: "void", ln: script[0].ln, pre: script,
+                    synth: true, capt: {}, req: [], ens: [] }
+        let node = mk(K_FUNC, main.ln)
+        node.a = main
         rest.push(node)
     else
         main.pre = script
+    for k in SCRIPT_CAPT
+        main.capt[k] = 1
+    for it in script
+        if it.k == K_GINIT
+            for k in it.a.c[2]
+                main.capt[k] = 1
     ITEMS = rest
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2421,10 +2577,16 @@ struct FS
     next: int
     loops: any
     tryd: int
+    parent: any
+    upvals: any
+    captured: any
+    rslot: any
+    ens_on: bool
 
 struct Loc
     slot: int
     mutable: bool
+    cell: bool
 
 struct LC
     breaks: any
@@ -2596,7 +2758,7 @@ declare_local(name, mut_, ln)
         fail_at(ln, "too many local variables in one function (max 250)")
     if f.next > f.rec.nloc
         f.rec.nloc = f.next
-    let loc = Loc { slot: slot, mutable: mut_ }
+    let loc = Loc { slot: slot, mutable: mut_, cell: f.captured.has(name) }
     let sc = f.scopes
     sc[len(sc) - 1][name] = loc
     return loc
@@ -2605,7 +2767,10 @@ hidden_local()
     return declare_local(" tmp", true, 0).slot
 
 find_local(name)
-    let sc = F.scopes
+    return find_local_in(F, name)
+
+find_local_in(fs, name)
+    let sc = fs.scopes
     var i = len(sc) - 1
     while i >= 0
         let l = sc[i].get_or(name, None)
@@ -2614,8 +2779,40 @@ find_local(name)
         i -= 1
     return None
 
+# value on the stack -> a freshly declared local (in a cell if captured)
+store_new_local(loc, ln)
+    emit_b(OP_STORE_LOCAL, loc.slot, ln)
+    if loc.cell
+        emit_b(OP_MAKE_CELL, loc.slot, ln)
+
+# upvalue index of `name` in function state fs, or -1 (resolve_upval)
+resolve_upval(fs, name)
+    if fs.parent == None
+        return -1
+    var i = 0
+    while i < len(fs.upvals)
+        if fs.upvals[i][0] == name
+            return i
+        i += 1
+    let loc = find_local_in(fs.parent, name)
+    if loc != None
+        if not loc.cell
+            return -1
+        fs.upvals.push([name, true, loc.slot, loc.mutable])
+        return len(fs.upvals) - 1
+    let idx = resolve_upval(fs.parent, name)
+    if idx < 0
+        return -1
+    fs.upvals.push([name, false, idx, fs.parent.upvals[idx][3]])
+    return len(fs.upvals) - 1
+
 shadowed(name)
-    return find_local(name) != None
+    if find_local(name) != None
+        return true
+    for u in F.upvals
+        if u[0] == name
+            return true
+    return false
 
 # ── type helpers ───────────────────────────────────────────────────────────
 numeric_cast(ty)
@@ -2779,6 +2976,197 @@ const_eval(node, env)
             return CV { ty: 0, v: len(v.v) }
     return None
 
+# ── Python repr() of a compile-time constant (E-CONTRACT messages) ──────────
+cv_repr(c)
+    if c.ty == 3
+        if c.v
+            return "True"
+        return "False"
+    if c.ty == 0
+        return i64_dec(c.v)
+    if c.ty == 2
+        return py_str_repr(c.v)
+    return float_repr(c.v)
+
+i64_dec(v)
+    if not is_big(v)
+        return str(v)
+    var a = i64_of(v)
+    let neg = i64_isneg(a)
+    if neg
+        a = i64_negl(a)
+    var digits = []
+    while a[0] != 0 or a[1] != 0 or a[2] != 0 or a[3] != 0
+        let qr = i64_divmodu(a, [10, 0, 0, 0])
+        digits.push(BYTE[48 + qr[1][0]])
+        a = qr[0]
+    digits.reverse()
+    if neg
+        return "-" + digits.join("")
+    return digits.join("")
+
+hex2(c)
+    let h = "0123456789abcdef"
+    return BYTE[h[c >> 4]] + BYTE[h[c & 15]]
+
+py_str_repr(s)
+    var q = 39
+    if s.contains("'") and not s.contains("\"")
+        q = 34
+    var out = [BYTE[q]]
+    var i = 0
+    while i < len(s)
+        let c = s[i]
+        if c == 92
+            out.push("\\\\")
+        elif c == q
+            out.push("\\" + BYTE[q])
+        elif c == 10
+            out.push("\\n")
+        elif c == 13
+            out.push("\\r")
+        elif c == 9
+            out.push("\\t")
+        elif c < 32 or c == 127
+            out.push("\\x" + hex2(c))
+        else
+            out.push(BYTE[c])
+        i += 1
+    out.push(BYTE[q])
+    return out.join("")
+
+# quotient and remainder of a natural by a small number
+bn_divsmall(a, d)
+    var q = []
+    var i = 0
+    while i < len(a)
+        q.push(0)
+        i += 1
+    var r = 0
+    i = len(a) - 1
+    while i >= 0
+        let t = r * 65536 + a[i]
+        q[i] = t / d
+        r = t % d
+        i -= 1
+    return [bn_trim(q), r]
+
+bn_to_dec(a)
+    if len(a) == 0
+        return "0"
+    var chunks = []
+    var x = a
+    while len(x) > 0
+        let qr = bn_divsmall(x, 10000)
+        chunks.push(qr[1])
+        x = qr[0]
+    var out = [str(chunks[len(chunks) - 1])]
+    var i = len(chunks) - 2
+    while i >= 0
+        let s = str(chunks[i])
+        out.push("0000".slice(0, 4 - len(s)) + s)
+        i -= 1
+    return out.join("")
+
+# digits of ds rounded (half to even) to p digits: [digits, decimal point shift]
+round_digits(ds, p)
+    if len(ds) <= p
+        return [ds, 0]
+    var keep = str_bytes(ds.slice(0, p))
+    let d = ds[p] - 48
+    var rest = false
+    var i = p + 1
+    while i < len(ds)
+        if ds[i] != 48
+            rest = true
+        i += 1
+    var shift = 0
+    if d > 5 or (d == 5 and (rest or (keep[p - 1] - 48) % 2 == 1))
+        i = p - 1
+        while i >= 0 and keep[i] == 57
+            keep[i] = 48
+            i -= 1
+        if i < 0
+            keep.insert(0, 49)
+            keep.pop()
+            shift = 1
+        else
+            keep[i] = keep[i] + 1
+    var s = bytes_to_str(keep)
+    var e = len(s)
+    while e > 1 and s[e - 1] == 48
+        e -= 1
+    return [s.slice(0, e), shift]
+
+# repr() of a double given as 8 bytes: the shortest digits that round-trip
+float_repr(b8)
+    var sign = ""
+    if b8[7] >= 128
+        sign = "-"
+    let biased = ((b8[7] & 127) << 4) | (b8[6] >> 4)
+    var M = bn_trim([b8[0] + b8[1] * 256, b8[2] + b8[3] * 256, b8[4] + b8[5] * 256, b8[6] & 15])
+    if biased == 2047
+        if len(M) == 0
+            return sign + "inf"
+        return "nan"
+    var E = -1074
+    if biased > 0
+        while len(M) < 4
+            M.push(0)
+        M[3] = M[3] + 16
+        E = biased - 1075
+    if len(M) == 0
+        return sign + "0.0"
+    var N = M
+    var k = 0
+    if E >= 0
+        N = bn_shl(M, E)
+    else
+        k = 0 - E
+        var i = 0
+        while i < k
+            N = bn_muladd(N, 5, 0)
+            i += 1
+    let ds = bn_to_dec(N)
+    var decpt = len(ds) - k
+    var target = str_bytes(b8)
+    target[7] = target[7] & 127
+    let want = bytes_to_str(target)
+    var digits = ds
+    var p = 1
+    while p <= 17
+        let r = round_digits(ds, p)
+        var D = []
+        var j = 0
+        while j < len(r[0])
+            D = bn_muladd(D, 10, r[0][j] - 48)
+            j += 1
+        let dp = decpt + r[1]
+        if float_bits_dec(D, dp - len(r[0]), len(r[0])) == want
+            digits = r[0]
+            decpt = dp
+            break
+        p += 1
+    let nd = len(digits)
+    if decpt > 16 or decpt < -3
+        var m = digits.slice(0, 1)
+        if nd > 1
+            m = m + "." + digits.slice(1, nd)
+        var e = decpt - 1
+        var es = "+"
+        if e < 0
+            es = "-"
+            e = 0 - e
+        var ed = str(e)
+        if len(ed) < 2
+            ed = "0" + ed
+        return sign + m + "e" + es + ed
+    if decpt <= 0
+        return sign + "0." + "0".repeat(0 - decpt) + digits
+    if decpt >= nd
+        return sign + digits + "0".repeat(decpt - nd) + ".0"
+    return sign + digits.slice(0, decpt) + "." + digits.slice(decpt, nd)
+
 try_fold(node)
     return const_eval(node, INLINE)
 
@@ -2796,8 +3184,11 @@ add_function(name, fi, owner)
     return idx
 
 new_fs(rec, fi, owner)
+    var capt = {}
+    if fi != None and fi.capt != None
+        capt = fi.capt
     F = FS { rec: rec, fi: fi, owner: owner, code: [], lines: [], last: -1, scopes: [{}], next: 0,
-             loops: [], tryd: 0 }
+             loops: [], tryd: 0, upvals: [], captured: capt }
 
 finish_fs()
     let f = F
@@ -2998,6 +3389,17 @@ compile_function(pe)
             emit_b(OP_CAST, c, 0)
             emit_b(OP_STORE_LOCAL, i, 0)
         i += 1
+    for p in params
+        let loc = find_local(p.name)
+        if loc.cell
+            emit_b(OP_MAKE_CELL, loc.slot, 0)
+    if fi.req != None
+        for r in fi.req
+            cexpr(r[0])
+            let skip = emit_jump(OP_JUMP_IF_TRUE, r[0].ln)
+            emit_h(OP_PUSH_CONST, const_str(strip_ws("contract violation: " + fi.name + " requires " + r[1])), r[0].ln)
+            emit(OP_PANIC, r[0].ln)
+            patch_jump(skip)
     # body: script statements first (script mode), then the function's own
     SEM = not fi.prelude
     begin_scope()
@@ -3051,7 +3453,11 @@ stmt_c()
     elif t == T_ASSERT or t == T_INVARIANT
         assert_c(tok.ln, t)
     elif t == T_MATCH
-        unsupported(tok.ln, "match")
+        let m = parse_match()
+        if m.ln == 0
+            m.ln = tok.ln
+        if not DRY
+            cmatch(m, false)
     elif t == T_PERFORM or t == T_INTENT
         unsupported(tok.ln, tok.v)
     else
@@ -3207,8 +3613,7 @@ vardecl_c(ln, t)
                 lit = value.k == K_INT
             if not lit
                 emit_b(OP_CAST, c, ln)
-    let loc = declare_local(name, t == T_VAR, ln)
-    emit_b(OP_STORE_LOCAL, loc.slot, ln)
+    store_new_local(declare_local(name, t == T_VAR, ln), ln)
 
 assert_c(ln, t)
     adv()
@@ -3230,6 +3635,25 @@ assert_c(ln, t)
     emit(OP_PANIC, ln)
     patch_jump(ok)
 
+struct FC
+    rng: bool
+    v: any
+    top: int
+    jmp: int
+    lc: any
+
+load_loc(loc, ln)
+    if loc.cell
+        emit_b(OP_LOAD_CELL, loc.slot, ln)
+    else
+        emit_b(OP_LOAD_LOCAL, loc.slot, ln)
+
+store_loc(loc, ln)
+    if loc.cell
+        emit_b(OP_STORE_CELL, loc.slot, ln)
+    else
+        emit_b(OP_STORE_LOCAL, loc.slot, ln)
+
 for_c(ln)
     adv()
     let vname = expect(T_IDENT).v
@@ -3239,55 +3663,283 @@ for_c(ln)
     if DRY
         body_c()
         return
+    let fc = for_begin(vname, it, ln)
+    body_c()
+    for_end(fc, ln)
+
+# BytecodeCompiler.compile_for, split around the body
+for_begin(vname, it, ln)
     begin_scope()
     if it.k == K_RANGE
         cexpr(it.a)
         let v = declare_local(vname, true, ln)
-        emit_b(OP_STORE_LOCAL, v.slot, ln)
+        store_new_local(v, ln)
         cexpr(it.b)
         let end_slot = hidden_local()
         emit_b(OP_STORE_LOCAL, end_slot, 0)
         let top = here()
-        emit_b(OP_LOAD_LOCAL, v.slot, ln)
+        load_loc(v, ln)
         emit_b(OP_LOAD_LOCAL, end_slot, 0)
         if it.n
             emit(OP_LE, 0)
         else
             emit(OP_LT, 0)
-        let exit_jump = emit_jump(OP_JUMP_IF_FALSE, ln)
-        let ctx = push_loop(None)
-        body_c()
-        for c in ctx.conts
+        let jmp = emit_jump(OP_JUMP_IF_FALSE, ln)
+        return FC { rng: true, v: v, top: top, jmp: jmp, lc: push_loop(None) }
+    cexpr(it)
+    emit_bb(OP_NATIVE, N_ITER, 1, ln)
+    let its = hidden_local()
+    let idx = hidden_local()
+    emit_b(OP_STORE_LOCAL, its, 0)
+    emit(OP_PUSH_I8, 0)
+    F.code.push(0)
+    emit_b(OP_STORE_LOCAL, idx, 0)
+    let top = here()
+    emit_b(OP_FOR_ITER, its, ln)
+    put_s(0)
+    let at = len(F.code) - 2
+    let v = declare_local(vname, true, ln)
+    store_new_local(v, ln)
+    return FC { rng: false, v: v, top: top, jmp: at, lc: push_loop(top) }
+
+for_end(fc, ln)
+    if fc.rng
+        for c in fc.lc.conts
             patch_jump(c)
-        emit_b(OP_LOAD_LOCAL, v.slot, 0)
+        load_loc(fc.v, 0)
         emit(OP_PUSH_I8, 0)
         F.code.push(1)
         emit(OP_ADD, 0)
-        emit_b(OP_STORE_LOCAL, v.slot, 0)
-        emit_loop(top, ln)
-        patch_jump(exit_jump)
-        pop_loop(ctx)
-    else
-        cexpr(it)
-        emit_bb(OP_NATIVE, N_ITER, 1, ln)
-        let its = hidden_local()
-        let idx = hidden_local()
-        emit_b(OP_STORE_LOCAL, its, 0)
-        emit(OP_PUSH_I8, 0)
-        F.code.push(0)
-        emit_b(OP_STORE_LOCAL, idx, 0)
-        let top = here()
-        emit_b(OP_FOR_ITER, its, ln)
-        put_s(0)
-        let at = len(F.code) - 2
-        let v = declare_local(vname, true, ln)
-        emit_b(OP_STORE_LOCAL, v.slot, ln)
-        let ctx = push_loop(top)
-        body_c()
-        emit_loop(top, ln)
-        patch_jump(at)
-        pop_loop(ctx)
+        store_loc(fc.v, 0)
+    emit_loop(fc.top, ln)
+    patch_jump(fc.jmp)
+    pop_loop(fc.lc)
     end_scope()
+
+# [expr for x in iter if cond] (compile_comprehension: a for loop pushing
+# into a hidden array; the code is that of the desugared AST)
+ccomprehension(node)
+    begin_scope()
+    emit_h(OP_NEW_ARRAY, 0, node.ln)
+    let res = hidden_local()
+    emit_b(OP_STORE_LOCAL, res, 0)
+    let sc = F.scopes
+    sc[len(sc) - 1][" res"] = Loc { slot: res, mutable: false, cell: false }
+    let fc = for_begin(node.s, node.b, node.ln)
+    begin_scope()
+    var nxt = -1
+    if node.c != None
+        cexpr(node.c)
+        nxt = emit_jump(OP_JUMP_IF_FALSE, node.c.ln)
+        begin_scope()
+    let saved = SEM
+    SEM = false
+    emit_b(OP_LOAD_LOCAL, res, node.ln)
+    cexpr(node.a)
+    emit_h(OP_INVOKE, const_str("push"), node.ln)
+    put_b(1, node.ln)
+    put_b(1, node.ln)
+    SEM = saved
+    emit(OP_POP, 0)
+    if node.c != None
+        end_scope()
+        let endj = emit_jump(OP_JUMP, 0)
+        patch_jump(nxt)
+        patch_jump(endj)
+    end_scope()
+    for_end(fc, node.ln)
+    emit_b(OP_LOAD_LOCAL, res, 0)
+    end_scope()
+
+# |params| body -> a new function; captured variables become upvalues
+clambda(node)
+    let rec = FuncRec { name: "<lambda:" + str(node.ln) + ">", flags: 4 }
+    let fidx = len(FUNCS)
+    FUNCS.push(rec)
+    let parent = F
+    var capt = {}
+    lambda_captures(node.a, capt)
+    F = FS { rec: rec, owner: parent.owner, code: [], lines: [], last: -1, scopes: [{}], next: 0,
+             loops: [], tryd: 0, parent: parent, upvals: [], captured: capt }
+    let np = len(node.c)
+    rec.np = np
+    rec.nreq = np
+    for p in node.c
+        declare_local(p, true, node.ln)
+    for p in node.c
+        let loc = find_local(p)
+        if loc.cell
+            emit_b(OP_MAKE_CELL, loc.slot, 0)
+    cexpr(node.a)
+    emit(OP_RETURN, node.ln)
+    let ups = F.upvals
+    rec.nup = len(ups)
+    finish_fs()
+    F = parent
+    if len(ups) == 0
+        emit_h(OP_PUSH_FUNC, fidx, node.ln)
+        return
+    for u in ups
+        if u[1]
+            emit_b(OP_LOAD_LOCAL, u[2], node.ln)
+        else
+            emit_b(OP_LOAD_UPVAL_RAW, u[2], node.ln)
+    emit_hb(OP_MAKE_CLOSURE, fidx, len(ups), node.ln)
+
+# ── pattern matching (compile_match / compile_pattern / destructure) ───────
+cmatch(node, want_value)
+    begin_scope()
+    cexpr(node.a)
+    let subj = hidden_local()
+    emit_b(OP_STORE_LOCAL, subj, 0)
+    var ends = []
+    for arm in node.c
+        begin_scope()
+        var fails = []
+        cpattern(arm[0], subj, fails)
+        if arm[1] != None
+            cexpr(arm[1])
+            fails.push(emit_jump(OP_JUMP_IF_FALSE, arm[1].ln))
+        cexpr(arm[2])
+        if not want_value
+            emit(OP_POP, 0)
+        ends.push(emit_jump(OP_JUMP, 0))
+        for f in fails
+            patch_jump(f)
+        end_scope()
+    if want_value
+        emit(OP_PUSH_NIL, 0)
+    for e in ends
+        patch_jump(e)
+    end_scope()
+
+# (type index, arity) of constructor patterns Some(x), Point(a, b), E.V(x)
+pattern_type(c)
+    if c.k == K_IDENT
+        if c.s == "Some"
+            return [0, 1]
+        if c.s == "Ok"
+            return [1, 1]
+        if c.s == "Err"
+            return [2, 1]
+        if STRUCT_TYPES.has(c.s)
+            return [STRUCT_TYPES[c.s], len(STRUCT_FIELDS[c.s])]
+    if c.k == K_ATTR and c.a.k == K_IDENT
+        let vs = ADT_VARIANTS.get_or(c.a.s, None)
+        if vs != None and vs.has(c.s)
+            return vs[c.s]
+    return None
+
+compare_with(pat, subj, fails)
+    emit_b(OP_LOAD_LOCAL, subj, 0)
+    cexpr(pat)
+    emit(OP_EQ, 0)
+    fails.push(emit_jump(OP_JUMP_IF_FALSE, pat.ln))
+
+match_type(subj, t, ln, fails)
+    emit_b(OP_LOAD_LOCAL, subj, 0)
+    emit_h(OP_MATCH_TYPE, t, 0)
+    fails.push(emit_jump(OP_JUMP_IF_FALSE, ln))
+
+cpattern(pat, subj, fails)
+    let k = pat.k
+    if k == K_IDENT
+        let name = pat.s
+        if name == "_"
+            return
+        if name == "NULL"
+            emit_b(OP_LOAD_LOCAL, subj, 0)
+            emit(OP_PUSH_NIL, 0)
+            emit(OP_EQ, 0)
+            fails.push(emit_jump(OP_JUMP_IF_FALSE, pat.ln))
+            return
+        if find_local(name) == None and (INLINE.has(name) or GLOBAL_SLOTS.has(name))
+            compare_with(pat, subj, fails)
+            return
+        let loc = declare_local(name, false, pat.ln)
+        emit_b(OP_LOAD_LOCAL, subj, 0)
+        store_new_local(loc, pat.ln)
+        return
+    if k == K_ATTR and pat.a.k == K_IDENT and ADT_VARIANTS.has(pat.a.s)
+        let variant = ADT_VARIANTS[pat.a.s].get_or(pat.s, None)
+        if variant == None
+            fail_at(pat.ln, "enum '" + pat.a.s + "' has no variant '" + pat.s + "'")
+        match_type(subj, variant[0], pat.ln, fails)
+        return
+    if k == K_CALL
+        let info = pattern_type(pat.a)
+        if info == None
+            compare_with(pat, subj, fails)
+            return
+        if len(pat.c) != info[1]
+            fail_at(pat.ln, "pattern expects " + str(info[1]) + " field(s), got " + str(len(pat.c)))
+        match_type(subj, info[0], pat.ln, fails)
+        destructure(pat.c, None, subj, fails)
+        return
+    if k == K_TUPLE or k == K_ARRAY
+        emit_b(OP_LOAD_LOCAL, subj, 0)
+        emit_h(OP_IS_ARRAY_LEN, len(pat.c), 0)
+        fails.push(emit_jump(OP_JUMP_IF_FALSE, pat.ln))
+        destructure(pat.c, None, subj, fails)
+        return
+    if k == K_SINIT and STRUCT_TYPES.has(pat.s)
+        match_type(subj, STRUCT_TYPES[pat.s], pat.ln, fails)
+        var names = []
+        var subs = []
+        for f in pat.c
+            names.push(f)
+            subs.push(pat.c[f])
+        destructure(subs, names, subj, fails)
+        return
+    if k == K_RANGE
+        emit_b(OP_LOAD_LOCAL, subj, 0)
+        cexpr(pat.a)
+        emit(OP_GE, 0)
+        fails.push(emit_jump(OP_JUMP_IF_FALSE, pat.ln))
+        emit_b(OP_LOAD_LOCAL, subj, 0)
+        cexpr(pat.b)
+        if pat.n
+            emit(OP_LE, 0)
+        else
+            emit(OP_LT, 0)
+        fails.push(emit_jump(OP_JUMP_IF_FALSE, pat.ln))
+        return
+    if k == K_BIN and pat.s == "|"
+        var alts = []
+        var stack = [pat]
+        while len(stack) > 0
+            let p = stack.pop()
+            if p.k == K_BIN and p.s == "|"
+                stack.push(p.b)
+                stack.push(p.a)
+            else
+                alts.push(p)
+        var oks = []
+        for alt in alts
+            emit_b(OP_LOAD_LOCAL, subj, 0)
+            cexpr(alt)
+            emit(OP_EQ, 0)
+            oks.push(emit_jump(OP_JUMP_IF_TRUE, alt.ln))
+        fails.push(emit_jump(OP_JUMP, pat.ln))
+        for o in oks
+            patch_jump(o)
+        return
+    compare_with(pat, subj, fails)
+
+destructure(subs, names, subj, fails)
+    var i = 0
+    while i < len(subs)
+        let sub = subs[i]
+        if not (sub.k == K_IDENT and sub.s == "_")
+            let tmp = hidden_local()
+            emit_b(OP_LOAD_LOCAL, subj, 0)
+            if names == None
+                emit_b(OP_GET_SLOT, i, 0)
+            else
+                emit_h(OP_GET_FIELD, const_str(names[i]), 0)
+            emit_b(OP_STORE_LOCAL, tmp, 0)
+            cpattern(sub, tmp, fails)
+        i += 1
 
 cbreak(ln, is_break)
     if len(F.loops) == 0
@@ -3345,13 +3997,33 @@ cassign(target, op, value, ln)
         fail_at(ln, "invalid assignment target")
 
 emit_return_nil(ln)
-    emit(OP_RETURN_NIL, ln)
+    let fi = F.fi
+    if fi != None and fi.ens != None and len(fi.ens) > 0 and fi.ret != "void"
+        emit(OP_PUSH_NIL, 0)
+        emit_return_value(ln)
+    else
+        emit(OP_RETURN_NIL, ln)
 
+# return the value on the stack, checking #[ensures] first
 emit_return_value(ln)
-    if F.fi != None
-        let c = numeric_cast(F.fi.ret)
+    let fi = F.fi
+    if fi != None
+        let c = numeric_cast(fi.ret)
         if c >= 0
             emit_b(OP_CAST, c, ln)
+        if fi.ens != None and len(fi.ens) > 0
+            if F.rslot == None
+                F.rslot = hidden_local()
+            emit_b(OP_STORE_LOCAL, F.rslot, ln)
+            F.ens_on = true
+            for e in fi.ens
+                cexpr(e[0])
+                let ok = emit_jump(OP_JUMP_IF_TRUE, e[0].ln)
+                emit_h(OP_PUSH_CONST, const_str(strip_ws("contract violation: " + fi.name + " ensures " + e[1])), e[0].ln)
+                emit(OP_PANIC, e[0].ln)
+                patch_jump(ok)
+            F.ens_on = false
+            emit_b(OP_LOAD_LOCAL, F.rslot, 0)
     emit(OP_RETURN, ln)
 
 prelude_function(meth)
@@ -3375,9 +4047,19 @@ prelude_function(meth)
 
 # ── statements ─────────────────────────────────────────────────────────────
 emit_load_var(name, ln)
+    if F.ens_on and name == "result"
+        emit_b(OP_LOAD_LOCAL, F.rslot, ln)
+        return true
     let loc = find_local(name)
     if loc != None
-        emit_b(OP_LOAD_LOCAL, loc.slot, ln)
+        if loc.cell
+            emit_b(OP_LOAD_CELL, loc.slot, ln)
+        else
+            emit_b(OP_LOAD_LOCAL, loc.slot, ln)
+        return true
+    let up = resolve_upval(F, name)
+    if up >= 0
+        emit_b(OP_LOAD_UPVAL, up, ln)
         return true
     let c = INLINE.get_or(name, None)
     if c != None
@@ -3393,7 +4075,16 @@ emit_store_var(name, ln)
     if loc != None
         if not loc.mutable
             fail_at(ln, "cannot assign twice to immutable variable '" + name + "'")
-        emit_b(OP_STORE_LOCAL, loc.slot, ln)
+        if loc.cell
+            emit_b(OP_STORE_CELL, loc.slot, ln)
+        else
+            emit_b(OP_STORE_LOCAL, loc.slot, ln)
+        return
+    let up = resolve_upval(F, name)
+    if up >= 0
+        if not F.upvals[up][3]
+            fail_at(ln, "cannot assign to immutable captured variable '" + name + "'")
+        emit_b(OP_STORE_UPVAL, up, ln)
         return
     if GLOBAL_SLOTS.has(name)
         if not GLOBAL_MUT[name]
@@ -3493,6 +4184,12 @@ cexpr(node)
             emit(OP_UNWRAP_OR_RETURN, node.ln)
         else
             emit(OP_UNWRAP_OR_PANIC, node.ln)
+    elif k == K_LAMBDA
+        clambda(node)
+    elif k == K_MATCH
+        cmatch(node, true)
+    elif k == K_LISTCOMP
+        ccomprehension(node)
     else
         fail_at(node.ln, "internal error: cannot compile node kind " + str(k))
 
@@ -3602,6 +4299,30 @@ sem_check(key, node)
     let argc = len(node.c)
     if argc < required or argc > n
         fail_at(node.ln, "'" + key + "' expects " + expects_text(required, n) + " argument(s), got " + str(argc))
+    if fi.req == None or len(fi.req) == 0
+        return
+    var env = {}
+    for k in SEM_CONSTS
+        env[k] = SEM_CONSTS[k]
+    var i = 0
+    for p in fi.params
+        if p.name != "self"
+            var arg = p.def
+            if i < argc
+                arg = node.c[i]
+            let v = const_eval(arg, SEM_CONSTS)
+            if v == None
+                return
+            env[p.name] = v
+            i += 1
+    for r in fi.req
+        let ok = const_eval(r[0], env)
+        if ok != None and not cv_truthy(ok)
+            var shown = []
+            for p in fi.params
+                if p.name != "self"
+                    shown.push(p.name + "=" + cv_repr(env[p.name]))
+            fail_at(node.ln, "contract violation: call to '" + key + "' (" + shown.join(", ") + ") breaks #[requires: " + r[1] + "]")
 
 # SemanticChecker.resolve_call for obj.meth(...) calls compiled as INVOKE
 sem_check_method(node, obj, meth)
@@ -3765,6 +4486,8 @@ cstruct_init(node)
                 found = true
         if not found
             fail_at(node.ln, "struct '" + name + "' has no field '" + g + "'")
+    let saved = SEM
+    SEM = false
     for fld in fields
         if given.has(fld.name)
             let e = given[fld.name]
@@ -3772,12 +4495,10 @@ cstruct_init(node)
             if FLOAT_TYPES.has(fld.ty) and e.k != K_FLOAT
                 emit_b(OP_CAST, 1, 0)
         elif fld.def != None
-            let saved = SEM
-            SEM = false
             cexpr(fld.def)
-            SEM = saved
         else
             push_cv(zero_value(fld.ty), node.ln)
+    SEM = saved
     emit_hb(OP_NEW_STRUCT, STRUCT_TYPES[name], len(fields), node.ln)
 
 cfstring(node)
