@@ -6218,10 +6218,41 @@ class Op:
     # effects with resumption (TIL 3.1, see docs/dev/TIL_3_1_DESIGN.md §8)
     HANDLE = 0x76; END_HANDLE = 0x77; PERFORM = 0x78; RESUME = 0x79
     HALT = 0x7F
-    # 0x80-0xBF: reserved for superinstructions (§13)
+    # 0x80-0xBF: superinstructions (TIL 3.1, docs/TIL_BYTECODE_V2.md). The
+    # compiler's peephole pass (fuse_superinstructions) emits them; each does
+    # exactly what the sequence in its comment does.
+    LOAD_LOCAL2 = 0x80          # LOAD_LOCAL a; LOAD_LOCAL b
+    LOAD_LOCAL_FIELD = 0x81     # LOAD_LOCAL a; GET_FIELD name
+    INC_LOCAL = 0x82            # LOAD_LOCAL a; PUSH_I8 k; ADD; STORE_LOCAL a
+    CAST_LOCAL = 0x83           # LOAD_LOCAL a; CAST kind; STORE_LOCAL a
+    CAST_RETURN = 0x84          # CAST kind; RETURN
+    ADD_STORE_LOCAL = 0x85      # ADD; STORE_LOCAL a
+    NATIVE_POP = 0x86           # NATIVE id argc; POP
+    INDEX_L = 0x87              # LOAD_LOCAL b; GET_INDEX
+    INDEX_LL = 0x88             # LOAD_LOCAL a; LOAD_LOCAL b; GET_INDEX
+    RETURN_LOCAL = 0x89         # LOAD_LOCAL a; RETURN
+    FOR_ITER_STORE = 0x8A       # FOR_ITER it off; STORE_LOCAL x
+    JUMP_IF_NOT = 0x90          # <cmp>; JUMP_IF_FALSE off        (cmp = EQ..GE opcode)
+    JUMP_IF_NOT_L = 0x91        # LOAD_LOCAL b; <cmp>; JUMP_IF_FALSE off
+    JUMP_IF_NOT_I = 0x92        # PUSH_I8/PUSH_I16 k; <cmp>; JUMP_IF_FALSE off
+    JUMP_IF_NOT_LL = 0x93       # LOAD_LOCAL a; LOAD_LOCAL b; <cmp>; JUMP_IF_FALSE off
+    JUMP_IF_NOT_LI = 0x94       # LOAD_LOCAL a; PUSH_I8/PUSH_I16 k; <cmp>; JUMP_IF_FALSE off
+    # <op>_I k = PUSH_I8/PUSH_I16 k; <op>   (k: i16; 0xA0 + index in FUSED_BINOPS)
+    ADD_I = 0xA0; SUB_I = 0xA1; MUL_I = 0xA2; DIV_I = 0xA3; MOD_I = 0xA4; BAND_I = 0xA5
+    BOR_I = 0xA6; BXOR_I = 0xA7; SHL_I = 0xA8; SHR_I = 0xA9; EQ_I = 0xAA; NE_I = 0xAB
+    LT_I = 0xAC; LE_I = 0xAD; GT_I = 0xAE; GE_I = 0xAF
+    # <op>_L b = LOAD_LOCAL b; <op>   (0xB0 + index in FUSED_BINOPS)
+    ADD_L = 0xB0; SUB_L = 0xB1; MUL_L = 0xB2; DIV_L = 0xB3; MOD_L = 0xB4; BAND_L = 0xB5
+    BOR_L = 0xB6; BXOR_L = 0xB7; SHL_L = 0xB8; SHR_L = 0xB9; EQ_L = 0xBA; NE_L = 0xBB
+    LT_L = 0xBC; LE_L = 0xBD; GT_L = 0xBE; GE_L = 0xBF
 
 
 OP_NAMES = {v: k for k, v in vars(Op).items() if not k.startswith('_')}
+
+# base operators of the <op>_I / <op>_L superinstructions (opcode & 15)
+FUSED_BINOPS = [Op.ADD, Op.SUB, Op.MUL, Op.DIV, Op.MOD, Op.BAND, Op.BOR, Op.BXOR, Op.SHL, Op.SHR,
+                Op.EQ, Op.NE, Op.LT, Op.LE, Op.GT, Op.GE]
+CMP_OPS = (Op.EQ, Op.NE, Op.LT, Op.LE, Op.GT, Op.GE)
 
 # Operand layout per opcode: b=u8 c=i8 h=u16 s=i16 (little endian)
 OP_OPERANDS = {
@@ -6236,7 +6267,17 @@ OP_OPERANDS = {
     Op.CONCAT: 'b', Op.FOR_ITER: 'bs', Op.MATCH_TYPE: 'h', Op.CAST: 'b',
     Op.IS_ARRAY_LEN: 'h', Op.TRY: 's', Op.TRY_TIMEOUT: 's',
     Op.HANDLE: 'bs', Op.PERFORM: 'hhb',
+    # superinstructions
+    Op.LOAD_LOCAL2: 'bb', Op.LOAD_LOCAL_FIELD: 'bh', Op.INC_LOCAL: 'bc', Op.CAST_LOCAL: 'bb',
+    Op.CAST_RETURN: 'b', Op.ADD_STORE_LOCAL: 'b', Op.NATIVE_POP: 'bb', Op.INDEX_L: 'b',
+    Op.INDEX_LL: 'bb', Op.RETURN_LOCAL: 'b', Op.FOR_ITER_STORE: 'bbs',
+    Op.JUMP_IF_NOT: 'bs', Op.JUMP_IF_NOT_L: 'bbs', Op.JUMP_IF_NOT_I: 'bss', Op.JUMP_IF_NOT_LL: 'bbbs',
+    Op.JUMP_IF_NOT_LI: 'bbss',
 }
+for _i in range(16):
+    OP_OPERANDS[0xA0 + _i] = 's'      # <op>_I k (i16)
+    OP_OPERANDS[0xB0 + _i] = 'b'      # <op>_L b
+del _i
 _OPERAND_SIZE = {'b': 1, 'c': 1, 'h': 2, 's': 2}
 
 # Builtin functions callable with NATIVE <id> <argc>. The order is part of the
@@ -6486,6 +6527,198 @@ class TBCModule:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#             PEEPHOLE PASS: SUPERINSTRUCTIONS (TIL 3.1, §13 of the design)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Frequent instruction sequences are replaced by one superinstruction (opcodes
+# 0x80-0xBF, docs/TIL_BYTECODE_V2.md) that does exactly the same thing in one
+# dispatch. Rules that keep every observable behaviour unchanged:
+#   * a sequence never spans a jump target or a line-table entry: only its first
+#     instruction may be one, so jumps, error lines and tracebacks stay the same;
+#   * sequences contain no calls, no TRY/END_TRY (recovery points), no HANDLE;
+#     their jumps count a step when they go backwards, like JUMP_IF_FALSE;
+#   * jump offsets and the line table are rebuilt for the shorter code.
+# `JUMP 0` (a jump to the next instruction) is dropped. The choice of sequences
+# minimises the number of instructions per function (dynamic programming).
+
+# instructions whose last operand is a jump offset (relative to the instruction end)
+_JUMP_OPS = frozenset([Op.JUMP, Op.JUMP_IF_FALSE, Op.JUMP_IF_TRUE, Op.TRY, Op.TRY_TIMEOUT,
+                       Op.FOR_ITER, Op.ARG_DEFAULT, Op.HANDLE, Op.JUMP_IF_NOT, Op.JUMP_IF_NOT_L,
+                       Op.JUMP_IF_NOT_I, Op.JUMP_IF_NOT_LL, Op.JUMP_IF_NOT_LI, Op.FOR_ITER_STORE])
+_PUSH_INT = (Op.PUSH_I8, Op.PUSH_I16)       # small integer constants (immediates of fused ops)
+_FUSED_INDEX = {op: i for i, op in enumerate(FUSED_BINOPS)}
+
+
+def _decode_insns(code) -> Optional[List[list]]:
+    """[pc, op, operands, end] per instruction; None if the code cannot be decoded."""
+    out = []
+    pc, n = 0, len(code)
+    while pc < n:
+        op = code[pc]
+        if op not in OP_NAMES:
+            return None
+        p = pc + 1
+        vals = []
+        for kind in OP_OPERANDS.get(op, ''):
+            if p + _OPERAND_SIZE[kind] > n:
+                return None
+            if kind == 'b':
+                vals.append(code[p])
+            elif kind == 'c':
+                vals.append(code[p] - 256 if code[p] > 127 else code[p])
+            else:
+                v = code[p] | (code[p + 1] << 8)
+                vals.append(v - 0x10000 if kind == 's' and v >= 0x8000 else v)
+            p += _OPERAND_SIZE[kind]
+        out.append([pc, op, vals, p])
+        pc = p
+    return out
+
+
+def _fusions_at(insns: List[list], i: int, boundary: Set[int]):
+    """Superinstructions that can replace insns[i:i+n]: (n, op, operands, cost).
+    Jump operands are absolute targets here (relocated by the caller)."""
+    def ops(n):
+        if i + n > len(insns) or any(insns[j][0] in boundary for j in range(i + 1, i + n)):
+            return None
+        return [insns[j] for j in range(i, i + n)]
+
+    found = []
+    g = ops(4)
+    if g:
+        (_, o0, v0, _e0), (_, o1, v1, _e1), (_, o2, v2, _e2), (_, o3, v3, e3) = g
+        if o0 == Op.LOAD_LOCAL and o1 == Op.PUSH_I8 and o2 == Op.ADD and o3 == Op.STORE_LOCAL \
+                and v0[0] == v3[0]:
+            found.append((4, Op.INC_LOCAL, [v0[0], v1[0]], 1.0))
+        if o0 == Op.LOAD_LOCAL and o2 in CMP_OPS and o3 == Op.JUMP_IF_FALSE:
+            if o1 == Op.LOAD_LOCAL:
+                found.append((4, Op.JUMP_IF_NOT_LL, [o2, v0[0], v1[0], e3 + v3[0]], 1.0))
+            elif o1 in _PUSH_INT:
+                found.append((4, Op.JUMP_IF_NOT_LI, [o2, v0[0], v1[0], e3 + v3[0]], 1.0))
+    g = ops(3)
+    if g:
+        (_, o0, v0, _e0), (_, o1, v1, _e1), (_, o2, v2, e2) = g
+        if o0 == Op.LOAD_LOCAL and o1 == Op.CAST and o2 == Op.STORE_LOCAL and v0[0] == v2[0]:
+            found.append((3, Op.CAST_LOCAL, [v0[0], v1[0]], 1.0))
+        if o1 in CMP_OPS and o2 == Op.JUMP_IF_FALSE:
+            if o0 == Op.LOAD_LOCAL:
+                found.append((3, Op.JUMP_IF_NOT_L, [o1, v0[0], e2 + v2[0]], 1.0))
+            elif o0 in _PUSH_INT:
+                found.append((3, Op.JUMP_IF_NOT_I, [o1, v0[0], e2 + v2[0]], 1.0))
+        if o0 == Op.LOAD_LOCAL and o1 == Op.LOAD_LOCAL and o2 == Op.GET_INDEX:
+            found.append((3, Op.INDEX_LL, [v0[0], v1[0]], 1.0))
+    g = ops(2)
+    if g:
+        (_, o0, v0, e0), (_, o1, v1, e1) = g
+        if o0 in CMP_OPS and o1 == Op.JUMP_IF_FALSE:
+            found.append((2, Op.JUMP_IF_NOT, [o0, e1 + v1[0]], 1.0))
+        elif o0 == Op.LOAD_LOCAL:
+            if o1 == Op.GET_INDEX:
+                found.append((2, Op.INDEX_L, [v0[0]], 1.0))
+            elif o1 == Op.GET_FIELD:
+                found.append((2, Op.LOAD_LOCAL_FIELD, [v0[0], v1[0]], 1.0))
+            elif o1 == Op.RETURN:
+                found.append((2, Op.RETURN_LOCAL, [v0[0]], 1.0))
+            elif o1 in _FUSED_INDEX:
+                found.append((2, 0xB0 + _FUSED_INDEX[o1], [v0[0]], 1.0))
+            elif o1 == Op.LOAD_LOCAL:
+                # slightly dearer than LOAD_LOCAL + <op>_L, which also saves the push
+                found.append((2, Op.LOAD_LOCAL2, [v0[0], v1[0]], 1.05))
+        elif o0 in _PUSH_INT and o1 in _FUSED_INDEX:
+            found.append((2, 0xA0 + _FUSED_INDEX[o1], [v0[0]], 1.0))
+        elif o0 == Op.FOR_ITER and o1 == Op.STORE_LOCAL:
+            found.append((2, Op.FOR_ITER_STORE, [v0[0], v1[0], e0 + v0[1]], 1.0))
+        elif o0 == Op.CAST and o1 == Op.RETURN:
+            found.append((2, Op.CAST_RETURN, [v0[0]], 1.0))
+        elif o0 == Op.ADD and o1 == Op.STORE_LOCAL:
+            found.append((2, Op.ADD_STORE_LOCAL, [v1[0]], 1.0))
+        elif o0 == Op.NATIVE and o1 == Op.POP:
+            found.append((2, Op.NATIVE_POP, [v0[0], v0[1]], 1.0))
+    return found
+
+
+def _encode_insn(op: int, vals: List[int]) -> bytes:
+    out = bytearray([op])
+    for kind, val in zip(OP_OPERANDS.get(op, ''), vals):
+        if kind == 'b':
+            out.append(val)
+        elif kind == 'c':
+            out += _struct.pack('<b', val)
+        elif kind == 'h':
+            out += _struct.pack('<H', val)
+        else:
+            out += _struct.pack('<h', val)
+    return bytes(out)
+
+
+def fuse_superinstructions(func: 'TBCFunction') -> Optional[Dict[int, int]]:
+    """Rewrite one function's code with superinstructions (in place: code and
+    line table). Returns the map old pc -> new pc (function-relative), or None
+    when the code was left unchanged."""
+    insns = _decode_insns(func.code)
+    if not insns:
+        return None
+    end = len(func.code)
+    targets = {ins[3] + ins[2][-1] for ins in insns if ins[1] in _JUMP_OPS}
+    if any(t < 0 or t > end for t in targets):
+        return None
+    boundary = targets | {pc for pc, _line in func.lines} | {0}
+    n = len(insns)
+    best = [0.0] * (n + 1)
+    choice: List[Any] = [None] * n
+    for i in range(n - 1, -1, -1):
+        best[i] = 1.0 + best[i + 1]
+        if insns[i][1] == Op.JUMP and insns[i][2][0] == 0:
+            best[i] = best[i + 1]               # a jump to the next instruction
+            choice[i] = 'drop'
+        for length, op, vals, cost in _fusions_at(insns, i, boundary):
+            if cost + best[i + length] < best[i] - 1e-9:
+                best[i] = cost + best[i + length]
+                choice[i] = (length, op, vals)
+    # layout: new pc of every old instruction start (and of the end)
+    new_pc: Dict[int, int] = {}
+    plan = []                                   # (op, operands with absolute old targets)
+    i = pc = 0
+    while i < n:
+        c = choice[i]
+        if c == 'drop':
+            new_pc[insns[i][0]] = pc
+            i += 1
+            continue
+        if c is None:
+            length, op, vals = 1, insns[i][1], list(insns[i][2])
+            if op in _JUMP_OPS:
+                vals[-1] = insns[i][3] + vals[-1]
+        else:
+            length, op, vals = c
+        for j in range(i, i + length):
+            new_pc[insns[j][0]] = pc
+        plan.append((pc, op, vals))
+        pc += 1 + sum(_OPERAND_SIZE[k] for k in OP_OPERANDS.get(op, ''))
+        i += length
+    new_pc[end] = pc
+    code = bytearray()
+    for at, op, vals in plan:
+        if op in _JUMP_OPS:
+            vals = list(vals)
+            size = 1 + sum(_OPERAND_SIZE[k] for k in OP_OPERANDS[op])
+            rel = new_pc[vals[-1]] - (at + size)
+            if not -32768 <= rel <= 32767:
+                raise CompileError("function too large: jump offset exceeds 32 KB")
+            vals[-1] = rel
+        code += _encode_insn(op, vals)
+    lines: List[Tuple[int, int]] = []
+    for old, line in func.lines:
+        at = new_pc[old]
+        if lines and lines[-1][0] == at:
+            lines[-1] = (at, line)              # a dropped JUMP shared its line entry
+        else:
+            lines.append((at, line))
+    func.code = code
+    func.lines = lines
+    return new_pc
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #                         BYTECODE COMPILER (AST -> .tbc)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -6514,10 +6747,11 @@ class _FuncState:
 class BytecodeCompiler:
     """Compiles a (resolved) TIL Program into a TBCModule."""
 
-    def __init__(self, source: str = "", filename: str = "<stdin>"):
+    def __init__(self, source: str = "", filename: str = "<stdin>", fuse: bool = True):
         self.reporter = ErrorReporter(source, filename)
         self.filename = filename
         self.m = TBCModule()
+        self.fuse = fuse          # peephole pass: superinstructions (til ... --no-fuse turns it off)
 
     # ── errors ──────────────────────────────────────────────────────────────
     def error(self, node, msg: str, hint: str = ""):
@@ -6734,6 +6968,9 @@ class BytecodeCompiler:
             fidx, fdef, owner = self.pending[i]
             self.compile_function(fidx, fdef, owner)
             i += 1
+        if self.fuse:
+            for f in m.funcs:
+                fuse_superinstructions(f)
         return m
 
     def declare_enum(self, e: EnumDef):
@@ -8697,6 +8934,41 @@ class TILVM:
                     if rf[3] and now > rf[3]:
                         raise TILPanic(b"timeout", target=i)
 
+    def binop(self, op: int, a, b):
+        """Binary operator `op` (ADD..GE) exactly as its plain instruction computes it
+        (used by the <op>_I / <op>_L superinstructions)."""
+        if op <= Op.MUL:
+            if type(a) is int and type(b) is int:
+                r = a + b if op == Op.ADD else (a - b if op == Op.SUB else a * b)
+                if not -0x8000000000000000 <= r <= 0x7FFFFFFFFFFFFFFF:
+                    r = wrap_int64(r)
+                return r
+            return self.arith(op, a, b)
+        if op <= Op.POW:
+            return self.arith(op, a, b)
+        if op == Op.EQ:
+            return self.equal(a, b)
+        if op == Op.NE:
+            return not self.equal(a, b)
+        if Op.LT <= op <= Op.GE:
+            if type(a) is int and type(b) is int:
+                return (a < b if op == Op.LT else a <= b if op == Op.LE else
+                        a > b if op == Op.GT else a >= b)
+            return self.compare(op, a, b)
+        return self.bitwise(op, a, b)
+
+    def cmp_values(self, cmp: int, a, b) -> bool:
+        """a <cmp> b for the compare-and-branch superinstructions (cmp = EQ..GE)."""
+        if cmp == Op.EQ:
+            return self.equal(a, b)
+        if cmp == Op.NE:
+            return not self.equal(a, b)
+        if not Op.LT <= cmp <= Op.GE:
+            raise TILFatal(f"bad opcode (comparison 0x{cmp:02x})")
+        if type(a) is int and type(b) is int:
+            return a < b if cmp == Op.LT else a <= b if cmp == Op.LE else a > b if cmp == Op.GT else a >= b
+        return self.compare(cmp, a, b)
+
     def execute(self):
         code = self.code
         consts = self.consts
@@ -8708,80 +8980,127 @@ class TILVM:
         base = frame[2]
         closure = frame[3]
         op_pc = pc
-        unpack_h = _struct.unpack_from
+        binops = FUSED_BINOPS
+        # opcodes as locals: the dispatch chain below compares against them (fast)
+        LOAD_LOCAL, STORE_LOCAL, PUSH_I8, PUSH_CONST = Op.LOAD_LOCAL, Op.STORE_LOCAL, Op.PUSH_I8, Op.PUSH_CONST
+        ADD, SUB, MUL, LT, LE, GT, GE = Op.ADD, Op.SUB, Op.MUL, Op.LT, Op.LE, Op.GT, Op.GE
+        JUMP, JUMP_IF_FALSE, JUMP_IF_TRUE = Op.JUMP, Op.JUMP_IF_FALSE, Op.JUMP_IF_TRUE
+        CALL, CALL_VALUE, INVOKE, RETURN, RETURN_NIL = Op.CALL, Op.CALL_VALUE, Op.INVOKE, Op.RETURN, Op.RETURN_NIL
+        LOAD_LOCAL2, LOAD_LOCAL_FIELD, INC_LOCAL, CAST_LOCAL = \
+            Op.LOAD_LOCAL2, Op.LOAD_LOCAL_FIELD, Op.INC_LOCAL, Op.CAST_LOCAL
+        CAST_RETURN, ADD_STORE_LOCAL, NATIVE_POP, RETURN_LOCAL = \
+            Op.CAST_RETURN, Op.ADD_STORE_LOCAL, Op.NATIVE_POP, Op.RETURN_LOCAL
+        INDEX_L, INDEX_LL, FOR_ITER_STORE = Op.INDEX_L, Op.INDEX_LL, Op.FOR_ITER_STORE
+        JUMP_IF_NOT, JUMP_IF_NOT_L, JUMP_IF_NOT_I, JUMP_IF_NOT_LL, JUMP_IF_NOT_LI = \
+            Op.JUMP_IF_NOT, Op.JUMP_IF_NOT_L, Op.JUMP_IF_NOT_I, Op.JUMP_IF_NOT_LL, Op.JUMP_IF_NOT_LI
         try:
             while True:
                 op_pc = pc
                 op = code[pc]
                 pc += 1
-                if op == Op.LOAD_LOCAL:
+                if op == LOAD_LOCAL:
                     stack.append(stack[base + code[pc]])
                     pc += 1
-                elif op == Op.STORE_LOCAL:
+                elif op == JUMP_IF_NOT_LL:
+                    # LOAD_LOCAL a; LOAD_LOCAL b; <cmp>; JUMP_IF_FALSE
+                    cmp = code[pc]
+                    a = stack[base + code[pc + 1]]
+                    b = stack[base + code[pc + 2]]
+                    if type(a) is int and type(b) is int and LT <= cmp <= GE:
+                        t = (a < b if cmp == LT else a <= b if cmp == LE else
+                             a > b if cmp == GT else a >= b)
+                    else:
+                        t = self.cmp_values(cmp, a, b)
+                    if t:
+                        pc += 5
+                    else:
+                        rel = code[pc + 3] | (code[pc + 4] << 8)
+                        if rel >= 0x8000:
+                            rel -= 0x10000
+                            self.check_budget(op_pc)
+                        pc += 5 + rel
+                elif op == STORE_LOCAL:
                     stack[base + code[pc]] = stack.pop()
                     pc += 1
-                elif op == Op.PUSH_I8:
-                    v = code[pc]
-                    stack.append(v - 256 if v > 127 else v)
-                    pc += 1
-                elif op == Op.PUSH_CONST:
-                    stack.append(consts[code[pc] | (code[pc + 1] << 8)])
-                    pc += 2
-                elif op == Op.ADD or op == Op.SUB or op == Op.MUL:
-                    b = stack.pop()
-                    a = stack[-1]
-                    if type(a) is int and type(b) is int:
-                        r = a + b if op == Op.ADD else (a - b if op == Op.SUB else a * b)
+                elif op == INC_LOCAL:
+                    # LOAD_LOCAL a; PUSH_I8 k; ADD; STORE_LOCAL a
+                    slot = base + code[pc]
+                    k = code[pc + 1]
+                    if k > 127:
+                        k -= 256
+                    a = stack[slot]
+                    if type(a) is int:
+                        r = a + k
                         if not -0x8000000000000000 <= r <= 0x7FFFFFFFFFFFFFFF:
                             r = wrap_int64(r)
-                        stack[-1] = r
+                        stack[slot] = r
                     else:
-                        stack[-1] = self.arith(op, a, b)
-                elif op == Op.LT or op == Op.LE or op == Op.GT or op == Op.GE:
-                    b = stack.pop()
-                    a = stack[-1]
-                    if type(a) is int and type(b) is int:
-                        stack[-1] = (a < b if op == Op.LT else a <= b if op == Op.LE else
-                                     a > b if op == Op.GT else a >= b)
-                    else:
-                        stack[-1] = self.compare(op, a, b)
-                elif op == Op.JUMP:
+                        stack[slot] = self.arith(ADD, a, k)
+                    pc += 2
+                elif op == JUMP:
                     rel = code[pc] | (code[pc + 1] << 8)
                     if rel >= 0x8000:
                         rel -= 0x10000
                         self.check_budget(op_pc)
                     pc += 2 + rel
-                elif op == Op.JUMP_IF_FALSE or op == Op.JUMP_IF_TRUE:
-                    v = stack.pop()
-                    t = v is True or (v is not False and v is not None and self.truthy(v))
-                    if t == (op == Op.JUMP_IF_TRUE):
-                        rel = code[pc] | (code[pc + 1] << 8)
-                        if rel >= 0x8000:
-                            rel -= 0x10000
-                            self.check_budget(op_pc)
-                        pc += 2 + rel
+                elif op >= 0xA0:
+                    # <op>_I k = PUSH_I8/PUSH_I16 k; <op>      <op>_L b = LOAD_LOCAL b; <op>
+                    if op >= 0xB0:
+                        if op > 0xBF:
+                            raise TILFatal(f"bad opcode 0x{op:02x} at {op_pc}")
+                        b = stack[base + code[pc]]
+                        pc += 1
                     else:
+                        b = code[pc] | (code[pc + 1] << 8)
+                        if b >= 0x8000:
+                            b -= 0x10000
                         pc += 2
-                elif op == Op.LOAD_GLOBAL:
-                    stack.append(self.globals[code[pc] | (code[pc + 1] << 8)])
+                    a = stack[-1]
+                    bop = binops[op & 15]
+                    if type(a) is int and type(b) is int:
+                        if bop == ADD:
+                            r = a + b
+                        elif bop == SUB:
+                            r = a - b
+                        elif bop == LT:
+                            stack[-1] = a < b
+                            continue
+                        elif bop == MUL:
+                            r = a * b
+                        else:
+                            stack[-1] = self.binop(bop, a, b)
+                            continue
+                        if not -0x8000000000000000 <= r <= 0x7FFFFFFFFFFFFFFF:
+                            r = wrap_int64(r)
+                        stack[-1] = r
+                    else:
+                        stack[-1] = self.binop(bop, a, b)
+                elif op == LOAD_LOCAL2:
+                    stack.append(stack[base + code[pc]])
+                    stack.append(stack[base + code[pc + 1]])
                     pc += 2
-                elif op == Op.STORE_GLOBAL:
-                    self.globals[code[pc] | (code[pc + 1] << 8)] = stack.pop()
-                    pc += 2
-                elif op == Op.EQ:
+                elif op == PUSH_I8:
+                    v = code[pc]
+                    stack.append(v - 256 if v > 127 else v)
+                    pc += 1
+                elif op == ADD or op == SUB or op == MUL:
                     b = stack.pop()
-                    stack[-1] = self.equal(stack[-1], b)
-                elif op == Op.NE:
-                    b = stack.pop()
-                    stack[-1] = not self.equal(stack[-1], b)
-                elif op == Op.CALL or op == Op.CALL_VALUE or op == Op.INVOKE:
-                    if op == Op.CALL:
+                    a = stack[-1]
+                    if type(a) is int and type(b) is int:
+                        r = a + b if op == ADD else (a - b if op == SUB else a * b)
+                        if not -0x8000000000000000 <= r <= 0x7FFFFFFFFFFFFFFF:
+                            r = wrap_int64(r)
+                        stack[-1] = r
+                    else:
+                        stack[-1] = self.arith(op, a, b)
+                elif op == CALL or op == CALL_VALUE or op == INVOKE:
+                    if op == CALL:
                         fidx = code[pc] | (code[pc + 1] << 8)
                         argc = code[pc + 2]
                         pc += 3
                         new_closure = None
                         extra = 0
-                    elif op == Op.CALL_VALUE:
+                    elif op == CALL_VALUE:
                         argc = code[pc]
                         pc += 1
                         callee = stack[-argc - 1]
@@ -8830,18 +9149,28 @@ class TILVM:
                         raise TILFatal("stack overflow (recursion too deep)")
                     frame[1] = pc
                     new_base = len(stack) - argc
-                    for _ in range(fn.n_params - argc):
-                        stack.append(_UNDEF)
-                    for _ in range(fn.n_locals - fn.n_params):
-                        stack.append(None)
+                    if argc < fn.n_params:
+                        stack.extend([_UNDEF] * (fn.n_params - argc))
+                    if fn.n_locals > fn.n_params:
+                        stack.extend([None] * (fn.n_locals - fn.n_params))
                     frame = [fidx, fn.offset, new_base, new_closure, extra]
                     frames.append(frame)
                     pc = fn.offset
                     base = new_base
                     closure = new_closure
                     self.check_budget(op_pc)
-                elif op == Op.RETURN or op == Op.RETURN_NIL:
-                    result = stack.pop() if op == Op.RETURN else None
+                elif op == RETURN or op == RETURN_NIL or op == CAST_RETURN or op == RETURN_LOCAL:
+                    if op == RETURN:
+                        result = stack.pop()
+                    elif op == CAST_RETURN:
+                        # CAST kind; RETURN
+                        result = self.cast(code[pc], stack[-1])
+                        stack.pop()
+                    elif op == RETURN_LOCAL:
+                        # LOAD_LOCAL a; RETURN
+                        result = stack[base + code[pc]]
+                    else:
+                        result = None
                     depth = len(frames)
                     while self.recover and self.recover[-1][1] >= depth:
                         if self.recover.pop()[3]:
@@ -8855,6 +9184,124 @@ class TILVM:
                     pc = frame[1]
                     base = frame[2]
                     closure = frame[3]
+                elif op == LOAD_LOCAL_FIELD:
+                    # LOAD_LOCAL a; GET_FIELD name
+                    stack.append(self.get_field(stack[base + code[pc]], code[pc + 1] | (code[pc + 2] << 8)))
+                    pc += 3
+                elif op == JUMP_IF_NOT_LI or op == JUMP_IF_NOT_L or op == JUMP_IF_NOT_I or op == JUMP_IF_NOT:
+                    cmp = code[pc]
+                    if op == JUMP_IF_NOT_LI:
+                        # LOAD_LOCAL a; PUSH_I8/PUSH_I16 k; <cmp>; JUMP_IF_FALSE
+                        a = stack[base + code[pc + 1]]
+                        b = code[pc + 2] | (code[pc + 3] << 8)
+                        if b >= 0x8000:
+                            b -= 0x10000
+                        pc += 4
+                    elif op == JUMP_IF_NOT_L:
+                        # LOAD_LOCAL b; <cmp>; JUMP_IF_FALSE
+                        a = stack[-1]
+                        b = stack[base + code[pc + 1]]
+                        pc += 2
+                    elif op == JUMP_IF_NOT_I:
+                        # PUSH_I8/PUSH_I16 k; <cmp>; JUMP_IF_FALSE
+                        a = stack[-1]
+                        b = code[pc + 1] | (code[pc + 2] << 8)
+                        if b >= 0x8000:
+                            b -= 0x10000
+                        pc += 3
+                    else:
+                        # <cmp>; JUMP_IF_FALSE
+                        a = stack[-2]
+                        b = stack[-1]
+                        pc += 1
+                    if type(a) is int and type(b) is int and LT <= cmp <= GE:
+                        t = (a < b if cmp == LT else a <= b if cmp == LE else
+                             a > b if cmp == GT else a >= b)
+                    else:
+                        t = self.cmp_values(cmp, a, b)
+                    if op == JUMP_IF_NOT:
+                        del stack[-2:]
+                    elif op != JUMP_IF_NOT_LI:
+                        stack.pop()
+                    if t:
+                        pc += 2
+                    else:
+                        rel = code[pc] | (code[pc + 1] << 8)
+                        if rel >= 0x8000:
+                            rel -= 0x10000
+                            self.check_budget(op_pc)
+                        pc += 2 + rel
+                elif op == CAST_LOCAL:
+                    # LOAD_LOCAL a; CAST kind; STORE_LOCAL a
+                    slot = base + code[pc]
+                    v = stack[slot]
+                    if not (type(v) is int and code[pc + 1] == 0):
+                        stack[slot] = self.cast(code[pc + 1], v)
+                    pc += 2
+                elif op == ADD_STORE_LOCAL:
+                    # ADD; STORE_LOCAL a
+                    b = stack.pop()
+                    a = stack.pop()
+                    if type(a) is int and type(b) is int:
+                        r = a + b
+                        if not -0x8000000000000000 <= r <= 0x7FFFFFFFFFFFFFFF:
+                            r = wrap_int64(r)
+                    else:
+                        r = self.arith(ADD, a, b)
+                    stack[base + code[pc]] = r
+                    pc += 1
+                elif op == PUSH_CONST:
+                    stack.append(consts[code[pc] | (code[pc + 1] << 8)])
+                    pc += 2
+                elif op == LT or op == LE or op == GT or op == GE:
+                    b = stack.pop()
+                    a = stack[-1]
+                    if type(a) is int and type(b) is int:
+                        stack[-1] = (a < b if op == LT else a <= b if op == LE else
+                                     a > b if op == GT else a >= b)
+                    else:
+                        stack[-1] = self.compare(op, a, b)
+                elif op == JUMP_IF_FALSE or op == JUMP_IF_TRUE:
+                    v = stack.pop()
+                    t = v is True or (v is not False and v is not None and self.truthy(v))
+                    if t == (op == JUMP_IF_TRUE):
+                        rel = code[pc] | (code[pc + 1] << 8)
+                        if rel >= 0x8000:
+                            rel -= 0x10000
+                            self.check_budget(op_pc)
+                        pc += 2 + rel
+                    else:
+                        pc += 2
+                elif op == INDEX_LL:
+                    # LOAD_LOCAL a; LOAD_LOCAL b; GET_INDEX
+                    stack.append(self.index_get(stack[base + code[pc]], stack[base + code[pc + 1]]))
+                    pc += 2
+                elif op == INDEX_L:
+                    # LOAD_LOCAL b; GET_INDEX
+                    stack[-1] = self.index_get(stack[-1], stack[base + code[pc]])
+                    pc += 1
+                elif op == Op.LOAD_GLOBAL:
+                    stack.append(self.globals[code[pc] | (code[pc + 1] << 8)])
+                    pc += 2
+                elif op == Op.STORE_GLOBAL:
+                    self.globals[code[pc] | (code[pc + 1] << 8)] = stack.pop()
+                    pc += 2
+                elif op == Op.EQ:
+                    b = stack.pop()
+                    stack[-1] = self.equal(stack[-1], b)
+                elif op == Op.NE:
+                    b = stack.pop()
+                    stack[-1] = not self.equal(stack[-1], b)
+                elif op == Op.NATIVE or op == NATIVE_POP:
+                    nid, argc = code[pc], code[pc + 1]
+                    pc += 2
+                    args = stack[len(stack) - argc:] if argc else []
+                    if argc:
+                        del stack[len(stack) - argc:]
+                    frame[1] = pc
+                    v = self.call_native(nid, args)
+                    if op != NATIVE_POP:
+                        stack.append(v)
                 elif op == Op.POP:
                     stack.pop()
                 elif op == Op.PUSH_NIL:
@@ -8919,14 +9366,6 @@ class TILVM:
                         pc += 3 + (rel - 0x10000 if rel >= 0x8000 else rel)
                     else:
                         pc += 3
-                elif op == Op.NATIVE:
-                    nid, argc = code[pc], code[pc + 1]
-                    pc += 2
-                    args = stack[len(stack) - argc:] if argc else []
-                    if argc:
-                        del stack[len(stack) - argc:]
-                    frame[1] = pc
-                    stack.append(self.call_native(nid, args))
                 elif op == Op.NEW_ARRAY:
                     n = code[pc] | (code[pc + 1] << 8)
                     pc += 2
@@ -8992,11 +9431,20 @@ class TILVM:
                     parts = stack[len(stack) - n:]
                     del stack[len(stack) - n:]
                     stack.append(b"".join(p if type(p) is bytes else self.to_str(p) for p in parts))
-                elif op == Op.FOR_ITER:
+                elif op == Op.FOR_ITER or op == FOR_ITER_STORE:
                     slot = base + code[pc]
                     container = stack[slot]
                     i = stack[slot + 1]
-                    if i < len(container):
+                    if op == FOR_ITER_STORE:
+                        # FOR_ITER it off; STORE_LOCAL x
+                        if i < len(container):
+                            stack[base + code[pc + 1]] = container[i]
+                            stack[slot + 1] = i + 1
+                            pc += 4
+                        else:
+                            rel = code[pc + 2] | (code[pc + 3] << 8)
+                            pc += 4 + (rel - 0x10000 if rel >= 0x8000 else rel)
+                    elif i < len(container):
                         stack.append(container[i])
                         stack[slot + 1] = i + 1
                         pc += 3
@@ -9121,8 +9569,15 @@ def disassemble(m: TBCModule) -> str:
                 note = "." + m.consts[vals[0]].decode('utf-8', 'replace') + "()"
             elif op in (Op.GET_FIELD, Op.SET_FIELD):
                 note = "." + m.consts[vals[0]].decode('utf-8', 'replace')
-            elif op == Op.NATIVE:
+            elif op == Op.LOAD_LOCAL_FIELD:
+                note = "." + m.consts[vals[1]].decode('utf-8', 'replace') if vals[1] < len(m.consts) else "?"
+            elif op in (Op.NATIVE, Op.NATIVE_POP):
                 note = NATIVES[vals[0]] + "()" if vals[0] < len(NATIVES) else "?"
+            elif op in (Op.JUMP_IF_NOT, Op.JUMP_IF_NOT_L, Op.JUMP_IF_NOT_I, Op.JUMP_IF_NOT_LL,
+                        Op.JUMP_IF_NOT_LI):
+                note = f"{OP_NAMES.get(vals[0], '?')} -> {p + vals[-1] - f.offset:04d}"
+            elif op in (Op.CAST_LOCAL, Op.CAST_RETURN):
+                note = {v: k for k, v in CAST_KINDS.items()}.get(vals[-1], "?")
             elif op in (Op.NEW_STRUCT, Op.MATCH_TYPE):
                 note = m.types[vals[0]][0] if vals[0] < len(m.types) else "?"
             elif op in (Op.JUMP, Op.JUMP_IF_FALSE, Op.JUMP_IF_TRUE, Op.TRY, Op.TRY_TIMEOUT, Op.HANDLE):
@@ -9143,14 +9598,16 @@ def disassemble(m: TBCModule) -> str:
     return "\n".join(out)
 
 
-def compile_to_bytecode(source: str, filename: str = "<stdin>", verify: bool = True) -> TBCModule:
-    """TIL source -> bytecode module (parse, resolve imports, verify, compile)."""
+def compile_to_bytecode(source: str, filename: str = "<stdin>", verify: bool = True,
+                        fuse: bool = True) -> TBCModule:
+    """TIL source -> bytecode module (parse, resolve imports, verify, compile).
+    fuse=False skips the superinstruction pass (til ... --no-fuse)."""
     program = resolve_imports(parse_source(source, filename), filename)
     if verify:
         errors = SemanticChecker(source, filename).check(program)
         if errors:
             raise CompileError("\n\n".join(errors))
-    module = BytecodeCompiler(source, filename).compile_program(program)
+    module = BytecodeCompiler(source, filename, fuse=fuse).compile_program(program)
     module.link()
     return module
 
@@ -9562,6 +10019,7 @@ RUN_VALUE_OPTIONS = {
 RUN_FLAG_OPTIONS = {
     '--screen-ansi': 'screen_ansi',  # graphics: draw the screen in the terminal
     '--prove': 'prove',              # check: prove contracts for all inputs
+    '--no-fuse': 'no_fuse',          # run/build/dis: bytecode without superinstructions
 }
 
 
@@ -9880,6 +10338,7 @@ def main():
 
         with open(input_file, 'r', encoding='utf-8') as f:
             source = f.read()
+        fuse = not opts.get('no_fuse')
 
         if command == 'check':
             ast = resolve_imports(parse_source(source, input_file), input_file)
@@ -9908,7 +10367,7 @@ def main():
             return 0
 
         if command == 'dis':
-            print(disassemble(compile_to_bytecode(source, input_file, compiler.verify)))
+            print(disassemble(compile_to_bytecode(source, input_file, compiler.verify, fuse)))
             return 0
 
         base = os.path.splitext(os.path.basename(input_file))[0]
@@ -9918,7 +10377,7 @@ def main():
             use_vm = 'py'
 
         if command == 'run' and use_vm:
-            module = compile_to_bytecode(source, input_file, compiler.verify)
+            module = compile_to_bytecode(source, input_file, compiler.verify, fuse)
             if use_vm == 'py':
                 return run_bytecode(module, max_steps, prog_args, opts)
             exe = _cvm_binary(compiler.verbose)
@@ -9935,7 +10394,7 @@ def main():
                 os.unlink(tbc_path)
 
         if target in ('vm', 'tbc'):
-            module = compile_to_bytecode(source, input_file, compiler.verify)
+            module = compile_to_bytecode(source, input_file, compiler.verify, fuse)
             data = module.serialize(strip=strip)
             out = output_file or base + '.tbc'
             with open(out, 'wb') as f:
@@ -9944,7 +10403,7 @@ def main():
             return 0
 
         if target in ('c-vm', 'calc', 'embed'):
-            module = compile_to_bytecode(source, input_file, compiler.verify)
+            module = compile_to_bytecode(source, input_file, compiler.verify, fuse)
             text = amalgamate_c_vm(module.serialize(strip=strip), input_file)
             out = output_file or base + '_vm.c'
             with open(out, 'w', encoding='utf-8', newline='\n') as f:
@@ -9982,7 +10441,7 @@ def main():
                           file=sys.stderr)
                     if compiler.verbose:
                         print(getattr(compiler, 'last_c_error', ''), file=sys.stderr)
-                    return run_bytecode(compile_to_bytecode(source, input_file, compiler.verify), max_steps,
+                    return run_bytecode(compile_to_bytecode(source, input_file, compiler.verify, fuse), max_steps,
                                         prog_args, opts)
                 return subprocess.run([tmp_exe] + prog_args).returncode
             finally:

@@ -26,6 +26,13 @@
  *   TILVM_MAX_TRY      nested retry/timeout    (default 32)
  *   TILVM_MAX_CONSTS   constants per program   (default 4096)
  *   TILVM_MAX_TYPES    struct types            (default 512)
+ *   TILVM_MAX_FUNCS    functions decoded into a table at load (default TILVM_MAX_CONSTS;
+ *                      TILVM_LEAN: 0 = no table, records are read from the bytecode).
+ *                      A program with more functions is rejected by tilvm_load (-10).
+ *   TILVM_FIELD_CACHE  entries of the struct field / method lookup cache (power of two;
+ *                      default 64, TILVM_LEAN: 0 = no cache)
+ *   TILVM_COMPUTED_GOTO 1 = dispatch with GCC/Clang "labels as values" (default with
+ *                      __GNUC__, except TILVM_LEAN and -Os builds), 0 = portable switch
  *   TILVM_NO_STDIO     no <stdio.h>: the host must set vm->write
  *   TILVM_NO_TIME      no <time.h>: timeouts count steps (1 ms = 1000 steps)
  *   TILVM_NO_MATH      no <math.h>: sqrt/sin/... use built-in approximations
@@ -71,6 +78,20 @@
 #endif
 #ifndef TILVM_MARK_STACK
 #define TILVM_MARK_STACK 64
+#endif
+#ifndef TILVM_MAX_FUNCS
+#ifdef TILVM_LEAN
+#define TILVM_MAX_FUNCS 0
+#else
+#define TILVM_MAX_FUNCS TILVM_MAX_CONSTS
+#endif
+#endif
+#ifndef TILVM_FIELD_CACHE
+#ifdef TILVM_LEAN
+#define TILVM_FIELD_CACHE 0
+#else
+#define TILVM_FIELD_CACHE 64
+#endif
 #endif
 
 #if TILVM_INT_BITS == 16
@@ -157,6 +178,17 @@ typedef struct tilvm_state {
     tv_val stack[TILVM_STACK_SIZE];
 } tilvm_state;
 
+/* A function record decoded once at load (TILVM_MAX_FUNCS > 0). */
+typedef struct tv_func {
+    uint32_t code;      /* absolute offset of the first instruction in the bytecode */
+    uint8_t nparams, nreq, nlocals, flags;
+} tv_func;
+
+/* Struct field / method lookup cache entry: (type, name constant) -> slot or function. */
+typedef struct tv_cache {
+    uint16_t type, name, value;
+} tv_cache;
+
 typedef void (*tilvm_write_fn)(void *ctx, const char *data, size_t len);
 typedef int (*tilvm_read_fn)(void *ctx, char *buf, size_t cap);   /* returns length or -1 */
 typedef uint32_t (*tilvm_clock_fn)(void *ctx);                    /* milliseconds */
@@ -207,6 +239,13 @@ typedef struct tilvm {
     uint32_t const_off[TILVM_MAX_CONSTS];
     uint32_t type_off[TILVM_MAX_TYPES];
     uint32_t bc_hash;
+#if TILVM_MAX_FUNCS > 0
+    tv_func funcs[TILVM_MAX_FUNCS];   /* decoded function records (TIL 3.1) */
+#endif
+#if TILVM_FIELD_CACHE > 0
+    tv_cache field_cache[TILVM_FIELD_CACHE];    /* (struct type, field name) -> slot */
+    tv_cache method_cache[TILVM_FIELD_CACHE];   /* (struct type, method name) -> function */
+#endif
 
     /* ---- runtime ---- */
     const char *err_msg;        /* last runtime error (C string) */

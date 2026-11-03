@@ -1,0 +1,21 @@
+# maps.til - map insert and lookup (TIL 3.1 VM benchmark)
+
+main()
+    var m = {}
+    for i in 0..300
+        m[f"key{i}"] = i
+    var s = 0
+    for r in 0..40
+        for i in 0..300
+            s += m[f"key{i}"]
+    var squares = {}
+    for i in 0..300
+        squares[i] = i * i
+    var t = 0
+    for r in 0..40
+        for i in 0..300
+            if squares.has(i)
+                t += squares[i] % 7
+    print(s)
+    print(t)
+    print(len(m), len(squares))

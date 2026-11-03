@@ -1,0 +1,31 @@
+# structs.til - field access and method calls (TIL 3.1 VM benchmark)
+
+struct Vec
+    x: int
+    y: int
+
+impl Vec
+    add(self, o: Vec) -> Vec
+        return Vec { x: self.x + o.x, y: self.y + o.y }
+
+    dot(self, o: Vec) -> int
+        return self.x * o.x + self.y * o.y
+
+struct Particle
+    pos: Vec
+    vel: Vec
+    mass: int
+
+main()
+    var ps = []
+    for i in 0..100
+        ps.push(Particle { pos: Vec { x: i, y: 0 }, vel: Vec { x: 1, y: i % 7 }, mass: i % 5 + 1 })
+    var energy = 0
+    for step in 0..1500
+        for p in ps
+            p.pos = p.pos.add(p.vel)
+            energy += p.vel.dot(p.vel) * p.mass
+            if p.pos.x > 1000
+                p.pos.x = 0
+    print(energy)
+    print(ps[7].pos.x, ps[7].pos.y)

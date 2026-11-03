@@ -43,8 +43,28 @@ enum {
     OP_UNWRAP_OR_RETURN = 0x74, OP_UNWRAP_OR_PANIC = 0x75,
     /* effects with resumption (TIL 3.1, docs/dev/TIL_3_1_DESIGN.md section 8) */
     OP_HANDLE = 0x76, OP_END_HANDLE = 0x77, OP_PERFORM = 0x78, OP_RESUME = 0x79,
-    OP_HALT = 0x7F
-    /* 0x80-0xBF: reserved for superinstructions */
+    OP_HALT = 0x7F,
+    /* 0x80-0xBF: superinstructions emitted by the compiler's peephole pass
+     * (TIL 3.1, docs/TIL_BYTECODE_V2.md); each one does exactly what the
+     * instruction sequence it replaces does */
+    OP_LOAD_LOCAL2 = 0x80, OP_LOAD_LOCAL_FIELD = 0x81, OP_INC_LOCAL = 0x82, OP_CAST_LOCAL = 0x83,
+    OP_CAST_RETURN = 0x84, OP_ADD_STORE_LOCAL = 0x85, OP_NATIVE_POP = 0x86, OP_INDEX_L = 0x87,
+    OP_INDEX_LL = 0x88, OP_RETURN_LOCAL = 0x89, OP_FOR_ITER_STORE = 0x8A,
+    OP_JUMP_IF_NOT = 0x90, OP_JUMP_IF_NOT_L = 0x91, OP_JUMP_IF_NOT_I = 0x92, OP_JUMP_IF_NOT_LL = 0x93,
+    OP_JUMP_IF_NOT_LI = 0x94,
+    /* <op>_I k = PUSH_I8/PUSH_I16 k; <op> (k: i16)   <op>_L b = LOAD_LOCAL b; <op>   (op: FUSED_BINOP) */
+    OP_ADD_I = 0xA0, OP_SUB_I = 0xA1, OP_MUL_I = 0xA2, OP_DIV_I = 0xA3, OP_MOD_I = 0xA4,
+    OP_BAND_I = 0xA5, OP_BOR_I = 0xA6, OP_BXOR_I = 0xA7, OP_SHL_I = 0xA8, OP_SHR_I = 0xA9,
+    OP_EQ_I = 0xAA, OP_NE_I = 0xAB, OP_LT_I = 0xAC, OP_LE_I = 0xAD, OP_GT_I = 0xAE, OP_GE_I = 0xAF,
+    OP_ADD_L = 0xB0, OP_SUB_L = 0xB1, OP_MUL_L = 0xB2, OP_DIV_L = 0xB3, OP_MOD_L = 0xB4,
+    OP_BAND_L = 0xB5, OP_BOR_L = 0xB6, OP_BXOR_L = 0xB7, OP_SHL_L = 0xB8, OP_SHR_L = 0xB9,
+    OP_EQ_L = 0xBA, OP_NE_L = 0xBB, OP_LT_L = 0xBC, OP_LE_L = 0xBD, OP_GT_L = 0xBE, OP_GE_L = 0xBF
+};
+
+/* base operator of the <op>_I / <op>_L superinstructions (opcode & 15) */
+static const uint8_t FUSED_BINOP[16] = {
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_BAND, OP_BOR, OP_BXOR, OP_SHL, OP_SHR,
+    OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE
 };
 
 /* NATIVES (order = NATIVES in src/til.py) */
@@ -474,6 +494,24 @@ static const uint8_t *func_rec(tilvm *vm, uint16_t f) { return vm->bc + vm->func
 #define FN_FLAGS(p) ((p)[6])
 #define FN_OFFSET(p) RD32((p) + 7)
 
+/* function records: decoded once by tilvm_load (TILVM_MAX_FUNCS > 0) or read
+ * from the bytecode on every call (TILVM_MAX_FUNCS == 0, smallest RAM) */
+#if TILVM_MAX_FUNCS > 0
+#define F_CODE(vm, f) ((vm)->funcs[f].code)
+#define F_NPARAMS(vm, f) ((vm)->funcs[f].nparams)
+#define F_NREQ(vm, f) ((vm)->funcs[f].nreq)
+#define F_NLOCALS(vm, f) ((vm)->funcs[f].nlocals)
+#else
+#define F_CODE(vm, f) ((vm)->code_off + FN_OFFSET(func_rec(vm, f)))
+#define F_NPARAMS(vm, f) FN_NPARAMS(func_rec(vm, f))
+#define F_NREQ(vm, f) FN_NREQ(func_rec(vm, f))
+#define F_NLOCALS(vm, f) FN_NLOCALS(func_rec(vm, f))
+#endif
+
+/* compile-time check: the lookup cache size is a power of two (or 0) */
+typedef char tv_check_cache_size[(TILVM_FIELD_CACHE & (TILVM_FIELD_CACHE - 1)) == 0 ? 1 : -1];
+#define CACHE_EMPTY 0xFFFFu
+
 static int const_str_eq(tilvm *vm, uint16_t k, const char *s) {
     const uint8_t *p = const_ptr(vm, k);
     uint16_t n = RD16(p);
@@ -734,6 +772,18 @@ static int to_str_slot(tilvm *vm, uint16_t slot) {
     tv_ref r;
     tv_val *v = &vm->st.stack[slot];
     if (is_str(v)) return 1;
+#ifndef TILVM_LEAN
+    if (v->t == TV_INT) {             /* common case: format once, allocate once */
+        char num[32];
+        const char *p = fmt_int(num, v->u.i);
+        uint32_t n = (uint32_t)strlen(p);
+        r = new_str(vm, n);
+        if (!r) return 0;
+        memcpy(STROBJ(vm, r)->data, p, n);
+        set_ref(&vm->st.stack[slot], TV_STR, r);
+        return 1;
+    }
+#endif
     s.vm = vm; s.mode = 0; s.dst = 0; s.len = 0;
     emit_value(&s, v, 0, 0);
     if (s.len > TV_STR_MAX) return fail(vm, "string too long");
@@ -1125,6 +1175,27 @@ static void map_key(tv_val *k) {
 static int map_find(tilvm *vm, tv_ref map, const tv_val *key) {
     tv_arrobj *m = ARROBJ(vm, map);
     uint32_t i, n = m->len;
+#ifndef TILVM_LEAN
+    /* the usual key types, compared without the general equal() (same results) */
+    const tv_val *v = VALS(vm, m->buf);
+    if (key->t == TV_INT) {            /* only ints and floats can equal an int */
+        for (i = 0; i < n; i++, v += 2) {
+            if (v->t == TV_INT) { if (v->u.i == key->u.i) return (int)i; }
+            else if (v->t == TV_FLOAT && equal(vm, v, key, 0)) return (int)i;
+        }
+        return -1;
+    }
+    if (is_str(key)) {                 /* only strings can equal a string */
+        uint32_t kl, l;
+        const char *kp = str_data(vm, key, &kl), *p;
+        for (i = 0; i < n; i++, v += 2) {
+            if (!is_str(v)) continue;
+            p = str_data(vm, v, &l);
+            if (l == kl && memcmp(p, kp, l) == 0) return (int)i;
+        }
+        return -1;
+    }
+#endif
     for (i = 0; i < n; i++)
         if (equal(vm, &VALS(vm, m->buf)[2 * i], key, 0)) return (int)i;
     return -1;
@@ -1267,6 +1338,25 @@ static int field_slot(tilvm *vm, uint16_t t, uint16_t name_const) {
     }
     return -1;
 }
+
+/* field_slot() through a small direct-mapped cache: (type, name) -> slot.
+ * The probe is a macro so that it is inlined into the interpreter. */
+#if TILVM_FIELD_CACHE > 0
+#define CACHE_AT(cache, T_, N_) (&(cache)[((uint32_t)(T_) * 31u + (N_)) & (TILVM_FIELD_CACHE - 1)])
+static int field_slot_fill(tilvm *vm, uint16_t t, uint16_t name_const) {
+    tv_cache *c = CACHE_AT(vm->field_cache, t, name_const);
+    int slot = field_slot(vm, t, name_const);
+    if (slot >= 0) { c->type = t; c->name = name_const; c->value = (uint16_t)slot; }
+    return slot;
+}
+#define FIELD_SLOT(VM_, T_, N_, OUT_) do {                                     \
+        const tv_cache *c_ = CACHE_AT((VM_)->field_cache, T_, N_);             \
+        (OUT_) = c_->type == (T_) && c_->name == (N_) ? (int)c_->value          \
+                                                      : field_slot_fill(VM_, T_, N_); \
+    } while (0)
+#else
+#define FIELD_SLOT(VM_, T_, N_, OUT_) ((OUT_) = field_slot(VM_, T_, N_))
+#endif
 
 static int no_field(tilvm *vm, uint16_t name_const, const tv_val *obj) {
     const uint8_t *p = const_ptr(vm, name_const);
@@ -1945,8 +2035,20 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
 static int find_bytes(const char *h, uint32_t hl, const char *n, uint32_t nl, uint32_t from) {
     uint32_t i;
     if (nl == 0) return (int)from;
+#ifndef TILVM_LEAN
+    /* memchr jumps to the next possible start (same result as the plain loop) */
+    for (i = from; i + nl <= hl; i++) {
+        const char *p = (const char *)memchr(h + i, (unsigned char)n[0], hl - nl + 1 - i);
+        uint32_t j;
+        if (!p) return -1;
+        i = (uint32_t)(p - h);
+        for (j = 1; j < nl && p[j] == n[j]; j++) { }
+        if (j == nl) return (int)i;
+    }
+#else
     for (i = from; i + nl <= hl; i++)
         if (memcmp(h + i, n, nl) == 0) return (int)i;
+#endif
     return -1;
 }
 
@@ -2103,7 +2205,7 @@ static void sort_array(tilvm *vm, tv_ref arr, int *err) {
     tv_arrobj *a = ARROBJ(vm, arr);
     uint32_t n = a->len, i, j;
     tv_val *v = VALS(vm, a->buf), key;
-    int lt;
+    int lt = 0;
     for (i = 0; i < n; i++) {
         if (!(is_num(&v[i]) && is_num(&v[0])) && !(is_str(&v[i]) && is_str(&v[0]))) {
             *err = 1;
@@ -2438,6 +2540,9 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
     }
     vm->n_funcs = RD16(bc + p); p += 2;
     vm->funcs_off = p;
+#if TILVM_MAX_FUNCS > 0
+    if (vm->n_funcs > TILVM_MAX_FUNCS) return -10;
+#endif
     p += 11u * vm->n_funcs;
     n = RD16(bc + p); p += 2;
     if (n > TILVM_MAX_TYPES) return -7;
@@ -2459,6 +2564,22 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
     vm->n_lines = RD16(bc + p); p += 2;
     vm->lines_off = p;
     if (vm->n_globals + 8 > TILVM_STACK_SIZE) return -8;
+#if TILVM_MAX_FUNCS > 0
+    for (i = 0; i < vm->n_funcs; i++) {       /* decode the function records once */
+        const uint8_t *f = func_rec(vm, (uint16_t)i);
+        vm->funcs[i].code = vm->code_off + FN_OFFSET(f);
+        vm->funcs[i].nparams = FN_NPARAMS(f);
+        vm->funcs[i].nreq = FN_NREQ(f);
+        vm->funcs[i].nlocals = FN_NLOCALS(f);
+        vm->funcs[i].flags = FN_FLAGS(f);
+    }
+#endif
+#if TILVM_FIELD_CACHE > 0
+    for (i = 0; i < TILVM_FIELD_CACHE; i++) {
+        vm->field_cache[i].type = CACHE_EMPTY;
+        vm->method_cache[i].type = CACHE_EMPTY;
+    }
+#endif
     vm->bc_hash = fnv1a(bc, size);
 #ifndef TILVM_NO_STDIO
     vm->write = tilvm_default_write;
@@ -2575,11 +2696,10 @@ static int recover(tilvm *vm, int target) {
     return 1;
 }
 
-/* push constant k (int / float / string kept in ROM) */
-static void push_const(tilvm *vm, uint16_t k) {
+/* constant k (int / float / string kept in ROM) -> *dst */
+static void load_const(tilvm *vm, uint16_t k, tv_val *dst) {
     const uint8_t *p = vm->bc + vm->const_off[k];
     uint8_t tag = p[-1];
-    tv_val *dst = &STK[SP];
     if (tag == 3) { dst->t = TV_STRK; dst->u.i = 0; dst->u.k = k; }
     else if (tag == 1) {
 #if TILVM_INT_BITS == 64
@@ -2611,7 +2731,6 @@ static void push_const(tilvm *vm, uint16_t k) {
         set_nil(dst);
 #endif
     }
-    SP++;
 }
 
 static int no_method_error(tilvm *vm, uint16_t name_c, const tv_val *recv) {
@@ -2650,28 +2769,29 @@ static uint16_t find_method(tilvm *vm, uint16_t t, uint16_t name_c, int *found) 
     return 0;
 }
 
-/* Decode CALL / CALL_VALUE / INVOKE. Returns 1 when a bytecode function must be
- * entered (outputs set), 2 when a builtin method already left its result on the
- * stack, 0 on error. */
-static int prepare_call(tilvm *vm, uint8_t op, uint32_t *pc, uint16_t *fidx, uint8_t *argc,
-                        uint8_t *extra, tv_ref *clos) {
+/* find_method() through a cache: (type, name) -> function (CACHE_EMPTY = no method) */
+static uint16_t find_method_cached(tilvm *vm, uint16_t t, uint16_t name_c, int *found) {
+#if TILVM_FIELD_CACHE > 0
+    tv_cache *c = CACHE_AT(vm->method_cache, t, name_c);
+    uint16_t f;
+    if (c->type == t && c->name == name_c) { *found = c->value != CACHE_EMPTY; return c->value; }
+    f = find_method(vm, t, name_c, found);
+    c->type = t;
+    c->name = name_c;
+    c->value = *found ? f : (uint16_t)CACHE_EMPTY;
+    return f;
+#else
+    return find_method(vm, t, name_c, found);
+#endif
+}
+
+/* Decode INVOKE (operands at *pc) for the general cases: methods of user structs,
+ * functions held in struct fields, prelude functions and builtin methods. Returns 1
+ * when a bytecode function must be entered (outputs set), 2 when a builtin method
+ * already left its result on the stack, 0 on error. */
+static int prepare_invoke(tilvm *vm, uint32_t *pc, uint16_t *fidx, uint8_t *argc,
+                          uint8_t *extra, tv_ref *clos) {
     const uint8_t *code = vm->bc;
-    if (op == OP_CALL) {
-        *fidx = RD16(code + *pc);
-        *argc = code[*pc + 2];
-        *pc += 3;
-        return 1;
-    }
-    if (op == OP_CALL_VALUE) {
-        tv_val *callee;
-        *argc = code[*pc];
-        *pc += 1;
-        callee = &STK[SP - *argc - 1];
-        *extra = 1;
-        if (callee->t == TV_FUNC) { *fidx = callee->u.k; return 1; }
-        if (callee->t == TV_CLOSURE) { *clos = callee->u.r; *fidx = CLOSOBJ(vm, *clos)->func; return 1; }
-        return failn(vm, type_name(vm, callee), " is not callable", 0, 0, 0, 0);
-    }
     {
         uint16_t name_c = RD16(code + *pc), k;
         uint8_t mid = code[*pc + 2];
@@ -2682,7 +2802,7 @@ static int prepare_call(tilvm *vm, uint8_t op, uint32_t *pc, uint16_t *fidx, uin
         recv = &STK[SP - *argc - 1];
         if (recv->t == TV_STRUCT) {
             uint16_t t = OBJ(vm, recv->u.r)->aux;
-            *fidx = find_method(vm, t, name_c, &found);
+            *fidx = find_method_cached(vm, t, name_c, &found);
             if (found) { (*argc)++; return 1; }       /* the receiver becomes self */
             if (t > TYPE_ERR) {
                 int slot = field_slot(vm, t, name_c);
@@ -2706,40 +2826,21 @@ static int prepare_call(tilvm *vm, uint8_t op, uint32_t *pc, uint16_t *fidx, uin
     }
 }
 
-/* Push a call frame. Returns 1 ok, 0 recoverable error (arity), -1 fatal. */
-static int push_frame(tilvm *vm, uint16_t fidx, uint8_t argc, uint8_t extra, tv_ref clos) {
-    tilvm_state *st = &vm->st;
+/* "f() takes N argument(s), got M" (a recoverable error) */
+static int arity_error(tilvm *vm, uint16_t fidx, uint8_t argc) {
     const uint8_t *f = func_rec(vm, fidx);
-    tv_frame *fr;
-    uint16_t nb;
-    uint8_t i;
-    if (argc > FN_NPARAMS(f) || argc < FN_NREQ(f)) {
-        char name[48], n1[32], n2[32];
-        uint32_t nl;
-        tv_val nv;
-        const char *np;
-        nv.t = TV_STRK;
-        nv.u.k = FN_NAME(f);
-        np = str_data(vm, &nv, &nl);
-        if (nl > sizeof(name) - 1) nl = sizeof(name) - 1;
-        memcpy(name, np, nl);
-        name[nl] = 0;
-        return failn(vm, name, "() takes ", fmt_int(n1, (tv_int)FN_NPARAMS(f)), " argument(s), got ",
-                     fmt_int(n2, (tv_int)argc), 0);
-    }
-    if (st->n_frames >= TILVM_MAX_FRAMES) { fail(vm, "stack overflow (recursion too deep)"); return -1; }
-    if (SP + (FN_NLOCALS(f) - argc) + 4 > TILVM_STACK_SIZE) { fail(vm, "stack overflow"); return -1; }
-    nb = (uint16_t)(SP - argc);
-    for (i = argc; i < FN_NPARAMS(f); i++) { STK[SP].t = TV_UNDEF; STK[SP].u.i = 0; SP++; }
-    for (i = FN_NPARAMS(f); i < FN_NLOCALS(f); i++) set_nil(&STK[SP++]);
-    fr = &st->frames[st->n_frames++];
-    fr->func = fidx;
-    fr->base = nb;
-    fr->closure = clos;
-    fr->extra = extra;
-    fr->ret_pc = 0;
-    fr->pc = vm->code_off + FN_OFFSET(f);
-    return 1;
+    char name[48], n1[32], n2[32];
+    uint32_t nl;
+    tv_val nv;
+    const char *np;
+    nv.t = TV_STRK;
+    nv.u.k = FN_NAME(f);
+    np = str_data(vm, &nv, &nl);
+    if (nl > sizeof(name) - 1) nl = sizeof(name) - 1;
+    memcpy(name, np, nl);
+    name[nl] = 0;
+    return failn(vm, name, "() takes ", fmt_int(n1, (tv_int)FN_NPARAMS(f)), " argument(s), got ",
+                 fmt_int(n2, (tv_int)argc), 0);
 }
 
 #ifndef TILVM_LEAN
@@ -2774,6 +2875,37 @@ static int concat_values(tilvm *vm, uint8_t n) {
     uint32_t total = 0, k = 0, l;
     uint16_t first = (uint16_t)(SP - n);
     tv_ref r;
+#ifndef TILVM_LEAN
+    /* measure the text of every part, then one allocation (the parts stay on the
+     * stack, so the collector keeps and updates them) and one copy */
+    sink s;
+    char num[32];
+    for (i = 0; i < n; i++) {
+        const tv_val *v = &STK[first + i];
+        if (is_str(v)) str_data(vm, v, &l);
+        else if (v->t == TV_INT) l = (uint32_t)strlen(fmt_int(num, v->u.i));
+        else { s.vm = vm; s.mode = 0; s.dst = 0; s.len = 0; emit_value(&s, v, 0, 0); l = s.len; }
+        if (l > TV_STR_MAX || (total += l) > TV_STR_MAX) return fail(vm, "string too long");
+    }
+    r = new_str(vm, total);
+    if (!r) return 0;
+    for (i = 0; i < n; i++) {
+        const tv_val *v = &STK[first + i];
+        if (is_str(v)) {
+            const char *p = str_data(vm, v, &l);
+            memcpy(STROBJ(vm, r)->data + k, p, l);
+        } else if (v->t == TV_INT) {
+            const char *p = fmt_int(num, v->u.i);
+            l = (uint32_t)strlen(p);
+            memcpy(STROBJ(vm, r)->data + k, p, l);
+        } else {
+            s.vm = vm; s.mode = 1; s.dst = STROBJ(vm, r)->data + k; s.len = 0;
+            emit_value(&s, v, 0, 0);
+            l = s.len;
+        }
+        k += l;
+    }
+#else
     for (i = 0; i < n; i++) {
         if (!to_str_slot(vm, (uint16_t)(first + i))) return 0;
         str_data(vm, &STK[first + i], &l);
@@ -2787,6 +2919,7 @@ static int concat_values(tilvm *vm, uint8_t n) {
         memcpy(STROBJ(vm, r)->data + k, p, l);
         k += l;
     }
+#endif
     SP = first;
     set_ref(&STK[SP++], TV_STR, r);
     return 1;
@@ -2826,344 +2959,878 @@ static int expired_try(tilvm *vm) {
 }
 
 /* ─── the interpreter ───────────────────────────────────────────────────── */
-#define READ8() (code[pc++])
-#define READ16() (pc += 2, RD16(code + pc - 2))
-#define READS16() ((int16_t)READ16())
-#define PANIC_IF(c) do { if (c) goto panic; } while (0)
-#define CHECK_STACK(n) PANIC_IF(SP + (n) > TILVM_STACK_SIZE && fail(vm, "stack overflow") == 0)
+/*
+ * Registers: ip = next bytecode byte, sp = first free value-stack slot,
+ * bp = locals of the current frame, fr = current frame, op_ip = start of the
+ * current instruction (error reports). They live in C locals; the VM state
+ * (st->sp, fr->pc) is brought up to date before a helper that works on the
+ * stack (HELPER, SYNC_SP / RELOAD_SP), before anything that may allocate (the
+ * collector scans the st->sp stack slots) and before returning to the host.
+ *
+ * Dispatch: with TILVM_COMPUTED_GOTO (GCC/Clang "labels as values") every
+ * handler ends with its own indirect jump through dispatch[], otherwise one
+ * portable switch; both come from the same CASE() handlers. To add an opcode:
+ * write `CASE(OP_X) ... NEXT;` and put &&L_OP_X at its number in dispatch[].
+ *
+ * Steps (loop back-edges + calls) are counted at `backedge`. `fuel` counts down
+ * to the next step at which the sandbox limit (vm->max_steps) or the budget of
+ * tilvm_run_steps() must be looked at, so the common case is one decrement and
+ * two tests; slow_backedge does exactly what TIL 3.0 did at every step.
+ *
+ * Superinstructions (0x80-0xBF) behave exactly like the sequences they replace
+ * (same results, errors, error lines and steps); their slow paths push the
+ * operands and run the plain handler. TILVM_LEAN keeps only those slow paths.
+ */
+#ifndef TILVM_COMPUTED_GOTO
+#if defined(__GNUC__) && !defined(TILVM_LEAN) && !defined(__SDCC) && !defined(__OPTIMIZE_SIZE__)
+#define TILVM_COMPUTED_GOTO 1      /* GCC/Clang, not when optimizing for size (-Os) */
+#else
+#define TILVM_COMPUTED_GOTO 0
+#endif
+#endif
+
+#if TILVM_COMPUTED_GOTO
+#define CASE(x) L_##x:
+#define NEXT do { op_ip = ip; op = *ip++; goto *dispatch[op]; } while (0)
+#define DISPATCH_OP() goto *dispatch[op]
+#else
+#define CASE(x) case x:
+#define NEXT goto next
+#define DISPATCH_OP() goto dispatch_op
+#endif
+#define SYNC_SP() (st->sp = (uint16_t)(sp - stk))
+#define RELOAD_SP() (sp = stk + st->sp)
+#define SAVE_PC() (fr->pc = (uint32_t)(ip - code))
+#define TOPSLOT(n) ((uint16_t)(sp - stk - (n)))          /* stack index of sp[-n] */
+#define RDS16(p) ((int16_t)RD16(p))
+#define CHECK_STACK(n) do { if (stk_end - sp < (n)) goto stack_overflow; } while (0)
+/* run a helper that works on vm->st.sp; panic when it fails */
+#define HELPER(call) do { int ok_; SYNC_SP(); ok_ = (call); RELOAD_SP(); if (!ok_) goto panic; } while (0)
+#define REFUEL() (fuel_set = fuel = refuel(vm, budget))
+
+/* steps that may run before the slow path of `backedge` must check the sandbox
+ * limit or the budget (budget 0 = none) */
+static uint32_t refuel(const tilvm *vm, uint32_t budget) {
+    uint32_t fuel = budget ? budget : 0xFFFFFFFFu;
+    if (vm->max_steps) {
+        uint32_t left = vm->st.steps < vm->max_steps ? vm->max_steps - vm->st.steps : 0;
+        if (left != 0xFFFFFFFFu) left++;
+        if (left < fuel) fuel = left;
+    }
+    return fuel;
+}
+
+/* integer comparison x <c> y for c in OP_EQ..OP_GE without branches:
+ * bit (sign(x - y) + 1) of the mask */
+static const uint8_t CMP_MASK[6] = { 2, 5, 1, 3, 4, 6 };
+#define IS_CMP(c) ((unsigned)(c) - OP_EQ < 6u)
+#define INT_CMP(c, x, y) ((CMP_MASK[(c) - OP_EQ] >> (((x) > (y)) - ((x) < (y)) + 1)) & 1)
+
+/* a <c> b for any values (fused compare-and-branch): 1 / 0, -1 error, -2 bad operand */
+static int cmp_values(tilvm *vm, unsigned c, const tv_val *a, const tv_val *b) {
+    int r;
+    if (c == OP_EQ || c == OP_NE) {
+        r = equal(vm, a, b, 0);
+        return c == OP_EQ ? r : !r;
+    }
+    if (!IS_CMP(c)) { fail(vm, "bad opcode"); return -2; }
+    if (!compare(vm, (int)c, a, b, &r)) return -1;
+    return r;
+}
+
+#ifndef TILVM_LEAN
+/* does the program replace builtin array method `mid` by a prelude function? */
+static int prelude_has(tilvm *vm, uint8_t mid) {
+    uint8_t k;
+    for (k = 0; k < vm->n_prelude; k++)
+        if (vm->bc[vm->prelude_off + 3u * k] == mid) return 1;
+    return 0;
+}
+#endif
+
+#if TILVM_COMPUTED_GOTO && defined(__GNUC__)
+/* labels as values are a GNU extension: allowed here even under -pedantic */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
 
 int tilvm_run_steps(tilvm *vm, uint32_t budget) {
-    const uint8_t *code = vm->bc;
-    tilvm_state *st = &vm->st;
+    const uint8_t *const code = vm->bc;
+    tilvm_state *const st = &vm->st;
+    tv_val *const stk = st->stack;
+    tv_val *const stk_end = stk + TILVM_STACK_SIZE;
+    const uint8_t *ip, *op_ip;
+    tv_val *sp, *bp;
     tv_frame *fr;
-    uint32_t pc, op_pc = 0;
-    uint16_t base;
-    int target = -1;
-    uint8_t op;
+    tv_val result, imm;
+    const tv_val *cmp_a = 0, *cmp_b = 0;
+    unsigned op, cmp = 0, cmp_pop = 0;
+    int target = -1, r;
+    uint32_t fuel, fuel_set;
+    uint16_t fidx = 0, name_c = 0;
+    uint8_t argc = 0, extra = 0;
+    tv_ref clos = 0;
+#if TILVM_COMPUTED_GOTO
+    static const void *const dispatch[256] = {
+        /* 0x00 */ &&L_OP_NOP, &&L_OP_PUSH_NIL, &&L_OP_PUSH_TRUE, &&L_OP_PUSH_FALSE, &&L_OP_PUSH_I8, &&L_OP_PUSH_I16, &&L_OP_PUSH_CONST, &&L_OP_POP,
+        /* 0x08 */ &&L_OP_DUP, &&L_OP_DUP2, &&L_OP_SWAP, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0x10 */ &&L_OP_LOAD_LOCAL, &&L_OP_STORE_LOCAL, &&L_OP_LOAD_GLOBAL, &&L_OP_STORE_GLOBAL, &&L_OP_LOAD_UPVAL, &&L_OP_STORE_UPVAL, &&L_OP_LOAD_CELL, &&L_OP_STORE_CELL,
+        /* 0x18 */ &&L_OP_MAKE_CELL, &&L_OP_LOAD_UPVAL_RAW, &&L_OP_ARG_DEFAULT, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0x20 */ &&L_OP_ADD, &&L_OP_SUB, &&L_OP_MUL, &&L_OP_DIV, &&L_OP_MOD, &&L_OP_POW, &&L_OP_NEG, &&L_OP_NOT,
+        /* 0x28 */ &&L_OP_BAND, &&L_OP_BOR, &&L_OP_BXOR, &&L_OP_BNOT, &&L_OP_SHL, &&L_OP_SHR, &&L_BAD, &&L_BAD,
+        /* 0x30 */ &&L_OP_EQ, &&L_OP_NE, &&L_OP_LT, &&L_OP_LE, &&L_OP_GT, &&L_OP_GE, &&L_BAD, &&L_BAD,
+        /* 0x38 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0x40 */ &&L_OP_JUMP, &&L_OP_JUMP_IF_FALSE, &&L_OP_JUMP_IF_TRUE, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0x48 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0x50 */ &&L_OP_CALL, &&L_OP_CALL_VALUE, &&L_OP_INVOKE, &&L_OP_RETURN, &&L_OP_RETURN_NIL, &&L_OP_NATIVE, &&L_BAD, &&L_BAD,
+        /* 0x58 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0x60 */ &&L_OP_NEW_ARRAY, &&L_OP_NEW_MAP, &&L_OP_NEW_STRUCT, &&L_OP_GET_INDEX, &&L_OP_SET_INDEX, &&L_OP_GET_FIELD, &&L_OP_SET_FIELD, &&L_OP_GET_SLOT,
+        /* 0x68 */ &&L_OP_MAKE_CLOSURE, &&L_OP_PUSH_FUNC, &&L_OP_CONCAT, &&L_OP_FOR_ITER, &&L_OP_MATCH_TYPE, &&L_OP_CAST, &&L_OP_IS_ARRAY_LEN, &&L_BAD,
+        /* 0x70 */ &&L_OP_TRY, &&L_OP_TRY_TIMEOUT, &&L_OP_END_TRY, &&L_OP_PANIC, &&L_OP_UNWRAP_OR_RETURN, &&L_OP_UNWRAP_OR_PANIC, &&L_BAD, &&L_BAD,
+        /* 0x78 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_OP_HALT,
+        /* 0x80 */ &&L_OP_LOAD_LOCAL2, &&L_OP_LOAD_LOCAL_FIELD, &&L_OP_INC_LOCAL, &&L_OP_CAST_LOCAL, &&L_OP_CAST_RETURN, &&L_OP_ADD_STORE_LOCAL, &&L_OP_NATIVE_POP, &&L_OP_INDEX_L,
+        /* 0x88 */ &&L_OP_INDEX_LL, &&L_OP_RETURN_LOCAL, &&L_OP_FOR_ITER_STORE, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0x90 */ &&L_OP_JUMP_IF_NOT, &&L_OP_JUMP_IF_NOT_L, &&L_OP_JUMP_IF_NOT_I, &&L_OP_JUMP_IF_NOT_LL, &&L_OP_JUMP_IF_NOT_LI, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0x98 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0xA0 */ &&L_OP_ADD_I, &&L_OP_SUB_I, &&L_OP_MUL_I, &&L_OP_DIV_I, &&L_OP_MOD_I, &&L_OP_BAND_I, &&L_OP_BOR_I, &&L_OP_BXOR_I,
+        /* 0xA8 */ &&L_OP_SHL_I, &&L_OP_SHR_I, &&L_OP_EQ_I, &&L_OP_NE_I, &&L_OP_LT_I, &&L_OP_LE_I, &&L_OP_GT_I, &&L_OP_GE_I,
+        /* 0xB0 */ &&L_OP_ADD_L, &&L_OP_SUB_L, &&L_OP_MUL_L, &&L_OP_DIV_L, &&L_OP_MOD_L, &&L_OP_BAND_L, &&L_OP_BOR_L, &&L_OP_BXOR_L,
+        /* 0xB8 */ &&L_OP_SHL_L, &&L_OP_SHR_L, &&L_OP_EQ_L, &&L_OP_NE_L, &&L_OP_LT_L, &&L_OP_LE_L, &&L_OP_GT_L, &&L_OP_GE_L,
+        /* 0xC0 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0xC8 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0xD0 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0xD8 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0xE0 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0xE8 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0xF0 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+        /* 0xF8 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
+    };
+#endif
 
     if (st->halted == 1) return TILVM_DONE;
     if (st->halted == 2) return TILVM_EXIT;
     if (st->failed) return TILVM_ERROR;
+    set_nil(&result);
+    set_nil(&imm);
+    REFUEL();
 
 resume:
     fr = &st->frames[st->n_frames - 1];
-    pc = fr->pc;
-    base = fr->base;
-    for (;;) {
-        op_pc = pc;
-        op = code[pc++];
-        switch (op) {
-        case OP_NOP: break;
-        case OP_PUSH_NIL: CHECK_STACK(1); set_nil(&STK[SP++]); break;
-        case OP_PUSH_TRUE: CHECK_STACK(1); set_bool(&STK[SP++], 1); break;
-        case OP_PUSH_FALSE: CHECK_STACK(1); set_bool(&STK[SP++], 0); break;
-        case OP_PUSH_I8: CHECK_STACK(1); set_int(&STK[SP++], (tv_int)(int8_t)READ8()); break;
-        case OP_PUSH_I16: CHECK_STACK(1); set_int(&STK[SP++], (tv_int)READS16()); break;
-        case OP_PUSH_CONST: CHECK_STACK(1); push_const(vm, READ16()); break;
-        case OP_POP: SP--; break;
-        case OP_DUP: CHECK_STACK(1); STK[SP] = STK[SP - 1]; SP++; break;
-        case OP_DUP2: CHECK_STACK(2); STK[SP] = STK[SP - 2]; STK[SP + 1] = STK[SP - 1]; SP += 2; break;
-        case OP_SWAP: { tv_val t; t = STK[SP - 1]; STK[SP - 1] = STK[SP - 2]; STK[SP - 2] = t; break; }
-        case OP_LOAD_LOCAL: CHECK_STACK(1); STK[SP] = STK[base + READ8()]; SP++; break;
-        case OP_STORE_LOCAL: STK[base + READ8()] = STK[--SP]; break;
-        case OP_LOAD_GLOBAL: CHECK_STACK(1); STK[SP] = STK[READ16()]; SP++; break;
-        case OP_STORE_GLOBAL: STK[READ16()] = STK[--SP]; break;
-        case OP_LOAD_CELL: CHECK_STACK(1); STK[SP] = CELLOBJ(vm, STK[base + READ8()].u.r)->v; SP++; break;
-        case OP_STORE_CELL: CELLOBJ(vm, STK[base + READ8()].u.r)->v = STK[--SP]; break;
-        case OP_MAKE_CELL: {
-            uint8_t slot = READ8();
-            tv_ref r = alloc_obj(vm, OBJ_CELL, sizeof(tv_cellobj));
-            PANIC_IF(!r);
-            CELLOBJ(vm, r)->v = STK[base + slot];
-            set_ref(&STK[base + slot], TV_CELL, r);
-            break;
-        }
-        case OP_LOAD_UPVAL: {
-            tv_ref cell = CLOSOBJ(vm, fr->closure)->v[READ8()].u.r;
-            CHECK_STACK(1);
-            STK[SP++] = CELLOBJ(vm, cell)->v;
-            break;
-        }
-        case OP_STORE_UPVAL: {
-            tv_ref cell = CLOSOBJ(vm, fr->closure)->v[READ8()].u.r;
-            CELLOBJ(vm, cell)->v = STK[--SP];
-            break;
-        }
-        case OP_LOAD_UPVAL_RAW: CHECK_STACK(1); STK[SP] = CLOSOBJ(vm, fr->closure)->v[READ8()]; SP++; break;
-        case OP_ARG_DEFAULT: {
-            uint8_t slot = READ8();
-            int16_t rel = READS16();
-            if (STK[base + slot].t != TV_UNDEF) pc = (uint32_t)((int32_t)pc + rel);
-            break;
-        }
-        case OP_ADD: case OP_SUB: case OP_MUL:
-            if (STK[SP - 2].t == TV_INT && STK[SP - 1].t == TV_INT) {
-                tv_int x = STK[SP - 2].u.i, y = STK[SP - 1].u.i;
-                STK[SP - 2].u.i = op == OP_ADD ? iwrap_add(x, y) : op == OP_SUB ? iwrap_sub(x, y) : iwrap_mul(x, y);
-                SP--;
-                break;
-            }
-            PANIC_IF(!arith(vm, op));
-            break;
-        case OP_DIV: case OP_MOD: case OP_POW: PANIC_IF(!arith(vm, op)); break;
-        case OP_NEG:
-            if (TOP.t == TV_INT) TOP.u.i = (tv_int)((tv_uint)0 - (tv_uint)TOP.u.i);
-#if TILVM_FLOAT
-            else if (TOP.t == TV_FLOAT) TOP.u.f = -TOP.u.f;
+    ip = code + fr->pc;
+    op_ip = ip;
+    bp = stk + fr->base;
+    RELOAD_SP();
+#if TILVM_COMPUTED_GOTO
+    NEXT;
+#else
+next:
+    op_ip = ip;
+    op = *ip++;
+dispatch_op:
+    switch (op) {
 #endif
-            else PANIC_IF(!fail(vm, "cannot negate a non-number"));
-            break;
-        case OP_NOT: set_bool(&TOP, !truthy(vm, &TOP)); break;
-        case OP_BNOT:
-            PANIC_IF(TOP.t != TV_INT && !fail(vm, "~ needs an integer"));
-            TOP.u.i = ~TOP.u.i;
-            break;
-        case OP_BAND: case OP_BOR: case OP_BXOR: case OP_SHL: case OP_SHR: {
-            tv_int x = STK[SP - 2].u.i, y = STK[SP - 1].u.i, r;
-            PANIC_IF((STK[SP - 2].t != TV_INT || STK[SP - 1].t != TV_INT) && !fail(vm, "bitwise operators need integers"));
-            switch (op) {
-            case OP_BAND: r = x & y; break;
-            case OP_BOR: r = x | y; break;
-            case OP_BXOR: r = x ^ y; break;
-            case OP_SHL: r = (tv_int)((tv_uint)x << ((unsigned)y & (TILVM_INT_BITS - 1))); break;
-            default: r = ishr(x, (unsigned)y & (TILVM_INT_BITS - 1)); break;
-            }
-            set_int(&STK[SP - 2], r);
-            SP--;
-            break;
-        }
-        case OP_EQ: case OP_NE: {
-            int e = equal(vm, &STK[SP - 2], &STK[SP - 1], 0);
-            set_bool(&STK[SP - 2], op == OP_EQ ? e : !e);
-            SP--;
-            break;
-        }
-        case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
-            int r;
-            if (STK[SP - 2].t == TV_INT && STK[SP - 1].t == TV_INT) {
-                tv_int x = STK[SP - 2].u.i, y = STK[SP - 1].u.i;
-                r = op == OP_LT ? x < y : op == OP_LE ? x <= y : op == OP_GT ? x > y : x >= y;
-            } else {
-                PANIC_IF(!compare(vm, op, &STK[SP - 2], &STK[SP - 1], &r));
-            }
-            set_bool(&STK[SP - 2], r);
-            SP--;
-            break;
-        }
-        case OP_JUMP: {
-            int16_t rel = READS16();
-            pc = (uint32_t)((int32_t)pc + rel);
-            if (rel < 0) goto backedge;
-            break;
-        }
-        case OP_JUMP_IF_FALSE: case OP_JUMP_IF_TRUE: {
-            int16_t rel = READS16();
-            tv_val *v = &STK[--SP];
-            int t = v->t == TV_BOOL ? (int)v->u.i : truthy(vm, v);
-            if (t == (op == OP_JUMP_IF_TRUE)) {
-                pc = (uint32_t)((int32_t)pc + rel);
-                if (rel < 0) goto backedge;
-            }
-            break;
-        }
-        case OP_CALL: case OP_CALL_VALUE: case OP_INVOKE: {
-            uint16_t fidx = 0;
-            uint8_t argc = 0, extra = 0;
-            tv_ref clos = 0;
-            int r;
-            fr->pc = pc;
-            r = prepare_call(vm, op, &pc, &fidx, &argc, &extra, &clos);
-            if (r == 0) goto panic;
-            if (r == 2) break;                     /* builtin method: result pushed */
-            fr->pc = pc;
-            r = push_frame(vm, fidx, argc, extra, clos);
-            if (r == 0) goto panic;
-            if (r < 0) { st->failed = 1; goto fatal; }
-            fr = &st->frames[st->n_frames - 1];
-            pc = fr->pc;
-            base = fr->base;
-            goto backedge;
-        }
-        case OP_RETURN: case OP_RETURN_NIL: {
-            tv_val result;
-            if (op == OP_RETURN) result = STK[--SP]; else set_nil(&result);
-        do_return:
-            while (st->n_try && st->tries[st->n_try - 1].n_frames >= st->n_frames) {
-                if (st->tries[st->n_try - 1].deadline) st->n_deadlines--;
-                st->n_try--;
-            }
-            SP = (uint16_t)(fr->base - fr->extra);
-            STK[SP++] = result;
-            st->n_frames--;
-            if (!st->n_frames) { st->halted = 1; return TILVM_DONE; }
-            fr = &st->frames[st->n_frames - 1];
-            pc = fr->pc;
-            base = fr->base;
-            break;
-        case OP_UNWRAP_OR_RETURN: case OP_UNWRAP_OR_PANIC: {
-            tv_val *v = &TOP;
-            int ok = v->t == TV_STRUCT && (OBJ(vm, v->u.r)->aux == TYPE_SOME || OBJ(vm, v->u.r)->aux == TYPE_OK);
-            int bad = v->t == TV_NIL || (v->t == TV_STRUCT && OBJ(vm, v->u.r)->aux == TYPE_ERR);
-            if (ok) { *v = STRUCTOBJ(vm, v->u.r)->v[0]; break; }
-            if (!bad) break;
-            if (op == OP_UNWRAP_OR_PANIC) {
-                if (v->t == TV_NIL) { fail(vm, "? applied to None"); goto panic; }
-                STK[SP - 1] = STRUCTOBJ(vm, v->u.r)->v[0];
-                PANIC_IF(!to_str_slot(vm, (uint16_t)(SP - 1)));
-                vm->err_val = STK[SP - 1];
-                vm->err_msg = "? applied to Err: ";
-                goto panic;
-            }
-            result = STK[--SP];
-            goto do_return;
-        }
-        }
-        case OP_NATIVE: {
-            uint8_t id = READ8(), argc = READ8();
-            fr->pc = pc;
-            PANIC_IF(!call_native(vm, id, argc));
-            if (st->halted == 2) return TILVM_EXIT;
-            break;
-        }
-        case OP_NEW_ARRAY: case OP_NEW_MAP: {
-            uint16_t n = READ16();
-            CHECK_STACK(2);
-            PANIC_IF(!make_array(vm, op == OP_NEW_MAP ? OBJ_MAP : OBJ_ARRAY, n));
-#ifndef TILVM_LEAN
-            if (op == OP_NEW_MAP && n) PANIC_IF(!map_literal_fixup(vm));
-#endif
-            break;
-        }
-        case OP_NEW_STRUCT: {
-            uint16_t t = READ16();
-            uint8_t n = READ8();
-            PANIC_IF(!new_struct(vm, t, n));
-            break;
-        }
-        case OP_GET_INDEX: PANIC_IF(!get_index(vm)); break;
-        case OP_SET_INDEX: PANIC_IF(!set_index(vm)); break;
-        case OP_GET_FIELD: case OP_SET_FIELD: {
-            uint16_t name_c = READ16();
-            tv_val *o = &STK[SP - (op == OP_GET_FIELD ? 1 : 2)];
-            int slot = -1;
-            if (o->t == TV_STRUCT) slot = field_slot(vm, OBJ(vm, o->u.r)->aux, name_c);
-            if (slot < 0) { no_field(vm, name_c, o); goto panic; }
-            if (op == OP_GET_FIELD) *o = STRUCTOBJ(vm, o->u.r)->v[slot];
-            else { STRUCTOBJ(vm, o->u.r)->v[slot] = STK[SP - 1]; SP -= 2; }
-            break;
-        }
-        case OP_GET_SLOT: {
-            uint8_t i = READ8();
-            tv_val *v = &TOP;
-            if (v->t == TV_STRUCT && i < (OBJ(vm, v->u.r)->size - offsetof(tv_structobj, v)) / sizeof(tv_val))
-                *v = STRUCTOBJ(vm, v->u.r)->v[i];
-            else if (v->t == TV_ARRAY && i < ARROBJ(vm, v->u.r)->len)
-                *v = VALS(vm, ARROBJ(vm, v->u.r)->buf)[i];
-            else { fail(vm, "pattern slot out of range"); goto panic; }
-            break;
-        }
-        case OP_MAKE_CLOSURE: {
-            uint16_t fidx = READ16();
-            uint8_t n = READ8(), i;
-            tv_ref r = alloc_obj(vm, OBJ_CLOSURE, (uint32_t)offsetof(tv_closobj, v) + n * (uint32_t)sizeof(tv_val));
-            PANIC_IF(!r);
-            OBJ(vm, r)->aux = n;
-            CLOSOBJ(vm, r)->func = fidx;
-            for (i = 0; i < n; i++) CLOSOBJ(vm, r)->v[i] = STK[SP - n + i];
-            SP = (uint16_t)(SP - n);
-            set_ref(&STK[SP++], TV_CLOSURE, r);
-            break;
-        }
-        case OP_PUSH_FUNC: CHECK_STACK(1); STK[SP].t = TV_FUNC; STK[SP].u.i = 0; STK[SP].u.k = READ16(); SP++; break;
-        case OP_CONCAT: PANIC_IF(!concat_values(vm, READ8())); break;
-        case OP_FOR_ITER: {
-            uint8_t slot = READ8();
-            int16_t rel = READS16();
-            tv_val *c = &STK[base + slot], *ix = &STK[base + slot + 1];
-            uint32_t len = 0;
-            const char *p = 0;
-            if (c->t == TV_ARRAY) len = ARROBJ(vm, c->u.r)->len;
-            else p = str_data(vm, c, &len);
-            if ((tv_uint)ix->u.i < len) {
-                CHECK_STACK(1);
-                if (c->t == TV_ARRAY) STK[SP] = VALS(vm, ARROBJ(vm, c->u.r)->buf)[ix->u.i];
-                else set_int(&STK[SP], (tv_int)(uint8_t)p[ix->u.i]);
-                SP++;
-                ix->u.i++;
-            } else {
-                pc = (uint32_t)((int32_t)pc + rel);
-            }
-            break;
-        }
-        case OP_MATCH_TYPE: {
-            uint16_t t = READ16();
-            set_bool(&TOP, TOP.t == TV_STRUCT && OBJ(vm, TOP.u.r)->aux == t);
-            break;
-        }
-        case OP_IS_ARRAY_LEN: {
-            uint16_t n = READ16();
-            set_bool(&TOP, TOP.t == TV_ARRAY && ARROBJ(vm, TOP.u.r)->len == n);
-            break;
-        }
-        case OP_CAST: PANIC_IF(!cast_slot(vm, (uint16_t)(SP - 1), READ8())); break;
-        case OP_TRY: case OP_TRY_TIMEOUT: {
-            int16_t rel = READS16();
-            PANIC_IF(!push_try(vm, op, (uint32_t)((int32_t)pc + rel)));
-            break;
-        }
-        case OP_END_TRY:
-            if (st->n_try) {
-                if (st->tries[st->n_try - 1].deadline) st->n_deadlines--;
-                st->n_try--;
-            }
-            break;
-        case OP_PANIC:
-            PANIC_IF(!to_str_slot(vm, (uint16_t)(SP - 1)));
-            vm->err_val = STK[--SP];
-            vm->err_msg = "";
-            goto panic;
-        case OP_HALT:
-            st->halted = 1;
-            fr->pc = pc;
-            return TILVM_DONE;
-        default:
-            fail(vm, "bad opcode");
-            st->failed = 1;
-            goto fatal;
-        }
-        continue;
 
-    backedge:
-        /* loop back-edges and calls: step budget, sandbox limit, deadlines */
-        st->steps++;
-        if (vm->max_steps && st->steps > vm->max_steps) {
-            fail(vm, "step limit exceeded");
-            st->failed = 1;
-            goto fatal;
-        }
-        if (st->n_deadlines && ++st->tick >= 256) {
-            st->tick = 0;
-            target = expired_try(vm);
-            if (target >= 0) { fail(vm, "timeout"); goto panic; }
-        }
-        if (budget && !--budget) {
-            fr->pc = pc;
-            return TILVM_YIELD;
-        }
-        continue;
+    /* ── constants and stack ── */
+    CASE(OP_NOP) NEXT;
+    CASE(OP_PUSH_NIL) CHECK_STACK(1); set_nil(sp); sp++; NEXT;
+    CASE(OP_PUSH_TRUE) CHECK_STACK(1); set_bool(sp, 1); sp++; NEXT;
+    CASE(OP_PUSH_FALSE) CHECK_STACK(1); set_bool(sp, 0); sp++; NEXT;
+    CASE(OP_PUSH_I8) CHECK_STACK(1); set_int(sp, (tv_int)(int8_t)*ip); sp++; ip++; NEXT;
+    CASE(OP_PUSH_I16) CHECK_STACK(1); set_int(sp, (tv_int)RDS16(ip)); sp++; ip += 2; NEXT;
+    CASE(OP_PUSH_CONST) CHECK_STACK(1); load_const(vm, RD16(ip), sp); sp++; ip += 2; NEXT;
+    CASE(OP_POP) sp--; NEXT;
+    CASE(OP_DUP) CHECK_STACK(1); sp[0] = sp[-1]; sp++; NEXT;
+    CASE(OP_DUP2) CHECK_STACK(2); sp[0] = sp[-2]; sp[1] = sp[-1]; sp += 2; NEXT;
+    CASE(OP_SWAP) result = sp[-1]; sp[-1] = sp[-2]; sp[-2] = result; NEXT;
 
-    panic:
-        fr->pc = pc;
-        if (recover(vm, target)) { target = -1; goto resume; }
-        report(vm, op_pc, "runtime error: ");
-        st->failed = 1;
-        return TILVM_ERROR;
-    fatal:
-        fr->pc = pc;
-        report(vm, op_pc, "fatal error: ");
-        return TILVM_ERROR;
+    /* ── variables ── */
+    CASE(OP_LOAD_LOCAL) CHECK_STACK(1); *sp++ = bp[*ip++]; NEXT;
+    CASE(OP_STORE_LOCAL) bp[*ip++] = *--sp; NEXT;
+    CASE(OP_LOAD_GLOBAL) CHECK_STACK(1); *sp++ = stk[RD16(ip)]; ip += 2; NEXT;
+    CASE(OP_STORE_GLOBAL) stk[RD16(ip)] = *--sp; ip += 2; NEXT;
+    CASE(OP_LOAD_CELL) CHECK_STACK(1); *sp++ = CELLOBJ(vm, bp[*ip++].u.r)->v; NEXT;
+    CASE(OP_STORE_CELL) CELLOBJ(vm, bp[*ip++].u.r)->v = *--sp; NEXT;
+    CASE(OP_MAKE_CELL) {
+        uint8_t slot = *ip++;
+        tv_ref cell;
+        SYNC_SP();
+        cell = alloc_obj(vm, OBJ_CELL, sizeof(tv_cellobj));
+        if (!cell) goto panic;
+        CELLOBJ(vm, cell)->v = bp[slot];
+        set_ref(&bp[slot], TV_CELL, cell);
+        NEXT;
     }
+    CASE(OP_LOAD_UPVAL) CHECK_STACK(1); *sp++ = CELLOBJ(vm, CLOSOBJ(vm, fr->closure)->v[*ip++].u.r)->v; NEXT;
+    CASE(OP_STORE_UPVAL) CELLOBJ(vm, CLOSOBJ(vm, fr->closure)->v[*ip++].u.r)->v = *--sp; NEXT;
+    CASE(OP_LOAD_UPVAL_RAW) CHECK_STACK(1); *sp++ = CLOSOBJ(vm, fr->closure)->v[*ip++]; NEXT;
+    CASE(OP_ARG_DEFAULT) {
+        uint8_t slot = ip[0];
+        int16_t rel = RDS16(ip + 1);
+        ip += 3;
+        if (bp[slot].t != TV_UNDEF) ip += rel;
+        NEXT;
+    }
+
+    /* ── arithmetic ── */
+#ifndef TILVM_LEAN
+    CASE(OP_ADD)
+        if (sp[-2].t == TV_INT && sp[-1].t == TV_INT) { sp[-2].u.i = iwrap_add(sp[-2].u.i, sp[-1].u.i); sp--; NEXT; }
+        goto arith_op;
+    CASE(OP_SUB)
+        if (sp[-2].t == TV_INT && sp[-1].t == TV_INT) { sp[-2].u.i = iwrap_sub(sp[-2].u.i, sp[-1].u.i); sp--; NEXT; }
+        goto arith_op;
+    CASE(OP_MUL)
+        if (sp[-2].t == TV_INT && sp[-1].t == TV_INT) { sp[-2].u.i = iwrap_mul(sp[-2].u.i, sp[-1].u.i); sp--; NEXT; }
+        goto arith_op;
+#else
+    CASE(OP_ADD) CASE(OP_SUB) CASE(OP_MUL)
+        if (sp[-2].t == TV_INT && sp[-1].t == TV_INT) {
+            tv_int x = sp[-2].u.i, y = sp[-1].u.i;
+            sp[-2].u.i = op == OP_ADD ? iwrap_add(x, y) : op == OP_SUB ? iwrap_sub(x, y) : iwrap_mul(x, y);
+            sp--;
+            NEXT;
+        }
+        goto arith_op;
+#endif
+#ifndef TILVM_LEAN
+    CASE(OP_DIV)
+        if (sp[-2].t == TV_INT && sp[-1].t == TV_INT && sp[-1].u.i != 0) {
+            sp[-2].u.i = idiv(sp[-2].u.i, sp[-1].u.i); sp--; NEXT;
+        }
+        goto arith_op;
+    CASE(OP_MOD)
+        if (sp[-2].t == TV_INT && sp[-1].t == TV_INT && sp[-1].u.i != 0) {
+            sp[-2].u.i = imod(sp[-2].u.i, sp[-1].u.i); sp--; NEXT;
+        }
+        goto arith_op;
+    CASE(OP_POW)
+#else
+    CASE(OP_DIV) CASE(OP_MOD) CASE(OP_POW)
+#endif
+    arith_op:
+        HELPER(arith(vm, (int)op));
+        NEXT;
+    CASE(OP_NEG)
+        if (sp[-1].t == TV_INT) sp[-1].u.i = (tv_int)((tv_uint)0 - (tv_uint)sp[-1].u.i);
+#if TILVM_FLOAT
+        else if (sp[-1].t == TV_FLOAT) sp[-1].u.f = -sp[-1].u.f;
+#endif
+        else { fail(vm, "cannot negate a non-number"); goto panic; }
+        NEXT;
+    CASE(OP_NOT) set_bool(&sp[-1], !truthy(vm, &sp[-1])); NEXT;
+    CASE(OP_BNOT)
+        if (sp[-1].t != TV_INT) { fail(vm, "~ needs an integer"); goto panic; }
+        sp[-1].u.i = ~sp[-1].u.i;
+        NEXT;
+    CASE(OP_BAND) CASE(OP_BOR) CASE(OP_BXOR) CASE(OP_SHL) CASE(OP_SHR) {
+        tv_int x = sp[-2].u.i, y = sp[-1].u.i, v;
+        if (sp[-2].t != TV_INT || sp[-1].t != TV_INT) { fail(vm, "bitwise operators need integers"); goto panic; }
+        switch (op) {
+        case OP_BAND: v = x & y; break;
+        case OP_BOR: v = x | y; break;
+        case OP_BXOR: v = x ^ y; break;
+        case OP_SHL: v = (tv_int)((tv_uint)x << ((unsigned)y & (TILVM_INT_BITS - 1))); break;
+        default: v = ishr(x, (unsigned)y & (TILVM_INT_BITS - 1)); break;
+        }
+        set_int(&sp[-2], v);
+        sp--;
+        NEXT;
+    }
+    CASE(OP_EQ) CASE(OP_NE) {
+#ifndef TILVM_LEAN
+        int e = sp[-2].t == TV_INT && sp[-1].t == TV_INT ? sp[-2].u.i == sp[-1].u.i
+                                                         : equal(vm, &sp[-2], &sp[-1], 0);
+#else
+        int e = equal(vm, &sp[-2], &sp[-1], 0);
+#endif
+        set_bool(&sp[-2], op == OP_EQ ? e : !e);
+        sp--;
+        NEXT;
+    }
+    CASE(OP_LT) CASE(OP_LE) CASE(OP_GT) CASE(OP_GE)
+        if (sp[-2].t == TV_INT && sp[-1].t == TV_INT) r = INT_CMP(op, sp[-2].u.i, sp[-1].u.i);
+        else if (!compare(vm, (int)op, &sp[-2], &sp[-1], &r)) goto panic;
+        set_bool(&sp[-2], r);
+        sp--;
+        NEXT;
+
+    /* ── jumps ── */
+    CASE(OP_JUMP) {
+        int16_t rel = RDS16(ip);
+        ip += 2 + rel;
+        if (rel < 0) goto backedge;
+        NEXT;
+    }
+    CASE(OP_JUMP_IF_FALSE) CASE(OP_JUMP_IF_TRUE) {
+        int16_t rel = RDS16(ip);
+        tv_val *v = --sp;
+        int t = v->t == TV_BOOL ? (int)v->u.i : truthy(vm, v);
+        ip += 2;
+        if (t == (op == OP_JUMP_IF_TRUE)) {
+            ip += rel;
+            if (rel < 0) goto backedge;
+        }
+        NEXT;
+    }
+
+    /* ── calls ── */
+    CASE(OP_CALL)
+        fidx = RD16(ip);
+        argc = ip[2];
+        ip += 3;
+        extra = 0;
+        clos = 0;
+        goto call_fn;
+    CASE(OP_CALL_VALUE) {
+        const tv_val *callee;
+        argc = *ip++;
+        callee = &sp[-(int)argc - 1];
+        extra = 1;
+        clos = 0;
+        if (callee->t == TV_FUNC) fidx = callee->u.k;
+        else if (callee->t == TV_CLOSURE) { clos = callee->u.r; fidx = CLOSOBJ(vm, clos)->func; }
+        else { failn(vm, type_name(vm, callee), " is not callable", 0, 0, 0, 0); goto panic; }
+        goto call_fn;
+    }
+    CASE(OP_INVOKE) {
+        uint32_t pc;
+#ifndef TILVM_LEAN
+        const tv_val *recv;
+        name_c = RD16(ip);
+        argc = ip[3];
+        recv = &sp[-(int)argc - 1];
+        if (recv->t == TV_STRUCT) {                  /* user method: cached lookup */
+            uint16_t t = OBJ(vm, recv->u.r)->aux;
+            int found;
+#if TILVM_FIELD_CACHE > 0
+            const tv_cache *c = CACHE_AT(vm->method_cache, t, name_c);
+            if (c->type == t && c->name == name_c) { fidx = c->value; found = fidx != CACHE_EMPTY; }
+            else
+#endif
+                fidx = find_method_cached(vm, t, name_c, &found);
+            if (found) { ip += 4; argc++; extra = 0; clos = 0; goto call_fn; }
+        } else if (recv->t == TV_ARRAY && ip[2] == M_PUSH && argc == 1 && !prelude_has(vm, M_PUSH)) {
+            tv_arrobj *a = ARROBJ(vm, recv->u.r);  /* array.push(x): no general method call */
+            ip += 4;
+            if (a->len < OBJ(vm, a->buf)->aux) {     /* room in the buffer */
+                VALS(vm, a->buf)[a->len] = sp[-1];
+                a->len = (tv_size)(a->len + 1);
+            } else {
+                HELPER(array_push(vm, TOPSLOT(2), TOPSLOT(1)));
+            }
+            sp--;
+            set_nil(&sp[-1]);
+            NEXT;
+        }
+#endif
+        pc = (uint32_t)(ip - code);
+        extra = 0;
+        clos = 0;
+        SAVE_PC();
+        SYNC_SP();
+        r = prepare_invoke(vm, &pc, &fidx, &argc, &extra, &clos);
+        RELOAD_SP();
+        ip = code + pc;
+        if (r == 0) goto panic;
+        if (r == 2) NEXT;                            /* builtin method: result pushed */
+        goto call_fn;
+    }
+call_fn:   /* enter function fidx: argc arguments on the stack (+ `extra` callee slot below) */
+    {
+        uint8_t np = F_NPARAMS(vm, fidx), nl = F_NLOCALS(vm, fidx), i;
+        tv_val *nb;
+        SAVE_PC();                                   /* the caller continues after the call */
+        if (argc > np || argc < F_NREQ(vm, fidx)) { arity_error(vm, fidx, argc); goto panic; }
+        if (st->n_frames >= TILVM_MAX_FRAMES) { fail(vm, "stack overflow (recursion too deep)"); st->failed = 1; goto fatal; }
+        if ((sp - stk) + (nl - argc) + 4 > TILVM_STACK_SIZE) { fail(vm, "stack overflow"); st->failed = 1; goto fatal; }
+        nb = sp - argc;
+        for (i = argc; i < np; i++) { sp->t = TV_UNDEF; sp->u.i = 0; sp++; }
+        for (i = np; i < nl; i++) { set_nil(sp); sp++; }
+        fr = &st->frames[st->n_frames++];
+        fr->func = fidx;
+        fr->base = (uint16_t)(nb - stk);
+        fr->closure = clos;
+        fr->extra = extra;
+        fr->ret_pc = 0;
+        fr->pc = F_CODE(vm, fidx);
+        ip = code + fr->pc;
+        bp = nb;
+        goto backedge;
+    }
+    CASE(OP_RETURN) result = *--sp; goto do_return;
+    CASE(OP_RETURN_NIL) set_nil(&result);
+do_return:
+    while (st->n_try && st->tries[st->n_try - 1].n_frames >= st->n_frames) {
+        if (st->tries[st->n_try - 1].deadline) st->n_deadlines--;
+        st->n_try--;
+    }
+    sp = stk + fr->base - fr->extra;
+    *sp++ = result;
+    if (!--st->n_frames) { st->halted = 1; SYNC_SP(); return TILVM_DONE; }
+    fr = &st->frames[st->n_frames - 1];
+    ip = code + fr->pc;
+    bp = stk + fr->base;
+    NEXT;
+    CASE(OP_UNWRAP_OR_RETURN) CASE(OP_UNWRAP_OR_PANIC) {
+        tv_val *v = &sp[-1];
+        int ok = v->t == TV_STRUCT && (OBJ(vm, v->u.r)->aux == TYPE_SOME || OBJ(vm, v->u.r)->aux == TYPE_OK);
+        int bad = v->t == TV_NIL || (v->t == TV_STRUCT && OBJ(vm, v->u.r)->aux == TYPE_ERR);
+        if (ok) { *v = STRUCTOBJ(vm, v->u.r)->v[0]; NEXT; }
+        if (!bad) NEXT;
+        if (op == OP_UNWRAP_OR_PANIC) {
+            if (v->t == TV_NIL) { fail(vm, "? applied to None"); goto panic; }
+            sp[-1] = STRUCTOBJ(vm, v->u.r)->v[0];
+            HELPER(to_str_slot(vm, TOPSLOT(1)));
+            vm->err_val = sp[-1];
+            vm->err_msg = "? applied to Err: ";
+            goto panic;
+        }
+        result = *--sp;
+        goto do_return;
+    }
+    CASE(OP_NATIVE) CASE(OP_NATIVE_POP) {
+        uint8_t id = ip[0], n = ip[1];
+        ip += 2;
+        SAVE_PC();
+        HELPER(call_native(vm, id, n));
+        if (st->halted == 2) return TILVM_EXIT;
+        if (op == OP_NATIVE_POP) sp--;
+        NEXT;
+    }
+
+    /* ── objects ── */
+    CASE(OP_NEW_ARRAY) CASE(OP_NEW_MAP) {
+        uint16_t n = RD16(ip);
+        ip += 2;
+        CHECK_STACK(2);
+        HELPER(make_array(vm, op == OP_NEW_MAP ? OBJ_MAP : OBJ_ARRAY, n));
+#ifndef TILVM_LEAN
+        if (op == OP_NEW_MAP && n) HELPER(map_literal_fixup(vm));
+#endif
+        NEXT;
+    }
+    CASE(OP_NEW_STRUCT) {
+        uint16_t t = RD16(ip);
+        uint8_t n = ip[2];
+        ip += 3;
+        HELPER(new_struct(vm, t, n));
+        NEXT;
+    }
+    CASE(OP_GET_INDEX)
+    get_index:
+#ifndef TILVM_LEAN
+        if (sp[-2].t == TV_ARRAY && sp[-1].t == TV_INT) {
+            tv_arrobj *a = ARROBJ(vm, sp[-2].u.r);
+            if ((tv_uint)sp[-1].u.i < a->len) { sp[-2] = VALS(vm, a->buf)[sp[-1].u.i]; sp--; NEXT; }
+        }
+#endif
+        HELPER(get_index(vm));
+        NEXT;
+    CASE(OP_SET_INDEX)
+#ifndef TILVM_LEAN
+        if (sp[-3].t == TV_ARRAY && sp[-2].t == TV_INT) {
+            tv_arrobj *a = ARROBJ(vm, sp[-3].u.r);
+            if ((tv_uint)sp[-2].u.i < a->len) { VALS(vm, a->buf)[sp[-2].u.i] = sp[-1]; sp -= 3; NEXT; }
+        }
+#endif
+        HELPER(set_index(vm));
+        NEXT;
+    CASE(OP_GET_FIELD)
+        name_c = RD16(ip);
+        ip += 2;
+    get_field:
+        if (sp[-1].t == TV_STRUCT) {
+            int slot;
+            FIELD_SLOT(vm, OBJ(vm, sp[-1].u.r)->aux, name_c, slot);
+            if (slot >= 0) { sp[-1] = STRUCTOBJ(vm, sp[-1].u.r)->v[slot]; NEXT; }
+        }
+        no_field(vm, name_c, &sp[-1]);
+        goto panic;
+    CASE(OP_SET_FIELD) {
+        tv_val *o = &sp[-2];
+        name_c = RD16(ip);
+        ip += 2;
+        if (o->t == TV_STRUCT) {
+            int slot;
+            FIELD_SLOT(vm, OBJ(vm, o->u.r)->aux, name_c, slot);
+            if (slot >= 0) { STRUCTOBJ(vm, o->u.r)->v[slot] = sp[-1]; sp -= 2; NEXT; }
+        }
+        no_field(vm, name_c, o);
+        goto panic;
+    }
+    CASE(OP_GET_SLOT) {
+        uint8_t i = *ip++;
+        tv_val *v = &sp[-1];
+        if (v->t == TV_STRUCT && i < (OBJ(vm, v->u.r)->size - offsetof(tv_structobj, v)) / sizeof(tv_val))
+            *v = STRUCTOBJ(vm, v->u.r)->v[i];
+        else if (v->t == TV_ARRAY && i < ARROBJ(vm, v->u.r)->len)
+            *v = VALS(vm, ARROBJ(vm, v->u.r)->buf)[i];
+        else { fail(vm, "pattern slot out of range"); goto panic; }
+        NEXT;
+    }
+    CASE(OP_MAKE_CLOSURE) {
+        uint16_t f = RD16(ip);
+        uint8_t n = ip[2], i;
+        tv_ref cr;
+        ip += 3;
+        SYNC_SP();
+        cr = alloc_obj(vm, OBJ_CLOSURE, (uint32_t)offsetof(tv_closobj, v) + n * (uint32_t)sizeof(tv_val));
+        if (!cr) goto panic;
+        OBJ(vm, cr)->aux = n;
+        CLOSOBJ(vm, cr)->func = f;
+        for (i = 0; i < n; i++) CLOSOBJ(vm, cr)->v[i] = sp[(int)i - (int)n];
+        sp -= n;
+        set_ref(sp, TV_CLOSURE, cr);
+        sp++;
+        NEXT;
+    }
+    CASE(OP_PUSH_FUNC) CHECK_STACK(1); sp->t = TV_FUNC; sp->u.i = 0; sp->u.k = RD16(ip); sp++; ip += 2; NEXT;
+    CASE(OP_CONCAT) {
+        uint8_t n = *ip++;
+        HELPER(concat_values(vm, n));
+        NEXT;
+    }
+    CASE(OP_FOR_ITER) CASE(OP_FOR_ITER_STORE) {
+        /* FOR_ITER it off [; STORE_LOCAL x]: next element of the array / string in
+         * local `it` (index in it + 1), or jump when done */
+        tv_val *c = &bp[ip[0]], *ix = c + 1, *dst;
+        uint32_t len = 0;
+        const char *p = 0;
+        int16_t rel;
+        if (op == OP_FOR_ITER) {
+            rel = RDS16(ip + 1);
+            ip += 3;
+            dst = sp;
+        } else {
+            rel = RDS16(ip + 2);
+            dst = &bp[ip[1]];
+            ip += 4;
+        }
+        if (c->t == TV_ARRAY) len = ARROBJ(vm, c->u.r)->len;
+        else p = str_data(vm, c, &len);
+        if ((tv_uint)ix->u.i < len) {
+            if (op == OP_FOR_ITER) CHECK_STACK(1);
+            if (c->t == TV_ARRAY) *dst = VALS(vm, ARROBJ(vm, c->u.r)->buf)[ix->u.i];
+            else set_int(dst, (tv_int)(uint8_t)p[ix->u.i]);
+            if (op == OP_FOR_ITER) sp++;
+            ix->u.i++;
+        } else {
+            ip += rel;
+        }
+        NEXT;
+    }
+    CASE(OP_MATCH_TYPE) {
+        uint16_t t = RD16(ip);
+        ip += 2;
+        set_bool(&sp[-1], sp[-1].t == TV_STRUCT && OBJ(vm, sp[-1].u.r)->aux == t);
+        NEXT;
+    }
+    CASE(OP_IS_ARRAY_LEN) {
+        uint16_t n = RD16(ip);
+        ip += 2;
+        set_bool(&sp[-1], sp[-1].t == TV_ARRAY && ARROBJ(vm, sp[-1].u.r)->len == n);
+        NEXT;
+    }
+    CASE(OP_CAST) {
+        uint8_t kind = *ip++;
+        HELPER(cast_slot(vm, TOPSLOT(1), kind));
+        NEXT;
+    }
+
+    /* ── errors and recovery points ── */
+    CASE(OP_TRY) CASE(OP_TRY_TIMEOUT) {
+        int16_t rel = RDS16(ip);
+        ip += 2;
+        HELPER(push_try(vm, (uint8_t)op, (uint32_t)(ip - code) + (uint32_t)(int32_t)rel));
+        NEXT;
+    }
+    CASE(OP_END_TRY)
+        if (st->n_try) {
+            if (st->tries[st->n_try - 1].deadline) st->n_deadlines--;
+            st->n_try--;
+        }
+        NEXT;
+    CASE(OP_PANIC)
+        HELPER(to_str_slot(vm, TOPSLOT(1)));
+        vm->err_val = *--sp;
+        vm->err_msg = "";
+        goto panic;
+    CASE(OP_HALT)
+        st->halted = 1;
+        SAVE_PC();
+        SYNC_SP();
+        return TILVM_DONE;
+
+    /* ── superinstructions (docs/TIL_BYTECODE_V2.md) ── */
+    CASE(OP_LOAD_LOCAL2)                     /* LOAD_LOCAL a; LOAD_LOCAL b */
+        CHECK_STACK(2);
+        sp[0] = bp[ip[0]];
+        sp[1] = bp[ip[1]];
+        sp += 2;
+        ip += 2;
+        NEXT;
+    CASE(OP_LOAD_LOCAL_FIELD)                /* LOAD_LOCAL a; GET_FIELD name */
+        CHECK_STACK(1);
+        *sp++ = bp[ip[0]];
+        name_c = RD16(ip + 1);
+        ip += 3;
+        goto get_field;
+    CASE(OP_INC_LOCAL) {                     /* LOAD_LOCAL a; PUSH_I8 k; ADD; STORE_LOCAL a */
+        tv_val *v = &bp[ip[0]];
+#ifndef TILVM_LEAN
+        if (v->t == TV_INT) { v->u.i = iwrap_add(v->u.i, (tv_int)(int8_t)ip[1]); ip += 2; NEXT; }
+#endif
+        CHECK_STACK(2);
+        sp[0] = *v;
+        set_int(&sp[1], (tv_int)(int8_t)ip[1]);
+        sp += 2;
+        HELPER(arith(vm, OP_ADD));
+        *v = *--sp;
+        ip += 2;
+        NEXT;
+    }
+    CASE(OP_CAST_LOCAL) {                    /* LOAD_LOCAL a; CAST kind; STORE_LOCAL a */
+        tv_val *v = &bp[ip[0]];
+        uint8_t kind = ip[1];
+        ip += 2;
+#ifndef TILVM_LEAN
+        if (kind == 0 && v->t == TV_INT) NEXT;
+#if TILVM_FLOAT
+        if (kind == 1 && v->t == TV_FLOAT) NEXT;
+#endif
+#endif
+        CHECK_STACK(1);
+        *sp++ = *v;
+        HELPER(cast_slot(vm, TOPSLOT(1), kind));
+        *v = *--sp;
+        NEXT;
+    }
+    CASE(OP_CAST_RETURN) {                   /* CAST kind; RETURN */
+        uint8_t kind = *ip++;
+#ifndef TILVM_LEAN
+        if (!(kind == 0 && sp[-1].t == TV_INT))
+#endif
+            HELPER(cast_slot(vm, TOPSLOT(1), kind));
+        result = *--sp;
+        goto do_return;
+    }
+    CASE(OP_RETURN_LOCAL)                    /* LOAD_LOCAL a; RETURN */
+        result = bp[*ip++];
+        goto do_return;
+    CASE(OP_ADD_STORE_LOCAL)                 /* ADD; STORE_LOCAL a */
+#ifndef TILVM_LEAN
+        if (sp[-2].t == TV_INT && sp[-1].t == TV_INT) {
+            set_int(&bp[*ip++], iwrap_add(sp[-2].u.i, sp[-1].u.i));
+            sp -= 2;
+            NEXT;
+        }
+#endif
+        HELPER(arith(vm, OP_ADD));
+        bp[*ip++] = *--sp;
+        NEXT;
+    CASE(OP_INDEX_L)                         /* LOAD_LOCAL b; GET_INDEX */
+#ifndef TILVM_LEAN
+        if (sp[-1].t == TV_ARRAY && bp[*ip].t == TV_INT) {
+            tv_arrobj *a = ARROBJ(vm, sp[-1].u.r);
+            if ((tv_uint)bp[*ip].u.i < a->len) { sp[-1] = VALS(vm, a->buf)[bp[*ip].u.i]; ip++; NEXT; }
+        }
+#endif
+        CHECK_STACK(1);
+        *sp++ = bp[*ip++];
+        goto get_index;
+    CASE(OP_INDEX_LL)                        /* LOAD_LOCAL a; LOAD_LOCAL b; GET_INDEX */
+#ifndef TILVM_LEAN
+        if (bp[ip[0]].t == TV_ARRAY && bp[ip[1]].t == TV_INT && sp < stk_end) {
+            tv_arrobj *a = ARROBJ(vm, bp[ip[0]].u.r);
+            if ((tv_uint)bp[ip[1]].u.i < a->len) { *sp++ = VALS(vm, a->buf)[bp[ip[1]].u.i]; ip += 2; NEXT; }
+        }
+#endif
+        CHECK_STACK(2);
+        sp[0] = bp[ip[0]];
+        sp[1] = bp[ip[1]];
+        sp += 2;
+        ip += 2;
+        goto get_index;
+
+    /* <cmp> + JUMP_IF_FALSE: jump when the comparison is false */
+    CASE(OP_JUMP_IF_NOT)                     /* <cmp>; JUMP_IF_FALSE */
+        cmp_a = &sp[-2]; cmp_b = &sp[-1]; cmp_pop = 2; cmp = ip[0]; ip += 1;
+        goto cmp_branch;
+    CASE(OP_JUMP_IF_NOT_L)                   /* LOAD_LOCAL b; <cmp>; JUMP_IF_FALSE */
+        cmp_a = &sp[-1]; cmp_b = &bp[ip[1]]; cmp_pop = 1; cmp = ip[0]; ip += 2;
+        goto cmp_branch;
+    CASE(OP_JUMP_IF_NOT_I)                   /* PUSH_I8/I16 k; <cmp>; JUMP_IF_FALSE */
+        set_int(&imm, (tv_int)RDS16(ip + 1));
+        cmp_a = &sp[-1]; cmp_b = &imm; cmp_pop = 1; cmp = ip[0]; ip += 3;
+        goto cmp_branch;
+    CASE(OP_JUMP_IF_NOT_LL)                  /* LOAD_LOCAL a; LOAD_LOCAL b; <cmp>; JUMP_IF_FALSE */
+        cmp_a = &bp[ip[1]]; cmp_b = &bp[ip[2]]; cmp_pop = 0; cmp = ip[0];
+#ifndef TILVM_LEAN
+        if (cmp_a->t == TV_INT && cmp_b->t == TV_INT && IS_CMP(cmp)) {
+            int16_t rel = RDS16(ip + 3);
+            ip += 5;
+            if (!INT_CMP(cmp, cmp_a->u.i, cmp_b->u.i)) { ip += rel; if (rel < 0) goto backedge; }
+            NEXT;
+        }
+#endif
+        ip += 3;
+        goto cmp_branch;
+    CASE(OP_JUMP_IF_NOT_LI)                  /* LOAD_LOCAL a; PUSH_I8/I16 k; <cmp>; JUMP_IF_FALSE */
+        cmp_a = &bp[ip[1]]; cmp = ip[0];
+#ifndef TILVM_LEAN
+        if (cmp_a->t == TV_INT && IS_CMP(cmp)) {
+            int16_t rel = RDS16(ip + 4);
+            tv_int k = (tv_int)RDS16(ip + 2);
+            ip += 6;
+            if (!INT_CMP(cmp, cmp_a->u.i, k)) { ip += rel; if (rel < 0) goto backedge; }
+            NEXT;
+        }
+#endif
+        set_int(&imm, (tv_int)RDS16(ip + 2));
+        cmp_b = &imm; cmp_pop = 0; ip += 4;
+cmp_branch:   /* ip at the i16 offset */
+    {
+        int16_t rel = RDS16(ip);
+        ip += 2;
+        if (cmp_a->t == TV_INT && cmp_b->t == TV_INT && IS_CMP(cmp)) r = INT_CMP(cmp, cmp_a->u.i, cmp_b->u.i);
+        else {
+            r = cmp_values(vm, cmp, cmp_a, cmp_b);
+            if (r == -2) { st->failed = 1; goto fatal; }
+            if (r < 0) goto panic;
+        }
+        sp -= cmp_pop;
+        if (!r) { ip += rel; if (rel < 0) goto backedge; }
+        NEXT;
+    }
+
+    /* <op>_I k = PUSH_I8/PUSH_I16 k; <op> (k: i16)     <op>_L b = LOAD_LOCAL b; <op> */
+#ifndef TILVM_LEAN
+#define FAST_I(expr) \
+        if (sp[-1].t == TV_INT) { tv_int x = sp[-1].u.i, k = (tv_int)RDS16(ip); ip += 2; sp[-1].u.i = (expr); NEXT; } \
+        goto fused_i;
+#define FAST_I_BOOL(expr) \
+        if (sp[-1].t == TV_INT) { tv_int x = sp[-1].u.i, k = (tv_int)RDS16(ip); ip += 2; set_bool(&sp[-1], expr); NEXT; } \
+        goto fused_i;
+#define FAST_L(expr) \
+        if (sp[-1].t == TV_INT && bp[*ip].t == TV_INT) { tv_int x = sp[-1].u.i, k = bp[*ip].u.i; ip++; sp[-1].u.i = (expr); NEXT; } \
+        goto fused_l;
+#define FAST_L_BOOL(expr) \
+        if (sp[-1].t == TV_INT && bp[*ip].t == TV_INT) { tv_int x = sp[-1].u.i, k = bp[*ip].u.i; ip++; set_bool(&sp[-1], expr); NEXT; } \
+        goto fused_l;
+    CASE(OP_ADD_I) FAST_I(iwrap_add(x, k))
+    CASE(OP_SUB_I) FAST_I(iwrap_sub(x, k))
+    CASE(OP_MUL_I) FAST_I(iwrap_mul(x, k))
+    CASE(OP_BAND_I) FAST_I(x & k)
+    CASE(OP_BOR_I) FAST_I(x | k)
+    CASE(OP_BXOR_I) FAST_I(x ^ k)
+    CASE(OP_EQ_I) FAST_I_BOOL(x == k)
+    CASE(OP_NE_I) FAST_I_BOOL(x != k)
+    CASE(OP_LT_I) FAST_I_BOOL(x < k)
+    CASE(OP_LE_I) FAST_I_BOOL(x <= k)
+    CASE(OP_GT_I) FAST_I_BOOL(x > k)
+    CASE(OP_GE_I) FAST_I_BOOL(x >= k)
+    CASE(OP_DIV_I) if (RDS16(ip) != 0) { FAST_I(idiv(x, k)) } goto fused_i;
+    CASE(OP_MOD_I) if (RDS16(ip) != 0) { FAST_I(imod(x, k)) } goto fused_i;
+    CASE(OP_ADD_L) FAST_L(iwrap_add(x, k))
+    CASE(OP_SUB_L) FAST_L(iwrap_sub(x, k))
+    CASE(OP_MUL_L) FAST_L(iwrap_mul(x, k))
+    CASE(OP_BAND_L) FAST_L(x & k)
+    CASE(OP_BOR_L) FAST_L(x | k)
+    CASE(OP_BXOR_L) FAST_L(x ^ k)
+    CASE(OP_EQ_L) FAST_L_BOOL(x == k)
+    CASE(OP_NE_L) FAST_L_BOOL(x != k)
+    CASE(OP_LT_L) FAST_L_BOOL(x < k)
+    CASE(OP_LE_L) FAST_L_BOOL(x <= k)
+    CASE(OP_GT_L) FAST_L_BOOL(x > k)
+    CASE(OP_GE_L) FAST_L_BOOL(x >= k)
+    CASE(OP_DIV_L) if (bp[*ip].t == TV_INT && bp[*ip].u.i != 0) { FAST_L(idiv(x, k)) } goto fused_l;
+    CASE(OP_MOD_L) if (bp[*ip].t == TV_INT && bp[*ip].u.i != 0) { FAST_L(imod(x, k)) } goto fused_l;
+#undef FAST_I
+#undef FAST_I_BOOL
+#undef FAST_L
+#undef FAST_L_BOOL
+    CASE(OP_SHL_I) CASE(OP_SHR_I)
+    fused_i:
+#else
+    CASE(OP_ADD_I) CASE(OP_SUB_I) CASE(OP_MUL_I) CASE(OP_DIV_I) CASE(OP_MOD_I) CASE(OP_BAND_I)
+    CASE(OP_BOR_I) CASE(OP_BXOR_I) CASE(OP_SHL_I) CASE(OP_SHR_I) CASE(OP_EQ_I) CASE(OP_NE_I)
+    CASE(OP_LT_I) CASE(OP_LE_I) CASE(OP_GT_I) CASE(OP_GE_I)
+#endif
+        CHECK_STACK(1);
+        set_int(sp, (tv_int)RDS16(ip));
+        sp++;
+        ip += 2;
+        op = FUSED_BINOP[op & 15];
+        DISPATCH_OP();
+#ifndef TILVM_LEAN
+    CASE(OP_SHL_L) CASE(OP_SHR_L)
+    fused_l:
+#else
+    CASE(OP_ADD_L) CASE(OP_SUB_L) CASE(OP_MUL_L) CASE(OP_DIV_L) CASE(OP_MOD_L) CASE(OP_BAND_L)
+    CASE(OP_BOR_L) CASE(OP_BXOR_L) CASE(OP_SHL_L) CASE(OP_SHR_L) CASE(OP_EQ_L) CASE(OP_NE_L)
+    CASE(OP_LT_L) CASE(OP_LE_L) CASE(OP_GT_L) CASE(OP_GE_L)
+#endif
+        CHECK_STACK(1);
+        *sp++ = bp[*ip++];
+        op = FUSED_BINOP[op & 15];
+        DISPATCH_OP();
+
+#if TILVM_COMPUTED_GOTO
+    L_BAD:
+#else
+    default:
+#endif
+        fail(vm, "bad opcode");
+        st->failed = 1;
+        goto fatal;
+#if !TILVM_COMPUTED_GOTO
+    }
+#endif
+
+backedge:
+    /* loop back-edges and calls: one step */
+    st->steps++;
+    if (--fuel != 0 && !st->n_deadlines) NEXT;
+    /* sandbox limit, deadlines and the budget, exactly as TIL 3.0 checked them at
+     * every step (the steps since the last REFUEL all passed these checks) */
+    if (budget) budget -= fuel_set - fuel - 1;
+    if (vm->max_steps && st->steps > vm->max_steps) {
+        fail(vm, "step limit exceeded");
+        st->failed = 1;
+        goto fatal;
+    }
+    if (st->n_deadlines && ++st->tick >= 256) {
+        st->tick = 0;
+        target = expired_try(vm);
+        if (target >= 0) { REFUEL(); fail(vm, "timeout"); goto panic; }
+    }
+    if (budget && !--budget) {
+        SAVE_PC();
+        SYNC_SP();
+        return TILVM_YIELD;
+    }
+    REFUEL();
+    NEXT;
+
+stack_overflow:
+    fail(vm, "stack overflow");
+panic:
+    SAVE_PC();
+    SYNC_SP();
+    if (recover(vm, target)) { target = -1; goto resume; }
+    report(vm, (uint32_t)(op_ip - code), "runtime error: ");
+    st->failed = 1;
+    return TILVM_ERROR;
+fatal:
+    SAVE_PC();
+    SYNC_SP();
+    report(vm, (uint32_t)(op_ip - code), "fatal error: ");
+    return TILVM_ERROR;
 }
+
+#if TILVM_COMPUTED_GOTO && defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
 
 int tilvm_run(tilvm *vm) {
     int rc = tilvm_run_steps(vm, 0);
