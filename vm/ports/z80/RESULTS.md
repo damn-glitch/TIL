@@ -60,6 +60,7 @@ All numbers: SDCC 4.2.0 #13081, `-mz80`, VM profile of the `Makefile` (heap
 | + shared push/pop tails in `lean_op`, `reset_state` memset | 51,631 B | no |
 | + `?` helper, shared error messages, map equality via `map_find`, no 32-bit multiply/divide routines | 49,328 B | no |
 | + `--opt-code-speed --max-allocs-per-node 10000` (Makefile) | **47,726 B** | **yes** |
+| for comparison: same code and flags, 32-bit ints (compiled only, not run) | 49,106 B | no (about 1 KB over with harness and runtime) |
 
 ¹ The rest of the VM shrank by 1.9 KB, but SDCC allocated registers worse in the
 huge interpreter function (+2.8 KB) — which is why the data opcodes moved out.
