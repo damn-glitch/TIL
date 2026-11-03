@@ -175,6 +175,19 @@ KNOWN = [
     ("Error: File not found: prog.til",
      "Ошибка: файл не найден: prog.til",
      "Қате: файл табылмады: prog.til"),
+    ("fatal error: native recursion limit",
+     "фатальная ошибка: превышен внутренний предел рекурсии",
+     "қатерлі қате: ішкі рекурсия шегінен асып кетті"),
+    # effects with resumption (the til31/effects branch)
+    ("runtime error: unhandled effect 'Log'",
+     "ошибка выполнения: необработанный эффект 'Log'",
+     "орындау қатесі: өңделмеген әсер: 'Log'"),
+    ("error[E-VM]: effect 'Ask' expects 1 argument(s), got 2",
+     "ошибка[E-VM]: эффект 'Ask' ожидает аргументов: 1, передано: 2",
+     "қате[E-VM]: 'Ask' әсері 1 аргумент күтеді, бірақ 2 берілді"),
+    ("Syntax Error: error: duplicate clause for effect 'Ask' in one handle",
+     "Синтаксическая ошибка: повторная ветвь для эффекта 'Ask' в одном handle",
+     "Синтаксистік қате: бір handle ішінде 'Ask' әсерінің тармағы қайталанған"),
 ]
 
 
@@ -582,6 +595,8 @@ class TestCoverage:
         r = subprocess.run([sys.executable, os.path.join(TOOLS, 'i18n_coverage.py')],
                            capture_output=True, text=True)
         assert r.returncode == 0, r.stdout + r.stderr
-        assert "total" in r.stdout and "missing translations" not in r.stdout
+        assert "total" in r.stdout
+        listed = [l for l in r.stdout.split('\n') if l.startswith('  [')]
+        assert all(l.endswith('(not enforced)') for l in listed), listed     # plain CLI prints only
         assert i18n_coverage.skeleton(i18n_coverage.Template(["'", None, "' broke"], 'runtime', 'x:1')) == (
             '    ("\'{x1}\' broke",\n     "\'{x1}\' broke",   # ru: TODO\n     "\'{x1}\' broke"),  # kk: TODO\n')

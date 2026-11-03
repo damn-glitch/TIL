@@ -12,9 +12,10 @@ translation in the message catalog (src/tilmsg.py).
 Message templates are extracted statically:
 
 * src/til.py and the feature modules next to it (src/til*.py), with Python's
-  `ast`: the message (and hint) argument of every `self.error(...)` -- its
-  position is read from the class's own `def error` signature, so new checker
-  classes are picked up automatically --, of `self.panic(...)`,
+  `ast`: the message (and hint) argument of every `self.method(...)` call
+  whose method takes a `msg`/`message` (and `hint`) parameter -- `error`,
+  `panic`, `consume(type, msg)`, ...; positions are read from the method's
+  own signature, so new checker classes are picked up automatically --, of
   `ErrorReporter.format_error/format_warning(...)`, `TILPanic(...)`,
   `TILFatal(...)`, `CompileError(...)`, `ValueError(...)` (src/til.py only),
   the literal messages `BytecodeCompiler` compiles into programs (`push_const`
@@ -137,7 +138,8 @@ class PyExtractor(ast.NodeVisitor):
 
     # classes whose error() reports syntax errors / warnings, and the category
     CLASS_CATEGORY = {'Lexer': 'syntax', 'Parser': 'syntax', 'SemanticChecker': 'semantic',
-                      'BytecodeCompiler': 'vm-compile', 'TypeChecker': 'type-warning'}
+                      'BytecodeCompiler': 'vm-compile', 'TypeChecker': 'type-warning', 'TILVM': 'runtime'}
+    MESSAGE_PARAMS = ('msg', 'message')
     RAISE_CATEGORY = {'TILPanic': 'runtime', 'TILFatal': 'runtime', 'CompileError': 'compile',
                       'ValueError': 'compile'}
 
@@ -191,12 +193,10 @@ class PyExtractor(ast.NodeVisitor):
         f = node.func
         cls = self.class_stack[-1].name if self.class_stack else None
         if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == 'self' and cls:
-            if f.attr == 'error' and 'error' in self.methods.get(cls, {}):
-                self.extract_error_call(cls, node)
-            elif f.attr == 'panic' and 'panic' in self.methods.get(cls, {}):
-                msg = self.argument(self.methods[cls]['panic'], node, ('msg', 'message'))
-                if msg is not None:
-                    self.add(msg, 'runtime', node)
+            method = self.methods.get(cls, {}).get(f.attr)
+            if method is not None and any(a.arg in self.MESSAGE_PARAMS for a in method.args.args):
+                # error(msg), panic(msg), consume(type, msg), _syntax_error_at(node, msg, hint), ...
+                self.extract_message_call(cls, method, node)
             elif f.attr == 'push_const' and cls == 'BytecodeCompiler' and node.args \
                     and self.is_text(node.args[0]):
                 self.add(node.args[0], 'runtime', node)       # messages compiled into PANIC
@@ -222,10 +222,10 @@ class PyExtractor(ast.NodeVisitor):
             self.add(node.args[0], 'cli', node)
         self.generic_visit(node)
 
-    def extract_error_call(self, cls: str, node: ast.Call):
-        method = self.methods[cls]['error']
+    def extract_message_call(self, cls: str, method: ast.FunctionDef, node: ast.Call):
+        """A call of a method that takes a message (and maybe a hint) parameter."""
         category = self.CLASS_CATEGORY.get(cls, 'semantic')
-        msg = self.argument(method, node, ('msg', 'message'))
+        msg = self.argument(method, node, self.MESSAGE_PARAMS)
         if msg is not None:
             self.add(msg, category, node)
         hint = self.argument(method, node, ('hint',))

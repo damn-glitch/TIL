@@ -148,6 +148,7 @@ templates:
    python3 tools/i18n_coverage.py              # summary and missing messages (exit 1 if any)
    python3 tools/i18n_coverage.py --skeleton   # entries to paste into MESSAGES
    python3 tools/i18n_coverage.py --list       # every extracted template
+   python3 tools/i18n_coverage.py --unused     # entries no current message needs
    ```
 
    It extracts message templates statically from `src/til.py`, the feature
@@ -155,7 +156,9 @@ templates:
    the exact rules) and checks each one against the catalog with the same
    lookup `til` uses. `tests/test_i18n.py` fails while a message of the
    enforced categories has no entry; plain `print(..., file=sys.stderr)`
-   messages are reported but not enforced.
+   messages are reported but not enforced. Entries may exist ahead of the
+   code (the effects messages were written against their branch before it was
+   merged); `--unused` lists them, they do no harm.
 3. Add the entry to `MESSAGES` (in the section of its subsystem) with the
    Russian and Kazakh text, following the conventions below. Rename the `x1`,
    `x2` placeholders of the skeleton to meaningful names.
