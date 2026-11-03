@@ -29,6 +29,7 @@ import os
 import re
 import sys
 import time
+import zlib
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -39,6 +40,11 @@ z3 = None                     # imported on first use (plain `til check` stays f
 INT_MIN = -(1 << 63)
 INT_MAX = (1 << 63) - 1
 DEFAULT_TIMEOUT_MS = 10000    # per solver query
+DEFAULT_MEMORY_MB = 2048      # Z3's memory limit (z3 parameter memory_max_size); TIL_PROVE_MEMORY_MB
+MIN_MEMORY_MB = 256           # below ~32 MB Z3 itself crashes; keep a margin
+POW_VAR_EXACT = 8             # x ** e with a variable e: exact for e <= 8 (and e < 0)
+POW_CONST_EXACT = 64          # x ** k with a constant k: exact for k <= 64
+POW_FN = '**'                 # uninterpreted function for the other powers
 PROBE_STEPS = 300000          # step budget when a counterexample is run on the VM
 SEARCH_RUNS = 40              # edge-value runs when the solver's candidate does not reproduce
 SEARCH_STEPS = 20000          # step budget of each of those runs
@@ -46,6 +52,7 @@ INSTALL_HINT = "pip install z3-solver"
 ERROR_CODE = "E-PROVE"
 
 INT, BOOL, NIL, OPAQUE = 'int', 'bool', 'nil', 'opaque'
+START = '__start__'           # the VM's entry function: global initializers, then main()
 
 
 def load_z3() -> bool:
@@ -99,6 +106,7 @@ class _V:
 
 
 _NIL = _V(NIL)
+_PENDING = object()           # a global whose value is computed on first use
 
 
 def _opaque(what: str) -> _V:
@@ -176,7 +184,8 @@ def _tdiv(a, b):
 
 
 def _free_consts(exprs) -> Set[str]:
-    """Names of the uninterpreted constants occurring in z3 expressions."""
+    """Names of the uninterpreted constants and functions (`**` for large
+    exponents) occurring in z3 expressions."""
     out: Set[str] = set()
     seen: Set[int] = set()
     stack = list(exprs)
@@ -186,10 +195,9 @@ def _free_consts(exprs) -> Set[str]:
         if k in seen:
             continue
         seen.add(k)
-        if z3.is_const(e) and e.decl().kind() == z3.Z3_OP_UNINTERPRETED:
+        if z3.is_app(e) and e.decl().kind() == z3.Z3_OP_UNINTERPRETED:
             out.add(e.decl().name())
-        else:
-            stack.extend(e.children())
+        stack.extend(e.children())
     return out
 
 
@@ -263,11 +271,30 @@ class _BVDomain:
         return z3.If(a < 0, -a, a)         # abs(MIN) == MIN
 
     def pow(self, enc, st, a, b, node):
-        one = self.const(1)
+        """Wrapping power like the VMs (pow(a, b, 2**64); negative exponents
+        give 1, -1 or 0).  Exact for constant exponents up to POW_CONST_EXACT
+        and variable exponents up to POW_VAR_EXACT; above that only even
+        bases (0 for exponents >= 64), 1 and -1 are exact and the rest is an
+        unknown function of (a, b) - square-and-multiply over 64 exponent
+        bits makes Z3 run out of memory."""
+        one, zero = self.const(1), self.const(0)
+
+        def odd(v):
+            return z3.Extract(0, 0, v) == 1
+
+        def large(e_ge_64, e_is_odd):
+            # a positive exponent that is not modeled exactly: 0, 1 and -1 are; an even
+            # a = 2k with e >= 64 gives 2**e * k**e == 0 (mod 2**64); the rest is unknown
+            special = z3.If(a == 1, one, z3.If(a == -1, z3.If(e_is_odd, self.const(-1), one),
+                                               z3.If(a == 0, zero, enc.unknown_pow(a, b))))
+            return z3.If(z3.And(e_ge_64, z3.Not(odd(a))), zero, special)
         if z3.is_bv_value(b):
             e = b.as_signed_long()
             if e < 0:
-                return z3.If(a == 1, one, z3.If(a == -1, self.const(-1 if e & 1 else 1), self.const(0)))
+                return z3.If(a == 1, one, z3.If(a == -1, self.const(-1 if e & 1 else 1), zero))
+            if e > POW_CONST_EXACT:
+                self.nonlinear = True
+                return large(z3.BoolVal(True), z3.BoolVal(bool(e & 1)))
             r, base = one, a
             while e:
                 if e & 1:
@@ -277,12 +304,13 @@ class _BVDomain:
                     base = self.mul(enc, st, base, base, node)
             return r
         self.nonlinear = True
-        r, base = one, a
-        for i in range(63):                # square and multiply over the exponent bits
-            r = z3.If(z3.Extract(i, i, b) == 1, r * base, r)
-            base = base * base
-        neg = z3.If(a == 1, one, z3.If(a == -1, z3.If(z3.Extract(0, 0, b) == 1, self.const(-1), one),
-                                       self.const(0)))
+        powers = [one]
+        for _ in range(POW_VAR_EXACT):
+            powers.append(powers[-1] * a)
+        r = large(b >= 64, odd(b))
+        for k in range(POW_VAR_EXACT, -1, -1):
+            r = z3.If(b == k, powers[k], r)
+        neg = z3.If(a == 1, one, z3.If(a == -1, z3.If(odd(b), self.const(-1), one), zero))
         return z3.If(b < 0, neg, r)
 
 
@@ -414,6 +442,64 @@ def _names_in(expr) -> List[str]:
     return out
 
 
+def _identifiers(expr) -> Set[str]:
+    """Every identifier an expression mentions, called function names included."""
+    if expr is None:
+        return set()
+    return {n.name for n in til.walk(expr) if isinstance(n, til.Identifier)}
+
+
+def _bound_names(fdef) -> Set[str]:
+    """Names the body of a function binds or assigns anywhere (every nested
+    scope counts): let/var/const, loop variables, match bindings, parameters
+    of lambdas and handler clauses, `error` in the `else` of retry/timeout,
+    nested definitions and assignment targets.  A name in this set may mean
+    something else at a `return` than at the function's entry."""
+    out: Set[str] = set()
+    for n in til.walk(fdef.body):
+        t = type(n)
+        if t is til.VarDecl:
+            out.add(n.name)
+        elif t is til.For or t is til.ListComprehension:
+            out.add(n.var)
+        elif t is til.Assignment:
+            if isinstance(n.target, til.Identifier):
+                out.add(n.target.name)
+        elif t is til.Lambda:
+            for p in n.params:
+                out.add(p[0] if isinstance(p, (tuple, list)) else str(getattr(p, 'name', p)))
+        elif t is til.MatchExpr:
+            for arm in n.arms:
+                pat = arm[0] if isinstance(arm, (tuple, list)) else getattr(arm, 'pattern', None)
+                out |= _identifiers(pat)
+        elif t is til.RetryExpr or t is til.TimeoutExpr:
+            out.add('error')
+        elif t is til.EffectHandler:
+            for h in n.handlers:
+                for part in (h[1:2] if isinstance(h, (tuple, list)) else ()):
+                    for p in (part if isinstance(part, (tuple, list)) else [part]):
+                        out.add(p[0] if isinstance(p, (tuple, list)) else str(getattr(p, 'name', p)))
+        elif t is til.FuncDef:
+            out.add(n.name)
+            out.update(p.name for p in n.params)
+    return out
+
+
+def _break_in(stmts) -> bool:
+    """Is there a `break` that leaves the loop whose body these statements are
+    (not one of a nested loop)?"""
+    stack = list(stmts)
+    while stack:
+        n = stack.pop()
+        t = type(n)
+        if t is til.Break:
+            return True
+        if t in (til.While, til.Loop, til.For, til.Lambda, til.ListComprehension):
+            continue
+        stack.extend(til.iter_children(n))
+    return False
+
+
 class _Encoder:
     """Symbolic execution of one function: produces the obligations (path
     condition => goal) whose validity means the function is correct."""
@@ -436,6 +522,7 @@ class _Encoder:
         self.inline_stack: List[Tuple[str, Any]] = []
         self.attr: Optional[Tuple[str, int]] = None
         self.suffix = ""
+        self.note = ""                # where a call is, when not in the body itself (a struct default)
         self.frames: Optional[list] = None
         self.unmodeled = 0
         self.loop_depth = 0          # > 0: obligations depend on a loop abstraction
@@ -550,6 +637,14 @@ class _Encoder:
             return _NIL
         return _opaque(what or "an unknown value")
 
+    def unknown_pow(self, a, b):
+        """`a ** b` where the encoding is not exact: an unknown function of
+        (a, b) - the same arguments give the same value, nothing else is known."""
+        self.fresh_desc[POW_FN] = ('opaque', "the value of '**' for a large exponent (exact only for exponents "
+                                             f"up to {POW_VAR_EXACT}, or {POW_CONST_EXACT} when constant, for the "
+                                             "bases 0, 1 and -1, and for even bases with exponents from 64)")
+        return z3.Function(POW_FN, a.sort(), b.sort(), a.sort())(a, b)
+
     def int_const(self, v: int) -> _V:
         return _V(INT, self.dom.const(til.wrap_int64(v)))
 
@@ -612,6 +707,11 @@ class _Encoder:
     def encode(self) -> List[Obligation]:
         fdef = self.fdef
         st = _State((), [{}])
+        if self.key == START:
+            # the global initializers: an immutable global is nil until its initializer ran
+            for g in self.p.global_order:
+                if not g.mutable:
+                    st.declare(g.name, _NIL)
         for p in fdef.params:
             if p.name == 'self':
                 raise Unsupported("methods with 'self' are not supported (the receiver is a struct)", fdef)
@@ -870,6 +970,40 @@ class _Encoder:
             if var not in assigned and a.sort == INT and b.sort == INT:
                 implicit.append(self.range_bound(var, a, b, it.inclusive))
             res = self.run_loop(node, st, rest, cond_fn, invs, assigned | {var}, step_fn, implicit)
+        elif rng is not None and not (rng[0].sort == INT and rng[1].sort == INT):
+            # `for i in range(len(xs))`: range() makes the list [a, b) (it fails
+            # when a bound is not an int), so each element is an int - at least
+            # a and below b where these are known - and the number of iterations
+            # is unknown; the element is a new unknown in every iteration
+            a, b = rng
+            what = ('loop', f"'{var}' in an iteration of the loop at line {node.line}")
+
+            def bounds(v: _V, upper: bool) -> list:
+                out = [a.z <= v.z] if a.sort == INT else []
+                if upper and b.sort == INT:
+                    out.append(v.z < b.z)
+                return out
+
+            def element(s: _State, upper: bool) -> _V:
+                v = self.fresh(s, INT, var, desc=what)
+                s.pc = s.pc + tuple(bounds(v, upper))
+                return v
+            # before the loop only `a <= i` (always satisfiable: the range may be empty)
+            st.declare(var, element(st, False))
+
+            def cond_fn(h: _State):
+                # another iteration: an element exists, and it lies in [a, b)
+                self.n_fresh += 1
+                name = f"more@{self.n_fresh}"
+                self.fresh_desc[name] = ('loop', f"the number of iterations of the loop at line {node.line}")
+                return _and([z3.Bool(name)] + bounds(h.lookup(var), True))
+
+            def step_fn(s: _State):
+                # the next element (the checks after an iteration are about a next one)
+                s.assign(var, element(s, True))
+                return s
+            self.unmodeled += 1
+            res = self.run_loop(node, st, rest, cond_fn, invs, assigned | {var}, step_fn, [])
         elif rng is not None:
             # `for i in range(a, b)`: a hidden counter; i is re-bound each iteration
             a, b = rng
@@ -912,15 +1046,13 @@ class _Encoder:
         return res
 
     def range_call(self, it, st: _State):
-        """(start, end) of `range(n)` / `range(a, b)` over ints, else None."""
+        """(start, end) of a call `range(n)` / `range(a, b)`, else None."""
         if not (isinstance(it, til.Call) and isinstance(it.func, til.Identifier)
                 and it.func.name == 'range' and 1 <= len(it.args) <= 2):
             return None
         if st.lookup('range') is not None or 'range' in self.p.funcs:
             return None
         args = [self.ev(a, st) for a in it.args]
-        if any(a.sort != INT for a in args):
-            raise Unsupported("range() over values that are not ints", it)
         return (self.int_const(0), args[0]) if len(args) == 1 else (args[0], args[1])
 
     def range_bound(self, var: str, a: _V, b: _V, inclusive: bool):
@@ -1117,9 +1249,7 @@ class _Encoder:
                 self.ev(v, st)
             return _opaque("a map")
         if t is T.StructInit:
-            for v in node.fields.values():
-                self.ev(v, st)
-            return _opaque(f"a {node.name} value")
+            return self.ev_struct_init(node, st)
         if t is T.Index:
             self.ev(node.obj, st)
             self.ev(node.index, st)
@@ -1141,6 +1271,26 @@ class _Encoder:
         raise Unsupported(f"{names.get(t.__name__, t.__name__)} are not supported"
                           if t.__name__ in names else f"{t.__name__} is not supported", node)
 
+    def ev_struct_init(self, node, st: _State) -> _V:
+        """Like compile_struct_init: the fields in the order of the struct
+        definition; a field left out gets its default value, evaluated here
+        (in this function's scope) - calls in it are checked like any other."""
+        sdef = self.p.struct_defs.get(node.name)
+        if sdef is None:
+            for v in node.fields.values():
+                self.ev(v, st)
+            return _opaque(f"a {node.name} value")
+        for fld in sdef.fields:
+            if fld.name in node.fields:
+                self.ev(node.fields[fld.name], st)
+            elif fld.default is not None:
+                note = f" (in the default value of field '{fld.name}' of '{node.name}'" + \
+                    (f", line {fld.default.line})" if getattr(fld.default, 'line', 0) else ")")
+                with self.context(sites=self.sites + [node], note=self.note + note,
+                                  suffix=self.suffix or note):
+                    self.ev(fld.default, st)
+        return _opaque(f"a {node.name} value")
+
     def ev_name(self, node, st: _State) -> _V:
         name = node.name
         if name == 'NULL':
@@ -1150,7 +1300,7 @@ class _Encoder:
         v = st.lookup(name)
         if v is not None:
             return v
-        g = self.p.global_value(name)
+        g = self.p.global_value(name, self.key)
         if g is not None:
             return g if isinstance(g, _V) else self.const_value(g[0])
         if name in self.p.funcs and '.' not in name:
@@ -1167,7 +1317,8 @@ class _Encoder:
         if isinstance(obj, til.Identifier) and st.lookup(obj.name) is None:
             values = self.p.enum_values.get(obj.name)
             if values is not None and node.attr in values:
-                return self.int_const(values[node.attr])
+                v = values[node.attr]          # the compiler pushes it with push_int (a bool becomes 0/1)
+                return self.int_const(v) if isinstance(v, int) else _opaque(f"{obj.name}.{node.attr}")
             if obj.name in self.p.adt_names:
                 return _opaque(f"{obj.name}.{node.attr}")
         self.ev(obj, st)
@@ -1309,7 +1460,7 @@ class _Encoder:
             if name in p.struct_names or name in ('Some', 'Ok', 'Err'):
                 self.ev_args(node, st)
                 return _opaque(f"a {name} value")
-            if p.global_value(name) is not None:
+            if p.is_global(name):
                 self.ev_args(node, st)
                 self.unmodeled += 1
                 return _opaque(f"the result of calling the global '{name}'")
@@ -1325,7 +1476,7 @@ class _Encoder:
                 if oname in p.adt_names:
                     self.ev_args(node, st)
                     return _opaque(f"{oname}.{f.attr}(...)")
-                if oname in p.module_names and p.global_value(oname) is None and f.attr in p.funcs:
+                if oname in p.module_names and not p.is_global(oname) and f.attr in p.funcs:
                     return self.call_user(f.attr, node, st)
                 if oname.startswith('__Vec__') or oname.startswith('__HashMap__'):
                     return _opaque("a collection")
@@ -1377,10 +1528,14 @@ class _Encoder:
                 del self.obligations[saved_n:]
                 self.unmodeled = saved_um
         self.unmodeled += 1
-        return self.call_result(key, callee, st)
+        return self.call_result(key, callee, st, args)
 
-    def call_result(self, key: str, callee, st: _State) -> _V:
-        """An unconstrained result of the callee's declared return type."""
+    def call_result(self, key: str, callee, st: _State, args: List[_V]) -> _V:
+        """An unconstrained result of the callee's declared return type -
+        when the VM guarantees that type: `-> int` results are cast to int at
+        every `return <value>`, but a callee without #[ensures] that ends
+        without `return` (or with a bare `return`) returns nil; `-> bool`
+        results are not converted at all."""
         kind = _type_kind(callee.ret_type)
         short = key.replace('.', '_')
         if callee.ensures:
@@ -1388,26 +1543,43 @@ class _Encoder:
         else:
             desc = ('call', f"the result of '{key}' (it has no #[ensures])")
         if kind == 'int':
+            if self.p.may_return_nil(key):
+                self.unmodeled += 1
+                return _opaque(f"the result of '{key}' (it can end without returning a value, "
+                               f"and then the result is nil)")
             return self.fresh(st, INT, short, desc=desc)
         if kind == 'bool':
-            if self.p.certainly_bool(key):
+            need = self.p.bool_result(key)
+            if need is not None and all(i < len(args) and args[i].sort == BOOL for i in need):
                 return self.fresh(st, BOOL, short, desc=desc)
-            return _opaque(f"the result of '{key}' (its `-> bool` returns are not all booleans)")
+            self.unmodeled += 1
+            if need is None:
+                return _opaque(f"the result of '{key}' (its `-> bool` returns are not all booleans)")
+            return _opaque(f"the result of '{key}' (it can return a `bool` parameter unchanged, "
+                           f"and this call does not pass a bool there)")
         if isinstance(callee.ret_type, til.VoidType) and not self.p.returns_value(key):
             return _NIL
         return _opaque(f"the result of '{key}'")
 
     def callee_env(self, callee, args: List[_V], node, st: _State) -> Dict[str, _V]:
-        env: Dict[str, _V] = {}
+        """The callee's parameters at its entry.  Like the VM: missing
+        arguments get their defaults (evaluated in the callee, where every
+        parameter name is a local - not set yet for the later ones), then the
+        annotated parameters are converted."""
+        raw: Dict[str, _V] = {}
+        for prm in callee.params:
+            raw[prm.name] = _opaque(f"parameter '{prm.name}' before it is set")
         for i, prm in enumerate(callee.params):
             if i < len(args):
-                v = args[i]
+                raw[prm.name] = args[i]
             elif prm.default is not None:
-                v = self.ev(prm.default, _State(st.pc, [dict(env)]))
+                sub = _State(st.pc, [dict(raw)])
+                raw[prm.name] = self.ev(prm.default, sub)
+                st.pc = sub.pc
             else:
                 raise Unsupported(f"call passes too few arguments", node)
-            env[prm.name] = self.convert_annotated(v, prm.type, f"parameter '{prm.name}'")
-        return env
+        return {prm.name: self.convert_annotated(raw[prm.name], prm.type, f"parameter '{prm.name}'")
+                for prm in callee.params}
 
     def call_with_contract(self, key: str, callee, args: List[_V], node, st: _State) -> _V:
         """Modular reasoning: the call must satisfy the callee's #[requires];
@@ -1428,11 +1600,12 @@ class _Encoder:
             st.pc = sub.pc
             msg = f"contract violation: {callee.name} requires {text}".strip()
             via = f" (called from '{self.cur_func()}')" if self.inline_stack else ""
+            via += self.note
             with self.context(sites=self.sites + [node]):
                 self.add_ob(st, 'call', t, node, f"#[requires: {text}] of '{key}'{via}",
                             (msg, call_frames), shown)
         self.unmodeled += 1              # the callee may fail or not return
-        res = self.call_result(key, callee, st)
+        res = self.call_result(key, callee, st, args)
         if res.sort in (INT, BOOL):
             for cond, text in self.p.usable_ensures(key):
                 for part in _conjuncts(cond):
@@ -1478,6 +1651,59 @@ _PROBE_NATIVES = {
     'bytes_to_str', 'str_bytes', 'exit',
 }
 _PROBE_MAX_ITEMS = 1000000
+PROBE_MEMORY_MB = 512         # address space a counterexample run may add (Linux, best effort)
+
+
+class _WatchedGlobals(list):
+    """The probe VM's global slots.  Reading a watched slot before anything
+    is stored in it is recorded: in script mode the script initializes some
+    globals, and a run of one function alone does not."""
+
+    def __init__(self, values, watched, names, record):
+        super().__init__(values)
+        self.watched = set(watched)
+        self.names = names
+        self.record = record
+
+    def __getitem__(self, i):
+        if i in self.watched:
+            self.record.add(self.names[i])
+        return list.__getitem__(self, i)
+
+    def __setitem__(self, i, v):
+        self.watched.discard(i)
+        list.__setitem__(self, i, v)
+
+
+@contextmanager
+def _memory_cap(extra_mb: int):
+    """While user code runs on the probe VM, limit the process's address
+    space to its current size + extra_mb (Linux; elsewhere nothing happens):
+    a run that allocates more raises MemoryError instead of exhausting the
+    machine.  The limit is restored afterwards."""
+    restore = None
+    try:
+        import resource
+        with open('/proc/self/statm') as f:
+            current = int(f.read().split()[0]) * os.sysconf('SC_PAGE_SIZE')
+        soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+        new = current + extra_mb * 1024 * 1024
+        if hard != resource.RLIM_INFINITY:
+            new = min(new, hard)
+        if soft == resource.RLIM_INFINITY or new < soft:
+            resource.setrlimit(resource.RLIMIT_AS, (new, hard))
+            restore = (resource, soft, hard)
+    except Exception:                    # no /proc, no resource module, not permitted
+        restore = None
+    try:
+        yield
+    finally:
+        if restore is not None:
+            res, soft, hard = restore
+            try:
+                res.setrlimit(res.RLIMIT_AS, (soft, hard))
+            except Exception:
+                pass
 
 
 def _make_probe_vm_class():
@@ -1485,10 +1711,13 @@ def _make_probe_vm_class():
         """The reference VM, sandboxed: output discarded, no input, no files,
         bounded steps and allocations; the runtime error is recorded."""
 
-        def __init__(self, module, argv=None, max_steps=PROBE_STEPS):
+        def __init__(self, module, argv=None, max_steps=PROBE_STEPS, watched=()):
             super().__init__(module, write=lambda data: None, read_line=lambda: b"",
                              max_steps=max_steps, argv=argv)
             self.failure = None
+            self.unset_reads: Set[str] = set()
+            if watched:
+                self.globals = _WatchedGlobals(self.globals, watched, module.globals, self.unset_reads)
 
         def report(self, msg, pc):
             text = msg.decode('utf-8', 'replace')
@@ -1514,17 +1743,38 @@ def _make_probe_vm_class():
             if op == til.Op.MUL and type(a) in (bytes, list) and type(b) is int and \
                     len(a) * b > _PROBE_MAX_ITEMS:
                 self.panic("value too large")
-            return super().arith(op, a, b)
+            r = super().arith(op, a, b)
+            if type(r) in (bytes, list) and len(r) > _PROBE_MAX_ITEMS:
+                self.panic("value too large")
+            return r
 
         def call_method(self, mid, recv, args):
             if til.METHODS[mid] == 'repeat' and args and type(args[0]) is int and \
                     type(recv) is bytes and len(recv) * args[0] > _PROBE_MAX_ITEMS:
                 self.panic("value too large")
-            return super().call_method(mid, recv, args)
+            r = super().call_method(mid, recv, args)
+            for v in (r, recv):
+                if type(v) in (bytes, list, dict) and len(v) > _PROBE_MAX_ITEMS:
+                    self.panic("value too large")
+            return r
     return _ProbeVM
 
 
 _PROBE_VM = None
+
+
+class _Unfaithful(Exception):
+    """A probe run read globals that the script initializes (not the run)."""
+
+    def __init__(self, names: List[str]):
+        super().__init__(", ".join(names))
+        self.names = names
+
+    def explain(self) -> str:
+        names = ", ".join(f"'{n}'" for n in self.names)
+        one = len(self.names) == 1
+        return (f"it was not run: it reads the global{'' if one else 's'} {names}, which the script "
+                f"initializes{'' if one else ' them'} and a run of the function alone cannot")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1545,15 +1795,26 @@ class Failure:
         self.domain = ""
         self.depends: List[Tuple[str, str]] = []   # (kind, text) of the unknowns it relies on
         self.candidate: Optional[list] = None      # the solver's inputs, when edge values were used instead
+        self.others: List[Tuple[str, Any]] = []    # parameters that are not int/bool: the value a run
+        self.order: List[str] = []                 # uses (None: none possible); parameter order
 
     @property
     def values(self) -> Dict[str, Any]:
         return dict(self.inputs)
 
+    def arguments(self, inputs: Optional[List[Tuple[str, Any]]] = None) -> list:
+        """All arguments of a run, in parameter order: the int/bool inputs
+        and the fixed values of the other parameters."""
+        vals = dict(self.others)
+        vals.update(self.inputs if inputs is None else inputs)
+        return [vals[n] for n in self.order]
+
 
 class FunctionReport:
     def __init__(self, key: str, fdef):
         self.key = key
+        self.title = f"{START} (global initializers)" if key == START else key
+        self.quoted = f"'{START}' (the global initializers)" if key == START else f"'{key}'"
         self.fdef = fdef
         self.status = 'proved'        # proved | counterexample | not proved | unknown | unsupported
         self.failures: List[Failure] = []
@@ -1580,11 +1841,29 @@ class FunctionReport:
 _ATTR_RE = re.compile(r'#\[\s*(requires|ensures)\s*:')
 
 
+def memory_limit_mb() -> int:
+    """Z3's memory limit: TIL_PROVE_MEMORY_MB (at least MIN_MEMORY_MB),
+    else DEFAULT_MEMORY_MB."""
+    try:
+        mb = int(os.environ.get('TIL_PROVE_MEMORY_MB', '') or DEFAULT_MEMORY_MB)
+    except ValueError:
+        mb = DEFAULT_MEMORY_MB
+    return max(mb, MIN_MEMORY_MB)
+
+
+def _z3_out_of_memory(e: Exception) -> bool:
+    return 'memory' in str(e).lower()
+
+
 class Prover:
     def __init__(self, program, source: str, filename: str, timeout_ms: int = DEFAULT_TIMEOUT_MS,
-                 run_counterexamples: bool = True):
+                 run_counterexamples: bool = True, memory_mb: Optional[int] = None):
         if not load_z3():
             raise RuntimeError(f"the prover needs Z3: {INSTALL_HINT}")
+        # Z3 builds some terms before a query's time limit applies; a memory
+        # limit turns a blowup into an `unknown` result (Z3 stays usable)
+        self.memory_mb = max(memory_mb or memory_limit_mb(), MIN_MEMORY_MB)
+        z3.set_param('memory_max_size', self.memory_mb)
         self.program = program
         self.source = source
         self.filename = filename
@@ -1607,13 +1886,15 @@ class Prover:
         self.adt_names: Set[str] = set()
         self.module_names: Set[str] = set(getattr(prog, 'module_names', set()) or ())
         self.inline_consts: Dict[str, Any] = {}
-        self.globals: Dict[str, Any] = {}       # name -> (python value,) | _V (opaque)
+        self.globals: Dict[str, Any] = {}       # name -> (python value,) | _V (opaque) | _PENDING
+        self.struct_defs: Dict[str, Any] = {}
         traits = {}
         for s in prog.statements:
             if isinstance(s, til.FuncDef):
                 self.funcs[s.name] = s
             elif isinstance(s, til.StructDef):
                 self.struct_names.add(s.name)
+                self.struct_defs[s.name] = s
             elif isinstance(s, til.TraitDef):
                 traits[s.name] = s
             elif isinstance(s, til.EnumDef):
@@ -1642,7 +1923,15 @@ class Prover:
                             self.funcs[f"{s.type_name}.{tm.name}"] = tm
         self.methods_with_requires = {k.split('.', 1)[1] for k, f in self.funcs.items()
                                       if '.' in k and f.requires}
-        consts: Dict[str, Any] = {}
+        # Globals.  Literal constants are inlined by the compiler: always known.
+        # The others are computed by __start__ in declaration order before
+        # main() runs (script mode: `deferred` ones by the script itself);
+        # see _evaluate_globals.
+        self.global_order: List[Any] = []       # VarDecls initialized by __start__, in order
+        self.deferred_names: Set[str] = set()   # script mode: initialized by the script (main)
+        self.late: Dict[str, _V] = {}           # globals code can read before they are set
+        self._globals_done = False
+        self._startup: Any = _PENDING
         for s in prog.statements:
             if not isinstance(s, til.VarDecl):
                 continue
@@ -1650,30 +1939,222 @@ class Prover:
                                                       til.BoolLit, til.CharLit)):
                 value = ord(s.value.value) if isinstance(s.value, til.CharLit) else s.value.value
                 self.inline_consts[s.name] = value
-                consts[s.name] = value
                 self.globals[s.name] = (value,)
                 continue
-            if s.mutable:
-                self.globals[s.name] = _opaque(f"the mutable global '{s.name}'")
-            elif s.deferred:
-                self.globals[s.name] = _opaque(f"the global '{s.name}' (initialized by the script)")
-            elif s.value is None:
-                self.globals[s.name] = (None,)
-            else:
-                try:
-                    value = til.const_eval(s.value, consts)
-                except Exception:
-                    self.globals[s.name] = _opaque(f"the global '{s.name}' (computed at run time)")
-                    continue
-                if isinstance(value, (bool, int)):
-                    value = value if isinstance(value, bool) else til.wrap_int64(value)
-                    consts[s.name] = value
-                    self.globals[s.name] = (value,)
-                else:
-                    self.globals[s.name] = _opaque(f"the global '{s.name}'")
+            if s.deferred:
+                self.globals[s.name] = _opaque(f"the global '{s.name}' (the script initializes it)")
+                self.deferred_names.add(s.name)
+                continue
+            self.global_order.append(s)
+            self.globals[s.name] = (_opaque(f"the mutable global '{s.name}'") if s.mutable else _PENDING)
+        self.start_def = self._start_function()
 
-    def global_value(self, name: str):
-        return self.globals.get(name)
+    def _start_function(self):
+        """__start__ as a function: each global initializer in order (the
+        immutable globals become variables of it, nil until initialized)."""
+        stmts = []
+        for g in self.global_order:
+            if g.value is None:
+                continue
+            if g.mutable:
+                stmts.append(til.ExprStmt(expr=g.value, line=g.line, col=g.col))
+            else:
+                stmts.append(til.Assignment(target=til.Identifier(name=g.name, line=g.line, col=g.col),
+                                            value=g.value, op='=', line=g.line, col=g.col))
+        line = self.global_order[0].line if self.global_order else 1
+        return til.FuncDef(name=START, params=[], ret_type=til.T_VOID, body=til.Block(statements=stmts),
+                           line=line, col=1)
+
+    def fdef_of(self, key: str):
+        return self.start_def if key == START else self.funcs[key]
+
+    def is_global(self, name: str) -> bool:
+        return name in self.globals
+
+    def global_value(self, name: str, key: Optional[str] = None):
+        """(python value,) or a _V for a global, as function `key` sees it
+        (None: any function).  Globals that code running during __start__
+        can read before they are set are unknown in such code."""
+        g = self.globals.get(name)
+        if g is _PENDING:
+            self._evaluate_globals()
+            g = self.globals.get(name)
+            if g is _PENDING:               # read by an initializer before it is set
+                return (None,)
+        if name in self.late and (key is None or self.may_run_at_startup(key)):
+            return self.late[name]
+        return g
+
+    def _evaluate_globals(self):
+        """The values __start__ gives the immutable globals, computed with the
+        encoder itself - so with the VM's semantics (constant folding like the
+        compiler, ints and bools never equal, ...) and in declaration order:
+        a global not initialized yet is nil.  Once an initializer runs user
+        code (calls a function, a method, a struct default ...), that code -
+        and so any function it calls - can read the later globals while they
+        are still nil: those are `late`."""
+        if self._globals_done:
+            return
+        self._globals_done = True
+        enc = _Encoder(self, START, self.start_def, _BVDomain())
+        env: Dict[str, _V] = {g.name: _NIL for g in self.global_order}
+        late_after = None
+        for g in self.global_order:
+            if late_after is None and g.value is not None and self.runs_user_code(g.value):
+                late_after = g.name
+            v = self._initial_value(enc, g, env)
+            if g.mutable:
+                env[g.name] = self.globals[g.name]
+                continue
+            env[g.name] = v
+            if v.sort in (INT, BOOL):
+                self.globals[g.name] = (z3.is_true(v.z) if v.sort == BOOL else v.z.as_signed_long(),)
+            elif v.sort == NIL:
+                self.globals[g.name] = (None,)
+            else:
+                self.globals[g.name] = v
+            if late_after is not None:
+                self.late[g.name] = _opaque(
+                    f"the global '{g.name}' (it is initialized after functions have started to run - "
+                    f"the initializer of '{late_after}' runs them - and they can read it while it is nil)")
+
+    def _initial_value(self, enc: '_Encoder', g, env: Dict[str, _V]) -> _V:
+        if g.value is None:
+            return _NIL
+        st = _State((), [dict(env)])
+        try:
+            with enc.context(mode='assume', strict=False, ovf='drop'):
+                v = enc.ev(g.value, st)
+        except Exception:               # Unsupported, ...: not known (sound)
+            return _opaque(f"the global '{g.name}' (computed at run time)")
+        if v.sort == INT:
+            z = z3.simplify(v.z)
+            if z3.is_bv_value(z):
+                return _V(INT, z)
+        elif v.sort == BOOL:
+            z = z3.simplify(v.z)
+            if z3.is_true(z) or z3.is_false(z):
+                return _V(BOOL, z)
+        elif v.sort == NIL:
+            return _NIL
+        return _opaque(f"the global '{g.name}' (computed at run time)")
+
+    # ── code that runs while the globals are initialized ────────────────────
+    def runs_user_code(self, expr) -> bool:
+        """Can evaluating this expression run TIL code of the program (a user
+        function, a method, a function value, a struct field default that
+        does)?  Lambdas are only created, not run."""
+        c = self._callees(expr)
+        return c is None or bool(c)
+
+    def _callees(self, node, shadow: Set[str] = frozenset()) -> Optional[Set[str]]:
+        """User functions an expression or statement can call directly (also
+        through struct field defaults); None when it can call a function value
+        (a closure, a higher-order method, a struct field holding a function):
+        then any function, as far as the prover knows.  `shadow`: local names
+        of the enclosing function (a call of such a name calls a value)."""
+        out: Set[str] = set()
+        seen_structs: Set[str] = set()
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if n is None:
+                continue
+            t = type(n)
+            if t is til.Lambda:
+                continue                         # created here, run elsewhere (a call through a value)
+            if t is til.Call:
+                f = n.func
+                if isinstance(f, til.Identifier):
+                    name = f.name
+                    if name in shadow:
+                        return None                  # a local function value
+                    if name in self.funcs and '.' not in name:
+                        out.add(name)
+                    elif name in self.struct_names or name in ('Some', 'Ok', 'Err'):
+                        pass
+                    elif name in til.NATIVE_ID and name not in self.globals:
+                        pass
+                    else:
+                        return None                  # a local or global function value
+                elif isinstance(f, til.Attribute):
+                    obj, meth = f.obj, f.attr
+                    oname = obj.name if isinstance(obj, til.Identifier) and obj.name not in shadow else None
+                    if oname in self.struct_names and f"{oname}.{meth}" in self.funcs:
+                        out.add(f"{oname}.{meth}")
+                    elif oname in self.adt_names:
+                        pass
+                    elif oname in self.module_names and oname not in self.globals and meth in self.funcs:
+                        out.add(meth)
+                    elif meth in til.PRELUDE_SOURCE or any(
+                            fld.name == meth for sd in self.struct_defs.values() for fld in sd.fields):
+                        return None                  # map/filter/..., or a field holding a function
+                    else:
+                        out.update(k for k in self.funcs if k.endswith('.' + meth))
+                        stack.append(obj)
+                    stack.extend(n.args)
+                    continue
+                else:
+                    return None
+                stack.extend(n.args)
+                continue
+            if t is til.StructInit:
+                sdef = self.struct_defs.get(n.name)
+                if sdef is not None and n.name not in seen_structs:
+                    seen_structs.add(n.name)
+                    for fld in sdef.fields:
+                        if fld.name not in n.fields and fld.default is not None:
+                            stack.append(fld.default)
+                stack.extend(n.fields.values())
+                continue
+            if t is til.PerformEffect:
+                if n.name in self.funcs:
+                    out.add(n.name)
+                stack.extend(n.args)
+                continue
+            stack.extend(til.iter_children(n))
+        return out
+
+    def _callees_of_function(self, key: str) -> Optional[Set[str]]:
+        f = self.funcs[key]
+        out: Set[str] = set()
+        shadow = _bound_names(f) | {p.name for p in f.params}
+        parts = [f.body] + list(f.requires) + list(f.ensures) + [p.default for p in f.params]
+        for part in parts:
+            c = self._callees(part, shadow)
+            if c is None:
+                return None
+            out |= c
+        return out
+
+    def may_run_at_startup(self, key: str) -> bool:
+        """Can function `key` run while __start__ initializes the globals
+        (called, directly or not, from an initializer that runs user code)?"""
+        if key == START:
+            return True
+        if self._startup is _PENDING:
+            self._startup = self._startup_functions()
+        return self._startup is None or key in self._startup
+
+    def _startup_functions(self) -> Optional[Set[str]]:
+        todo: List[str] = []
+        for g in self.global_order:
+            if g.value is not None:
+                c = self._callees(g.value)
+                if c is None:
+                    return None
+                todo.extend(sorted(c))
+        seen: Set[str] = set()
+        while todo:
+            k = todo.pop()
+            if k in seen or k not in self.funcs:
+                continue
+            seen.add(k)
+            c = self._callees_of_function(k)
+            if c is None:
+                return None
+            todo.extend(sorted(c))
+        return seen
 
     def fold(self, node):
         """Mirror of BytecodeCompiler.try_fold: constant subexpressions are
@@ -1695,14 +2176,20 @@ class Prover:
     def returns_value(self, key: str) -> bool:
         return any(isinstance(n, til.Return) and n.value is not None for n in til.walk(self.funcs[key].body))
 
-    def certainly_bool(self, key: str) -> bool:
-        """Every `return` of this `-> bool` function returns a bool (the VM does
-        not convert bool results), and it cannot end without `return`."""
+    def bool_result(self, key: str) -> Optional[frozenset]:
+        """For a `-> bool` function (the VM does not convert bool results):
+        None when it may return something that is not a bool or end without
+        `return`; otherwise the positions of the bool parameters it may return
+        unchanged - its result is a bool when those arguments are bools (the
+        VM does not convert bool parameters either)."""
         if key in self._bool:
             return self._bool[key]
-        self._bool[key] = True               # recursion: assume, the base cases decide
+        self._bool[key] = frozenset()        # recursion: assume, the base cases decide
         f = self.funcs[key]
-        bool_params = {p.name for p in f.params if _type_kind(p.type) == 'bool'}
+        shadow = _bound_names(f)
+        bool_params = {p.name: i for i, p in enumerate(f.params)
+                       if _type_kind(p.type) == 'bool' and p.name not in shadow}
+        need: Set[int] = set()
 
         def is_bool(e) -> bool:
             if isinstance(e, til.BoolLit):
@@ -1712,44 +2199,67 @@ class Prover:
             if isinstance(e, til.UnaryOp):
                 return e.op == 'not'
             if isinstance(e, til.Identifier):
-                return e.name in bool_params
+                if e.name in bool_params:
+                    need.add(bool_params[e.name])
+                    return True
+                return False
             if isinstance(e, til.IfExpr):
                 return e.else_expr is not None and is_bool(e.then_expr) and is_bool(e.else_expr)
             if isinstance(e, til.Cast):
                 return isinstance(e.target_type, til.PrimitiveType) and e.target_type.name == 'bool'
             if isinstance(e, til.Call) and isinstance(e.func, til.Identifier):
-                if e.func.name in self.funcs:
-                    g = self.funcs[e.func.name]
-                    return _type_kind(g.ret_type) == 'bool' and self.certainly_bool(e.func.name)
-                return e.func.name == 'bool'
+                name = e.func.name
+                if name in shadow:
+                    return False                     # a local function value
+                if name in self.funcs:
+                    g = self.funcs[name]
+                    return _type_kind(g.ret_type) == 'bool' and self.bool_result(name) == frozenset()
+                return name == 'bool'
             return False
-        ok = _always_returns(_body_stmts(f.body))
+        ok = _always_returns(_body_stmts(f.body), self.funcs)
         for n in til.walk(f.body):
             if isinstance(n, til.Return) and (n.value is None or not is_bool(n.value)):
                 ok = False
-        self._bool[key] = ok
-        return ok
+        result = frozenset(need) if ok else None
+        self._bool[key] = result
+        return result
+
+    def may_return_nil(self, key: str) -> bool:
+        """Can this function return nil to its caller?  Without #[ensures] a
+        bare `return` and the end of the body return nil (RETURN_NIL: no cast
+        to the return type); with #[ensures] every return is cast."""
+        f = self.funcs[key]
+        if f.ensures and not isinstance(f.ret_type, til.VoidType):
+            return False
+        if not _always_returns(_body_stmts(f.body), self.funcs):
+            return True
+        return any(isinstance(n, til.Return) and n.value is None for n in til.walk(f.body))
 
     def usable_ensures(self, key: str) -> list:
-        """#[ensures] clauses a caller may assume: those that read only
-        `result`, parameters the callee never assigns, and global constants
-        (others see values the caller does not know)."""
+        """#[ensures] clauses a caller may assume.  The VM evaluates them at
+        each `return`, in the callee's scope there; a caller sees only the
+        arguments.  So a clause is used only when every name it mentions
+        means the same at every return as at the entry: `result`, parameters
+        and global names that the callee never declares again, assigns or
+        binds anywhere (a local `let x` shadowing the parameter `x` or a
+        constant, a loop variable, ...)."""
         if key in self._usable:
             return self._usable[key]
         f = self.funcs[key]
         params = {p.name for p in f.params}
-        assigned = _assigned_names(_body_stmts(f.body))
+        shadow = _bound_names(f)
         out = []
         for k, cond in enumerate(f.ensures):
             ok = True
-            for name in _names_in(cond):
+            for name in _identifiers(cond):
                 if name == 'result' or name == 'NULL':
-                    continue
-                if name in params:
-                    if name in assigned:
-                        ok = False
-                elif self.global_value(name) is None and name not in self.funcs and \
-                        name not in self.enum_values and name not in self.module_names:
+                    continue                 # `result` always means the returned value
+                if name in shadow:
+                    ok = False
+                elif name not in params and not self.is_global(name) and name not in self.funcs and \
+                        name not in self.enum_values and name not in self.module_names and \
+                        name not in self.struct_names and name not in self.adt_names and \
+                        name not in til.NATIVE_ID:
                     ok = False
             if ok:
                 out.append((cond, _text(f.ensures_text, k)))
@@ -1793,10 +2303,12 @@ class Prover:
     # ── scope ───────────────────────────────────────────────────────────────
     def local_keys(self) -> List[str]:
         """Functions defined in the file itself (not imported), in order."""
-        try:
-            own = til.parse_source(self.source, self.filename)
-        except Exception:
-            return list(self.funcs)
+        own = self.program
+        if self.module_names:               # imports: only the file's own definitions
+            try:
+                own = til.parse_source(self.source, self.filename)
+            except Exception:
+                return list(self.funcs)
         keys = []
         for s in own.statements:
             if isinstance(s, til.FuncDef):
@@ -1806,14 +2318,25 @@ class Prover:
         return [k for k in keys if k in self.funcs]
 
     def has_contract_work(self, key: str) -> bool:
-        f = self.funcs[key]
+        f = self.fdef_of(key)
         if f.requires or f.ensures:
             return True
-        for n in til.walk(f.body):
+        return self._contract_work_in(f.body, set())
+
+    def _contract_work_in(self, node, seen_structs: Set[str]) -> bool:
+        """An assert/invariant, or a call of a function with #[requires] (also
+        in the default values of the fields a struct initializer leaves out)."""
+        for n in til.walk(node):
             if isinstance(n, (til.AssertStmt, til.InvariantStmt)):
                 return True
             if isinstance(n, til.Call) and self._calls_contract(n):
                 return True
+            if isinstance(n, til.StructInit) and n.name in self.struct_defs and n.name not in seen_structs:
+                seen_structs.add(n.name)
+                for fld in self.struct_defs[n.name].fields:
+                    if fld.name not in n.fields and fld.default is not None and \
+                            self._contract_work_in(fld.default, seen_structs):
+                        return True
         return False
 
     def _calls_contract(self, call) -> bool:
@@ -1831,12 +2354,19 @@ class Prover:
         return False
 
     def targets(self, explicit: bool, only: Optional[str] = None) -> List[str]:
+        """Functions to prove: explicit - every one with contract work (and
+        __start__, the global initializers, when they call functions with
+        #[requires]); else the #[level: 4] ones; `only` - that function."""
+        if not explicit and only is None:
+            if not any(getattr(f, 'level', 2) == 4 for f in self.funcs.values()):
+                return []                   # plain `til check`: nothing to do, no second parse
+            return [k for k in self.local_keys() if getattr(self.funcs[k], 'level', 2) == 4]
         keys = self.local_keys()
+        if START not in self.funcs and self.start_def.body.statements:
+            keys = [START] + keys
         if only is not None:
             return [k for k in keys if k == only or k.split('.')[-1] == only]
-        if explicit:
-            return [k for k in keys if self.has_contract_work(k)]
-        return [k for k in keys if getattr(self.funcs[k], 'level', 2) == 4]
+        return [k for k in keys if self.has_contract_work(k)]
 
     # ── solving ─────────────────────────────────────────────────────────────
     def solve(self, ob: Obligation, solver: str = 'pipeline'):
@@ -1846,19 +2376,24 @@ class Prover:
         own configuration (bit-blasting for bit-vectors)."""
         if z3.is_true(ob.goal):
             return 'proved', None, ""
-        if solver == 'pipeline':
-            s = z3.Then('simplify', 'propagate-values', 'solve-eqs', 'smt').solver()
-        else:
-            s = z3.Solver()
-        s.set('timeout', self.timeout)
-        s.add(*ob.pc)
-        s.add(z3.Not(ob.goal))
-        r = s.check()
-        if r == z3.unsat:
-            return 'proved', None, ""
-        if r == z3.sat:
-            return 'sat', s.model(), ""
-        return 'unknown', None, s.reason_unknown()
+        try:
+            if solver == 'pipeline':
+                s = z3.Then('simplify', 'propagate-values', 'solve-eqs', 'smt').solver()
+            else:
+                s = z3.Solver()
+            s.set('timeout', self.timeout)
+            s.add(*ob.pc)
+            s.add(z3.Not(ob.goal))
+            r = s.check()
+            if r == z3.unsat:
+                return 'proved', None, ""
+            if r == z3.sat:
+                return 'sat', s.model(), ""
+            return 'unknown', None, s.reason_unknown()
+        except z3.Z3Exception as e:
+            if _z3_out_of_memory(e):
+                return 'unknown', None, f"out of memory: Z3 needs more than {self.memory_mb} MB"
+            raise
 
     def _int_encoding(self, key: str, fdef, n_regular: int):
         """The integer encoding, usable only when every overflow obligation
@@ -1880,13 +2415,13 @@ class Prover:
         try:
             return self._prove_function(key)
         except Exception as e:          # never crash `til check`: report it, prove nothing
-            rep = FunctionReport(key, self.funcs[key])
+            rep = FunctionReport(key, self.fdef_of(key))
             rep.status = 'unsupported'
             rep.reason = f"internal error in the prover ({type(e).__name__}: {e})"
             return rep
 
     def _prove_function(self, key: str) -> FunctionReport:
-        fdef = self.funcs[key]
+        fdef = self.fdef_of(key)
         rep = FunctionReport(key, fdef)
         t0 = time.time()
         try:
@@ -1948,11 +2483,9 @@ class Prover:
             fail = self._failure(key, ob, o, enc, model, dom)
             rep.failures.append(fail)
             rep.details.append((ob, fail.status, dom))
-        if not rep.failures:
-            s = z3.Solver()
-            s.set('timeout', self.timeout)
-            s.add(*bv.entry_pc)
-            if fdef.requires and s.check() == z3.unsat:
+        if not rep.failures and fdef.requires:
+            vac = Obligation('vacuity', '', 0, 0, bv.entry_pc, z3.BoolVal(False), None, [], 0, False)
+            if self.solve(vac, 'default')[0] == 'proved':
                 rep.notes.append("its #[requires] can never hold: every call fails, so the proof is vacuous")
         for kind in ('counterexample', 'not proved', 'unknown'):
             if any(f.status == kind for f in rep.failures):
@@ -1970,22 +2503,31 @@ class Prover:
         fail = Failure(ob, 'counterexample')
         fail.domain = dom
         runnable = True
-        for name, sort, z, _t in enc.inputs:
+        for name, sort, z, t in enc.inputs:
+            fail.order.append(name)
             if sort in (INT, BOOL):
                 fail.inputs.append((name, value(_V(sort, z))))
             else:
-                runnable = False
-        fail.extras = [(label, value(v)) for label, v in o.show if v.sort in (INT, BOOL)]
+                d = _default_input(t)              # str "", float 0.0, array [] ...: a run can use it
+                fail.others.append((name, None if d is _NO_VALUE else d))
+                runnable = runnable and d is not _NO_VALUE
+        input_names = {name for name, *_ in enc.inputs}
+        shown = [(label, v) for label, v in o.show if v.sort in (INT, BOOL)]
+        fail.extras = [(label, value(v)) for label, v in shown]
+        # values that are functions of the inputs alone are what the VM computes;
+        # the others are the solver's choice for an abstraction (shown only with
+        # `not proved`, as what the solver found)
+        exact_extras = [(label, value(v)) for label, v in shown if _free_consts([v.z]) <= input_names]
         free = _free_consts(list(o.pc) + [o.goal])
         for name in sorted(free, key=lambda n: (len(n), n)):
             dep = enc.fresh_desc.get(name)
             if dep is not None and dep not in fail.depends:
                 fail.depends.append(dep)
-        exact = o.unmodeled == 0 and not o.loop and free <= {name for name, *_ in enc.inputs}
+        exact = o.unmodeled == 0 and not o.loop and free <= input_names
         if self.run_counterexamples and runnable and ob.expect is not None:
-            fail.confirmed, fail.outcome = self.confirm(key, fail.inputs, ob.expect)
+            fail.confirmed, fail.outcome = self.confirm(key, fail.arguments(), ob.expect)
             if fail.confirmed is False:
-                found = self.search_counterexample(key, fail.inputs, ob.expect)
+                found = self.search_counterexample(key, fail, ob.expect)
                 if found is not None:
                     fail.candidate = fail.inputs
                     fail.inputs = [(n, v) for (n, _old), v in zip(fail.inputs, found)]
@@ -1994,9 +2536,13 @@ class Prover:
                     fail.outcome = f"running it fails with: {ob.expect[0]} (found by running edge values; " \
                                    f"the solver's candidate relied on an abstraction)"
         elif not runnable:
-            fail.outcome = "it cannot be run with these inputs (some parameters are not int or bool)"
+            fail.outcome = ("it cannot be run: the prover has no value for the parameter"
+                            + ("s " if sum(v is None for _n, v in fail.others) > 1 else " ")
+                            + ", ".join(f"'{n}'" for n, v in fail.others if v is None))
         if fail.confirmed:
             fail.status = 'counterexample'
+            if fail.candidate is None:
+                fail.extras = exact_extras
         elif fail.confirmed is None and exact:
             fail.status = 'counterexample'
         else:
@@ -2004,31 +2550,41 @@ class Prover:
         return fail
 
     # ── running counterexamples ─────────────────────────────────────────────
-    def confirm(self, key: str, inputs: List[Tuple[str, Any]], expect) -> Tuple[Optional[bool], str]:
-        """Run the function with the inputs on the reference VM. Returns
+    def confirm(self, key: str, args: list, expect) -> Tuple[Optional[bool], str]:
+        """Run the function with these arguments on the reference VM. Returns
         (True, outcome) when it fails exactly as predicted, (False, what
         happened instead), or (None, why) when it cannot be run."""
         try:
-            failure = self.run_function(key, [v for _n, v in inputs])
+            failure = self.run_function(key, args)
+        except _Unfaithful as u:
+            return None, u.explain()
+        except MemoryError:
+            return None, f"it was not run to the end: the run needs more than {PROBE_MEMORY_MB} MB"
         except Exception as e:           # the program cannot be rebuilt / run here
-            return None, f"it could not be run ({e})"
+            return None, f"it could not be run ({type(e).__name__}: {e})"
         if failure is None:
             return False, "running it with these inputs does not fail"
         msg, frames = failure
-        if _matches(failure, expect):
+        if _matches(failure, expect, key not in ('main', START)):
             return True, f"running it fails with: {msg}"
         if msg.startswith("fatal error: step limit"):
             return False, f"running it with these inputs did not finish within {PROBE_STEPS} steps"
         where = f" (in '{frames[0][0]}', line {frames[0][1]})" if frames else ""
+        if key not in ('main', START) and frames and not any(name == 'main' for name, _l in frames):
+            return False, f"it was not run: the program fails before, while the global initializers run: " \
+                          f"{msg}{where}"
         return False, f"running it with these inputs fails differently: {msg}{where}"
 
-    def search_counterexample(self, key: str, inputs: List[Tuple[str, Any]], expect) -> Optional[list]:
+    def search_counterexample(self, key: str, fail: Failure, expect) -> Optional[list]:
         """The solver's candidate did not fail when run (it relies on an
-        abstraction).  Try edge values instead (0, +-1, MIN, MAX, ...): each
-        hit is a real counterexample, checked by running the function."""
+        abstraction).  Try edge values for the int/bool inputs instead (0,
+        +-1, MIN, MAX, ...): each hit is a real counterexample, checked by
+        running the function.  Returns the int/bool values found."""
+        inputs = fail.inputs
         if not inputs:
             return None
-        rng = __import__('random').Random(len(inputs) * 7919 + sum(hash(n) & 0xFFFF for n, _ in inputs))
+        # seeded from the names only (str hash() differs from run to run): deterministic
+        rng = __import__('random').Random(len(inputs) * 7919 + sum(zlib.crc32(n.encode('utf-8')) for n, _ in inputs))
         pools = []
         for _name, v in inputs:
             if isinstance(v, bool):
@@ -2055,10 +2611,11 @@ class Prover:
             if runs > SEARCH_RUNS:
                 break
             try:
-                failure = self.run_function(key, vals, SEARCH_STEPS)
-            except Exception:
+                failure = self.run_function(key, fail.arguments([(n, v) for (n, _o), v in zip(inputs, vals)]),
+                                            SEARCH_STEPS)
+            except Exception:            # _Unfaithful, MemoryError, ...: no faithful run
                 return None
-            if failure is not None and _matches(failure, expect):
+            if failure is not None and _matches(failure, expect, key not in ('main', START)):
                 return vals
         return None
 
@@ -2071,6 +2628,11 @@ class Prover:
             return self._probe_cache[cache_key]
         if key == 'main' and n_args == 0:
             prog = self.program
+        elif key == START:
+            # __start__ alone: the global initializers, without main()
+            prog = T.Program(statements=[s for s in self.program.statements
+                                         if not (isinstance(s, T.FuncDef) and s.name == 'main')])
+            prog.module_names = getattr(self.program, 'module_names', set())
         else:
             stmts = [s for s in self.program.statements if not (isinstance(s, T.FuncDef) and s.name == 'main')]
             if '.' in key:
@@ -2079,15 +2641,19 @@ class Prover:
             else:
                 func = T.Identifier(name=key)
             if literal_args is not None:
-                args = [T.BoolLit(value=v) if isinstance(v, bool) else T.IntLit(value=v) for v in literal_args]
+                args = [_literal(v) for v in literal_args]
             else:
                 args = []
-                for i, (_n, sort, _z, _t) in enumerate(self._inputs_of(key)):
+                for i, kind in enumerate(self._probe_kinds(key)):
                     item = T.Index(obj=T.Call(func=T.Identifier(name='args'), args=[]), index=T.IntLit(value=i))
-                    if sort == BOOL:
+                    if kind == 'bool':
                         args.append(T.BinaryOp(op='==', left=item, right=T.StringLit(value="true")))
+                    elif kind in ('int', 'float'):
+                        args.append(T.Call(func=T.Identifier(name=kind), args=[item]))
+                    elif kind == 'str':
+                        args.append(item)
                     else:
-                        args.append(T.Call(func=T.Identifier(name='int'), args=[item]))
+                        args.append(T.ArrayLit(elements=[]))
             main = T.FuncDef(name='main', params=[], ret_type=T.T_VOID,
                              body=T.Block(statements=[T.ExprStmt(expr=T.Call(func=func, args=args))]))
             prog = T.Program(statements=stmts + [main])
@@ -2098,29 +2664,86 @@ class Prover:
             self._probe_cache[cache_key] = module
         return module
 
-    def _inputs_of(self, key: str):
-        f = self.funcs[key]
-        return [(p.name, INT if _type_kind(p.type) == 'int' else BOOL, None, p.type) for p in f.params]
+    def _probe_kinds(self, key: str) -> List[str]:
+        """How the probe's main() passes each parameter (from args())."""
+        out = []
+        for p in self.funcs[key].params:
+            kind = _type_kind(p.type)
+            if kind is None:
+                d = _default_input(p.type)
+                kind = ('bool' if isinstance(d, bool) else 'int' if isinstance(d, int) else
+                        'float' if isinstance(d, float) else 'str' if isinstance(d, str) else 'array')
+            out.append(kind)
+        return out
 
     def run_function(self, key: str, values: List[Any], max_steps: int = PROBE_STEPS):
         """Run key(*values) on the sandboxed reference VM; returns the runtime
-        error (message, [(function, line), ...]) or None."""
+        error (message, [(function, line), ...]) or None.  Raises _Unfaithful
+        when the run read a global that only the script initializes (script
+        mode): such a run says nothing about the real program."""
         global _PROBE_VM
         if _PROBE_VM is None:
             _PROBE_VM = _make_probe_vm_class()
-        if values and ('args' in self.funcs or 'int' in self.funcs):
+        if values and ('args' in self.funcs or 'int' in self.funcs or 'float' in self.funcs):
             module, argv = self._probe_module(key, len(values), list(values)), []
         else:
             module = self._probe_module(key, len(values), None)
-            argv = [("true" if v else "false") if isinstance(v, bool) else str(v) for v in values]
-        vm = _PROBE_VM(module, argv, max_steps)
-        vm.run()
+            argv = [("true" if v else "false") if isinstance(v, bool) else v if isinstance(v, str) else
+                    repr(v) if isinstance(v, float) else "" if isinstance(v, list) else str(v) for v in values]
+        watched = []
+        if key not in ('main', START):       # main is the real program, __start__ runs before the script
+            watched = [i for i, name in enumerate(module.globals) if name in self.deferred_names]
+        vm = _PROBE_VM(module, argv, max_steps, watched)
+        with _memory_cap(PROBE_MEMORY_MB):
+            vm.run()
+        if vm.unset_reads:
+            raise _Unfaithful(sorted(vm.unset_reads))
         return vm.failure
 
 
-def _matches(failure, expect) -> bool:
+_NO_VALUE = object()
+
+
+def _default_input(t):
+    """A value for a parameter the prover does not model, so that a
+    counterexample can still be run (and shown): "" for str, 0.0 for floats,
+    0 for narrow and untyped ints, [] for arrays; _NO_VALUE otherwise."""
+    if isinstance(t, til.PrimitiveType):
+        if t.name == 'str':
+            return ""
+        if t.name in _FLOATS:
+            return 0.0
+        if t.name in _NARROW_INTS or t.name in ('int', 'i64', 'char'):
+            return 0
+        if t.name == 'bool':
+            return False
+        return _NO_VALUE
+    if isinstance(t, til.ArrayType) and not t.size:
+        return []
+    if isinstance(t, til.UnknownType):
+        return 0
+    return _NO_VALUE
+
+
+def _literal(v):
+    """A TIL literal for an argument of a probe run."""
+    if isinstance(v, bool):
+        return til.BoolLit(value=v)
+    if isinstance(v, int):
+        return til.IntLit(value=v)
+    if isinstance(v, float):
+        return til.FloatLit(value=v)
+    if isinstance(v, str):
+        return til.StringLit(value=v)
+    return til.ArrayLit(elements=[])
+
+
+def _matches(failure, expect, in_probe_call: bool = False) -> bool:
     """Is the VM's runtime error the predicted one (message, and the
-    innermost frames: function names, and lines where known)?"""
+    innermost frames: function names, and lines where known)?  With
+    in_probe_call it must also have happened inside the probe's own call
+    (main() is on the stack) - not while __start__ ran the global
+    initializers, which may call the same function with other arguments."""
     msg, frames = failure
     exp_msg, exp_frames = expect
     if msg != exp_msg or len(frames) < len(exp_frames):
@@ -2128,18 +2751,38 @@ def _matches(failure, expect) -> bool:
     for (ef, el), (af, al) in zip(exp_frames, frames):
         if ef != af or (el and al and el != al):
             return False
+    if in_probe_call and not any(name == 'main' for name, _line in frames[len(exp_frames):]):
+        return False
     return True
 
 
-def _always_returns(stmts: list) -> bool:
-    """Syntactically, does every path through the statements end in `return`?"""
+def _always_returns(stmts: list, funcs=()) -> bool:
+    """Syntactically, can the statements never finish normally - every path
+    ends in `return`, `panic(...)`/`exit(...)` or a loop that is never left?
+    (`funcs`: user function names, which shadow the panic/exit builtins.)"""
     for s in stmts:
-        if isinstance(s, til.Return):
+        if _never_completes(s, funcs):
             return True
-        if isinstance(s, til.If) and s.else_body is not None:
-            bodies = [s.then_body] + [b for _c, b in s.elifs] + [s.else_body]
-            if all(_always_returns(_body_stmts(b)) for b in bodies):
-                return True
+    return False
+
+
+def _never_completes(s, funcs=()) -> bool:
+    t = type(s)
+    if t is til.Return:
+        return True
+    if t is til.Block:
+        return _always_returns(s.statements, funcs)
+    if t is til.If:
+        if s.else_body is None:
+            return False
+        bodies = [s.then_body] + [b for _c, b in s.elifs] + [s.else_body]
+        return all(_always_returns(_body_stmts(b), funcs) for b in bodies)
+    if t is til.Loop or (t is til.While and isinstance(s.condition, til.BoolLit) and s.condition.value):
+        return not _break_in(_body_stmts(s.body))
+    if t is til.ExprStmt:
+        e = s.expr
+        return (isinstance(e, til.Call) and isinstance(e.func, til.Identifier)
+                and e.func.name in ('panic', 'exit') and e.func.name not in funcs)
     return False
 
 
@@ -2150,6 +2793,10 @@ def _always_returns(stmts: list) -> bool:
 def _fmt(v) -> str:
     if isinstance(v, bool):
         return "true" if v else "false"
+    if isinstance(v, str):
+        return '"' + v.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    if isinstance(v, list):
+        return "[" + ", ".join(_fmt(x) for x in v) + "]"
     return str(v)
 
 
@@ -2173,27 +2820,41 @@ def _assignments(pairs) -> str:
 
 
 def _inputs_text(fail: Failure) -> str:
-    return _assignments(fail.inputs) if fail.inputs else "no inputs (it fails on every run)"
+    """`x = 1, s = ""` (the values of a confirmed run), or `x = 1 and any s`
+    (parameters the prover does not model, which the failure does not need)."""
+    pairs = list(fail.inputs)
+    rest = []
+    for name, v in fail.others:
+        if fail.confirmed and v is not None:
+            pairs.append((name, v))
+        else:
+            rest.append(name)
+    if fail.order:                           # parameter order
+        pairs.sort(key=lambda nv: fail.order.index(nv[0]) if nv[0] in fail.order else len(fail.order))
+    text = _assignments(pairs)
+    if rest:
+        text = (text + " and " if text else "") + "any " + ", ".join(rest)
+    return text or "no inputs (it fails on every run)"
 
 
 def summary_line(rep: FunctionReport) -> str:
     if rep.status == 'proved':
         n = rep.n_obligations
-        text = f"{rep.key}: proved" + (f" ({n} condition{'s' if n != 1 else ''})" if n else
+        text = f"{rep.title}: proved" + (f" ({n} condition{'s' if n != 1 else ''})" if n else
                                        " (nothing to check)")
         return text + (f" - note: {rep.notes[0]}" if rep.notes else "")
     if rep.status == 'unsupported':
-        return f"{rep.key}: unsupported: {rep.reason} (line {rep.line})"
+        return f"{rep.title}: unsupported: {rep.reason} (line {rep.line})"
     first = next(f for f in rep.failures if f.status == rep.status)
     more = len(rep.failures) - 1
     tail = f"; {more} more problem{'s' if more != 1 else ''}" if more > 0 else ""
     ob = first.ob
     if rep.status == 'counterexample':
-        return f"{rep.key}: counterexample: {_inputs_text(first)} ({ob.what} fails, line {ob.line}){tail}"
+        return f"{rep.title}: counterexample: {_inputs_text(first)} ({ob.what} fails, line {ob.line}){tail}"
     if rep.status == 'not proved':
-        return f"{rep.key}: not proved: {ob.what} (line {ob.line}){tail}"
+        return f"{rep.title}: not proved: {ob.what} (line {ob.line}){tail}"
     why = "timeout" if first.reason in ('timeout', 'canceled') else first.reason
-    return f"{rep.key}: unknown ({why}): {ob.what} (line {ob.line}){tail}"
+    return f"{rep.title}: unknown ({why}): {ob.what} (line {ob.line}){tail}"
 
 
 def format_errors(rep: FunctionReport, reporter, timeout_ms: int) -> List[str]:
@@ -2201,7 +2862,7 @@ def format_errors(rep: FunctionReport, reporter, timeout_ms: int) -> List[str]:
     out = []
     if rep.status == 'unsupported':
         out.append(reporter.format_error(
-            rep.line, rep.col, f"cannot prove '{rep.key}': unsupported: {rep.reason}", ERROR_CODE,
+            rep.line, rep.col, f"cannot prove {rep.quoted}: unsupported: {rep.reason}", ERROR_CODE,
             "the prover models int and bool values, if/elif/else, loops with `invariant`, and calls; "
             "see docs/TIL_PROOFS.md (til prove --allow-unsupported skips such functions)"))
         return out
@@ -2209,7 +2870,7 @@ def format_errors(rep: FunctionReport, reporter, timeout_ms: int) -> List[str]:
         ob = fail.ob
         extras = _assignments(fail.extras)
         if fail.status == 'counterexample':
-            msg = f"'{rep.key}': {ob.what} fails for {_inputs_text(fail)}"
+            msg = f"{rep.quoted}: {ob.what} fails for {_inputs_text(fail)}"
             parts = [f"with these inputs {extras}"] if extras else []
             if fail.confirmed:
                 parts.append(f"confirmed on the TIL VM ({fail.outcome})")
@@ -2217,7 +2878,7 @@ def format_errors(rep: FunctionReport, reporter, timeout_ms: int) -> List[str]:
                 parts.append(f"not run on the VM: {fail.outcome}" if fail.outcome else "not run on the VM")
             hint = "; ".join(parts)
         elif fail.status == 'not proved':
-            msg = f"'{rep.key}': cannot prove {ob.what}"
+            msg = f"{rep.quoted}: cannot prove {ob.what}"
             found = f"the solver found {_inputs_text(fail)}" + (f" ({extras})" if extras else "")
             kinds = [k for k, _t in fail.depends]
             if ob.kind in ('loop-step', 'loop-entry') or 'loop' in kinds:
@@ -2236,8 +2897,11 @@ def format_errors(rep: FunctionReport, reporter, timeout_ms: int) -> List[str]:
             hint = f"{found}, but {fail.outcome or 'this is not a real run'}{relies}; {advice}"
         else:
             why = "timeout" if fail.reason in ('timeout', 'canceled') else fail.reason
-            msg = f"'{rep.key}': could not prove {ob.what} (unknown: {why}, {timeout_ms} ms per query)"
+            msg = f"{rep.quoted}: could not prove {ob.what} (unknown: {why}, {timeout_ms} ms per query)"
             hint = "raise --timeout, add bounds with #[requires: ...], or split the computation"
+            if 'memory' in why:
+                hint = "raise --memory (or TIL_PROVE_MEMORY_MB), add bounds with #[requires: ...], " \
+                       "or split the computation"
         out.append(reporter.format_error(ob.line, ob.col, msg, ERROR_CODE, hint))
     return out
 
@@ -2247,9 +2911,11 @@ def format_errors(rep: FunctionReport, reporter, timeout_ms: int) -> List[str]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def prove_program(program, source: str, filename: str, explicit: bool = True, only: Optional[str] = None,
-                  timeout_ms: int = DEFAULT_TIMEOUT_MS, run_counterexamples: bool = True) -> List[FunctionReport]:
-    """Prove the functions in scope; one report per function."""
-    prover = Prover(program, source, filename, timeout_ms, run_counterexamples)
+                  timeout_ms: int = DEFAULT_TIMEOUT_MS, run_counterexamples: bool = True,
+                  memory_mb: Optional[int] = None) -> List[FunctionReport]:
+    """Prove the functions in scope; one report per function (the global
+    initializers have the key START)."""
+    prover = Prover(program, source, filename, timeout_ms, run_counterexamples, memory_mb)
     return [prover.prove_function(k) for k in prover.targets(explicit, only)]
 
 
@@ -2310,19 +2976,26 @@ returns, every assert/invariant holds, every call satisfies the callee's
 #[requires] and nothing divides by zero (64-bit wrap-around semantics).
 
 options:
-  --timeout MS           solver time limit per condition (default {DEFAULT_TIMEOUT_MS})
-  --function NAME        prove only this function (also for functions without contracts)
+  --timeout MS           solver time limit per query (default {DEFAULT_TIMEOUT_MS})
+  --memory MB            Z3's memory limit (default {DEFAULT_MEMORY_MB}, at least {MIN_MEMORY_MB};
+                         or TIL_PROVE_MEMORY_MB)
+  --function NAME        prove only this function (also for functions without contracts;
+                         __start__ = the global initializers)
   --allow-unsupported    unsupported functions do not make the exit code nonzero
   -v, --verbose          list every proof condition and its result
+  --version              versions of TIL and Z3
   -h, --help             this help
 
 Exit code 0 when everything in scope is proved. Needs Z3: {INSTALL_HINT}
 """
 
+_VALUE_OPTIONS = ('--timeout', '--memory', '--function')
+
 
 def main(argv: List[str]) -> int:
     path = None
     timeout = DEFAULT_TIMEOUT_MS
+    memory = None
     only = None
     allow_unsupported = False
     verbose = False
@@ -2332,10 +3005,16 @@ def main(argv: List[str]) -> int:
         if a in ('-h', '--help'):
             print(USAGE, end="")
             return 0
-        if a in ('--timeout', '--function') and i + 1 < len(argv):
+        if a == '--version':
+            print(f"til prove (TIL {getattr(til, 'TIL_VERSION', '?')}), Z3 {z3_version()}")
+            return 0
+        if a in _VALUE_OPTIONS:
+            if i + 1 >= len(argv):
+                print(f"til prove: {a} needs a value\n\n{USAGE}", end="", file=sys.stderr)
+                return 2
             value = argv[i + 1]
             i += 2
-        elif a.startswith('--timeout=') or a.startswith('--function='):
+        elif a.split('=', 1)[0] in _VALUE_OPTIONS and '=' in a:
             a, value = a.split('=', 1)
             i += 1
         elif a == '--allow-unsupported':
@@ -2353,15 +3032,20 @@ def main(argv: List[str]) -> int:
         else:
             print(f"til prove: unknown option {a}\n\n{USAGE}", end="", file=sys.stderr)
             return 2
-        if a == '--timeout':
+        if a in ('--timeout', '--memory'):
+            what = "milliseconds" if a == '--timeout' else f"megabytes (at least {MIN_MEMORY_MB})"
+            least = 1 if a == '--timeout' else MIN_MEMORY_MB
             try:
-                timeout = int(value)
-                if timeout <= 0:
+                number = int(value)
+                if number < least:
                     raise ValueError
             except ValueError:
-                print(f"til prove: --timeout needs a positive number of milliseconds, got {value!r}",
-                      file=sys.stderr)
+                print(f"til prove: {a} needs a number of {what}, got {value!r}", file=sys.stderr)
                 return 2
+            if a == '--timeout':
+                timeout = number
+            else:
+                memory = number
         else:
             only = value
     if path is None:
@@ -2390,7 +3074,10 @@ def main(argv: List[str]) -> int:
     except til.CompileError as e:
         print(str(e), file=sys.stderr)
         return 1
-    prover = Prover(program, source, path, timeout)
+    except (ValueError, OSError) as e:      # a directory, a file that is not UTF-8, ...
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    prover = Prover(program, source, path, timeout, memory_mb=memory)
     if only is not None and not prover.targets(False, only):
         print(f"til prove: no function named '{only}' in {path}", file=sys.stderr)
         return 1

@@ -9763,6 +9763,9 @@ def run_repl():
 def main():
     args = sys.argv[1:]
 
+    if args and args[0] in EXTRA_COMMANDS:     # the tools parse their own options (--help too)
+        return run_extra_command(args[0], args[1:])
+
     if not args or '-h' in args or '--help' in args:
         print_help()
         return 0
@@ -9772,9 +9775,6 @@ def main():
         print("Author: Alisher Beisembekov")
         print("Backends: native (C via gcc/clang), TIL VM (bytecode: Python, C99 / calculators)")
         return 0
-
-    if args[0] in EXTRA_COMMANDS:
-        return run_extra_command(args[0], args[1:])
 
     command = None
     if args and args[0] in ('run', 'build', 'check', 'repl', 'exec', 'dis', 'translate'):
