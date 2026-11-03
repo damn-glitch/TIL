@@ -31,12 +31,16 @@
  *   TILVM_NO_MATH      no <math.h>: sqrt/sin/... use built-in approximations
  *   TILVM_LEAN         smallest code for 8-bit CPUs: the whole language core, but
  *                      without format specs, snapshots, input/chr/ord/type_of/clock/
- *                      random/sleep, and str split/replace/trim/repeat/count,
+ *                      random/sleep, and str split/replace/trim/repeat/to_float,
  *                      array insert/remove/sort/reverse/slice/copy/join/sum/min/max,
- *                      map values/copy/clear (they report "not available")
+ *                      map values/copy/clear (they report "not available" / "no
+ *                      method"), array + array ("unsupported operand types"), and
+ *                      the map-literal key check ({"a": 1, "a": 2} keeps both
+ *                      entries, 2.0 stays a float key); `til fit` reports all of them
  *   TILVM_STATS        record high-water marks (tilvm_get_stats; til fit --run)
- *   TILVM_PACK         pack values like 8-bit CPUs do (desktop emulation of AVR /
- *                      Z80 / eZ80 builds by til fit --run; GCC/Clang hosts only)
+ *   TILVM_PACK         pack values and heap objects like 8-bit CPUs do (desktop
+ *                      emulation of AVR / Z80 / eZ80 builds by til fit --run;
+ *                      GCC/Clang hosts only)
  */
 #ifndef TILVM_H
 #define TILVM_H

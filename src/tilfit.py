@@ -88,15 +88,20 @@ DEVICE_KEYS = {
     'screen': "display and keys (screen_*/draw_*/key natives)",
     'files': "a file system hook (read_file / write_file / file_exists)",
     'console': "text input for input()",
+    'args': "the port passes program arguments to args() (a command line)",
     'title': "", 'cpu': "", 'source': "where the numbers come from",
 }
+
+BOOL_KEYS = ('lean', 'no_stdio', 'no_time', 'no_math', 'bytecode_in_ram', 'clock', 'screen', 'files',
+             'console', 'args')
+STR_KEYS = ('abi', 'title', 'cpu', 'source')
 
 _DESKTOP_BUILD = dict(int_bits=64, float=2, heap=256 * KB, stack=8192, frames=1000, consts=4096,
                       types=512, try_depth=32, mark_stack=64, lean=False, no_stdio=False,
                       no_time=False, no_math=False)
 _BASE = dict(_DESKTOP_BUILD, storage=None, ram=None, c_stack=0, vm_static_ram=0,
              bytecode_in_ram=False, abi='lp64', clock=True, screen=False, files=False,
-             console=False, title='', cpu='', source='')
+             console=False, args=False, title='', cpu='', source='')
 
 
 class Device:
@@ -117,8 +122,18 @@ class Device:
         def need(cond, what):
             if not cond:
                 raise ValueError(f"device '{self.name}': {what}")
+        for key in DEVICE_KEYS:              # JSON types: true is not 1, 16.0 is not 16
+            v = getattr(self, key)
+            if key in BOOL_KEYS:
+                need(isinstance(v, bool), f"{key} must be true or false")
+            elif key in STR_KEYS:
+                need(isinstance(v, str), f"{key} must be a string")
+            elif not (key in ('storage', 'ram') and v is None):
+                need(isinstance(v, int) and not isinstance(v, bool), f"{key} must be a whole number")
         need(self.int_bits in (16, 32, 64), "int_bits must be 16, 32 or 64")
         need(self.float in (0, 1, 2), "float must be 0, 1 or 2")
+        need(not (self.float == 2 and self.abi in PACKED_ABIS),
+             f"float 2 (double) is 32-bit with the {self.abi} toolchain: use float 1")
         need(isinstance(self.heap, int) and 256 <= self.heap <= 0xFFFFFFFF, "heap must be 256..2^32-1 bytes")
         need(isinstance(self.stack, int) and 16 <= self.stack <= 0xFFFF, "stack must be 16..65535 slots")
         need(isinstance(self.frames, int) and 2 <= self.frames <= 0xFFFF, "frames must be 2..65535")
@@ -166,7 +181,7 @@ def _device(name: str, **values):
 
 
 _device('desktop', title="Desktop PC, the default C VM build", cpu="x86-64 / ARM64",
-        clock=True, screen=True, files=True, console=True,
+        clock=True, screen=True, files=True, console=True, args=True,
         source="vm/Makefile `make` (the defaults of vm/tilvm.h)")
 _device('ti84ce', title="TI-84 Plus CE graphing calculator",
         cpu="eZ80 @ 48 MHz, 256 KB RAM (154 KB for programs), 3 MB flash",
@@ -186,7 +201,7 @@ _device('nspire', title="TI-Nspire CX / CX II (Ndless)",
         cpu="ARM926EJ-S @ 132-396 MHz, 64 MB SDRAM, 100 MB flash",
         int_bits=64, float=2, heap=1 * MB, stack=16384, frames=2000, consts=8192, types=1024,
         try_depth=32, storage=16 * MB, ram=16 * MB, c_stack=64 * KB, abi='ilp32',
-        clock=True, screen=True, files=True, console=True,
+        clock=True, screen=True, files=True, console=True, args=True,
         source="vendor specs; vm/README.md (the desktop build with newlib works as is)")
 _device('casio-cg50', title="Casio fx-CG50 / Graph 90+E (gint add-in)",
         cpu="SH4A @ 59 MHz, 8 MB RAM, 16 MB flash",
@@ -251,9 +266,11 @@ def load_device(spec: str) -> Device:
         if not isinstance(data, dict):
             raise ValueError(f"device file {spec}: expected a JSON object")
         base_name = data.pop('base', 'desktop')
-        if base_name not in DEVICES:
-            raise ValueError(f"device file {spec}: unknown base device '{base_name}'")
+        if not isinstance(base_name, str) or base_name not in DEVICES:
+            raise ValueError(f"device file {spec}: unknown base device {base_name!r}")
         name = data.pop('name', os.path.splitext(os.path.basename(spec))[0])
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"device file {spec}: name must be a string")
         values = DEVICES[base_name].as_dict()
         values.pop('name')
         values['title'] = f"custom ({spec}, based on {base_name})"
@@ -424,7 +441,9 @@ ALLOC_METHODS = {'push': 'array push', 'insert': 'array insert', 'set': 'map ins
                  'split': 'strings', 'replace': 'string', 'trim': 'string', 'repeat': 'string',
                  'to_upper': 'string', 'to_lower': 'string', 'slice': 'slice', 'copy': 'copy',
                  'keys': 'array', 'values': 'array', 'join': 'string', 'to_string': 'string'}
-GROWING_ALLOCS = ('array push', 'array insert', 'map insert')
+GROWING_ALLOCS = ('array push', 'array insert', 'map insert', 'string built up with +',
+                  'array built up with +', 'string built up with *')
+MAP_LOOP = "a for-loop over a map first puts every key on the stack"
 
 # ── builtins and TILVM_LEAN (vm/tilvm.c, #ifndef TILVM_LEAN) ───────────────────
 LEAN_MISSING_NATIVES = ('input', 'chr', 'ord', 'type_of', 'clock_ms', 'random', 'seed', 'sleep_ms',
@@ -473,11 +492,26 @@ MAX_REVISITS = 64       # a join point whose stack keeps growing is a loop that 
 
 
 class CallSite:
-    __slots__ = ('pc', 'op', 'args', 'depth', 'tries', 'targets')
+    __slots__ = ('pc', 'op', 'args', 'depth', 'tries', 'targets', 'via', 'edges', 'callback', 'fn_arg')
 
     def __init__(self, pc, op, args, depth, tries):
         self.pc, self.op, self.args, self.depth, self.tries = pc, op, args, depth, tries
         self.targets: List[Tuple[int, int]] = []     # (callee, values consumed by its frame)
+        self.via: List[Tuple[int, int]] = []         # (callback, prelude function that calls it)
+        self.edges: List['Edge'] = []                # every frame this call can push (Analysis._edges)
+        self.callback = False      # the call of the function argument inside .map()/.filter()/...
+        self.fn_arg: Optional[int] = None   # INVOKE: the function passed as first argument, when known
+
+
+class Edge:
+    """A call in the call graph: `callee`'s frame starts `rel` value-stack slots above the
+    caller's frame base, `frames` frames and `tries` recovery points deeper.  A call of
+    .map()/.filter()/... with a function argument gives two edges: to the prelude
+    function, and through it (`via`) to the function argument (2 frames deeper)."""
+    __slots__ = ('callee', 'rel', 'frames', 'tries', 'via', 'site')
+
+    def __init__(self, callee: int, rel: int, frames: int, tries: int, via: Optional[int], site: CallSite):
+        self.callee, self.rel, self.frames, self.tries, self.via, self.site = callee, rel, frames, tries, via, site
 
 
 class FuncFacts:
@@ -506,6 +540,14 @@ class FuncFacts:
         self.ops: Set[int] = set()
         self.range_consts: Dict[int, int] = {}                  # pc of NATIVE range -> length
         self.reachable = 0
+        # the abstract interpretation's results per reachable instruction
+        self.code: Dict[int, Tuple[int, Tuple[int, ...], int]] = {}   # pc -> (op, operands, next pc)
+        self.depth_at: Dict[int, int] = {}                      # operand-stack depth before it
+        self.succ: Dict[int, List[int]] = {}                    # successors inside the function
+        self.cost: Dict[int, Tuple[int, int, int]] = {}         # (slots written, needed, tries) at it
+        self.prev_of: Dict[int, int] = {}                       # straight-line predecessor
+        self.jump_targets: Set[int] = set()
+        self.map_iters: Dict[int, int] = {}      # pc of NATIVE iter that may get a map -> depth after
 
     def fail(self, pc: int, text: str):
         self.complete = False
@@ -555,6 +597,7 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
         return ff
     states: Dict[int, Tuple[int, int]] = {}
     decoded: Dict[int, Tuple[int, Tuple[int, ...], int]] = {}
+    succs: Dict[int, List[int]] = {}
     visits: Dict[int, int] = {}
     work = [(start, 0, 0)]
     while work:
@@ -600,6 +643,7 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
             succ = [(nxt, d2, t2 + 1), (_flow_target(args, nxt), d2 + 1, t2)]
         else:
             succ = []
+        succs[pc] = [s[0] for s in succ if start <= s[0] < end]
         for s in succ:
             if not start <= s[0] < end:
                 ff.fail(pc, "control leaves the function" if s[0] == end else "jump outside the function")
@@ -629,6 +673,8 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
         if eff is not None and eff.flow in (JUMP, BRANCH, ITER, DEFAULT, TRY):
             targets.add(_flow_target(args, nxt))
     has_maps = an.has_maps
+    ff.prev_of, ff.jump_targets = prev_of, targets
+    prelude = ff.name.startswith('__prelude_')
     for pc in sorted(decoded):
         op, args, nxt = decoded[pc]
         eff = STACK_EFFECTS.get(op)
@@ -648,6 +694,8 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
             name = til.NATIVES[args[0]] if args[0] < len(til.NATIVES) else f"native#{args[0]}"
             ff.natives.append((pc, name, args[1]))
             peak, need = NATIVE_TRANSIENT.get(name, (0, 0))
+            if name == 'args':        # one string per program argument, then the array
+                peak, need = peak + an.n_args, need + an.n_args
             if name == 'range':
                 n = _const_range(an, decoded, prev_of, targets, pc)
                 if n is None:
@@ -659,7 +707,8 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
                     peak, need = n + 1 - args[1], n + 2 - args[1]
             elif name == 'iter' and has_maps:
                 peak, need = 1, 2
-                ff.data_dependent.append((pc, "a for-loop over a map first puts every key on the stack"))
+                ff.data_dependent.append((pc, MAP_LOOP))
+                ff.map_iters[pc] = max(d, d2)
             elif name == 'format':
                 ff.formats.append((pc, _const_string(an, decoded, prev_of, pc)))
             if name in ALLOC_NATIVES:
@@ -673,9 +722,19 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
                     ff.data_dependent.append((pc, f".{name}() {DATA_DEPENDENT_METHODS[name]}"))
                 if name in ALLOC_METHODS and (name != 'set' or has_maps):
                     ff.allocs.append((pc, ALLOC_METHODS[name]))
-            ff.calls.append(CallSite(pc, op, args, d, t))
+            site = CallSite(pc, op, args, d, t)
+            if args[2] >= 1 and pc in states:      # .map(f) / .reduce(f, init): f is the first argument
+                q = _producer(decoded, prev_of, targets, pc, args[2] - 1)
+                if q is not None and decoded[q][0] in (_O.PUSH_FUNC, _O.MAKE_CLOSURE):
+                    site.fn_arg = decoded[q][1][0]
+            ff.calls.append(site)
         elif eff.kind in (K_CALL, K_CALL_VALUE):
-            ff.calls.append(CallSite(pc, op, args, d, t))
+            site = CallSite(pc, op, args, d, t)
+            if op == _O.CALL_VALUE and prelude and pc in states:
+                # __prelude_map(a, f) & co. call their parameter f: the callers' edges cover it
+                q = _producer(decoded, prev_of, targets, pc, args[0])
+                site.callback = q is not None and decoded[q][0] == _O.LOAD_LOCAL and decoded[q][1][0] == 1
+            ff.calls.append(site)
         elif eff.kind == K_FUNC_REF:
             ff.func_refs.add(args[0])
         if op == _O.PUSH_CONST:
@@ -689,14 +748,43 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
         if eff.alloc:
             ff.allocs.append((pc, eff.alloc))
         occ = max(d, d2, d + peak)
+        tries = t + (1 if eff.flow == TRY else 0)
         ff.max_occ = max(ff.max_occ, occ)
         ff.max_need = max(ff.max_need, occ, d + need)
-        ff.max_try = max(ff.max_try, t + (1 if eff.flow == TRY else 0))
+        ff.max_try = max(ff.max_try, tries)
+        if pc in states:
+            ff.code[pc] = (op, args, nxt)
+            ff.depth_at[pc] = d
+            ff.cost[pc] = (occ, max(occ, d + need), tries)
+            ff.succ[pc] = succs.get(pc, [])
         if eff.flow in (JUMP, BRANCH):
             target = _flow_target(args, nxt)
             if target <= pc:
                 ff.loops.append((target, pc))
     return ff
+
+
+def _producer(decoded, prev_of, targets, pc: int, pos: int) -> Optional[int]:
+    """The instruction that pushed the value `pos` slots below the top of the operand
+    stack just before `pc`, found by walking straight-line code backwards (None when a
+    jump target or the start of the function is crossed: several producers possible)."""
+    p = pc
+    for _ in range(256):
+        if p in targets:
+            return None
+        q = prev_of.get(p)
+        if q is None or q not in decoded:
+            return None
+        op, args, _nxt = decoded[q]
+        eff = STACK_EFFECTS.get(op)
+        if eff is None or eff.flow in (JUMP, STOP):
+            return None
+        pushes = _value(eff.pushes, args)
+        if pos < pushes:
+            return q
+        pos += _value(eff.pops, args) - pushes
+        p = q
+    return None
 
 
 def _push_value(an: 'Analysis', ins) -> Any:
@@ -745,30 +833,162 @@ def _const_string(an, decoded, prev_of, pc) -> Optional[str]:
 #                 ANALYSIS OF THE WHOLE PROGRAM (call graph, worst cases)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class Recursion:
-    """A recursive part of the call graph (a strongly connected component)."""
+MAX_PATH_STEPS = 20000   # simple paths enumerated per recursion before falling back to per-call costs
 
-    def __init__(self, members: List[int]):
+
+class Recursion:
+    """A recursive part of the call graph (a strongly connected component) and what one
+    more level of it costs.
+
+    A *level* is one way around the recursion back to the function it is entered by:
+    count -> count, even -> odd -> even, depth -> .map() -> <lambda> -> depth.  Its cost
+    is the most expensive simple cycle (slots, frames and recovery points each maximised
+    on their own), so the number of levels computed from it always fits.  When a cycle
+    avoids the entry function (nested recursion), `unit` is 'calls': every call inside
+    the recursion is counted with the most expensive one."""
+
+    def __init__(self, members: List[int], intra: List[Tuple[int, Edge]]):
         self.members = members
-        self.slots_per_level = 0     # value-stack slots added by one more level
-        self.tries_per_level = 0     # recovery points added by one more level
-        self.call_pc: Optional[Tuple[int, int]] = None      # (function, pc) of a recursive call
+        self.intra = intra                # (caller, call) inside the recursion
+        self.unit = 'levels'
+        self.slots_per_level = 0          # value-stack slots added by one more level
+        self.frames_per_level = 1         # call frames added by one more level
+        self.tries_per_level = 0          # recovery points added by one more level
+        self.cycle: List[Tuple[int, Edge]] = []          # the most expensive level (for the report)
+        caller, best = max(intra, key=lambda x: (x[1].rel, x[1].frames))
+        self.call_pc: Optional[Tuple[int, int]] = (caller, best.site.pc)   # a recursive call
+        self.tops: Dict[int, Tuple[int, int, int, int]] = {}   # member as the topmost frame
+        self.entries: List[Dict[str, int]] = []   # one per function the recursion is entered by
+        # the entry with the deepest start (kept as attributes for the report and the tests)
         self.base = 0                # value-stack slots in use below its first frame
         self.frames_below = 1        # call depth of its first frame
         self.tries_below = 0
-        self.top_need = 0            # slots the topmost level needs above its base (with callees)
+        self.top_need = 0            # slots the topmost (partial) level needs above the base
         self.top_occ = 0             # ... and writes
         self.top_frames = 1
         self.top_tries = 0
+
+    def measure(self, entries: List[Tuple[int, int, int, int]]) -> Dict[int, Tuple[int, int, int]]:
+        """Per-level costs and, for every (function, base, frame depth, recovery points) the
+        recursion is entered by, what its topmost partial level needs.  Returns the deepest
+        position of each member within one level (base, frame depth, recovery points)."""
+        out: Dict[int, List[Edge]] = {f: [] for f in self.members}
+        for f, e in self.intra:
+            out[f].append(e)
+        paths: Dict[int, Any] = {}
+        if all(_acyclic_without(self.members, out, f) for f, _b, _d, _t in entries):
+            for f, _b, _d, _t in entries:
+                p = _simple_paths(f, out)
+                if p is None:
+                    break
+                paths[f] = p
+        inner: Dict[int, Tuple[int, int, int]] = {}
+
+        def deeper(f, pos):
+            old = inner.get(f)
+            inner[f] = pos if old is None else (max(old[0], pos[0]), max(old[1], pos[1]), max(old[2], pos[2]))
+
+        if len(paths) == len(entries):
+            self.unit = 'levels'
+            cyc = [0, 0, 0]
+            for f, (_reach, c, edges) in paths.items():
+                if not self.cycle or c[0] > cyc[0]:
+                    self.cycle = edges
+                cyc = [max(a, b) for a, b in zip(cyc, c)]
+            self.slots_per_level, self.frames_per_level, self.tries_per_level = cyc
+            for f, b, d, t in entries:
+                reach = paths[f][0]
+                self.entries.append(dict(
+                    function=f, base=b, frames_below=d, tries_below=t,
+                    top_occ=max(reach[x][0] + self.tops[x][0] for x in reach),
+                    top_need=max(reach[x][0] + self.tops[x][1] for x in reach),
+                    top_frames=max(reach[x][1] + self.tops[x][2] for x in reach),
+                    top_tries=max(reach[x][2] + self.tops[x][3] for x in reach)))
+                for x, (ps, pf, pt) in reach.items():
+                    deeper(x, (b + ps, d + pf, t + pt))
+        else:
+            self.unit = 'calls'
+            self.slots_per_level = max(e.rel for _f, e in self.intra)
+            self.frames_per_level = max(e.frames for _f, e in self.intra)
+            self.tries_per_level = max(e.tries for _f, e in self.intra)
+            tops = [self.tops[x] for x in self.members]
+            for f, b, d, t in entries:
+                self.entries.append(dict(
+                    function=f, base=b, frames_below=d, tries_below=t,
+                    top_occ=max(x[0] for x in tops), top_need=max(x[1] for x in tops),
+                    top_frames=max(x[2] for x in tops), top_tries=max(x[3] for x in tops)))
+                for x in self.members:
+                    deeper(x, (b, d, t) if x == f else
+                           (b + self.slots_per_level, d + self.frames_per_level, t + self.tries_per_level))
+        worst = max(self.entries, key=lambda en: (en['base'] + en['top_need'], en['frames_below']))
+        for key in ('base', 'frames_below', 'tries_below', 'top_need', 'top_occ', 'top_frames', 'top_tries'):
+            setattr(self, key, worst[key])
+        return inner
+
+
+def _acyclic_without(members: List[int], out: Dict[int, List[Edge]], removed: int) -> bool:
+    """True when every cycle of the recursion passes through `removed`."""
+    color = {f: 0 for f in members if f != removed}       # 0 new, 1 on the path, 2 done
+    for root in color:
+        if color[root]:
+            continue
+        color[root] = 1
+        stack = [(root, iter([e.callee for e in out[root]]))]
+        while stack:
+            v, it = stack[-1]
+            w = next(it, None)
+            if w is None:
+                color[v] = 2
+                stack.pop()
+            elif w != removed and color[w] == 1:
+                return False
+            elif w != removed and color[w] == 0:
+                color[w] = 1
+                stack.append((w, iter([e.callee for e in out[w]])))
+    return True
+
+
+def _simple_paths(start: int, out: Dict[int, List[Edge]]):
+    """Simple paths from `start` inside a recursion: per member the most expensive way to
+    reach it, and the most expensive cycle back to `start` (slots, frames, recovery points
+    each maximised on their own) with the edges of the most slot-expensive one.  None when
+    there are more than MAX_PATH_STEPS paths."""
+    reach: Dict[int, Tuple[int, int, int]] = {start: (0, 0, 0)}
+    cyc: Optional[Tuple[int, int, int]] = None
+    cyc_edges: List[Tuple[int, Edge]] = []
+    best_slots = -1
+    steps = 0
+    stack: List[Tuple[int, Tuple[int, int, int], Set[int], List[Tuple[int, Edge]]]] = [(start, (0, 0, 0), {start}, [])]
+    while stack:
+        v, cost, on_path, edges = stack.pop()
+        for e in out[v]:
+            steps += 1
+            if steps > MAX_PATH_STEPS:
+                return None
+            c = (cost[0] + e.rel, cost[1] + e.frames, cost[2] + e.tries)
+            if e.callee == start:
+                cyc = c if cyc is None else (max(cyc[0], c[0]), max(cyc[1], c[1]), max(cyc[2], c[2]))
+                if c[0] > best_slots:
+                    best_slots, cyc_edges = c[0], edges + [(v, e)]
+                continue
+            if e.callee in on_path:
+                continue
+            old = reach.get(e.callee)
+            reach[e.callee] = c if old is None else (max(old[0], c[0]), max(old[1], c[1]), max(old[2], c[2]))
+            stack.append((e.callee, c, on_path | {e.callee}, edges + [(v, e)]))
+    if cyc is None:
+        return None
+    return reach, cyc, cyc_edges
 
 
 class Analysis:
     """Static facts about a bytecode program, independent of any device."""
 
-    def __init__(self, data: bytes, filename: str = "<program>"):
+    def __init__(self, data: bytes, filename: str = "<program>", n_args: int = 0):
         self.data = bytes(data)
         self.filename = filename
         self.size = len(self.data)
+        self.n_args = n_args            # program arguments: args() puts each on the value stack
         try:
             self.module = m = til.TBCModule.from_bytes(self.data)
         except Exception as e:      # malformed file: struct.error, IndexError, ValueError ...
@@ -847,6 +1067,8 @@ class Analysis:
         callee's parameters (the callee's frame starts that far below the top)."""
         m = self.module
         op, args = site.op, site.args
+        if site.callback:           # f(x) inside .map()/...: the edges of the callers cover it
+            return []
         if op == _O.CALL:
             return [(args[0], args[1])] if args[0] < len(m.funcs) else []
         if op == _O.CALL_VALUE:     # any function whose address is taken (closures, fn values)
@@ -857,6 +1079,39 @@ class Analysis:
             out.append((m.prelude[mid], argc + 1))          # map/filter/... written in TIL
         if name in self.field_names:                          # struct field holding a function
             out += [(g, argc) for g in sorted(address_taken) if self.arity_ok(g, argc)]
+        return out
+
+    def callbacks(self, site: CallSite, address_taken: Set[int]) -> List[Tuple[int, int]]:
+        """(function, prelude function) pairs: .map(f)/.filter(f)/... called here runs the
+        prelude function, which calls f - the function passed at this site when the
+        bytecode shows it (a lambda or a named function), else any function value."""
+        m = self.module
+        if site.op != _O.INVOKE or site.args[2] < 1:
+            return []
+        p = m.prelude.get(site.args[1])
+        if p is None or not self.arity_ok(p, site.args[2] + 1):
+            return []
+        out: List[Tuple[int, int]] = []
+        for cb in self.facts(p).calls:
+            if not cb.callback:
+                continue
+            if site.fn_arg is not None:
+                cands = [site.fn_arg] if 0 <= site.fn_arg < len(m.funcs) else []
+            else:
+                cands = sorted(address_taken)
+            out += [(g, p) for g in cands if self.arity_ok(g, cb.args[0]) and (g, p) not in out]
+        return out
+
+    def _edges(self, ff: FuncFacts, site: CallSite) -> List[Edge]:
+        out = [Edge(g, ff.n_locals + site.depth - c, 1, site.tries, None, site) for g, c in site.targets]
+        if site.via:
+            below = ff.n_locals + site.depth - (site.args[2] + 1)    # the prelude function's frame
+            for g, p in site.via:
+                pf = self.facts(p)
+                for cb in pf.calls:
+                    if cb.callback:
+                        out.append(Edge(g, below + pf.n_locals + cb.depth - cb.args[0], 2,
+                                        site.tries + cb.tries, p, site))
         return out
 
     # ── reachability, call graph, worst cases ────────────────────────────────
@@ -870,7 +1125,9 @@ class Analysis:
             while work:
                 f = work.pop()
                 for site in self.facts(f).calls:
-                    for g, _c in self.call_targets(site, address_taken):
+                    callees = [g for g, _c in self.call_targets(site, address_taken)]
+                    callees += [g for g, _p in self.callbacks(site, address_taken)]
+                    for g in callees:
                         if g not in reach:
                             reach.add(g)
                             work.append(g)
@@ -885,8 +1142,62 @@ class Analysis:
         for f in self.reachable:
             for site in self.facts(f).calls:
                 site.targets = self.call_targets(site, address_taken)
+                site.via = self.callbacks(site, address_taken)
+        for f in self.reachable:
+            ff = self.facts(f)
+            for site in ff.calls:
+                site.edges = self._edges(ff, site)
         self.complete = all(self.facts(f).complete for f in self.reachable)
+        self.kinds = infer_kinds(self)
+        if self.kinds is not None:
+            self._loops_over_arrays()
+            self._arith_allocs()
         self._worst_cases()
+
+    def _arith_allocs(self):
+        """+ and * that give a string or an array allocate it; `s = s + x` in a loop builds
+        an ever longer value (the old one becomes garbage, the live data grows)."""
+        for (f, pc), (_a, _b, r) in sorted(self.kinds.binop.items()):
+            if not r or r & ~K_HEAP:           # may give a number: not an allocation for sure
+                continue
+            ff = self.facts(f)
+            sym = '+' if ff.code[pc][0] == _O.ADD else '*'
+            if self.accumulates(ff, pc):
+                kind = f"{'array' if r & K_ARRAY else 'string'} built up with {sym}"
+            else:
+                kind = 'string' if r == K_STR else 'array' if r == K_ARRAY else 'string or array'
+            ff.allocs.append((pc, kind))
+
+    @staticmethod
+    def accumulates(ff: FuncFacts, pc: int) -> bool:
+        """The result of the instruction at pc is stored into a variable it read (x = x + y)."""
+        nxt = ff.code[pc][2]
+        if nxt not in ff.code:
+            return False
+        store_op, store_args, _n = ff.code[nxt]
+        load = {_O.STORE_LOCAL: _O.LOAD_LOCAL, _O.STORE_GLOBAL: _O.LOAD_GLOBAL, _O.STORE_CELL: _O.LOAD_CELL,
+                _O.STORE_UPVAL: _O.LOAD_UPVAL, _O.SET_FIELD: _O.GET_FIELD}.get(store_op)
+        if load is None:
+            return False
+        for pos in (0, 1):
+            q = _producer(ff.code, ff.prev_of, ff.jump_targets, pc, pos)
+            if q is not None and ff.code[q][0] == load and ff.code[q][1][0] == store_args[0]:
+                return True
+        return False
+
+    def _loops_over_arrays(self):
+        """for x in a: iter() puts the keys on the stack only when `a` is a map."""
+        for f in self.reachable:
+            ff = self.facts(f)
+            plain = [pc for pc in ff.map_iters if not self.kinds.iter_arg.get((f, pc), K_ANY) & K_MAP]
+            if not plain:
+                continue
+            for pc in plain:
+                d = ff.map_iters.pop(pc)
+                ff.cost[pc] = (d, d, ff.cost[pc][2])
+            ff.data_dependent = [x for x in ff.data_dependent if x[0] not in plain]
+            ff.max_occ = max(c[0] for c in ff.cost.values())
+            ff.max_need = max(c[1] for c in ff.cost.values())
 
     def _sccs(self) -> List[List[int]]:
         """Tarjan's algorithm (iterative); components come callees-first."""
@@ -896,7 +1207,7 @@ class Analysis:
         stack: List[int] = []
         out: List[List[int]] = []
         counter = 0
-        succ = {f: sorted({g for s in self.facts(f).calls for g, _c in s.targets}) for f in self.reachable}
+        succ = {f: sorted({e.callee for s in self.facts(f).calls for e in s.edges}) for f in self.reachable}
         for root in self.reachable:
             if root in index:
                 continue
@@ -949,19 +1260,6 @@ class Analysis:
         rec_of: Dict[int, Recursion] = {}
         self.recursions: List[Recursion] = []
         for ci, comp in enumerate(self.sccs):            # callees before callers
-            rec = None
-            for f in comp:
-                for s in self.facts(f).calls:
-                    for g, c in s.targets:
-                        if comp_of.get(g) != ci:
-                            continue
-                        rec = rec or Recursion(comp)
-                        ff = self.facts(f)
-                        rel = ff.n_locals + s.depth - c
-                        if rec.call_pc is None or rel > rec.slots_per_level:
-                            rec.call_pc = (f, s.pc)
-                        rec.slots_per_level = max(rec.slots_per_level, rel)
-                        rec.tries_per_level = max(rec.tries_per_level, s.tries)
             for f in comp:
                 ff = self.facts(f)
                 occ[f] = need[f] = frames[f] = tries[f] = None
@@ -974,27 +1272,27 @@ class Analysis:
                 fr, tr = 1, ff.max_try
                 unknown = False
                 for s in ff.calls:
-                    for g, c in s.targets:
+                    for e in s.edges:
+                        g = e.callee
                         if comp_of.get(g) == ci:         # recursive call: per-level cost
                             continue
                         if need.get(g) is None:
                             unknown = True
                             continue
-                        rel = ff.n_locals + s.depth - c
-                        o = max(o, rel + occ[g])
-                        n = max(n, rel + need[g])
-                        fr = max(fr, 1 + frames[g])
-                        tr = max(tr, s.tries + tries[g])
+                        o = max(o, e.rel + occ[g])
+                        n = max(n, e.rel + need[g])
+                        fr = max(fr, e.frames + frames[g])
+                        tr = max(tr, e.tries + tries[g])
                 if not unknown:
                     occ[f], need[f], frames[f], tries[f] = o, n, fr, tr
-            if rec is not None:
+            intra = [(f, e) for f in comp for s in self.facts(f).calls for e in s.edges
+                     if comp_of.get(e.callee) == ci]
+            if intra and all(need.get(f) is not None for f in comp):
+                rec = Recursion(comp, intra)
+                rec.tops = {f: self._top_costs(f, ci, comp_of, occ, need, frames, tries) for f in comp}
                 rec_of[ci] = rec
-                if all(need.get(f) is not None for f in comp):
-                    rec.top_need = max(need[f] for f in comp)
-                    rec.top_occ = max(occ[f] for f in comp)
-                    rec.top_frames = max(frames[f] for f in comp)
-                    rec.top_tries = max(tries[f] for f in comp)
-                    self.recursions.append(rec)
+                self.recursions.append(rec)
+        self.comp_of = comp_of
         self.func_occ, self.func_need, self.func_frames, self.func_tries = occ, need, frames, tries
         g0 = self.n_globals
         self.slots_occ = None if occ.get(entry) is None else g0 + occ[entry]
@@ -1010,26 +1308,55 @@ class Analysis:
             rec = rec_of.get(ci)
             entered = [f for f in comp if f in base]
             if rec is not None and entered:
-                rec.base = max(base[f] for f in entered)
-                rec.frames_below = max(depth[f] for f in entered)
-                rec.tries_below = max(tdepth[f] for f in entered)
-                for f in comp:                         # reached only from inside: one level deeper
-                    if f not in base:
-                        base[f] = rec.base + rec.slots_per_level
-                        depth[f] = rec.frames_below + 1
-                        tdepth[f] = rec.tries_below + rec.tries_per_level
+                inner = rec.measure([(f, base[f], depth[f], tdepth[f]) for f in entered])
+                for f, (b, d, t) in inner.items():     # the deepest place within one level
+                    base[f] = max(base.get(f, 0), b)
+                    depth[f] = max(depth.get(f, 0), d)
+                    tdepth[f] = max(tdepth.get(f, 0), t)
             for f in comp:
                 if f not in base:
                     continue
-                ff = self.facts(f)
-                for s in ff.calls:
-                    for g, c in s.targets:
+                for s in self.facts(f).calls:
+                    for e in s.edges:
+                        g = e.callee
                         if comp_of.get(g) == ci:
                             continue
-                        rel = ff.n_locals + s.depth - c
-                        base[g] = max(base.get(g, 0), base[f] + rel)
-                        depth[g] = max(depth.get(g, 0), depth[f] + 1)
-                        tdepth[g] = max(tdepth.get(g, 0), tdepth[f] + s.tries)
+                        base[g] = max(base.get(g, 0), base[f] + e.rel)
+                        depth[g] = max(depth.get(g, 0), depth[f] + e.frames)
+                        tdepth[g] = max(tdepth.get(g, 0), tdepth[f] + e.tries)
+        self.recursions = [rec for rec in self.recursions if rec.entries]
+
+    def _top_costs(self, f: int, ci: int, comp_of, occ, need, frames, tries) -> Tuple[int, int, int, int]:
+        """(slots written, slots needed, frames, recovery points) of `f` as the topmost frame
+        of its recursion: what it can run before a recursive call, with its other callees."""
+        ff = self.facts(f)
+        stop = {s.pc for s in ff.calls if s.edges and all(comp_of.get(e.callee) == ci for e in s.edges)}
+        seen: Set[int] = set()
+        work = [ff.start]
+        while work:
+            pc = work.pop()
+            if pc in seen or pc not in ff.cost:
+                continue
+            seen.add(pc)
+            if pc not in stop:
+                work.extend(ff.succ.get(pc, ()))
+        o = ff.n_locals + max([ff.cost[pc][0] for pc in seen] or [0])
+        n = ff.n_locals + max([ff.cost[pc][1] for pc in seen] or [0])
+        if f != self.module.entry:
+            n = max(n, ff.n_locals + 4)
+        fr, tr = 1, max([ff.cost[pc][2] for pc in seen] or [0])
+        for s in ff.calls:
+            if s.pc not in seen or s.pc in stop:
+                continue
+            for e in s.edges:
+                g = e.callee
+                if comp_of.get(g) == ci or need.get(g) is None:
+                    continue
+                o = max(o, e.rel + occ[g])
+                n = max(n, e.rel + need[g])
+                fr = max(fr, e.frames + frames[g])
+                tr = max(tr, e.tries + tries[g])
+        return o, n, fr, tr
 
     # ── summaries ───────────────────────────────────────────────────────────
     def reachable_facts(self) -> List[FuncFacts]:
@@ -1050,28 +1377,43 @@ class Analysis:
         """(function, pc) of the reachable PUSH_CONST k instructions."""
         return [(ff.index, pc) for ff in self.reachable_facts() for pc in ff.const_uses.get(k, ())]
 
-    def worst_path(self, table: Optional[Dict[int, Optional[int]]] = None) -> List[int]:
-        """The call chain behind a worst case (value-stack need by default; recursion cut)."""
+    def worst_path(self, table: Optional[Dict[int, Optional[int]]] = None) -> List[str]:
+        """The call chain behind a worst case (value-stack need by default; recursion cut),
+        as display names."""
         table = self.func_need if table is None else table
         by_slots = table is self.func_need
-        path, f, seen = [self.module.entry], self.module.entry, set()
+        f = self.module.entry
+        path, seen = [self.display_name(f)], set()
         while f not in seen:
             seen.add(f)
             ff = self.facts(f)
             best, best_val = None, -1
             for s in ff.calls:
-                for g, c in s.targets:
-                    v = table.get(g)
-                    if g in seen or v is None:
+                for e in s.edges:
+                    v = table.get(e.callee)
+                    if e.callee in seen or v is None:
                         continue
-                    v += (ff.n_locals + s.depth - c) if by_slots else 0
+                    v += e.rel if by_slots else e.frames
                     if v > best_val:
-                        best, best_val = g, v
+                        best, best_val = e, v
             if best is None or (by_slots and best_val < ff.n_locals + ff.max_need):
                 break
-            path.append(best)
-            f = best
+            if best.via is not None:
+                path.append(self.display_name(best.via))
+            path.append(self.display_name(best.callee))
+            f = best.callee
         return path
+
+    def cycle_text(self, rec: Recursion) -> str:
+        """'even -> odd -> even' (the most expensive level of a recursion)."""
+        if not rec.cycle:
+            return ""
+        names = [self.display_name(rec.cycle[0][0])]
+        for _caller, e in rec.cycle:
+            if e.via is not None:
+                names.append(self.display_name(e.via))
+            names.append(self.display_name(e.callee))
+        return " -> ".join(names)
 
     def display_name(self, fidx: int) -> str:
         name = self.module.funcs[fidx].name
@@ -1080,6 +1422,299 @@ class Analysis:
         if name.startswith('__prelude_'):
             return f".{name[len('__prelude_'):]}()"
         return name
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#               VALUE KINDS (what may reach +, *, map literals, for-loops)
+# ═══════════════════════════════════════════════════════════════════════════════
+# A dataflow analysis over the same bytecode: the kinds of value (int, str, array,
+# ...) every operand-stack slot, local, global, parameter and return value may hold.
+# Locals and globals are flow-insensitive; parameters get what the call sites pass,
+# call results what the callees return (the call graph above).  It decides checks
+# where operand types matter: array + (missing in lean builds), allocations by + and
+# *, map-literal keys, and which for-loops may iterate over a map.
+
+K_NIL, K_BOOL, K_INT, K_FLOAT, K_STR, K_ARRAY, K_MAP, K_OTHER = 1, 2, 4, 8, 16, 32, 64, 128
+K_NUM = K_INT | K_FLOAT
+K_ANY = 255
+K_HEAP = K_STR | K_ARRAY          # results of + and * that allocate
+
+NATIVE_KINDS = {
+    'print': K_NIL, 'println': K_NIL, 'len': K_INT, 'str': K_STR, 'int': K_INT, 'float': K_FLOAT,
+    'abs': K_NUM, 'sqrt': K_FLOAT, 'pow': K_NUM, 'sin': K_FLOAT, 'cos': K_FLOAT, 'tan': K_FLOAT,
+    'log': K_FLOAT, 'exp': K_FLOAT, 'floor': K_NUM, 'ceil': K_NUM, 'round': K_NUM, 'input': K_STR,
+    'chr': K_STR, 'ord': K_INT, 'range': K_ARRAY, 'type_of': K_STR, 'format': K_STR, 'clock_ms': K_INT,
+    'random': K_NUM, 'seed': K_NIL, 'sleep_ms': K_NIL, 'bool': K_BOOL, 'iter': K_ARRAY | K_STR,
+    'read_file': K_STR, 'write_file': K_NIL, 'file_exists': K_BOOL, 'args': K_ARRAY, 'bytes_to_str': K_STR,
+    'str_bytes': K_ARRAY,
+}
+METHOD_KINDS = {
+    'len': K_INT, 'index_of': K_INT, 'count': K_INT, 'to_int': K_INT, 'to_float': K_FLOAT,
+    'is_empty': K_BOOL, 'contains': K_BOOL, 'starts_with': K_BOOL, 'ends_with': K_BOOL, 'has': K_BOOL,
+    'eq': K_BOOL, 'is_some': K_BOOL, 'is_none': K_BOOL, 'is_ok': K_BOOL, 'is_err': K_BOOL,
+    'to_upper': K_STR, 'to_lower': K_STR, 'trim': K_STR, 'repeat': K_STR, 'replace': K_STR,
+    'join': K_STR, 'to_string': K_STR, 'split': K_ARRAY, 'keys': K_ARRAY, 'values': K_ARRAY,
+    'slice': K_STR | K_ARRAY, 'copy': K_ARRAY | K_MAP,
+    # written in TIL (the prelude): their results are the prelude functions' return kinds
+    'map': 0, 'filter': 0, 'reduce': 0, 'each': 0, 'any': 0, 'all': 0,
+}
+CAST_RESULT = {til.CAST_KINDS['int']: K_INT, til.CAST_KINDS['float']: K_FLOAT, til.CAST_KINDS['str']: K_STR,
+               til.CAST_KINDS['bool']: K_BOOL}
+
+
+def kind_names(k: int) -> str:
+    names = [n for bit, n in ((K_NIL, "nil"), (K_BOOL, "bool"), (K_INT, "int"), (K_FLOAT, "float"),
+                              (K_STR, "str"), (K_ARRAY, "array"), (K_MAP, "map"), (K_OTHER, "other"))
+             if k & bit]
+    return "any" if k == K_ANY else "/".join(names) or "none"
+
+
+def arith_kinds(op: int, a: int, b: int) -> int:
+    """What a + b, a * b, ... may give (the C VM's arith(); errors give nothing)."""
+    r = 0
+    if a & K_INT and b & K_INT:
+        r |= K_INT
+    if a & K_NUM and b & K_NUM and (a | b) & K_FLOAT:
+        r |= K_FLOAT
+    if op == _O.ADD:
+        if a and b and (a | b) & K_STR:
+            r |= K_STR                  # str + anything converts the other side
+        if a & K_ARRAY and b & K_ARRAY:
+            r |= K_ARRAY
+    elif op == _O.MUL and a & K_STR and b & K_INT:
+        r |= K_STR
+    return r
+
+
+class _KindsUnknown(Exception):
+    pass
+
+
+class KindFacts:
+    """Results of the value-kind analysis (keys: (function, pc))."""
+
+    def __init__(self):
+        self.binop: Dict[Tuple[int, int], Tuple[int, int, int]] = {}   # ADD/MUL: (left, right, result)
+        self.map_keys: Dict[Tuple[int, int], List[int]] = {}            # NEW_MAP n > 0: kinds of the keys
+        self.iter_arg: Dict[Tuple[int, int], int] = {}                  # NATIVE iter: its argument
+        self.params: Dict[int, List[int]] = {}
+        self.returns: Dict[int, int] = {}
+        self.globals: List[int] = []
+
+
+class _KindState:
+    def __init__(self, an: 'Analysis'):
+        m = an.module
+        self.params = {f: [0] * m.funcs[f].n_params for f in an.reachable}
+        self.rets = {f: 0 for f in an.reachable}
+        self.glob = [K_NIL] * an.n_globals
+        self.fields: Dict[str, int] = {}       # struct fields by name (any struct type)
+        self.changed = False
+
+    def param(self, g: int, values: List[int], first: int = 0):
+        ps = self.params.get(g)
+        if ps is None:
+            return
+        for i, k in enumerate(values):
+            if first + i < len(ps) and k & ~ps[first + i]:
+                ps[first + i] |= k
+                self.changed = True
+
+    def ret(self, f: int, k: int):
+        if k & ~self.rets[f]:
+            self.rets[f] |= k
+            self.changed = True
+
+    def field(self, name: str, k: int):
+        old = self.fields.get(name, 0)
+        if k & ~old:
+            self.fields[name] = old | k
+            self.changed = True
+
+    def store_global(self, g: int, k: int):
+        if 0 <= g < len(self.glob) and k & ~self.glob[g]:
+            self.glob[g] |= k
+            self.changed = True
+
+
+def infer_kinds(an: 'Analysis', max_rounds: int = 200) -> Optional[KindFacts]:
+    """The value kinds of a completely analysed program (None when it is incomplete or
+    the analysis does not settle: every check then assumes any kind)."""
+    if not an.complete:
+        return None
+    callbacks: Dict[int, Set[int]] = {}        # prelude function -> functions passed to it
+    for f in an.reachable:
+        for s in an.facts(f).calls:
+            for g, p in s.via:
+                callbacks.setdefault(p, set()).add(g)
+    st = _KindState(an)
+    out = KindFacts()
+    try:
+        for _round in range(max_rounds):
+            st.changed = False
+            for f in an.reachable:
+                _function_kinds(an, f, st, out, callbacks)
+            if not st.changed:
+                out.params, out.returns, out.globals = st.params, st.rets, st.glob
+                return out
+    except _KindsUnknown:
+        pass
+    return None
+
+
+def _function_kinds(an: 'Analysis', f: int, st: _KindState, out: KindFacts, callbacks: Dict[int, Set[int]]):
+    """One pass over a function (locals flow-sensitive: a store replaces the kinds)."""
+    ff = an.facts(f)
+    consts, types = an.module.consts, an.module.types
+    sites = {s.pc: s for s in ff.calls}
+    params = st.params[f]
+    entry_locals = tuple(params) + (K_NIL,) * max(0, ff.n_locals - len(params))
+    states: Dict[int, Tuple[Tuple[int, ...], Tuple[int, ...]]] = {ff.start: ((), entry_locals)}
+    work = [ff.start]
+    steps = 0
+    while work:
+        steps += 1
+        if steps > 64 * len(ff.code) + 64:
+            raise _KindsUnknown()
+        pc = work.pop()
+        stack, loc = states[pc]
+        stk = list(stack)
+        op, args, nxt = ff.code[pc]
+        eff = STACK_EFFECTS[op]
+        pops = _value(eff.pops, args)
+        if len(stk) < pops:
+            raise _KindsUnknown()
+        popped = stk[len(stk) - pops:] if pops else []
+        del stk[len(stk) - pops:]
+        push: List[int] = []
+        if op in (_O.PUSH_I8, _O.PUSH_I16):
+            push = [K_INT]
+        elif op in (_O.PUSH_TRUE, _O.PUSH_FALSE):
+            push = [K_BOOL]
+        elif op == _O.PUSH_NIL:
+            push = [K_NIL]
+        elif op == _O.PUSH_CONST:
+            c = consts[args[0]] if args[0] < len(consts) else None
+            push = [K_STR if isinstance(c, bytes) else K_FLOAT if isinstance(c, float) else
+                    K_BOOL if isinstance(c, bool) else K_INT if isinstance(c, int) else K_ANY]
+        elif op in (_O.DUP, _O.DUP2):
+            push = popped * 2
+        elif op == _O.SWAP:
+            push = popped[::-1]
+        elif op == _O.LOAD_LOCAL:
+            push = [loc[args[0]] if args[0] < len(loc) else K_ANY]
+        elif op == _O.STORE_LOCAL:
+            if args[0] < len(loc):
+                loc = loc[:args[0]] + (popped[0],) + loc[args[0] + 1:]
+        elif op == _O.LOAD_GLOBAL:
+            push = [st.glob[args[0]] if args[0] < len(st.glob) else K_ANY]
+        elif op == _O.STORE_GLOBAL:
+            st.store_global(args[0], popped[0])
+        elif _O.ADD <= op <= _O.POW:
+            r = arith_kinds(op, popped[0], popped[1])
+            if op in (_O.ADD, _O.MUL):
+                old = out.binop.get((f, pc))
+                out.binop[(f, pc)] = (popped[0], popped[1], r) if old is None else \
+                    (old[0] | popped[0], old[1] | popped[1], old[2] | r)
+            push = [r]
+        elif op == _O.NEG:
+            push = [popped[0] & K_NUM]
+        elif op in (_O.NOT, _O.EQ, _O.NE, _O.LT, _O.LE, _O.GT, _O.GE, _O.MATCH_TYPE, _O.IS_ARRAY_LEN):
+            push = [K_BOOL]
+        elif op in (_O.BAND, _O.BOR, _O.BXOR, _O.BNOT, _O.SHL, _O.SHR):
+            push = [K_INT | K_BOOL]
+        elif op == _O.CAST:
+            push = [CAST_RESULT.get(args[0], K_ANY)]
+        elif op == _O.NEW_ARRAY:
+            push = [K_ARRAY]
+        elif op == _O.NEW_MAP:
+            if args[0]:
+                keys = popped[0::2]
+                old = out.map_keys.get((f, pc))
+                out.map_keys[(f, pc)] = keys if old is None else [a | b for a, b in zip(old, keys)]
+            push = [K_MAP]
+        elif op == _O.NEW_STRUCT:           # structs come only from NEW_STRUCT: fields by name
+            names = types[args[0]][1] if args[0] < len(types) else []
+            for i, name in enumerate(names):
+                st.field(name, popped[i] if i < len(popped) else K_NIL)
+            push = [K_OTHER]
+        elif op == _O.SET_FIELD:
+            st.field(an.const_text(args[0]), popped[1])
+        elif op == _O.GET_FIELD:
+            push = [st.fields.get(an.const_text(args[0]), 0)]
+        elif op in (_O.MAKE_CLOSURE, _O.PUSH_FUNC):
+            push = [K_OTHER]
+        elif op == _O.CONCAT:
+            push = [K_STR]
+        elif op == _O.NATIVE:
+            name = til.NATIVES[args[0]] if args[0] < len(til.NATIVES) else ""
+            if name == 'iter':
+                out.iter_arg[(f, pc)] = out.iter_arg.get((f, pc), 0) | (popped[0] if popped else K_ANY)
+            push = [NATIVE_KINDS.get(name, K_ANY)]
+        elif op in (_O.CALL, _O.CALL_VALUE, _O.INVOKE):
+            push = [_call_kinds(an, f, sites.get(pc), popped, st, callbacks)]
+        elif op == _O.RETURN:
+            st.ret(f, popped[0])
+        elif op == _O.RETURN_NIL:
+            st.ret(f, K_NIL)
+        elif op == _O.UNWRAP_OR_RETURN:
+            st.ret(f, K_NIL | K_OTHER)              # None / Err(...) returned as it is
+            push = [K_ANY]
+        else:                                       # cells, upvalues, fields, items, ...
+            push = [K_ANY] * _value(eff.pushes, args)
+        if len(push) != _value(eff.pushes, args):
+            raise _KindsUnknown()
+        after = tuple(stk + push)
+        flow = eff.flow
+        if flow == NEXT:
+            succ = [(nxt, after)]
+        elif flow == JUMP:
+            succ = [(_flow_target(args, nxt), after)]
+        elif flow in (BRANCH, DEFAULT):
+            succ = [(nxt, after), (_flow_target(args, nxt), after)]
+        elif flow == ITER:
+            succ = [(nxt, after), (_flow_target(args, nxt), tuple(stk))]
+        elif flow == TRY:
+            succ = [(nxt, after), (_flow_target(args, nxt), after + (K_ANY,))]
+        else:
+            succ = []
+        for q, s2 in succ:
+            if q not in ff.code:
+                continue
+            old = states.get(q)
+            if old is None:
+                states[q] = (s2, loc)
+                work.append(q)
+                continue
+            if len(old[0]) != len(s2) or len(old[1]) != len(loc):
+                raise _KindsUnknown()
+            joined = (tuple(a | b for a, b in zip(old[0], s2)), tuple(a | b for a, b in zip(old[1], loc)))
+            if joined != old:
+                states[q] = joined
+                work.append(q)
+
+
+def _call_kinds(an: 'Analysis', f: int, site: Optional[CallSite], popped: List[int], st: _KindState,
+                callbacks: Dict[int, Set[int]]) -> int:
+    """Pass argument kinds to the callees of a call; the kinds its result may have."""
+    if site is None:
+        return K_ANY
+    result, known = 0, False
+    if site.op == _O.CALL_VALUE and site.callback:
+        for g in sorted(callbacks.get(f, ())):           # f(x) inside .map()/...
+            if an.arity_ok(g, site.args[0]):
+                st.param(g, popped[1:])
+                result |= st.rets.get(g, K_ANY)
+                known = True
+        return result if known else K_ANY
+    for g, c in site.targets:
+        known = True
+        st.param(g, popped[len(popped) - c:])          # the callee's parameters are the last c values
+        result |= st.rets.get(g, K_ANY)
+    if site.op == _O.INVOKE and site.args[1] != til.NO_METHOD:
+        result |= METHOD_KINDS.get(an.const_text(site.args[0]), K_ANY)
+        known = True
+    return result if known else K_ANY
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1144,6 +1779,11 @@ def _places(an: Analysis, sites: List[Tuple[int, int]], limit: int = 3) -> str:
     return ", ".join(out[:limit]) + (f" and {more} more" if more > 0 else "")
 
 
+def _count(n: int, noun: str) -> str:
+    """'1 call frame', '3 call frames'."""
+    return f"{n} {noun}{'' if n == 1 else 's'}"
+
+
 def _int_bits_needed(v: int) -> int:
     if -32768 <= v <= 32767:
         return 16
@@ -1153,14 +1793,103 @@ def _int_bits_needed(v: int) -> int:
 
 
 def recursion_levels(rec: Recursion, dev: Device) -> Tuple[int, str]:
-    """How many levels of a recursion fit the device, and which limit is hit first."""
-    limits = [(dev.frames - rec.frames_below - rec.top_frames + 2, "call frames")]
-    if rec.slots_per_level > 0:
-        limits.append(((dev.stack - rec.base - rec.top_need) // rec.slots_per_level + 1, "value stack"))
-    if rec.tries_per_level > 0:
-        limits.append(((dev.try_depth - rec.tries_below - rec.top_tries) // rec.tries_per_level + 1,
-                       "recovery points"))
-    return min(limits)
+    """How many levels of a recursion surely fit the device (every level taking its most
+    expensive way round), and which limit is hit first.  With k levels the device needs
+        base + (k - 1) * slots_per_level + top_need             value-stack slots
+        frames_below - 1 + (k - 1) * frames_per_level + top_frames   call frames
+        tries_below + (k - 1) * tries_per_level + top_tries     recovery points
+    for every function the recursion is entered by."""
+    best: Optional[Tuple[int, str]] = None
+    for en in rec.entries:
+        limits = [((dev.frames - en['frames_below'] + 1 - en['top_frames']) // rec.frames_per_level + 1,
+                   "call frames")]
+        if rec.slots_per_level > 0:
+            limits.append(((dev.stack - en['base'] - en['top_need']) // rec.slots_per_level + 1, "value stack"))
+        if rec.tries_per_level > 0:
+            limits.append(((dev.try_depth - en['tries_below'] - en['top_tries']) // rec.tries_per_level + 1,
+                           "recovery points"))
+        cur = min(limits)
+        if best is None or cur < best:
+            best = cur
+    assert best is not None
+    return best
+
+
+def lean_array_concat(an: Analysis) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
+    """+ that joins two arrays (tv_array_concat is not in TILVM_LEAN): (sure, maybe).
+    Sure: one operand is always an array, so the + only works as a concatenation."""
+    sure: List[Tuple[int, int]] = []
+    maybe: List[Tuple[int, int]] = []
+    if an.kinds is None:
+        return sure, maybe
+    for (f, pc), (a, b, _r) in sorted(an.kinds.binop.items()):
+        if an.facts(f).code[pc][0] == _O.ADD and a & K_ARRAY and b & K_ARRAY:
+            (sure if K_ARRAY in (a, b) else maybe).append((f, pc))
+    return sure, maybe
+
+
+def _key_value(an: Analysis, ins) -> Optional[Tuple[Any, ...]]:
+    """A constant map key as the full VM compares it (2.0 == 2), or None."""
+    op, args, _nxt = ins
+    if op == _O.PUSH_NIL:
+        return ('nil',)
+    v = _push_value(an, ins)
+    if isinstance(v, bool):
+        return ('bool', v)
+    if isinstance(v, (int, float)):
+        return ('num', v)
+    if isinstance(v, bytes):
+        return ('str', v)
+    return None
+
+
+def lean_map_literals(an: Analysis) -> List[Tuple[bool, str, str]]:
+    """Map literals that a lean VM builds differently: it leaves out map_literal_fixup,
+    so repeated keys stay (len() and printing differ), 2.0 stays a float key, and keys
+    the full VM rejects (arrays, maps, structs) are accepted.  (sure, text, reason)."""
+    out: List[Tuple[bool, str, str]] = []
+    if an.kinds is None:
+        return out
+    for (f, pc), kinds in sorted(an.kinds.map_keys.items()):
+        ff = an.facts(f)
+        n = ff.code[pc][1][0]
+        keys = []
+        for i in range(n):
+            q = _producer(ff.code, ff.prev_of, ff.jump_targets, pc, 2 * (n - 1 - i) + 1)
+            keys.append(_key_value(an, ff.code[q]) if q is not None else None)
+        where = an.where(f, pc)
+        known = [k for k in keys if k is not None]
+        repeated = sorted({_show_key(k) for k in known if known.count(k) > 1})
+        floats = sorted({_show_key(k) for k in known if k[0] == 'num' and isinstance(k[1], float)
+                         and k[1] == int(k[1])})
+        if repeated:
+            out.append((True, f"the map literal at {where} repeats the key {', '.join(repeated)}: the lean VM keeps "
+                              f"every entry (the full VM keeps the last one), so len() and the output differ",
+                        "repeated keys in a map literal (the lean VM keeps them)"))
+        if floats:
+            out.append((True, f"the map literal at {where} has the key {', '.join(floats)}: the lean VM keeps it a "
+                              f"float key (the full VM turns it into an integer), so the output differs",
+                        "float keys in a map literal (the lean VM keeps them)"))
+        computed = [kinds[i] for i in range(n) if keys[i] is None]
+        risks = []
+        if computed and n > 1:
+            risks.append("if two keys are equal it keeps both entries")
+        if any(k & K_FLOAT for k in computed):
+            risks.append("it keeps float keys like 2.0 as floats")
+        if any(k & (K_ARRAY | K_MAP | K_OTHER) for k in computed):
+            risks.append("it accepts arrays, maps and structs as keys (the full VM stops)")
+        if risks:
+            out.append((False, f"the map literal at {where} has computed keys; unlike the full VM the lean VM does not "
+                               f"check them: {'; '.join(risks)}", ""))
+    return out
+
+
+def _show_key(k: Tuple[Any, ...]) -> str:
+    if k[0] == 'str':
+        return '"' + k[1].decode('utf-8', 'replace') + '"'
+    if k[0] == 'nil':
+        return "nil"
+    return str(k[1]).lower() if k[0] == 'bool' else repr(k[1])
 
 
 def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
@@ -1273,8 +2002,12 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
     if dev.no_math:
         names = [n for n in MATH_NATIVES if n in natives]
         if names:
-            r.error(f"{', '.join(n + '()' for n in names)} need <math.h>; this device's VM is built with "
-                    f"TILVM_NO_MATH", f"{', '.join(n + '()' for n in names)} (no math library)")
+            listed = ", ".join(n + "()" for n in names)
+            r.error(f"{listed} {'needs' if len(names) == 1 else 'need'} <math.h>; this device's VM is built "
+                    f"with TILVM_NO_MATH", f"{listed} (no math library)")
+        if dev.float and ('pow' in natives or any(_O.POW in ff.ops for ff in facts)):
+            r.warn("x ** y and pow() compute integer powers only on this device (TILVM_NO_MATH): a "
+                   "fractional exponent gives 0")
 
     # ── builtins left out of lean builds ────────────────────────────────────
     missing, partly = [], []
@@ -1291,6 +2024,9 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
                 missing.append((f".{name}()", methods[name]))
             else:
                 partly.append((name, lacks, methods[name], user))
+    concat_sure, concat_maybe = lean_array_concat(an) if dev.lean else ([], [])
+    if concat_sure:
+        missing.append(("array + array", concat_sure))
     label = (f"{len(natives)} native{'s' if len(natives) != 1 else ''}, "
              f"{len(methods)} method{'s' if len(methods) != 1 else ''}") + ("" if an.complete else " (incomplete)")
     r.row('builtins', "builtins", label, "lean" if dev.lean else "full",
@@ -1299,7 +2035,17 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
     if missing:
         r.error("the lean VM of this device leaves out " +
                 "; ".join(f"{n} ({_places(an, s, 2)})" for n, s in missing) +
-                " - calling them stops the program", "not in the lean VM: " + ", ".join(n for n, _s in missing))
+                " - using them stops the program", "not in the lean VM: " + ", ".join(n for n, _s in missing))
+    if concat_maybe:
+        r.warn(f"+ at {_places(an, concat_maybe, 3)} may join two arrays (the operand types depend on the "
+               f"data); the lean VM has no array concatenation: it stops with \"unsupported operand types "
+               f"for +: array and array\"")
+    if dev.lean:
+        for sure, text, reason in lean_map_literals(an):
+            if sure:
+                r.error(text, reason)
+            else:
+                r.warn(text)
     for name, lacks, sites, user in partly:
         extra = " (fine when it is your own struct's method)" if user else ""
         r.warn(f".{name}() ({_places(an, sites, 2)}) is not available for {' or '.join(lacks)} values "
@@ -1328,6 +2074,13 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
                    f"({_places(an, [s for n in fs for s in natives[n]], 2)})")
         if 'input' in natives and not dev.console:
             r.warn("input() returns an empty string: the device has no text input")
+        if 'args' in natives:
+            if dev.args:
+                r.warn(f"args() puts every program argument on the value stack before building the array: "
+                       f"one free slot per argument ({_places(an, natives['args'], 2)}; the numbers above count "
+                       f"{_count(an.n_args, 'argument')})")
+            else:
+                r.notes.append("args() returns an empty array on this device (no command line)")
     if not dev.clock:
         if any(ff.timeouts for ff in facts):
             r.warn("timeout(ms) counts VM steps on this device (no clock: 1 ms = 1000 steps)")
@@ -1344,21 +2097,22 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
         r.error("cannot verify the stack use: analysis incomplete: " + "; ".join(probs[:3]),
                 "analysis incomplete (" + probs[0] + ")")
     else:
-        rec_note = ""
+        notes = {'stack': "", 'frames': "", 'try': ""}
         if an.recursions:
             per = max(rc.slots_per_level for rc in an.recursions)
-            rec_note = f"+{per} per recursion level" if per else "recursion"
+            notes['stack'] = f"+{per} per recursion level" if per else "recursion"
+            notes['frames'] = f"+{max(rc.frames_per_level for rc in an.recursions)} per recursion level"
+            per = max(rc.tries_per_level for rc in an.recursions)
+            notes['try'] = f"+{per} per recursion level" if per else ""
         chains = {'stack': an.worst_path(), 'frames': an.worst_path(an.func_frames)}
         for key, label, need, limit, unit, what in (
                 ('stack', "value stack", an.slots_need, dev.stack, "slots", "value-stack slots"),
                 ('frames', "call frames", an.frames, dev.frames, "", "call frames"),
                 ('try', "recovery points", an.tries, dev.try_depth, "", "nested retry/timeout/intent blocks")):
             ok = need <= limit
-            note = rec_note if key == 'stack' else ("+1 per recursion level" if key == 'frames' and an.recursions
-                                                    else "")
-            r.row(key, label, f"{need} {unit}".strip(), str(limit), "ok" if ok else "FAIL", note,
+            r.row(key, label, f"{need} {unit}".strip(), str(limit), "ok" if ok else "FAIL", notes[key],
                   need_value=need, limit_value=limit)
-            path = [an.display_name(f) for f in chains.get(key, [])]
+            path = chains.get(key, [])
             if len(path) > 8:
                 path = path[:3] + [f"... {len(path) - 6} more ..."] + path[-3:]
             chain = f" (deepest call chain: {' -> '.join(path)})" if len(path) > 2 else ""
@@ -1373,18 +2127,27 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
             who = (f"{names[0]} calls itself" if len(names) == 1 else
                    f"{', '.join(names)} call each other")
             at = an.where(*rec.call_pc) if rec.call_pc else names[0]
-            cost = (f"{rec.slots_per_level} value-stack slot{'s' if rec.slots_per_level != 1 else ''} and "
-                    if rec.slots_per_level else "")
-            r.recursion.append({'functions': names, 'at': at, 'slots_per_level': rec.slots_per_level,
-                                'frames_per_level': 1, 'tries_per_level': rec.tries_per_level,
-                                'levels': max(levels, 0), 'limited_by': limiter})
+            cycle = an.cycle_text(rec)
+            costs = [_count(rec.slots_per_level, "value-stack slot") if rec.slots_per_level else "",
+                     _count(rec.frames_per_level, "call frame"),
+                     _count(rec.tries_per_level, "recovery point") if rec.tries_per_level else ""]
+            costs = [c for c in costs if c]
+            cost = ", ".join(costs[:-1]) + " and " + costs[-1] if len(costs) > 1 else costs[0]
+            r.recursion.append({'functions': names, 'at': at, 'unit': rec.unit, 'cycle': cycle,
+                                'slots_per_level': rec.slots_per_level, 'frames_per_level': rec.frames_per_level,
+                                'tries_per_level': rec.tries_per_level, 'levels': max(levels, 0),
+                                'limited_by': limiter})
             if levels < 2:
-                r.error(f"recursion: {who} ({at}) - not even two levels fit the {limiter} of this device",
+                r.error(f"recursion: {who} ({at}) - not even two {rec.unit} fit the {limiter} of this device",
                         f"recursion in {names[0]} does not fit")
-            else:
-                r.warn(f"recursion: {who} ({at}); the depth depends on the input. Each level needs "
-                       f"{cost}1 call frame: at most {levels} levels fit on this device "
+            elif rec.unit == 'calls':
+                r.warn(f"recursion: {who} ({at}) in more than one cycle; the depth depends on the input. "
+                       f"Each call needs at most {cost}: {levels} nested calls fit on this device "
                        f"(limited by {limiter})")
+            else:
+                shown = f" ({cycle})" if len(rec.cycle) > 1 or any(e.via is not None for _c, e in rec.cycle) else ""
+                r.warn(f"recursion: {who} ({at}); the depth depends on the input. Each level{shown} needs "
+                       f"{cost}: {levels} levels fit on this device (limited by {limiter})")
         dd: Dict[str, List[Tuple[int, int]]] = {}
         for ff in facts:
             for pc, text in ff.data_dependent:
@@ -1431,9 +2194,9 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
         places = ", ".join(an.where(f, head) for f, head, _k, _g in temporary[:3])
         more = f" and {len(temporary) - 3} more" if len(temporary) > 3 else ""
         kinds = sorted({k for _f, _h, ks, _g in temporary for k in ks})
-        r.notes.append(f"{len(temporary)} loop{'s' if len(temporary) != 1 else ''} allocate temporary "
-                       f"objects on every pass ({', '.join(kinds)}) at {places}{more}; the garbage "
-                       f"collector reclaims them")
+        verb = "allocates" if len(temporary) == 1 else "allocate"
+        r.notes.append(f"{_count(len(temporary), 'loop')} {verb} temporary objects on every pass "
+                       f"({', '.join(kinds)}) at {places}{more}; the garbage collector reclaims them")
     return r
 
 
@@ -1447,19 +2210,26 @@ LOAD_ERRORS = {
     -5: "malformed bytecode", -6: "an integer constant is too large for this VM",
     -7: "too many struct types for this VM", -8: "too many globals for the value stack",
 }
-# runtime errors that come from the device's limits or build (not from the program's logic)
-DEVICE_ERRORS = ("out of memory", "stack overflow", "too many nested retry/timeout blocks",
-                 "range too large", "array too large", "string too long", "is not available",
-                 "built without floating point", "need a build with <math.h>", "no method '")
+# runtime errors that come from the VM's limits: the program needs more than the device's
+# VM offers (also when the desktop VM runs out too - then it needs more than any VM offers)
+RESOURCE_ERRORS = ("out of memory", "stack overflow", "too many nested retry/timeout blocks",
+                   "range too large", "array too large", "string too long")
+# runtime errors that come from the device's VM build (lean, no floats, no math library)
+BUILD_ERRORS = ("is not available", "built without floating point", "need a build with <math.h>", "no method '")
+DEVICE_ERRORS = RESOURCE_ERRORS + BUILD_ERRORS
 
 
 def _cache_dir() -> str:
-    cache = os.environ.get('TIL_FIT_CACHE') or os.path.join(os.path.expanduser('~'), '.til', 'cache')
-    try:
-        os.makedirs(cache, exist_ok=True)
-        return cache
-    except OSError:
-        return tempfile.gettempdir()
+    """$TIL_FIT_CACHE, else a directory only this user can write to (til.user_cache_dir):
+    the cached device VMs are executed, so never a shared, predictable place."""
+    cache = os.environ.get('TIL_FIT_CACHE')
+    if cache:
+        try:
+            os.makedirs(cache, exist_ok=True)
+            return cache
+        except OSError:
+            pass
+    return til.user_cache_dir()
 
 
 VM_OPT = '-O2'      # optimization of the device VM builds (part of the cache key)
@@ -1535,14 +2305,15 @@ def run_on_device(dev: Device, data: bytes, prog_args: List[str], max_steps: int
     exe, err = build_device_vm(dev, verbose)
     if exe is None:
         raise RuntimeError(err)
-    desktop = til._cvm_binary(verbose) if compare else None
+    desktop = build_device_vm(DEVICES['desktop'], verbose)[0] if compare else None
     fd, tbc = tempfile.mkstemp(suffix='.tbc')
     try:
         with os.fdopen(fd, 'wb') as f:
             f.write(data)
         out = _exec_vm(exe, tbc, prog_args, max_steps, stdin_data, timeout, True)
+        # nothing to compare after a device run that timed out (and it would take as long again)
         out['desktop'] = (_exec_vm(desktop, tbc, prog_args, max_steps, stdin_data, timeout, False)
-                          if desktop else None)
+                          if desktop and not out['timeout'] else None)
     finally:
         os.unlink(tbc)
     return out
@@ -1580,10 +2351,15 @@ def apply_run(r: Report, run: Dict[str, Any], compared: bool, why_not: str = "")
         err = None
     if err is not None:
         desk_err = desk.get('error') if desk else None
-        if desk is not None and desk_err == err:
-            r.warn(f"the program stops with \"{err}\" on the desktop VM too (not a device limit)")
-        elif any(p in err for p in DEVICE_ERRORS + ("killed by signal",)) or \
-                (desk is not None and desk_err is None):
+        same = desk is not None and desk_err == err
+        if any(p in err for p in RESOURCE_ERRORS + ("killed by signal",)):
+            too = (" (the desktop VM stops there too: the program needs more than any VM build offers)"
+                   if same else "")
+            r.error(f"the run on the device's VM stops with \"{err}\"{too}", f"run: {err}")
+        elif same:
+            r.warn(f"the program stops with \"{err}\" on the desktop VM too (the program's own error, "
+                   f"not a device limit)")
+        elif any(p in err for p in BUILD_ERRORS) or (desk is not None and desk_err is None):
             r.error(f"the run on the device's VM stops with \"{err}\"", f"run: {err}")
         else:
             r.warn(f"the run stops with \"{err}\"")
@@ -1593,8 +2369,11 @@ def apply_run(r: Report, run: Dict[str, Any], compared: bool, why_not: str = "")
             i = next((k for k in range(min(len(a), len(b))) if a[k] != b[k]), min(len(a), len(b)))
             dline = repr(a[i]) if i < len(a) else "(end)"
             wline = repr(b[i]) if i < len(b) else "(end)"
+            causes = [c for c, on in (("integer width", dev.int_bits < 64), ("float precision", dev.float == 1),
+                                      ("the lean VM", dev.lean)) if on]
+            why = (" or ".join(causes) + "?") if causes else "please report this"
             r.warn(f"the output differs from the desktop VM from line {i + 1} on: {dline} instead of "
-                   f"{wline} (integer width or float precision?)")
+                   f"{wline} ({why})")
     if not compared and why_not:
         r.notes.append(f"output not compared with the desktop VM ({why_not})")
     for key, stat, limit, label in (('stack', 'peak_stack', dev.stack, "value stack"),
@@ -1883,7 +2662,7 @@ def main(argv: List[str]) -> int:
         return 2
     try:
         data, saving = load_program(program, strip)
-        an = Analysis(data, program)
+        an = Analysis(data, program, n_args=len(prog_args) if want_run else 0)
     except (til.CompileError, SyntaxError) as e:
         print(str(e), file=sys.stderr)
         return 2

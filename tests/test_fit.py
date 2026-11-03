@@ -29,6 +29,7 @@ from tilhelpers import CC, ROOT, VM_DIR, cli, compile_vm, cvm_binary, needs_cc, 
 
 fit = til.feature_module('tilfit')
 slow = pytest.mark.skipif(not os.environ.get('TIL_TEST_SLOW'), reason="set TIL_TEST_SLOW=1")
+DEFAULT_VM_OPT = fit.VM_OPT          # what `til fit` uses (the fixture below speeds up in-process builds)
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -968,3 +969,509 @@ class TestBuildIntegration:
     def test_til_help_lists_fit(self):
         r = cli('--help')
         assert "fit ..." in r.stdout and "--device" in r.stdout
+
+
+# ═══════════════════════════════════════════════════════════════
+# REVIEW ROUND 1: regressions
+# ═══════════════════════════════════════════════════════════════
+
+def custom_device(tmp_path, name: str, **values) -> str:
+    """A device JSON file based on `values['base']`; returns its path."""
+    path = tmp_path / f"{name}.json"
+    path.write_text(json.dumps(dict(values, name=name)), encoding='utf-8')
+    return str(path)
+
+
+def run_tbc(exe: str, data: bytes, tmp_path, name: str = "p.tbc", args=()):
+    path = tmp_path / name
+    path.write_bytes(data)
+    return subprocess.run([exe, str(path), *args], capture_output=True, text=True, timeout=60)
+
+
+CONCAT = 'main()\n    var xs = []\n    for i in 0..N\n        xs = xs + [i]\n    print(len(xs), xs[N - 1])\n'
+
+
+@needs_cc
+class TestArrayConcatenation:
+    """Finding 1: array + used one value-stack slot per element in the C VM."""
+
+    def test_concat_needs_no_stack_for_its_elements(self, tmp_path):
+        # 200 elements on a VM with 160 stack slots (atmega1284): it ran out of stack before
+        data = compile_vm(CONCAT.replace('N', '200')).serialize()
+        an = fit.Analysis(data, "<concat>")
+        r, peak = measure(data, tmp_path, device_vm('atmega1284'))
+        assert r.returncode == 0 and r.stdout == "200\n199\n", r.stderr
+        assert peak['stack'] == an.slots_occ                    # exact: + is constant stack use now
+        b = compile_vm('main()\n    let a = [1, 2, 3]\n    let b = [4, 5]\n    print(a + b)\n').serialize()
+        _r, peak = measure(b, tmp_path, device_vm('atmega1284'))
+        assert peak['stack'] == fit.Analysis(b, "<b>").slots_occ
+
+    def test_both_vms_agree(self, tmp_path):
+        src = ('main()\n    var a = [1, [2, 3], "s"]\n    let b = a + a + [] + ["z"]\n    b[1][0] = 9\n'
+               '    a = a + [4]\n    print(a, b, len(b), [] + [], [[1]] + [[2]])\n'
+               '    var big = []\n    for i in 0..100\n        big = big + [i, i * 2]\n'
+               '    print(len(big), big[199], big[0])\n')      # 200 elements, 160 stack slots
+        data = compile_vm(src).serialize()
+        rc, ref = run_vm(data)
+        assert rc == 0
+        for exe in (device_vm('atmega1284'), cvm_binary("gcstress"), cvm_binary()):
+            r = run_tbc(exe, data, tmp_path)
+            assert (r.returncode, r.stdout) == (0, ref), (exe, r.stderr)
+
+    def test_accumulating_loops_are_growing_allocations(self):
+        for src, kind in ((CONCAT.replace('N', '50'), "array built up with + at line 4"),
+                          ('main()\n    var s = ""\n    for i in 0..3000\n        s = s + "ab"\n    print(len(s))\n',
+                           "string built up with + at line 4"),
+                          ('main()\n    var s = ""\n    for i in 0..30\n        s += str(i)\n    print(s)\n',
+                           "string built up with + at line 4"),
+                          ('main()\n    var xs = [0]\n    for i in 0..5\n        xs = [i] + xs\n    print(xs)\n',
+                           "array built up with + at line 4"),
+                          ('struct Log\n    items: [int]\nimpl Log\n    add(self, x: int)\n'
+                           '        self.items = self.items + [x]\nmain()\n    var log = Log { items: [] }\n'
+                           '    for i in 0..3\n        log.add(i)\n    print(log.items)\n', None),
+                          ('main()\n    var s = "x"\n    while len(s) < 100\n        s = s * 2\n    print(len(s))\n',
+                           "string built up with * at line 4")):
+            r = report(src, 'atmega1284')
+            texts = [w.text for w in r.warnings]
+            if kind is None:      # in a method called from the loop: not a loop allocation site
+                assert not any("keeps allocating" in t for t in texts), texts
+                continue
+            assert any("keeps allocating" in t and kind in t for t in texts), (src, texts)
+            assert not any("temporary objects" in n for n in r.notes), r.notes
+        # temporaries: a new string per pass, nothing kept
+        r = report('main()\n    for i in 0..9\n        print("item " + str(i))\n', 'atmega1284')
+        assert any("1 loop allocates temporary objects on every pass (string)" in n for n in r.notes), r.notes
+        assert not any("keeps allocating" in w.text for w in r.warnings)
+        # numbers do not allocate
+        r = report('main()\n    var t = 0\n    for i in 0..9\n        t = t + i * 2\n    print(t)\n', 'atmega1284')
+        assert not r.notes or not any("temporary" in n for n in r.notes)
+
+    def test_reviewer_repro(self, tmp_path, capsys):
+        prog = write(tmp_path, CONCAT.replace('N', '200'))
+        rc, out, _ = fit_main(capsys, prog, '--device', 'atmega1284', '--run')
+        assert rc == 0 and "analysis bug" not in out and "stack overflow" not in out
+        assert "keeps allocating (array built up with +" in flat(out)
+        out_tbc = tmp_path / "c.tbc"
+        r = cli('build', '--target', 'vm', '--device', 'atmega1284', prog, '-o', str(out_tbc))
+        assert r.returncode == 0 and out_tbc.exists(), r.stderr
+        r = subprocess.run([device_vm('atmega1284'), str(out_tbc)], capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0 and r.stdout == "200\n199\n", r.stderr
+
+
+class TestValueKinds:
+    """The dataflow behind the type-dependent checks."""
+
+    def kinds_of(self, src):
+        an = analyze(src)
+        assert an.kinds is not None
+        return an, {an.where(f, pc): (fit.kind_names(a), fit.kind_names(b), fit.kind_names(r))
+                    for (f, pc), (a, b, r) in an.kinds.binop.items()}
+
+    def test_locals_params_returns_fields_globals(self):
+        src = ('struct P\n    x: float\n    y: float\nimpl P\n    norm(self) -> float\n'
+               '        return self.x * self.x + self.y * self.y\n'
+               'fib(n: int) -> int\n    if n < 2\n        return n\n    return fib(n - 1) + fib(n - 2)\n'
+               'var label = "n="\n'
+               'main()\n    let p = P { x: 3.0, y: 4.0 }\n    var xs = [1]\n    xs = xs + [2]\n'
+               '    print(label + str(fib(10)), p.norm(), xs)\n')
+        _an, k = self.kinds_of(src)
+        assert k['line 6 in P.norm'][2] == "float"
+        assert k['line 10 in fib'] == ("int", "int", "int")
+        assert k['line 15 in main'] == ("array", "array", "array")
+        assert k['line 16 in main'] == ("nil/str", "str", "str")      # globals start as nil
+
+    def test_lambdas_get_what_the_prelude_passes(self):
+        _an, k = self.kinds_of('main()\n    let xs = [[1], [2]]\n    print(xs.reduce(|a, b| a + b, []))\n')
+        a, b, r = k['line 3 in <lambda:3>']
+        assert "array" in a and b == "any" and "array" in r
+
+    def test_unknown_opcode_disables_kinds(self):
+        an = fit.Analysis(patched_tbc(0xB0), "<p>")
+        assert not an.complete and an.kinds is None
+
+
+class TestLeanDifferences:
+    """Finding 2: array + and map literals behave differently in TILVM_LEAN builds."""
+
+    @pytest.mark.parametrize("device", ['z80-16', 'arduino-mega'])
+    def test_array_concatenation_is_reported(self, device):
+        for src in ('main()\n    var xs = [1, 2]\n    xs = xs + [3]\n    print(xs)\n',
+                    'main()\n    var log = []\n    for i in 0..5\n        log += [i]\n    print(len(log))\n',
+                    'join(a, b)\n    return a + b\nmain()\n    print(join([1], [2]))\n'):
+            r = report(src, device)
+            assert not r.fits and "not in the lean VM: array + array" in r.verdict(), (src, r.verdict())
+            assert r.get_row('builtins')['status'] == "FAIL"
+            assert report(src, 'cortex-m3-64k').fits
+        # operand types only known at run time: a warning
+        r = report('main()\n    let m = [[1], [2]]\n    print(m[0] + m[1])\n', device)
+        assert r.fits and any("may join two arrays" in w.text for w in r.warnings)
+        # no false alarms for numbers, strings and struct fields
+        for src in ('fib(n: int) -> int\n    if n < 2\n        return n\n    return fib(n - 1) + fib(n - 2)\n'
+                    'print(fib(10))\n',
+                    'struct V\n    x: int\nimpl V\n    add(self, o: V) -> V\n        return V { x: self.x + o.x }\n'
+                    'main()\n    print(V { x: 1 }.add(V { x: 2 }).x, "a" + "b")\n'):
+            r = report(src, device)
+            assert r.fits and not any("join two arrays" in w.text for w in r.warnings), r.verdict()
+
+    @pytest.mark.parametrize("device", ['z80-16', 'arduino-mega'])
+    def test_map_literals(self, device):
+        r = report('main()\n    let m = {"a": 1, "b": 2, "a": 3}\n    print(len(m), m)\n', device)
+        assert not r.fits and "repeated keys in a map literal" in r.verdict()
+        assert any('repeats the key "a"' in e.text for e in r.errors)
+        r = report('main()\n    let m = {1: "x", 1.0: "y"}\n    print(m)\n', device.replace('z80-16', 'arduino-mega'))
+        assert not r.fits and "repeated keys" in r.verdict()
+        r = report('main()\n    let k = "a"\n    let j = "b"\n    let m = {k: 1, j: 2}\n    print(m)\n', device)
+        assert r.fits and any("computed keys" in w.text and "keeps both entries" in w.text for w in r.warnings)
+        r = report('main()\n    let m = {"a": 1, "b": 2}\n    print(m)\n', device)
+        assert r.fits and not r.warnings, [w.text for w in r.warnings]
+        assert report('main()\n    let m = {"a": 1, "a": 3}\n    print(m)\n', 'cortex-m3-64k').fits
+
+    def test_float_keys(self):
+        r = report('main()\n    let m = {2.0: "x"}\n    print(m)\n', 'arduino-mega')
+        assert not r.fits and "float keys in a map literal" in r.verdict()
+
+    @needs_cc
+    def test_the_lean_vm_really_differs(self, tmp_path):
+        """What the checks describe is what a TILVM_LEAN build does (update the checks
+        when the lean build gains these)."""
+        lean, full = device_vm('arduino-mega'), device_vm('cortex-m3-64k')
+        data = compile_vm('main()\n    print([1, 2] + [3])\n').serialize()
+        r = run_tbc(lean, data, tmp_path)
+        assert r.returncode == 1 and "unsupported operand types for +: array and array" in r.stderr
+        assert run_tbc(full, data, tmp_path).stdout == "[1, 2, 3]\n"
+        data = compile_vm('main()\n    let m = {"a": 1, "b": 2, "a": 3}\n    print(len(m))\n').serialize()
+        assert run_tbc(lean, data, tmp_path).stdout == "3\n"
+        assert run_tbc(full, data, tmp_path).stdout == "2\n"
+
+    def test_build_for_a_lean_device_fails(self, tmp_path):
+        prog = write(tmp_path, 'main()\n    var xs = [1, 2]\n    xs = xs + [3]\n    print(xs)\n')
+        out = tmp_path / "p.tbc"
+        r = cli('build', '--target', 'vm', '--device', 'z80-16', prog, '-o', str(out))
+        assert r.returncode == 1 and not out.exists() and "array + array" in r.stderr
+
+
+@needs_cc
+class TestRunVerdicts:
+    """Finding 3: device limits hit by the desktop VM too still mean "does not fit"."""
+
+    def test_out_of_memory_everywhere(self, tmp_path, capsys):
+        prog = write(tmp_path, 'var items = []\nfor i in 0..60000\n    items.push([i, i, i])\nprint(len(items))\n')
+        rc, out, _ = fit_main(capsys, prog, '--device', 'esp32', '--run', '--json')
+        data = json.loads(out)
+        assert rc == 1 and data['fits'] is False and data['run']['error'] == "out of memory"
+        assert data['run']['desktop']['error'] == "out of memory"
+        assert any("the desktop VM stops there too" in e for e in data['errors'])
+
+    def test_deep_recursion_everywhere(self, tmp_path, capsys):
+        prog = write(tmp_path, 'f(n: int) -> int\n    if n == 0\n        return 0\n    return 1 + f(n - 1)\n'
+                               'print(f(5000))\n')
+        rc, out, _ = fit_main(capsys, prog, '--device', 'z80-16', '--run')
+        assert rc == 1 and "verdict: does not fit: run: stack overflow (recursion too deep)" in out
+
+    def test_program_errors_stay_warnings(self, tmp_path, capsys):
+        prog = write(tmp_path, 'let xs = [1, 2, 3]\nprint(xs[5])\n')
+        rc, out, _ = fit_main(capsys, prog, '--device', 'cortex-m3-64k', '--run')
+        assert rc == 0 and "the program's own error" in flat(out)
+
+    def test_killed_by_signal(self, tmp_path):
+        r = fit.check(analyze('print(1)\n'), fit.DEVICES['esp32'])
+        fit.apply_run(r, {'exit_code': -9, 'stdout': '', 'errors': '', 'stats': {}, 'error': None,
+                          'timeout': False, 'desktop': None}, compared=False)
+        assert not r.fits and "run: the VM was killed by signal 9" in r.verdict()
+
+    @pytest.mark.skipif(sys.platform == 'win32', reason="POSIX signals")
+    def test_killed_by_signal_end_to_end(self, tmp_path):
+        fake = tmp_path / "fakevm"
+        fake.write_text("#!/bin/sh\nkill -9 $$\n")
+        fake.chmod(0o755)
+        tbc = tmp_path / "p.tbc"
+        tbc.write_bytes(tbc_bytes('print(1)\n'))
+        run = fit._exec_vm(str(fake), str(tbc), [], 0, b"", 30, True)
+        run['desktop'] = None
+        r = fit.check(analyze('print(1)\n'), fit.DEVICES['esp32'])
+        fit.apply_run(r, run, compared=False)
+        assert "killed by signal 9" in r.verdict()
+
+    def test_timeout_skips_the_desktop_run(self, monkeypatch):
+        calls = []
+
+        def fake_exec(exe, tbc, prog_args, max_steps, stdin_data, timeout, stats):
+            calls.append(exe)
+            return {'exit_code': None, 'stdout': '', 'errors': '', 'stats': {}, 'timeout': True}
+        monkeypatch.setattr(fit, '_exec_vm', fake_exec)
+        run = fit.run_on_device(fit.DEVICES['esp32'], tbc_bytes('print(1)\n'), [], timeout=0.5)
+        assert len(calls) == 1 and run['desktop'] is None
+        r = fit.check(analyze('print(1)\n'), fit.DEVICES['esp32'])
+        fit.apply_run(r, run, compared=True)
+        assert any("did not finish within the --timeout" in w.text for w in r.warnings)
+
+    @slow
+    def test_timeout_end_to_end(self, tmp_path, capsys):
+        import time
+        prog = write(tmp_path, 'var i = 0\nwhile true\n    i += 1\n')
+        device_vm('cortex-m3-64k'), device_vm('desktop')           # built and cached: time the run only
+        t0 = time.time()
+        rc, out, _ = fit_main(capsys, prog, '--device', 'cortex-m3-64k', '--run', '--timeout', '1')
+        assert rc == 0 and "did not finish within the --timeout" in flat(out)
+        assert time.time() - t0 < 1.9                # one timeout, not two
+
+    def test_stdin(self, tmp_path, capsys):
+        prog = write(tmp_path, 'let name = input("name? ")\nprint("hi " + name)\n')
+        text = tmp_path / "in.txt"
+        text.write_text("Aigerim\n")
+        rc, out, _ = fit_main(capsys, prog, '--device', 'esp32', '--run', '--stdin', str(text), '--show-output')
+        assert rc == 0 and out.startswith("name? hi Aigerim\n")
+        assert fit_main(capsys, prog, '--device', 'esp32', '--run', '--stdin', str(tmp_path / "none"))[0] == 2
+
+    def test_output_difference_names_the_likely_cause(self, tmp_path, capsys):
+        prog = write(tmp_path, 'var a = 300\nprint(a * a)\n')
+        rc, out, _ = fit_main(capsys, prog, '--device', 'arduino-mega', '--run')
+        assert "(integer width or float precision or the lean VM?)" in flat(out)
+
+    def test_live_data_warning(self, tmp_path, capsys):
+        dev = custom_device(tmp_path, "mega-1400", base="arduino-mega", heap=1400)
+        prog = write(tmp_path, 'main()\n    var keep = []\n    for k in 0..3\n        var row = []\n'
+                               '        for i in 0..33\n            row.push(i)\n        keep.push(row)\n'
+                               '    var t = 0\n    for j in 0..300\n        let s = f"{j}"\n        t += len(s)\n'
+                               '    print(len(keep), t)\n')
+        rc, out, _ = fit_main(capsys, prog, '--device', dev, '--run')
+        assert rc == 0 and "live data reached" in flat(out), out
+
+
+class TestArgs:
+    """Finding 4: args() puts every argument on the value stack."""
+
+    @needs_cc
+    def test_arguments_are_counted(self, tmp_path, capsys):
+        prog = write(tmp_path, 'main()\n    let a = args()\n    print(len(a))\n')
+        args = [str(i) for i in range(10)]
+        rc, out, _ = fit_main(capsys, prog, '--device', 'cortex-m3-64k', '--run', '--json', '--', *args)
+        data = json.loads(out)
+        assert rc == 0 and data['run']['stdout'] == "10\n"
+        assert data['run']['stats']['peak_stack'] == data['static']['stack_slots_written']
+        assert not any("analysis bug" in w for w in data['warnings'])
+        assert any("no command line" in n for n in data['notes'])
+
+    def test_devices_with_a_command_line_warn(self):
+        r = report('print(len(args()))\n', 'desktop')
+        assert any("args() puts every program argument" in w.text for w in r.warnings)
+        an = fit.Analysis(tbc_bytes('print(len(args()))\n'), "<a>", n_args=7)
+        assert an.slots_occ == analyze('print(len(args()))\n').slots_occ + 7
+        assert fit.DEVICES['nspire'].args and not fit.DEVICES['esp32'].args
+
+
+TREE = ('struct Node\n    v: int\n    kids: [Node]\ndepth(n: Node) -> int\n    let ds = n.kids.map(|k| depth(k))\n'
+        '    var best = 0\n    for d in ds\n        if d > best\n            best = d\n    return best + 1\n'
+        'build(d: int) -> Node\n    if d == 0\n        return Node { v: 0, kids: [] }\n'
+        '    return Node { v: d, kids: [build(d - 1)] }\nmain()\n    print(depth(build(DEPTH)))\n')
+MUTUAL = ('ev(n: int) -> bool\n    let a = n\n    let b = n\n    let c = n\n    let d = n\n    if n == 0\n'
+          '        return true\n    return od(n - 1)\n'
+          'od(n: int) -> bool\n    if n == 0\n        return false\n    return ev(n - 1)\nmain()\n    print(ev(N))\n')
+
+
+class TestRecursionLevels:
+    """Finding 5: a level is one way around the recursion (frames and slots summed)."""
+
+    def small_stack(self):
+        values = fit.DEVICES['desktop'].as_dict()
+        del values['name']
+        values.update(stack=300, heap=8192, title="small stack")
+        return fit.Device('small-stack', **values)
+
+    def test_recursion_through_map(self, tmp_path):
+        dev = fit.DEVICES['cortex-m3-64k']
+        r = fit.check(analyze(TREE.replace('DEPTH', '3')), dev)
+        rec = next(x for x in r.recursion if x['functions'][0] == 'depth')
+        assert rec['frames_per_level'] == 3 and rec['unit'] == 'levels'
+        assert rec['cycle'].startswith("depth -> .map() -> <lambda")
+        assert any("Each level (depth -> .map() -> <lambda" in w.text for w in r.warnings)
+        if fit.til.TILCompiler().find_c_compiler() is None:
+            return
+        levels = rec['levels']                 # a tree of `levels` levels surely fits
+        ok, _ = measure(compile_vm(TREE.replace('DEPTH', str(levels - 1))).serialize(), tmp_path,
+                        device_vm('cortex-m3-64k'))
+        bad, _ = measure(compile_vm(TREE.replace('DEPTH', str(levels + 1))).serialize(), tmp_path,
+                         device_vm('cortex-m3-64k'))
+        assert ok.returncode == 0, ok.stderr
+        assert bad.returncode == 1 and "recursion too deep" in bad.stderr
+
+    @needs_cc
+    def test_asymmetric_mutual_recursion_is_exact(self, tmp_path):
+        dev = self.small_stack()
+        rec = fit.check(analyze(MUTUAL.replace('N', '2')), dev).recursion[0]
+        assert (rec['slots_per_level'], rec['frames_per_level'], rec['cycle']) == (6, 2, "ev -> od -> ev")
+        exe, err = fit.build_device_vm(dev)
+        assert exe, err
+        levels = rec['levels']                 # ev(n) runs n // 2 + 1 levels
+        ok, _ = measure(compile_vm(MUTUAL.replace('N', str(2 * levels - 1))).serialize(), tmp_path, exe)
+        bad, _ = measure(compile_vm(MUTUAL.replace('N', str(2 * levels))).serialize(), tmp_path, exe)
+        assert ok.returncode == 0, ok.stderr
+        assert bad.returncode == 1 and "stack overflow" in bad.stderr
+
+    @needs_cc
+    def test_nested_map_is_not_recursion(self, tmp_path):
+        data = compile_vm('main()\n    let m = [[1, 2], [3, 4]]\n    let d = m.map(|row| row.map(|x| x * 2))\n'
+                          '    print(d)\n').serialize()
+        an = fit.Analysis(data, "<nest>")
+        assert not an.recursions and an.complete
+        _r, peak = measure(data, tmp_path)
+        assert (an.slots_occ, an.frames) == (peak['stack'], peak['frames'])
+
+    def test_cycles_that_avoid_the_entry_count_calls(self):
+        src = ('a(n: int) -> int\n    if n <= 0\n        return 0\n    return b(n - 1) + 1\n'
+               'b(n: int) -> int\n    if n % 2 == 0\n        return a(n)\n    return c(n - 1)\n'
+               'c(n: int) -> int\n    return b(n) + 1\nprint(a(9))\n')
+        r = report(src, 'cortex-m3-64k')
+        rec = r.recursion[0]
+        assert rec['unit'] == 'calls' and set(rec['functions']) == {'a', 'b', 'c'}
+        assert any("in more than one cycle" in w.text and "nested calls fit" in w.text for w in r.warnings)
+
+    def test_frames_row_shows_frames_per_level(self):
+        r = fit.check(analyze(TREE.replace('DEPTH', '3')), fit.DEVICES['cortex-m3-64k'])
+        assert r.get_row('frames')['note'] == "+3 per recursion level"
+
+
+class TestCliAndDevices:
+    def test_build_with_device_rejects_bytecode_input(self, tmp_path):
+        prog = write(tmp_path, 'print(chr(65) + "x".repeat(2))\n')
+        tbc = tmp_path / "p.tbc"
+        assert cli('build', '--target', 'vm', prog, '-o', str(tbc)).returncode == 0
+        out = tmp_path / "out.tbc"
+        r = cli('build', '--target', 'vm', '--device', 'z80-16', str(tbc), '-o', str(out))
+        assert r.returncode == 1 and "on a .til source" in r.stderr and not out.exists()
+        assert "Axx" not in r.stdout                            # the program did not run
+
+    def test_fit_help(self):
+        r = cli('fit', '--help')
+        assert r.returncode == 0 and r.stdout.startswith("usage: til fit")
+
+    def test_program_arguments_after_double_dash(self, tmp_path):
+        prog = write(tmp_path, 'print("ok")\n')
+        r = cli('fit', prog, '--device', 'esp32', '--', '--help')
+        assert r.returncode == 0 and "verdict: fits" in r.stdout
+
+    @pytest.mark.parametrize("values, message", [
+        ({"float": True}, "float must be a whole number"),
+        ({"int_bits": 16.0}, "int_bits must be a whole number"),
+        ({"lean": "no"}, "lean must be true or false"),
+        ({"heap": "4096"}, "heap must be a whole number"),
+        ({"title": 3}, "title must be a string"),
+        ({"base": "ti84ce", "float": 2}, "float 2 (double) is 32-bit with the ez80 toolchain"),
+        ({"base": 7}, "unknown base device"),
+        ({"name": 12}, "name must be a string"),
+    ])
+    def test_device_json_types(self, tmp_path, capsys, values, message):
+        dev = tmp_path / "d.json"
+        dev.write_text(json.dumps(dict({"base": "cortex-m3-64k"}, **values)))
+        prog = write(tmp_path, 'print(1.5)\n')
+        rc, _out, err = fit_main(capsys, prog, '--device', str(dev))
+        assert rc == 2 and message in err, err
+
+    def test_no_math(self, tmp_path, capsys):
+        dev = custom_device(tmp_path, "nomath", base="cortex-m3-64k", no_math=True)
+        prog = write(tmp_path, 'print(sin(1.0))\n')
+        rc, out, _ = fit_main(capsys, prog, '--device', dev)
+        assert rc == 1 and "sin() needs <math.h>" in flat(out) and "(no math library)" in out
+        prog = write(tmp_path, 'print(sin(1.0), cos(1.0))\n')
+        rc, out, _ = fit_main(capsys, prog, '--device', dev)
+        assert "sin(), cos() need <math.h>" in flat(out)
+        prog = write(tmp_path, 'let x = 2\nprint(x ** 0.5)\n')
+        rc, out, _ = fit_main(capsys, prog, '--device', dev)
+        assert rc == 0 and "integer powers only" in flat(out)
+
+    @needs_cc
+    def test_no_math_run(self, tmp_path, capsys):
+        dev = custom_device(tmp_path, "nomath", base="cortex-m3-64k", no_math=True)
+        prog = write(tmp_path, 'print(sin(1.0))\n')
+        rc, out, _ = fit_main(capsys, prog, '--device', dev, '--run')
+        assert rc == 1 and "need a build with <math.h>" in out
+
+    def test_device_service_warnings(self, tmp_path):
+        r = report('print(input("x? "))\n', 'cortex-m3-64k')
+        assert any("input() returns an empty string" in w.text for w in r.warnings)
+        dev = fit.load_device(custom_device(tmp_path, "nofloat", base="cortex-m3-64k", float=0))
+        r = fit.check(analyze('print(random())\n'), dev)
+        assert any("random() returns an integer 0..32767" in w.text for w in r.warnings)
+
+    def test_little_room_left(self):
+        src = 'main()\n    let a = [' + ", ".join("0" for _ in range(130)) + ']\n    print(len(a))\n'
+        r = report(src, 'atmega1284')
+        assert r.fits and any("little room left" in w.text and "value-stack slots" in w.text for w in r.warnings)
+
+    def test_unknown_builtin(self):
+        data = bytearray(tbc_bytes('print(len("ab"))\n'))
+        mod = til.TBCModule.from_bytes(bytes(data))
+        code_start = len(data) - 2 - 6 * len(mod.lines) - len(mod.code)
+        at = code_start + bytes(mod.code).index(bytes([til.Op.NATIVE, til.NATIVES.index('len')]))
+        data[at + 1] = 99
+        r = fit.check(fit.Analysis(bytes(data), "<p>"), fit.DEVICES['desktop'])
+        assert any("unknown builtins (native#99)" in w.text for w in r.warnings)
+
+    def test_grammar(self):
+        r = report('main()\n    for i in 0..3\n        print(f"i = {i}")\n', 'cortex-m3-64k')
+        assert any(n.startswith("1 loop allocates temporary objects") for n in r.notes), r.notes
+
+
+@needs_cc
+class TestPackedBigHeap:
+    """Finding 8: TILVM_PACK with a heap above 64 KB (eZ80 custom devices)."""
+
+    def test_no_misaligned_headers(self, tmp_path):
+        exe = str(tmp_path / "bigpack")
+        r = subprocess.run([CC, '-std=c99', '-g', '-O1', '-fsanitize=undefined', '-fno-sanitize-recover=undefined',
+                            '-DTILVM_STATS', '-DTILVM_PACK', '-DTILVM_INT_BITS=32', '-DTILVM_FLOAT=1',
+                            '-DTILVM_HEAP_SIZE=100000', '-o', exe, os.path.join(VM_DIR, 'tilvm.c'),
+                            os.path.join(VM_DIR, 'main.c'), '-lm'], capture_output=True, text=True)
+        if r.returncode != 0:
+            pytest.skip("no UBSan runtime: " + r.stderr[-200:])
+        for name in ('structs', 'closures', 'maps', 'strings'):
+            res = run_tbc(exe, compile_vm(CORPUS[name]).serialize(), tmp_path)
+            assert res.returncode == 0 and "runtime error" not in res.stderr, (name, res.stderr)
+
+    def test_custom_ez80_device_runs(self, tmp_path, capsys):
+        dev = custom_device(tmp_path, "ce-big", base="ti84ce", heap=100000, ram=262144)
+        prog = write(tmp_path, CORPUS['structs'])
+        rc, out, _ = fit_main(capsys, prog, '--device', dev, '--run')
+        assert rc == 0 and "verdict: fits" in out, out
+
+
+class TestCacheDirectory:
+    """Finding 10: cached VM executables never come from a shared, predictable place."""
+
+    @pytest.mark.skipif(not hasattr(os, 'getuid'), reason="POSIX ownership")
+    def test_private_fallback(self, tmp_path, monkeypatch):
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        monkeypatch.setenv('HOME', '/proc/nonexistent')
+        monkeypatch.delenv('TIL_FIT_CACHE', raising=False)
+        monkeypatch.setattr(til.tempfile, 'tempdir', str(shared))
+        d = fit._cache_dir()
+        assert os.path.dirname(d) == str(shared) and os.stat(d).st_mode & 0o077 == 0
+        assert os.stat(d).st_uid == os.getuid()
+        # a directory with that name that others can write to is not used
+        os.chmod(d, 0o777)
+        d2 = til.user_cache_dir()
+        assert d2 != d and os.stat(d2).st_mode & 0o077 == 0
+
+    @pytest.mark.skipif(not hasattr(os, 'getuid'), reason="POSIX ownership")
+    @needs_cc
+    def test_planted_binary_is_not_run(self, tmp_path):
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        dev = fit.DEVICES['esp32']
+        cc = til.TILCompiler().find_c_compiler()
+        import hashlib
+        digest = hashlib.sha256((cc + ' ' + DEFAULT_VM_OPT + ' ' + ' '.join(fit.device_vm_flags(dev))).encode())
+        for n in ('tilvm.c', 'tilvm.h', 'main.c'):
+            digest.update(open(os.path.join(VM_DIR, n), 'rb').read())
+        planted = shared / f"tilvm-fit-esp32-{digest.hexdigest()[:16]}"
+        planted.write_text('#!/bin/sh\necho PLANTED >&2\nexit 0\n')
+        planted.chmod(0o755)
+        prog = write(tmp_path, 'print("hi")\n')
+        env = dict(os.environ, HOME='/proc/nonexistent', TMPDIR=str(shared))
+        env.pop('TIL_FIT_CACHE', None)
+        r = subprocess.run([sys.executable, os.path.join(ROOT, 'src', 'til.py'), 'fit', prog, '--device', 'esp32',
+                            '--run', '--json'], capture_output=True, text=True, env=env, timeout=300)
+        data = json.loads(r.stdout)
+        assert "PLANTED" not in data['run']['errors'] and data['run']['stdout'] == "hi\n"
+        assert os.path.isdir(shared / f"til-cache-{os.getuid()}")      # built in the private directory

@@ -89,7 +89,9 @@ enum {
 /* ─── heap objects ──────────────────────────────────────────────────────── */
 enum { OBJ_STR = 1, OBJ_ARRAY, OBJ_MAP, OBJ_VALS, OBJ_STRUCT, OBJ_CLOSURE, OBJ_CELL };
 
-typedef struct tv_hdr {
+/* TV_PACK (TILVM_PACK, desktop emulation of 8-bit layouts): objects are 2-byte aligned
+ * there, so headers with 32-bit sizes (heap > 64 KB) must be packed too. */
+typedef struct TV_PACK tv_hdr {
     uint8_t kind;
     uint8_t mark;
     uint16_t aux;       /* struct: type index; closure: upvalue count */
@@ -97,12 +99,12 @@ typedef struct tv_hdr {
     tv_ref fwd;         /* forwarding address while compacting */
 } tv_hdr;
 
-typedef struct { tv_hdr h; tv_size len; char data[1]; } tv_strobj;
-typedef struct { tv_hdr h; tv_size len; tv_ref buf; } tv_arrobj;     /* arrays and maps */
-typedef struct { tv_hdr h; tv_val v[1]; } tv_valsobj;               /* capacity = aux */
-typedef struct { tv_hdr h; tv_val v[1]; } tv_structobj;             /* fields */
-typedef struct { tv_hdr h; uint16_t func; tv_val v[1]; } tv_closobj;  /* upvalues (cells) */
-typedef struct { tv_hdr h; tv_val v; } tv_cellobj;
+typedef struct TV_PACK { tv_hdr h; tv_size len; char data[1]; } tv_strobj;
+typedef struct TV_PACK { tv_hdr h; tv_size len; tv_ref buf; } tv_arrobj;     /* arrays and maps */
+typedef struct TV_PACK { tv_hdr h; tv_val v[1]; } tv_valsobj;               /* capacity = aux */
+typedef struct TV_PACK { tv_hdr h; tv_val v[1]; } tv_structobj;             /* fields */
+typedef struct TV_PACK { tv_hdr h; uint16_t func; tv_val v[1]; } tv_closobj;  /* upvalues (cells) */
+typedef struct TV_PACK { tv_hdr h; tv_val v; } tv_cellobj;
 
 struct tv_align_probe { char c; tv_val v; };
 #define TV_ALIGN (offsetof(struct tv_align_probe, v) < 2 ? 2 : offsetof(struct tv_align_probe, v))
@@ -1120,19 +1122,27 @@ static int array_push(tilvm *vm, uint16_t arr_slot, uint16_t val_slot) {
 }
 
 #ifndef TILVM_LEAN
-static int tv_array_concat(tilvm *vm) {    /* [.., a, b] -> [.., a+b] */
+/* [.., a, b] -> [.., a+b].  The elements are copied heap to heap: no value-stack
+ * slots beyond a and b, whatever the lengths (til fit relies on this). */
+static int tv_array_concat(tilvm *vm) {
     uint32_t la = ARROBJ(vm, STK[SP - 2].u.r)->len, lb = ARROBJ(vm, STK[SP - 1].u.r)->len, i;
-    if (SP + 1 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
-    for (i = 0; i < la + lb; i++) {           /* push copies of all elements */
-        tv_val v;
-        if (SP >= TILVM_STACK_SIZE - 2) return fail(vm, "stack overflow");
-        v = i < la ? VALS(vm, ARROBJ(vm, STK[SP - 2 - i].u.r)->buf)[i]
-                   : VALS(vm, ARROBJ(vm, STK[SP - 1 - i].u.r)->buf)[i - la];
-        STK[SP++] = v;
+    tv_ref buf, arr;
+    buf = new_vals(vm, la + lb < 4 ? 4 : la + lb);     /* a and b stay rooted on the stack */
+    if (!buf) return 0;
+    {
+        tv_val *dst = VALS(vm, buf);
+        const tv_val *src = VALS(vm, ARROBJ(vm, STK[SP - 2].u.r)->buf);
+        for (i = 0; i < la; i++) dst[i] = src[i];
+        src = VALS(vm, ARROBJ(vm, STK[SP - 1].u.r)->buf);
+        for (i = 0; i < lb; i++) dst[la + i] = src[i];
     }
-    if (!make_array(vm, OBJ_ARRAY, la + lb)) return 0;
-    STK[SP - 3] = STK[SP - 1];
-    SP -= 2;
+    set_ref(&STK[SP - 1], TV_CELL, buf);      /* b is copied: the buffer now roots the elements */
+    arr = alloc_obj(vm, OBJ_ARRAY, sizeof(tv_arrobj));
+    if (!arr) return 0;
+    ARROBJ(vm, arr)->buf = STK[SP - 1].u.r;  /* re-read after a possible collection */
+    ARROBJ(vm, arr)->len = (tv_size)(la + lb);
+    set_ref(&STK[SP - 2], TV_ARRAY, arr);
+    SP--;
     return 1;
 }
 

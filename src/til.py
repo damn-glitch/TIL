@@ -9501,17 +9501,46 @@ Examples:
 
 # ── VM helpers ───────────────────────────────────────────────────────────────
 
+def user_cache_dir() -> str:
+    """A directory for cached VM executables that only this user can write to:
+    ~/.til/cache, else <temp>/til-cache-<uid> (created 0700, owner and mode checked),
+    else a new private temporary directory.  Cached executables are run, so they must
+    never come from a shared, predictable place another user could have planted."""
+    def private(path: str, forbidden: int) -> bool:
+        import stat
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        if not hasattr(os, 'getuid'):          # Windows: per-user profile and temp directories
+            return True
+        return st.st_uid == os.getuid() and not st.st_mode & forbidden
+    home = os.path.join(os.path.expanduser('~'), '.til', 'cache')
+    try:
+        os.makedirs(home, exist_ok=True)
+        if private(home, 0o002):
+            return home
+    except OSError:
+        pass
+    tmp = os.path.join(tempfile.gettempdir(), f"til-cache-{os.getuid() if hasattr(os, 'getuid') else 0}")
+    try:
+        os.mkdir(tmp, 0o700)
+    except OSError:
+        pass
+    if private(tmp, 0o077):
+        return tmp
+    return tempfile.mkdtemp(prefix='til-cache-')
+
+
 def _cvm_binary(verbose: bool = False) -> Optional[str]:
     """Build (once) and return the host C VM executable."""
     vm_dir = find_vm_sources()
     cc = TILCompiler().find_c_compiler()
     if vm_dir is None or cc is None:
         return None
-    cache = os.path.join(os.path.expanduser('~'), '.til', 'cache')
-    try:
-        os.makedirs(cache, exist_ok=True)
-    except OSError:
-        cache = tempfile.gettempdir()
+    cache = user_cache_dir()
     sources = [os.path.join(vm_dir, n) for n in ('tilvm.c', 'tilvm.h', 'main.c')]
     # one cached binary per VM source version (several checkouts can share ~/.til/cache)
     import hashlib
@@ -9777,6 +9806,9 @@ def run_repl():
 def main():
     args = sys.argv[1:]
 
+    if args and args[0] in EXTRA_COMMANDS:      # they parse their own options (--help, program args)
+        return run_extra_command(args[0], args[1:])
+
     if not args or '-h' in args or '--help' in args:
         print_help()
         return 0
@@ -9786,9 +9818,6 @@ def main():
         print("Author: Alisher Beisembekov")
         print("Backends: native (C via gcc/clang), TIL VM (bytecode: Python, C99 / calculators)")
         return 0
-
-    if args[0] in EXTRA_COMMANDS:
-        return run_extra_command(args[0], args[1:])
 
     command = None
     if args and args[0] in ('run', 'build', 'check', 'repl', 'exec', 'dis', 'translate'):
@@ -9881,9 +9910,10 @@ def main():
     if not os.path.exists(input_file):
         print(f"Error: File not found: {input_file}", file=sys.stderr)
         return 1
-    if opts.get('device') and (command != 'build' or target not in ('vm', 'tbc', 'c-vm', 'calc', 'embed')):
-        print("Error: --device works with `til build --target vm|c-vm`; for a report on any "
-              "program use `til fit FILE --device NAME`", file=sys.stderr)
+    if opts.get('device') and (command != 'build' or target not in ('vm', 'tbc', 'c-vm', 'calc', 'embed')
+                               or input_file.endswith('.tbc')):
+        print("Error: --device works with `til build --target vm|c-vm` on a .til source; for a report on "
+              "any program (also .tbc) use `til fit FILE --device NAME`", file=sys.stderr)
         return 1
 
     try:
