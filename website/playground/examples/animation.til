@@ -1,0 +1,26 @@
+# Animation: a bouncing ball, about 60 frames per second.
+# It runs until you press Stop - or click the screen and press Esc.
+
+screen_init(160, 120)
+var x = 30
+var y = 40
+var dx = 2
+var dy = 1
+var frames = 0
+loop
+    if key_pressed() == 27
+        break
+    x += dx
+    y += dy
+    if x < 8 or x > 151
+        dx = -dx
+    if y < 8 or y > 111
+        dy = -dy
+    screen_clear(0x0B1020)
+    for r in 1..7
+        draw_circle(x, y, r, 0xFFB000)
+    draw_text(4, 4, f"frame {frames}", 0x8090A0)
+    screen_show()
+    frames += 1
+    sleep_ms(16)
+print(f"stopped after {frames} frames")

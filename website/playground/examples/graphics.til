@@ -1,0 +1,32 @@
+# Graphics: the VM draws lines, shapes and text into a screen,
+# and screen_show() puts the frame on the canvas.
+
+rgb(r: int, g: int, b: int) -> int
+    return r * 65536 + g * 256 + b
+
+screen_init(160, 120)
+
+# sky and grass
+for y in 0..80
+    draw_line(0, y, 159, y, rgb(20, 40 + y, 120 + y))
+fill_rect(0, 80, 160, 40, rgb(40, 140, 70))
+
+# the sun: a filled disc (one line per row) and a ring
+for dy in -10..=10
+    let half = int(sqrt(100.0 - dy * dy))
+    draw_line(128 - half, 24 + dy, 128 + half, 24 + dy, rgb(255, 210, 60))
+draw_circle(128, 24, 13, rgb(255, 240, 150))
+
+# a house
+fill_rect(30, 52, 44, 28, rgb(200, 90, 60))
+draw_line(26, 52, 52, 30, rgb(120, 40, 30))
+draw_line(52, 30, 78, 52, rgb(120, 40, 30))
+fill_rect(46, 64, 12, 16, rgb(90, 55, 30))
+draw_rect(34, 58, 8, 8, rgb(255, 255, 200))
+
+draw_rect(0, 0, 160, 120, rgb(255, 255, 255))
+draw_text(6, 106, "Hello from TIL!", rgb(255, 255, 255))
+screen_show()
+
+print(f"screen: {screen_width()} x {screen_height()} pixels")
+print(f"color at the center of the sun: {get_pixel(128, 24)}")

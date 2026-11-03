@@ -1,0 +1,23 @@
+# This program never ends - press Stop.
+# The VM runs in small slices, so the page stays responsive meanwhile.
+# Collatz: start at n, halve if even, else 3n + 1 - how long until 1?
+
+collatz_steps(start: int) -> int
+    var n = start
+    var steps = 0
+    while n != 1
+        if n % 2 == 0
+            n = n / 2
+        else
+            n = 3 * n + 1
+        steps += 1
+    return steps
+
+var record = 0
+var n = 1
+loop
+    let s = collatz_steps(n)
+    if s > record
+        record = s
+        print(f"new record: {n} needs {s} steps")
+    n += 1
