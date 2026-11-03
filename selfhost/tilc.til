@@ -1867,6 +1867,12 @@ skip_nl()
 
 # ── top level ───────────────────────────────────────────────────────────────
 parse_program(sf)
+    # Lexer.tokenize runs over the whole file before parsing: lexical errors
+    # are reported before syntax errors (tokens are not kept)
+    let lx = new_lexer(sf, 0, 1, [0], true)
+    while lex_next(lx).t != T_EOF
+        lx.q.clear()
+        lx.qh = 0
     if SC_ON
         SC_SCRIPT = SCI { calls: {}, refs: {} }
     DRY = true

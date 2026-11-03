@@ -115,10 +115,16 @@ They never change the behaviour of a valid program unless stated:
 * Identifiers: any non-ASCII character counts as a letter (Python: Unicode
   letters and digits only), so a few names Python rejects (e.g. with an
   emoji) are accepted. `\u{...}` accepts plain hex digits only.
-* Diagnostics: only the first error is reported; effect and capability
-  errors are reported before the arity and contract errors of the same
-  program (the Python compiler reports all, arity first); with several
-  violations in one function the first one may be a different one.
+* Diagnostics: only the first error is reported. When a program has several
+  errors of different kinds, tilc may report another one first: it checks
+  effects and capabilities right after parsing, but arity and constant
+  contracts while it compiles each function (the Python compiler runs all
+  SemanticChecker checks, arity first, before compiling). In a fuzz run of
+  ~1,800 mutated corpus programs that the Python compiler rejects, tilc
+  reported the same first message at the same line for 99.7% of them; every
+  difference was of this kind or the missing-module case below. No mutant
+  crashed tilc, and every mutant one compiler accepted the other accepted too
+  (with identical bytes).
 * Expressions nested more than ~50 levels deep exceed the VM's call depth
   (`fatal error: stack overflow (recursion too deep)`); the Python compiler
   stops even earlier (Python recursion limit).
