@@ -2375,6 +2375,8 @@ static void reset_state(tilvm *vm) {
     st->n_frames = 0;
     st->n_try = 0;
     st->n_deadlines = 0;
+    st->n_handlers = 0;
+    st->_hpad = 0;
     st->heap_top = (tv_size)ALIGN_UP(1);
     st->halted = 0;
     st->exit_code = 0;
@@ -2553,6 +2555,7 @@ static int recover(tilvm *vm, int target) {
     if (t->deadline) st->n_deadlines--;
     st->n_frames = t->n_frames;
     st->sp = t->sp;
+    st->n_handlers = t->n_handlers;     /* handles / running clauses inside the block */
     st->frames[st->n_frames - 1].pc = t->handler;
     /* push the message as a string */
     if (vm->err_val.t != TV_NIL && is_str(&vm->err_val) && (!vm->err_msg || !*vm->err_msg)) {
@@ -2811,6 +2814,7 @@ static int push_try(tilvm *vm, uint8_t op, uint32_t handler) {
     t->deadline = deadline;
     t->n_frames = st->n_frames;
     t->sp = SP;
+    t->n_handlers = st->n_handlers;
     if (deadline) st->n_deadlines++;
     return 1;
 }
@@ -2824,6 +2828,134 @@ static int expired_try(tilvm *vm) {
         if (st->tries[i].deadline && (int32_t)(now - st->tries[i].deadline) >= 0) return i;
     return -1;
 }
+
+/* ─── effect handlers with resumption (TIL 3.1, docs/TIL_EFFECTS.md) ────── */
+#define EFFECT_NAME_MAX 64     /* effect names in error messages (same cut in src/til.py) */
+
+/* effect name (string constant k) as a C string for error messages */
+static const char *effect_name(tilvm *vm, uint16_t k, char *buf) {
+    tv_val nv;
+    uint32_t n;
+    const char *p;
+    nv.t = TV_STRK;
+    nv.u.i = 0;
+    nv.u.k = k;
+    p = str_data(vm, &nv, &n);
+    if (n > EFFECT_NAME_MAX) n = EFFECT_NAME_MAX;
+    memcpy(buf, p, n);
+    buf[n] = 0;
+    return buf;
+}
+
+#ifdef TILVM_NO_EFFECTS
+/* PERFORM without handler support: the top-level function E (TIL 3.0). */
+static int effect_target(tilvm *vm, uint16_t name_c, uint16_t dflt, uint8_t argc,
+                         uint16_t *fidx, tv_ref *clos) {
+    char name[EFFECT_NAME_MAX + 1];
+    (void)argc;
+    *clos = 0;
+    if (dflt == 0xFFFF) return failn(vm, "unhandled effect '", effect_name(vm, name_c, name), "'", 0, 0, 0);
+    *fidx = dflt;
+    return 1;
+}
+#else
+static void pop_tries_to(tilvm *vm, uint16_t n) {
+    tilvm_state *st = &vm->st;
+    while (st->n_try > n) {
+        if (st->tries[st->n_try - 1].deadline) st->n_deadlines--;
+        st->n_try--;
+    }
+}
+
+/* Innermost visible clause for effect `name_c`: returns the handler index and
+ * stores the clause value, or -1. A running clause (kind 1) masks its owner and
+ * everything above it, so the search continues below the owner. */
+static int find_clause(tilvm *vm, uint16_t name_c, tv_val *clause) {
+    tilvm_state *st = &vm->st;
+    tv_val key;
+    int i = (int)st->n_handlers - 1;
+    key.t = TV_STRK;
+    key.u.i = 0;
+    key.u.k = name_c;
+    while (i >= 0) {
+        const tv_handler *h = &st->handlers[i];
+        uint16_t j;
+        if (h->kind == 1) { i = (int)h->n - 1; continue; }
+        for (j = 0; j < h->n; j++) {
+            const tv_val *nm = &STK[h->sp + 2u * j + 1u];
+            if ((nm->t == TV_STRK && nm->u.k == name_c) || (is_str(nm) && str_eq(vm, nm, &key))) {
+                *clause = STK[h->sp + 2u * j];
+                return i;
+            }
+        }
+        i--;
+    }
+    return -1;
+}
+
+/* RETURN with handler entries present: drop the handles the returning frame
+ * installed. Returning from an effect clause (= it finished without resume)
+ * aborts the handle that owns it: the clause value becomes the value of the
+ * handle expression. Returns 1 after such an abort, 0 for a normal return,
+ * -1 on a fatal error. */
+static int effect_leave(tilvm *vm, const tv_val *result) {
+    tilvm_state *st = &vm->st;
+    const tv_handler *m, *h;
+    uint16_t owner;
+    while (st->n_handlers && st->handlers[st->n_handlers - 1].n_frames >= st->n_frames) st->n_handlers--;
+    if (!(FN_FLAGS(func_rec(vm, st->frames[st->n_frames - 1].func)) & FLAG_EFFECT_CLAUSE)) return 0;
+    m = st->n_handlers ? &st->handlers[st->n_handlers - 1] : 0;
+    if (!m || m->kind != 1 || m->n_frames + 1 != st->n_frames) {
+        fail(vm, "effect clause returned outside its handler");
+        return -1;
+    }
+    owner = m->n;
+    h = &st->handlers[owner];
+    pop_tries_to(vm, h->n_try);
+    st->n_frames = h->n_frames;
+    SP = h->sp;
+    STK[SP++] = *result;
+    st->frames[st->n_frames - 1].pc = h->abort_pc;
+    st->n_handlers = owner;
+    return 1;
+}
+
+/* PERFORM: choose the function to enter (a clause, or the default handler).
+ * Returns 1 (fidx / clos set; for a clause the running-clause entry is pushed),
+ * 0 on a runtime error. */
+static int effect_target(tilvm *vm, uint16_t name_c, uint16_t dflt, uint8_t argc,
+                         uint16_t *fidx, tv_ref *clos) {
+    tilvm_state *st = &vm->st;
+    char name[EFFECT_NAME_MAX + 1], n1[32], n2[32];
+    tv_val clause;
+    tv_handler *m;
+    const uint8_t *f;
+    int idx = st->n_handlers ? find_clause(vm, name_c, &clause) : -1;
+    *clos = 0;
+    if (idx < 0) {
+        if (dflt == 0xFFFF) return failn(vm, "unhandled effect '", effect_name(vm, name_c, name), "'", 0, 0, 0);
+        *fidx = dflt;                       /* the top-level function E (TIL 3.0) */
+        return 1;
+    }
+    if (clause.t == TV_CLOSURE) { *clos = clause.u.r; *fidx = CLOSOBJ(vm, *clos)->func; }
+    else if (clause.t == TV_FUNC) *fidx = clause.u.k;
+    else return failn(vm, "effect '", effect_name(vm, name_c, name), "' has no callable clause", 0, 0, 0);
+    f = func_rec(vm, *fidx);
+    if (argc > FN_NPARAMS(f) || argc < FN_NREQ(f))
+        return failn(vm, "effect '", effect_name(vm, name_c, name), "' expects ",
+                     fmt_int(n1, (tv_int)FN_NPARAMS(f)), " argument(s), got ", fmt_int(n2, (tv_int)argc));
+    if (st->n_handlers >= TILVM_MAX_HANDLERS) return fail(vm, "too many nested handlers");
+    m = &st->handlers[st->n_handlers++];
+    m->kind = 1;
+    m->n_frames = st->n_frames;
+    m->sp = 0;
+    m->n_try = st->n_try;
+    m->n = (uint16_t)idx;
+    m->abort_pc = 0;
+    m->_pad[0] = m->_pad[1] = m->_pad[2] = 0;
+    return 1;
+}
+#endif /* TILVM_NO_EFFECTS */
 
 /* ─── the interpreter ───────────────────────────────────────────────────── */
 #define READ8() (code[pc++])
@@ -2992,6 +3124,18 @@ resume:
                 if (st->tries[st->n_try - 1].deadline) st->n_deadlines--;
                 st->n_try--;
             }
+#ifndef TILVM_NO_EFFECTS
+            if (st->n_handlers) {
+                int a = effect_leave(vm, &result);
+                if (a < 0) { st->failed = 1; goto fatal; }
+                if (a) {                           /* a clause aborted its handle */
+                    fr = &st->frames[st->n_frames - 1];
+                    pc = fr->pc;
+                    base = fr->base;
+                    break;
+                }
+            }
+#endif
             SP = (uint16_t)(fr->base - fr->extra);
             STK[SP++] = result;
             st->n_frames--;
@@ -3122,6 +3266,75 @@ resume:
             vm->err_val = STK[--SP];
             vm->err_msg = "";
             goto panic;
+        /* effects with resumption (docs/TIL_EFFECTS.md) */
+        case OP_PERFORM: {             /* PERFORM name, default, argc: a call */
+            uint16_t name_c = READ16(), dflt = READ16(), fidx = 0;
+            uint8_t argc = READ8();
+            tv_ref clos = 0;
+            int r;
+            fr->pc = pc;
+            PANIC_IF(!effect_target(vm, name_c, dflt, argc, &fidx, &clos));
+            r = push_frame(vm, fidx, argc, 0, clos);
+            if (r == 0) goto panic;
+            if (r < 0) { st->failed = 1; goto fatal; }
+            fr = &st->frames[st->n_frames - 1];
+            pc = fr->pc;
+            base = fr->base;
+            goto backedge;
+        }
+#ifdef TILVM_NO_EFFECTS
+        case OP_HANDLE:
+            fail(vm, "effect handlers are not available in this VM build");
+            goto panic;
+#else
+        case OP_HANDLE: {              /* HANDLE n, rel_end: the n pairs stay on the stack */
+            uint8_t n = READ8();
+            int16_t rel = READS16();
+            tv_handler *h;
+            if (st->n_handlers >= TILVM_MAX_HANDLERS) { fail(vm, "too many nested handlers"); goto panic; }
+            h = &st->handlers[st->n_handlers++];
+            h->kind = 0;
+            h->n_frames = st->n_frames;
+            h->sp = (uint16_t)(SP - 2u * n);
+            h->n_try = st->n_try;
+            h->n = n;
+            h->abort_pc = (uint32_t)((int32_t)pc + rel);
+            h->_pad[0] = h->_pad[1] = h->_pad[2] = 0;
+            break;
+        }
+        case OP_END_HANDLE: {          /* drop the record and its pairs, keep the value */
+            tv_handler *h = st->n_handlers ? &st->handlers[st->n_handlers - 1] : 0;
+            if (!h || h->kind != 0 || h->n_frames != st->n_frames) {
+                fail(vm, "END_HANDLE without an active handle");
+                st->failed = 1;
+                goto fatal;
+            }
+            st->n_handlers--;
+            STK[h->sp] = STK[SP - 1];
+            SP = (uint16_t)(h->sp + 1);
+            break;
+        }
+        case OP_RESUME: {              /* in a clause: TOS -> value of the perform */
+            tv_val v = STK[--SP];
+            int k = (int)st->n_handlers - 1;
+            while (k >= 0 && st->handlers[k].kind != 1) k--;
+            if (k < 0 || st->handlers[k].n_frames + 1 != st->n_frames ||
+                !(FN_FLAGS(func_rec(vm, fr->func)) & FLAG_EFFECT_CLAUSE)) {
+                fail(vm, "resume outside an effect clause");
+                st->failed = 1;
+                goto fatal;
+            }
+            pop_tries_to(vm, st->handlers[k].n_try);
+            st->n_handlers = (uint16_t)k;      /* exactly as at the perform */
+            SP = (uint16_t)(fr->base - fr->extra);
+            STK[SP++] = v;
+            st->n_frames--;
+            fr = &st->frames[st->n_frames - 1];
+            pc = fr->pc;
+            base = fr->base;
+            break;
+        }
+#endif /* TILVM_NO_EFFECTS */
         case OP_HALT:
             st->halted = 1;
             fr->pc = pc;
