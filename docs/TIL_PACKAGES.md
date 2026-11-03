@@ -164,9 +164,10 @@ nothing that depends on the installing machine's git configuration changes
 them — no line-ending conversion (`core.eol`, `core.autocrlf`, `text` /
 `eol` attributes in `.gitattributes`), no smudge filters (Git LFS files stay
 pointer files), no `ident` expansion — and the tree hash in `til.lock` is the
-same on Linux, macOS and Windows. File names follow the rules for archives
-(§7): no `..`, no `\`, `:` or control characters, UTF-8. A symbolic link in
-the repository is an error, a submodule is skipped with a warning.
+same on Linux, macOS and Windows. File modes are not kept (a package is TIL
+source; the hash ignores modes anyway). File names follow the rules for
+archives (§7): no `..`, no `\`, `:` or control characters, UTF-8. A symbolic
+link in the repository is an error, a submodule is skipped with a warning.
 
 ---
 

@@ -2009,6 +2009,7 @@ def build_parser() -> argparse.ArgumentParser:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('-C', dest='directory', metavar='DIR',
                         help="run as if started in DIR (relative paths and TIL_REGISTRY too)")
+    parser.add_argument('--version', action='version', version=f"til pkg (TIL {til.TIL_VERSION})")
     sub = parser.add_subparsers(dest='command', metavar='COMMAND')
     p = sub.add_parser('init', help="create til.json (name, version 0.1.0, no dependencies)")
     p.add_argument('name', nargs='?', help="package name (default: the directory name)")

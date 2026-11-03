@@ -1739,6 +1739,8 @@ class TestCommandLine:
             assert r.returncode == 0 and r.stdout.startswith('usage: til pkg'), (args, r.stdout[:200])
         r = cli('--help')
         assert r.returncode == 0 and not r.stdout.startswith('usage: til pkg')
+        r = cli('pkg', '--version')
+        assert r.returncode == 0 and r.stdout.startswith('til pkg (TIL ')
 
     def test_add_takes_relative_paths_from_where_it_runs(self, tmp_path, tilpkg_run):
         make_pkg(tmp_path / 'proj' / 'vendor' / 'geo', 'geo', '2.0.0')
