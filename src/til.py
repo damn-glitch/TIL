@@ -8659,6 +8659,7 @@ class TILVM:
     def report(self, msg: bytes, pc: int):
         out = getattr(sys.stderr, 'buffer', None)
         text = msg + b"\n" + (self.traceback(pc) + b"\n" if pc >= 0 else b"")
+        text = localize_bytes(text)      # the CLI's message language (programs still see English)
         self.flush()
         if out is not None:
             out.write(text)
@@ -9311,7 +9312,7 @@ def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
                 continue
             mod_ast = resolver.load_module(stmt.module, fname)
             if mod_ast is None:
-                print(f"Warning: Could not find module '{stmt.module}'", file=sys.stderr)
+                print(localize(f"Warning: Could not find module '{stmt.module}'"), file=sys.stderr)
                 continue
             module_names.add(stmt.module.split('.')[-1])
             if stmt.alias:
@@ -9379,7 +9380,7 @@ class TILCompiler:
             errors = checker.check(ast)
             
             for err in errors:
-                print(f"Warning: {err}", file=sys.stderr)
+                print(localize(f"Warning: {err}"), file=sys.stderr)
         
         if self.verbose:
             print(f"[TIL] Generating C code...")
@@ -9398,7 +9399,7 @@ class TILCompiler:
         # Find C compiler
         cc = self.find_c_compiler()
         if not cc:
-            print("Error: No C compiler found (tried gcc, clang, cc)", file=sys.stderr)
+            print(localize("Error: No C compiler found (tried gcc, clang, cc)"), file=sys.stderr)
             return False
         
         # Write C code to temp file (UTF-8 for string literals with Kazakh/Unicode)
@@ -9421,9 +9422,9 @@ class TILCompiler:
             if result.returncode != 0:
                 self.last_c_error = result.stderr
                 if not quiet:
-                    print(f"C compilation failed:\n{result.stderr}", file=sys.stderr)
-                    print("hint: this program may use features only the TIL VM supports; "
-                          "try `til run --vm` or `til build --target vm`", file=sys.stderr)
+                    print(localize("C compilation failed:") + f"\n{result.stderr}", file=sys.stderr)
+                    print(localize("hint: this program may use features only the TIL VM supports; "
+                                   "try `til run --vm` or `til build --target vm`"), file=sys.stderr)
                 return False
             
             if self.verbose:
@@ -9488,6 +9489,7 @@ Program arguments:        til run prog.til a b c   ->  args() == ["a", "b", "c"]
 
 Multi-Level Programming:  #[level: 0..4]  Hardware, Systems, Safe (default), Script, Formal
 Languages:                English + Kazakh always; #[lang: ru] / #[lang: kk-latn] per file
+Messages:                 --lang en|ru|kk or TIL_LANG (else the program's #[lang: ...], else English)
 
 Examples:
   til run hello.til                     # native (or VM if no C compiler)
@@ -9526,7 +9528,7 @@ def _cvm_binary(verbose: bool = False) -> Optional[str]:
             print(f"[TIL] Building C VM: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"C VM build failed:\n{result.stderr}", file=sys.stderr)
+            print(localize("C VM build failed:") + f"\n{result.stderr}", file=sys.stderr)
             return None
         os.replace(tmp_exe, exe)        # atomic: parallel builds never see half a file
     return exe
@@ -9583,7 +9585,7 @@ def run_extra_command(command: str, argv: List[str]) -> int:
     except ImportError as e:
         if getattr(e, 'name', None) != module_name:
             raise
-        print(f"til {command}: not available in this installation ({module_name}.py is missing)",
+        print(localize(f"til {command}: not available in this installation ({module_name}.py is missing)"),
               file=sys.stderr)
         return 1
     return module.main(argv)
@@ -9599,6 +9601,162 @@ def run_proofs(program: 'Program', source: str, filename: str, explicit: bool) -
             raise
         return ["til check --prove: the prover (tilprove.py) is not installed"] if explicit else []
     return prover.check_program(program, source, filename, explicit)
+
+
+# ── localized messages (TIL 3.1) ─────────────────────────────────────────────
+# Diagnostics are written in English everywhere in this file. The command line
+# translates what it prints (compile errors, warnings, hints, VM error reports)
+# with the catalog in src/tilmsg.py. Language: --lang > TIL_LANG > the
+# program's #[lang: ...] pragma (ru -> ru, kk / kk-latn -> kk) > English.
+# Values that programs see (`error` in a retry/timeout else branch) stay English.
+# Without tilmsg.py everything stays English.
+
+MESSAGE_LANGUAGES = ('en', 'ru', 'kk')
+MESSAGE_LANG: Optional[str] = None      # set by main(); None / 'en' = English
+_MESSAGE_LANG_FROM_USER = False          # --lang or TIL_LANG given (they beat the pragma)
+_MESSAGE_CATALOG: List[Any] = []         # [tilmsg module or None] once loaded
+
+
+def message_language_code(value: Optional[str]) -> Optional[str]:
+    """'ru', 'RU', 'ru_RU.UTF-8', 'kk', 'kk-latn', 'kz', 'en_US' -> 'ru' / 'kk' / 'en';
+    None for anything else."""
+    if not value:
+        return None
+    v = value.strip().lower()
+    if v in ('kk-latn', 'kk_latn', 'kz'):
+        return 'kk'
+    v = re.split(r'[_.@-]', v, maxsplit=1)[0]
+    return v if v in MESSAGE_LANGUAGES else None
+
+
+def pragma_message_language(source: str) -> Optional[str]:
+    """The message language named by the first `#[lang: ...]` pragma of a program."""
+    for m in _LANG_PRAGMA_RE.finditer(source or ""):
+        for code in m.group(1).split(','):
+            lang = message_language_code(code) if code.strip().lower() in LANGUAGES else None
+            if lang:
+                return lang
+    return None
+
+
+def message_language(cli_value: Optional[str] = None, source: str = "",
+                     environ: Optional[Dict[str, str]] = None) -> str:
+    """--lang value > TIL_LANG > `#[lang: ...]` pragma of `source` > 'en'."""
+    env = os.environ if environ is None else environ
+    return (message_language_code(cli_value) or message_language_code(env.get('TIL_LANG'))
+            or pragma_message_language(source) or 'en')
+
+
+def message_catalog():
+    """src/tilmsg.py, or None when it is not installed (then messages stay English)."""
+    if not _MESSAGE_CATALOG:
+        try:
+            _MESSAGE_CATALOG.append(feature_module('tilmsg'))
+        except ImportError as e:
+            if getattr(e, 'name', None) != 'tilmsg':
+                raise
+            _MESSAGE_CATALOG.append(None)
+    return _MESSAGE_CATALOG[0]
+
+
+def localize(text: str, lang: Optional[str] = None) -> str:
+    """Translate a diagnostic (any number of lines) into `lang` (default: the
+    language chosen by main()). Unknown messages stay English."""
+    lang = MESSAGE_LANG if lang is None else lang
+    if not text or not lang or lang == 'en':
+        return text
+    catalog = message_catalog()
+    if catalog is None:
+        return text
+    try:
+        return catalog.localize(text, lang)
+    except Exception:          # a bug in a translation must never hide the diagnostic
+        return text
+
+
+def localize_bytes(data: bytes, lang: Optional[str] = None) -> bytes:
+    """localize() for VM error reports (bytes; invalid UTF-8 is kept as it is)."""
+    lang = MESSAGE_LANG if lang is None else lang
+    if not data or not lang or lang == 'en':
+        return data
+    return localize(data.decode('utf-8', 'surrogateescape'), lang).encode('utf-8', 'surrogateescape')
+
+
+def set_message_language(args: List[str]) -> Optional[str]:
+    """main(): choose the message language from --lang / TIL_LANG (a program's
+    pragma is applied when its source is read). Returns an error for a bad --lang."""
+    global MESSAGE_LANG, _MESSAGE_LANG_FROM_USER
+    value = None
+    for i, arg in enumerate(args):
+        if arg == '--':
+            break
+        if arg == '--lang' and i + 1 < len(args):
+            value = args[i + 1]
+        elif arg.startswith('--lang='):
+            value = arg.split('=', 1)[1]
+    env_value = os.environ.get('TIL_LANG', '').strip()
+    if value is not None and message_language_code(value) is None:
+        MESSAGE_LANG = message_language(None, "")
+        return localize(f"Error: unknown message language '{value}' (use: en, ru, kk)")
+    if env_value and value is None and message_language_code(env_value) is None:
+        print(f"warning: TIL_LANG={env_value!r} is not a message language (en, ru, kk); using English",
+              file=sys.stderr)
+    MESSAGE_LANG = message_language(value, "")
+    _MESSAGE_LANG_FROM_USER = message_language_code(value) is not None or \
+        message_language_code(env_value) is not None
+    if value is not None and MESSAGE_LANG != 'en' and message_catalog() is None:
+        print("note: message translations are not installed (tilmsg.py is missing); "
+              "messages stay in English", file=sys.stderr)
+    return None
+
+
+def scoped_message_language(func):
+    """Decorator for main(): the message language it chooses lasts for that call
+    only (main() also runs in-process, e.g. in tests; library use stays English)."""
+    import functools
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        global MESSAGE_LANG, _MESSAGE_LANG_FROM_USER
+        saved = (MESSAGE_LANG, _MESSAGE_LANG_FROM_USER)
+        try:
+            return func(*args, **kwargs)
+        finally:
+            MESSAGE_LANG, _MESSAGE_LANG_FROM_USER = saved
+    return wrapper
+
+
+def use_program_message_language(source: str):
+    """main(): a program's `#[lang: ru]` / `#[lang: kk]` pragma selects the message
+    language unless --lang or TIL_LANG chose one."""
+    global MESSAGE_LANG
+    if not _MESSAGE_LANG_FROM_USER:
+        MESSAGE_LANG = pragma_message_language(source) or 'en'
+
+
+def run_localized(cmd: List[str]) -> int:
+    """Run a TIL executable (the C VM): with a non-English message language its
+    error reports (stderr) are translated line by line as they arrive."""
+    if not MESSAGE_LANG or MESSAGE_LANG == 'en' or message_catalog() is None:
+        return subprocess.run(cmd).returncode
+    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE)
+    out = getattr(sys.stderr, 'buffer', None)
+    try:
+        for line in iter(proc.stderr.readline, b''):
+            data = localize_bytes(line)
+            if out is not None:
+                out.write(data)
+                out.flush()
+            else:
+                sys.stderr.write(data.decode('utf-8', 'replace'))
+                sys.stderr.flush()
+    except BaseException:            # Ctrl-C, closed stderr, ...: do not leave the VM running
+        proc.kill()
+        raise
+    finally:
+        proc.stderr.close()
+        rc = proc.wait()
+    return rc
 
 
 # ── translate ────────────────────────────────────────────────────────────────
@@ -9723,7 +9881,7 @@ def run_repl():
             try:
                 compile_to_bytecode("\n".join(definitions + [block]) + "\n", "<repl>")
             except (SyntaxError, CompileError) as e:
-                print(e)
+                print(localize(str(e)))
                 continue
             definitions.append(block)
             print("ok")
@@ -9736,7 +9894,7 @@ def run_repl():
             source, is_expr = repl_program(definitions, history, block)
             module = compile_to_bytecode(source, "<repl>")
         except (SyntaxError, CompileError) as e:
-            print(e)
+            print(localize(str(e)))
             continue
         state = {'live': False, 'buf': b""}
         mark = _REPL_MARK.encode() + b"\n"
@@ -9760,6 +9918,7 @@ def run_repl():
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
+@scoped_message_language
 def main():
     args = sys.argv[1:]
 
@@ -9772,6 +9931,11 @@ def main():
         print("Author: Alisher Beisembekov")
         print("Backends: native (C via gcc/clang), TIL VM (bytecode: Python, C99 / calculators)")
         return 0
+
+    lang_error = set_message_language(args)       # messages: --lang / TIL_LANG (pragma: below)
+    if lang_error:
+        print(lang_error, file=sys.stderr)
+        return 1
 
     if args[0] in EXTRA_COMMANDS:
         return run_extra_command(args[0], args[1:])
@@ -9857,15 +10021,15 @@ def main():
         elif input_file is not None:
             prog_args.append(arg)        # after the program file: the program's arguments
         else:
-            print(f"Error: unknown option {arg}", file=sys.stderr)
+            print(localize(f"Error: unknown option {arg}"), file=sys.stderr)
             return 1
         i += 1
 
     if not input_file:
-        print("Error: No input file specified", file=sys.stderr)
+        print(localize("Error: No input file specified"), file=sys.stderr)
         return 1
     if not os.path.exists(input_file):
-        print(f"Error: File not found: {input_file}", file=sys.stderr)
+        print(localize(f"Error: File not found: {input_file}"), file=sys.stderr)
         return 1
 
     try:
@@ -9880,19 +10044,20 @@ def main():
 
         with open(input_file, 'r', encoding='utf-8') as f:
             source = f.read()
+        use_program_message_language(source)          # #[lang: ru] -> Russian messages
 
         if command == 'check':
             ast = resolve_imports(parse_source(source, input_file), input_file)
             errors = SemanticChecker(source, input_file).check(ast)
             if errors:
                 for err in errors:
-                    print(err, file=sys.stderr)
+                    print(localize(err), file=sys.stderr)
                 return 1
             BytecodeCompiler(source, input_file).compile_program(ast)   # names, arity, immutability
             proof_errors = run_proofs(ast, source, input_file, bool(opts.get('prove')))
             if proof_errors:
                 for err in proof_errors:
-                    print(err, file=sys.stderr)
+                    print(localize(err), file=sys.stderr)
                 return 1
             print(f"OK: {input_file}")
             return 0
@@ -9914,7 +10079,7 @@ def main():
         base = os.path.splitext(os.path.basename(input_file))[0]
 
         if command == 'run' and use_vm is None and compiler.find_c_compiler() is None:
-            print("[TIL] No C compiler found - running on the TIL VM", file=sys.stderr)
+            print(localize("[TIL] No C compiler found - running on the TIL VM"), file=sys.stderr)
             use_vm = 'py'
 
         if command == 'run' and use_vm:
@@ -9923,14 +10088,15 @@ def main():
                 return run_bytecode(module, max_steps, prog_args, opts)
             exe = _cvm_binary(compiler.verbose)
             if exe is None:
-                print("Error: cannot build the C VM (need vm/ sources and a C compiler)", file=sys.stderr)
+                print(localize("Error: cannot build the C VM (need vm/ sources and a C compiler)"),
+                      file=sys.stderr)
                 return 1
             fd, tbc_path = tempfile.mkstemp(suffix='.tbc')
             try:
                 with os.fdopen(fd, 'wb') as f:
                     f.write(module.serialize())
                 cmd = [exe] + (['--max-steps', str(max_steps)] if max_steps else []) + [tbc_path] + prog_args
-                return subprocess.run(cmd).returncode
+                return run_localized(cmd)              # C VM error reports in the message language
             finally:
                 os.unlink(tbc_path)
 
@@ -9963,7 +10129,7 @@ def main():
             return 0
 
         if target not in (None, 'native'):
-            print(f"Error: unknown target '{target}' (native, vm, c-vm, c)", file=sys.stderr)
+            print(localize(f"Error: unknown target '{target}' (native, vm, c-vm, c)"), file=sys.stderr)
             return 1
 
         # native build (C backend)
@@ -9978,7 +10144,7 @@ def main():
             try:
                 if not compiler.compile_to_executable(source, tmp_exe, input_file, quiet=True):
                     # The native backend covers a subset of TIL; the VM runs everything.
-                    print("[TIL] native backend cannot compile this program; running it on the TIL VM",
+                    print(localize("[TIL] native backend cannot compile this program; running it on the TIL VM"),
                           file=sys.stderr)
                     if compiler.verbose:
                         print(getattr(compiler, 'last_c_error', ''), file=sys.stderr)
@@ -9996,10 +10162,10 @@ def main():
         return 0
 
     except SyntaxError as e:
-        print(f"Syntax Error: {e}", file=sys.stderr)
+        print(localize(f"Syntax Error: {e}"), file=sys.stderr)
         return 1
     except CompileError as e:
-        print(str(e), file=sys.stderr)
+        print(localize(str(e)), file=sys.stderr)
         return 1
     except BrokenPipeError:
         try:
@@ -10008,10 +10174,10 @@ def main():
             pass
         return 0
     except (ValueError, OSError) as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(localize(f"Error: {e}"), file=sys.stderr)
         return 1
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(localize(f"Error: {e}"), file=sys.stderr)
         if compiler.verbose:
             import traceback
             traceback.print_exc()
