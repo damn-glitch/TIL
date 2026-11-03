@@ -847,6 +847,21 @@ class TestCatalogFailures:
                                            "in English\n")
 
 
+    @pytest.mark.parametrize("catalog,note", [
+        (None, "note: message translations are not installed (tilmsg.py is missing); messages stay in English\n"),
+        (object(), ""),                                   # a tilmsg.py of another version: plain English
+    ], ids=['missing', 'other version'])
+    def test_c_vm_stderr_without_a_usable_catalog(self, monkeypatch, capfd, catalog, note):
+        report = "runtime error: division by zero\n  at main (line 2)\n"
+        script = "import sys; sys.stderr.write(" + repr(report) + "); sys.exit(1)"
+        monkeypatch.setattr(til, 'MESSAGE_LANG', 'kk')
+        monkeypatch.setattr(til, '_MESSAGE_CATALOG', [catalog, None])
+        monkeypatch.setattr(til, '_CATALOG_NOTE_SHOWN', False)
+        capfd.readouterr()
+        assert til.run_localized([sys.executable, '-c', script]) == 1
+        assert capfd.readouterr().err == note + report
+
+
 class TestProgramText:
     """Finding 3: a program's own message is not translated piecemeal."""
 
@@ -1038,6 +1053,19 @@ class TestMergedBranches:
                                        'static int f(tilvm *vm, int mid) {\n'
                                        '    return failn(vm, E_NO_METHOD, METHOD_NAMES[mid], "\' on str", 0, 0, 0);\n}\n')
         assert _texts(i18n_coverage.extract_c(path)) == {"no method '{}' on str"}
+
+    def test_c_conditional_literals(self, tmp_path):
+        # til31/gfx: failn(vm, k ? "... argument 2 must be 1.." : "... argument 1 must be 1..", ...)
+        path = write(tmp_path, 'vm.c',
+                     'static int f(tilvm *vm, int k, int x) {\n    char lim[32], buf[32];\n'
+                     '    return failn(vm, k ? "screen_init() argument 2 must be 1.." : '
+                     '"screen_init() argument 1 must be 1..",\n'
+                     '                 fmt_int(lim, x), ", got ", fmt_int(buf, x), 0, 0);\n}\n')
+        templates = i18n_coverage.extract_c(path)
+        assert _texts(templates) == {"screen_init() argument 1 must be 1..{}, got {}",
+                                     "screen_init() argument 2 must be 1..{}, got {}"}
+        for t in templates:                               # and the catalog has them
+            assert i18n_coverage.coverage_of(tilmsg, t)[0] is True, t.text()
 
     def test_nested_messages_must_be_covered(self):
         outer = tilmsg.Entry("intent '{intent}' failed: {error:msg}", "a {intent} {error}", "b {intent} {error}",

@@ -75,7 +75,8 @@ Kept as they are:
   run-time messages only and their placeholders take a single word or a type
   name (see [The catalog](#the-catalog)). The lines after the first one of a
   multi-line message are copied unchanged; only traceback lines are
-  translated there;
+  translated there (a line of the message that looks exactly like one,
+  `  at f (line 3)`, cannot be told apart and is translated too);
 * a message longer than 10,000 characters (`tilmsg.MAX_LOOKUP`) is not looked
   up and stays English (its frame is translated), and `intent` failures nested
   more than 32 deep (`MAX_NESTING`) keep their inner messages English;

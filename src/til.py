@@ -9783,11 +9783,16 @@ class _StderrTranslator:
 
     def __init__(self, lang: str):
         catalog = message_catalog()
-        self.loc = None if catalog is None else catalog.ReportLocalizer(lang)
+        self.usable = True
+        try:
+            self.loc = None if catalog is None else catalog.ReportLocalizer(lang)
+        except Exception:          # a tilmsg.py from another version: English, as without one
+            self.loc, self.usable = None, False
 
     def feed(self, data: bytes) -> bytes:
         if self.loc is None:
-            _catalog_note()
+            if self.usable:
+                _catalog_note()
             return data
         try:
             return self.loc.feed(data.decode('utf-8', 'surrogateescape')).encode('utf-8', 'surrogateescape')

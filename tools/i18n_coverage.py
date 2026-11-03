@@ -583,7 +583,7 @@ def c_message_parts(name: str, args: List[str]) -> List[List[Optional[str]]]:
         alts: List[List[Optional[str]]] = [[]]
         for a in args:
             if not _is_null(a):
-                alts = _product(alts, c_alternatives(a) if c_literal(a) is not None else [[PH]])
+                alts = _product(alts, c_alternatives(a))       # (`k ? "a" : "b"` gives both)
         return alts
     if name == 'failf' and len(args) == 5:
         a, _n1, b, _n2, c = args
