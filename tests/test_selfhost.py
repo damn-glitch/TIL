@@ -704,6 +704,52 @@ class TestDiagnostics:
 
 
 # ═══════════════════════════════════════════════════════════════
+# C VM FIX: big arrays (found while building tilc's output)
+# ═══════════════════════════════════════════════════════════════
+
+LARGE_ARRAYS = """
+main()
+    var parts = []
+    for i in 0..10000
+        parts.push(str(i % 10))
+    let s = parts.join("")
+    print(len(s), s.slice(0, 12), len(parts.join(", ")))
+    print(len(parts.copy()), len(parts.slice(1, 9500)), len(parts + parts))
+    var m = {}
+    for i in 0..9000
+        m[i] = i * 2
+    print(len(m.keys()), m.values()[8999], len(m.copy()))
+    var n = 0
+    for k in m
+        n += 1
+    print(n, len(range(20000)), range(5, 20000)[19994])
+    print(len(s.split("")), len(("a," * 12000).split(",")), len((" x" * 9000).split()))
+"""
+
+
+@needs_cc
+class TestVMLargeArrays:
+    """join/copy/slice/+/keys/values/copy/iter/range/split staged every element
+    on the C VM's value stack (8192 slots): arrays of more than ~8000 elements
+    failed with "stack overflow" on the C VM but worked on the Python VM."""
+
+    # small stack: nothing may be staged on it; small heap: the GC runs often
+    @pytest.mark.parametrize("flags", [('-DTILVM_HEAP_SIZE=4194304',),
+                                       ('-DTILVM_HEAP_SIZE=2097152', '-DTILVM_STACK_SIZE=1024')])
+    def test_both_vms_agree(self, flags):
+        expected = "".join(f"{v}\n" for v in (10000, "012345678901", 29998, 10000, 9499, 20000, 9000,
+                                                17998, 9000, 9000, 20000, 19999, 10000, 12001, 9000))
+        data = py_compile(LARGE_ARRAYS)
+        assert run_vm(data) == (0, expected)
+        path = os.path.join(tempfile.mkdtemp(prefix='tilvm-big-'), 'big.tbc')
+        with open(path, 'wb') as f:
+            f.write(data)
+        r = subprocess.run([cvm_binary("host", flags), path], capture_output=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.decode() == expected
+
+
+# ═══════════════════════════════════════════════════════════════
 # CALCULATOR CONFIGURATION
 # ═══════════════════════════════════════════════════════════════
 

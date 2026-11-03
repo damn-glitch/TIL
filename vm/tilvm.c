@@ -1065,6 +1065,27 @@ static int make_array(tilvm *vm, uint8_t kind, uint32_t n) {
     return 1;
 }
 
+/* Push a new array (or map) with room for `nvals` values and length `len`;
+ * the caller fills the values. Results built this way never stage their
+ * elements on the value stack, so they work up to the 65535-element limit
+ * whatever TILVM_STACK_SIZE is. */
+static int push_empty(tilvm *vm, uint8_t kind, uint32_t nvals, uint32_t len) {
+    tv_ref buf, arr;
+    if (SP + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+    buf = new_vals(vm, nvals < 4 ? 4 : nvals);
+    if (!buf) return 0;
+    set_ref(&STK[SP], TV_CELL, buf);          /* keep the buffer rooted */
+    SP++;
+    arr = alloc_obj(vm, kind, sizeof(tv_arrobj));
+    SP--;
+    if (!arr) return 0;
+    ARROBJ(vm, arr)->buf = STK[SP].u.r;
+    ARROBJ(vm, arr)->len = (tv_size)len;
+    set_ref(&STK[SP], kind == OBJ_MAP ? TV_MAP : TV_ARRAY, arr);
+    SP++;
+    return 1;
+}
+
 /* Ensure array/map in slot has room for `need` values (may move). */
 static int reserve(tilvm *vm, uint16_t slot, uint32_t need) {
     tv_ref arr = STK[slot].u.r, buf = ARROBJ(vm, arr)->buf, nb;
@@ -1097,15 +1118,11 @@ static int array_push(tilvm *vm, uint16_t arr_slot, uint16_t val_slot) {
 #ifndef TILVM_LEAN
 static int tv_array_concat(tilvm *vm) {    /* [.., a, b] -> [.., a+b] */
     uint32_t la = ARROBJ(vm, STK[SP - 2].u.r)->len, lb = ARROBJ(vm, STK[SP - 1].u.r)->len, i;
-    if (SP + 1 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
-    for (i = 0; i < la + lb; i++) {           /* push copies of all elements */
-        tv_val v;
-        if (SP >= TILVM_STACK_SIZE - 2) return fail(vm, "stack overflow");
-        v = i < la ? VALS(vm, ARROBJ(vm, STK[SP - 2 - i].u.r)->buf)[i]
-                   : VALS(vm, ARROBJ(vm, STK[SP - 1 - i].u.r)->buf)[i - la];
-        STK[SP++] = v;
-    }
-    if (!make_array(vm, OBJ_ARRAY, la + lb)) return 0;
+    tv_val *d;
+    if (!push_empty(vm, OBJ_ARRAY, la + lb, la + lb)) return 0;
+    d = VALS(vm, ARROBJ(vm, STK[SP - 1].u.r)->buf);
+    for (i = 0; i < la; i++) d[i] = VALS(vm, ARROBJ(vm, STK[SP - 3].u.r)->buf)[i];
+    for (i = 0; i < lb; i++) d[la + i] = VALS(vm, ARROBJ(vm, STK[SP - 2].u.r)->buf)[i];
     STK[SP - 3] = STK[SP - 1];
     SP -= 2;
     return 1;
@@ -1667,11 +1684,12 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     }
     case N_ITER:
         if (a->t == TV_MAP) {
-            /* keys snapshot: push keys, make array */
+            /* keys snapshot */
             uint32_t n = ARROBJ(vm, a->u.r)->len, i;
-            if (SP + n + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
-            for (i = 0; i < n; i++) STK[SP++] = VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[2 * i];
-            if (!make_array(vm, OBJ_ARRAY, n)) return 0;
+            tv_val *d;
+            if (!push_empty(vm, OBJ_ARRAY, n, n)) return 0;
+            d = VALS(vm, ARROBJ(vm, STK[SP - 1].u.r)->buf);
+            for (i = 0; i < n; i++) d[i] = VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[2 * i];
             STK[base] = STK[SP - 1];
             SP = (uint16_t)(base + 1);
             return 1;
@@ -1809,10 +1827,14 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         hi = a[1].u.i;
         if (argc > 2 && truthy(vm, &a[2])) hi = iwrap_add(hi, 1);
         n = hi > lo ? (uint32_t)(hi - lo) : 0;
-        if (n > 0xFFFF || base + n + 2 > TILVM_STACK_SIZE) return fail(vm, "range too large");
+        if (n > 0xFFFF) return fail(vm, "range too large");
         SP = base;
-        for (i = 0; i < (tv_int)n; i++) set_int(&STK[SP++], lo + i);
-        return make_array(vm, OBJ_ARRAY, n);
+        if (!push_empty(vm, OBJ_ARRAY, n, n)) return 0;
+        {
+            tv_val *d = VALS(vm, ARROBJ(vm, STK[SP - 1].u.r)->buf);
+            for (i = 0; i < (tv_int)n; i++) set_int(&d[i], lo + i);
+        }
+        return 1;
     }
 #ifndef TILVM_LEAN
     case N_TYPE_OF: {
@@ -2046,11 +2068,14 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
     }
     case M_SPLIT: {
         /* split(sep) / split() on whitespace; pieces are pushed then gathered */
-        uint32_t start = 0, i, pieces = 0;
+        uint32_t start = 0, i;
+        uint16_t arr_slot;
         int ws = !argc;
         const char *t = 0;
         if (argc && !is_str(a1)) return fail(vm, "split() needs a string separator");
         if (argc) { t = str_data(vm, a1, &m); if (!m) ws = 2; }
+        if (!push_empty(vm, OBJ_ARRAY, 0, 0)) return 0;
+        arr_slot = (uint16_t)(SP - 1);
         i = 0;
         for (;;) {
             uint32_t pend, next;
@@ -2079,12 +2104,12 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
                 s = str_data(vm, &STK[base], &n);
                 memcpy(STROBJ(vm, r)->data, s + start, pend - start);
                 set_ref(&STK[SP++], TV_STR, r);
-                pieces++;
+                if (!array_push(vm, arr_slot, (uint16_t)(SP - 1))) return 0;
+                SP--;
             }
             if (ws == 0) { if (next > n) break; start = next; }
             else i = next;
         }
-        if (!make_array(vm, OBJ_ARRAY, pieces)) return 0;
         *res = STK[--SP];
         return 1;
     }
@@ -2218,36 +2243,37 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
             if (hi > (tv_int)n) hi = (tv_int)n;
             if (lo > hi) lo = hi;
         }
-        if (SP + (uint32_t)(hi - lo) + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
-        for (i = (uint32_t)lo; i < (uint32_t)hi; i++) STK[SP++] = VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[i];
-        if (!make_array(vm, OBJ_ARRAY, (uint32_t)(hi - lo))) return 0;
+        if (!push_empty(vm, OBJ_ARRAY, (uint32_t)(hi - lo), (uint32_t)(hi - lo))) return 0;
+        {
+            tv_val *d = VALS(vm, ARROBJ(vm, STK[SP - 1].u.r)->buf);
+            for (i = (uint32_t)lo; i < (uint32_t)hi; i++) d[i - (uint32_t)lo] = VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[i];
+        }
         *res = STK[--SP];
         return 1;
     }
     case M_JOIN: {
-        /* convert every element to a string on the stack, then concatenate */
-        uint32_t total = 0, sl = 0, k;
+        /* measure the text of every element, allocate once, then write it
+           (no temporary strings: works for arrays of any length) */
+        uint32_t sl = 0, l;
         tv_ref r;
-        if (SP + n + 3 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+        sink sk;
         if (argc) { if (!to_str_slot(vm, (uint16_t)(base + 1))) return 0; str_data(vm, &STK[base + 1], &sl); }
+        sk.vm = vm; sk.mode = 0; sk.dst = 0; sk.len = 0;
         for (i = 0; i < n; i++) {
-            STK[SP++] = VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[i];
-            if (!to_str_slot(vm, (uint16_t)(SP - 1))) return 0;
-            { uint32_t l; str_data(vm, &STK[SP - 1], &l); total += l; }
+            if (i) sk.len += sl;
+            emit_value(&sk, &VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[i], 0, 0);
+            if (sk.len > TV_STR_MAX) return fail(vm, "string too long");
         }
-        if (n) total += sl * (n - 1);
-        if (total > TV_STR_MAX) return fail(vm, "string too long");
-        r = new_str(vm, total);
+        r = new_str(vm, sk.len);                  /* may move the array: re-read it */
         if (!r) return 0;
-        for (i = 0, k = 0; i < n; i++) {
-            uint32_t l;
-            const char *p;
-            if (i && sl) { p = str_data(vm, &STK[base + 1], &l); memcpy(STROBJ(vm, r)->data + k, p, l); k += l; }
-            p = str_data(vm, &STK[SP - n + i], &l);
-            memcpy(STROBJ(vm, r)->data + k, p, l);
-            k += l;
+        sk.mode = 1; sk.dst = STROBJ(vm, r)->data; sk.len = 0;
+        for (i = 0; i < n; i++) {
+            if (i && sl) {
+                const char *sp = str_data(vm, &STK[base + 1], &l);
+                sink_put(&sk, sp, l);
+            }
+            emit_value(&sk, &VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[i], 0, 0);
         }
-        SP = (uint16_t)(SP - n);
         set_ref(res, TV_STR, r);
         return 1;
     }
@@ -2279,14 +2305,15 @@ static int map_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
     case M_VALUES: case M_COPY:
 #endif
     case M_KEYS: {
-        uint32_t per = mid == M_COPY ? 2 : 1;
-        if (SP + per * n + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+        uint32_t per = mid == M_COPY ? 2 : 1, k = 0;
+        tv_val *d;
+        if (!push_empty(vm, mid == M_COPY ? OBJ_MAP : OBJ_ARRAY, per * n, n)) return 0;
+        d = VALS(vm, ARROBJ(vm, STK[SP - 1].u.r)->buf);
         for (i = 0; i < n; i++) {
             tv_val *v = VALS(vm, ARROBJ(vm, STK[base].u.r)->buf);
-            if (mid != M_VALUES) STK[SP++] = v[2 * i];
-            if (mid != M_KEYS) STK[SP++] = v[2 * i + 1];
+            if (mid != M_VALUES) d[k++] = v[2 * i];
+            if (mid != M_KEYS) d[k++] = v[2 * i + 1];
         }
-        if (!make_array(vm, mid == M_COPY ? OBJ_MAP : OBJ_ARRAY, n)) return 0;
         *res = STK[--SP];
         return 1;
     }
