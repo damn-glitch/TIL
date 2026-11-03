@@ -2170,7 +2170,6 @@ class TypeInfer:
         self.aliases: Dict[str, Any] = {}
         self.module_names: Set[str] = set(getattr(program, 'module_names', set()) or ())
         self.solver = Solver('A')
-        self.globals_ctx: Optional[FuncCtx] = None
         self.instances: Dict[Tuple[str, Tuple[str, ...]], Instance] = {}
         self._alias_depth = 0
         self.collect()
@@ -2521,7 +2520,6 @@ class TypeInfer:
     def infer_globals(self):
         self.solver.sink = None
         ctx = FuncCtx(self, self.solver, None, 'A', True)
-        self.globals_ctx = ctx
         for g in self.globals.values():
             decl = g.decl
             if decl.value is None or decl.deferred:
@@ -3653,10 +3651,8 @@ class TypedCGen(til.CCodeGenerator):
         self.uid = 0
         self.scopes: List[Dict[str, Tuple[str, Any]]] = []   # TIL name -> (C name, type)
         self.cnames_used: List[Set[str]] = []
-        self.lambdas: Dict[str, Any] = {}          # C-level id -> lambda binding
         self.insts: Dict[Tuple[str, Tuple[str, ...]], Instance] = {}
         self.inst_names: Dict[Tuple[str, Tuple[str, ...]], str] = {}
-        self.loop_depth = 0
 
     # ── errors ──────────────────────────────────────────────────────────────
     def unsupported(self, what: str, node=None):
@@ -4360,7 +4356,6 @@ class TypedCGen(til.CCodeGenerator):
         self.output = []
         self.indent = 0
         self.scopes, self.cnames_used = [], []
-        self.lambdas = {}
         self._recover_stack = []
         self._loop_depth = 0
         if inst.conflicts:

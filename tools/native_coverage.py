@@ -36,7 +36,11 @@ What is measured per program
 
 Status: `native-ok` (same exit code and stdout as the VM), `native-mismatch`,
 `fallback` (the native backend cannot compile it: `til run` uses the VM), or
-`vm-limit` (the VM did not finish within the step budget: not compared).
+`vm-limit` (the VM did not finish within the step budget or stopped with a
+fatal error such as its recursion limit: native limits differ, not compared).
+
+The recorded baseline (`tools/native_coverage_baseline.json`) was measured on
+the TIL 3.0 native backend; docs/TIL_TYPES.md has the numbers before/after.
 """
 
 import ast
