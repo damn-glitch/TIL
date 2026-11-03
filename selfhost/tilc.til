@@ -1552,6 +1552,9 @@ const K_NULLCHK = 21
 const K_LAMBDA = 22
 const K_MATCH = 23
 const K_LISTCOMP = 24
+const K_RETRY = 25
+const K_TIMEOUT = 26
+const K_FORK = 27
 const K_VAR = 31
 const K_STMT = 32
 const K_GINIT = 42
@@ -1560,6 +1563,7 @@ const K_STRUCTDEF = 51
 const K_ENUMDEF = 52
 const K_IMPL = 53
 const K_TYPEALIAS = 54
+const K_TRAIT = 55
 
 # K_INT n=value | K_FLOAT s=8 bytes | K_STR s | K_CHAR n=code point | K_BOOL n
 # K_FSTR c=[K_STR | K_FPART(a=expr, s=spec)] | K_IDENT s | K_BIN s=op a b
@@ -1568,9 +1572,11 @@ const K_TYPEALIAS = 54
 # K_SINIT s=name c={field: expr} | K_IFX a b c | K_CAST a s=type | K_NULLCHK a
 # K_LAMBDA a=body c=[param names] | K_MATCH a=value c=[[pattern, guard, expr]]
 # K_LISTCOMP a=expr s=var b=iter c=condition
+# K_RETRY / K_TIMEOUT a=count|ms b=body c=fallback (expression or K_FORK)
+# K_FORK a=a token stream positioned at a block (compiled later as a value)
 # Statements have no tree: they are compiled while they are parsed (stmt_c).
 # Top-level items: K_FUNC a=FI | K_STRUCTDEF s c=[Fld] | K_ENUMDEF s c=[Vnt]
-# K_IMPL s c=[FI] | K_TYPEALIAS | K_VAR (global) s b=type n=flags (1 mutable,
+# K_IMPL s=type b=trait c=[FI] | K_TRAIT s c=[FI] | K_TYPEALIAS | K_VAR (global) s b=type n=flags (1 mutable,
 # 2 const, 4 deferred) a=literal value or None c=[pos, line] of the value
 # K_STMT c=[pos, line] (script statement) | K_GINIT a=K_VAR (deferred init)
 
@@ -1595,6 +1601,7 @@ struct FI
     capt: any
     req: any
     ens: any
+    nstmts: int
 
 struct Prm
     name: str
@@ -1634,6 +1641,9 @@ var CAPT = None
 var SCRIPT_CAPT = {}
 var SINIT_DEPTH = 0
 var SEM_CONSTS = {}
+# kind of the statement stmt_c just read: 1 expression, 2 match, 3 if with
+# else, 4 intent, 0 other (what compile_block_value needs of a last statement)
+var LAST_STMT = 0
 
 new_stream(lx)
     TSG = TS { lx: lx, buf: [], p: 0 }
@@ -1701,7 +1711,7 @@ parse_top_level(src)
     elif t == T_IMPL
         node = parse_impl(src)
     elif t == T_TRAIT
-        unsupported(TK.ln, "trait")
+        node = parse_trait(src)
     elif t == T_FN
         node = parse_fn(src, 0)
     elif t == T_TYPE
@@ -1771,7 +1781,7 @@ parse_pub_item(src)
     if TK.t == T_FN
         return parse_fn(src, 0)
     if TK.t == T_TRAIT
-        unsupported(TK.ln, "trait")
+        return parse_trait(src)
     if TK.t == T_IDENT and is_func_def()
         return parse_func_simple(src, 0)
     perr("Expected struct, enum, fn, or trait after 'pub'")
@@ -1800,12 +1810,12 @@ is_func_def()
 
 parse_fn(src, ind)
     expect(T_FN)
-    return parse_func_body(expect(T_IDENT), src, ind)
+    return parse_func_body(expect(T_IDENT), src, ind, false)
 
 parse_func_simple(src, ind)
-    return parse_func_body(expect(T_IDENT), src, ind)
+    return parse_func_body(expect(T_IDENT), src, ind, false)
 
-parse_func_body(name_tok, src, ind)
+parse_func_body(name_tok, src, ind, allow_sig)
     expect(T_LPAREN)
     let params = parse_params()
     expect(T_RPAREN)
@@ -1817,7 +1827,7 @@ parse_func_body(name_tok, src, ind)
     let bline = TK.ln
     let save_capt = CAPT
     CAPT = {}
-    func_body_c()
+    let nstmts = func_body_c(allow_sig)
     let attrs = PENDING_ATTRS
     PENDING_ATTRS = []
     var req = []
@@ -1836,7 +1846,8 @@ parse_func_body(name_tok, src, ind)
             else
                 ens.push([e, text])
     let fi = FI { name: name_tok.v, params: params, ret: ret, ln: name_tok.ln, src: src,
-                  bpos: bpos, bline: bline, bind: ind, capt: CAPT, req: req, ens: ens }
+                  bpos: bpos, bline: bline, bind: ind, capt: CAPT, req: req, ens: ens,
+                  nstmts: nstmts }
     CAPT = save_capt
     let node = mk(K_FUNC, name_tok.ln)
     node.a = fi
@@ -1986,9 +1997,12 @@ parse_enum()
 
 parse_impl(src)
     expect(T_IMPL)
-    let first = expect(T_IDENT).v
+    var first = expect(T_IDENT).v
+    var trait_name = None
     if TK.t == T_FOR
-        unsupported(TK.ln, "impl Trait for Type (traits)")
+        adv()
+        trait_name = first
+        first = expect(T_IDENT).v
     skip_nl()
     let ind = TK
     expect(T_INDENT)
@@ -2013,6 +2027,32 @@ parse_impl(src)
         adv()
     let node = mk(K_IMPL, 0)
     node.s = first
+    node.c = methods
+    node.b = trait_name
+    return node
+
+parse_trait(src)
+    expect(T_TRAIT)
+    let name = expect(T_IDENT).v
+    skip_nl()
+    let ind = TK
+    expect(T_INDENT)
+    var methods = []
+    while TK.t != T_DEDENT and TK.t != T_EOF
+        skip_nl()
+        if TK.t == T_DEDENT or TK.t == T_EOF
+            break
+        if TK.t == T_FN
+            adv()
+        if TK.t == T_IDENT and peek(1).t == T_LPAREN
+            methods.push(parse_func_body(adv(), src, ind.v, true).a)
+        else
+            perr("Expected method definition in trait")
+        skip_nl()
+    if TK.t == T_DEDENT
+        adv()
+    let node = mk(K_TRAIT, 0)
+    node.s = name
     node.c = methods
     return node
 
@@ -2375,9 +2415,30 @@ parse_primary_inner()
         return parse_lambda()
     if t == T_MATCH
         return parse_match()
-    if t == T_RETRY or t == T_TIMEOUT or t == T_HANDLE
-        unsupported(TK.ln, TK.v)
+    if t == T_RETRY or t == T_TIMEOUT
+        adv()
+        var node = mk(K_RETRY, 0)
+        if t == T_TIMEOUT
+            node = mk(K_TIMEOUT, 0)
+        expect(T_LPAREN)
+        node.a = parse_expression()
+        expect(T_RPAREN)
+        skip_nl()
+        node.b = body_or_expr()
+        skip_nl()
+        if TK.t == T_ELSE
+            adv()
+            skip_nl()
+            node.c = body_or_expr()
+        return node
+    if t == T_HANDLE
+        unsupported(TK.ln, "handle (effects)")
     perr("Unexpected token: " + TT_NAMES[t])
+
+body_or_expr()
+    if TK.t == T_INDENT
+        return block_ref()
+    return parse_expression()
 
 # |x, y| expr   or   |x: int| -> int { expr }
 parse_lambda()
@@ -3253,7 +3314,10 @@ compile_program()
     FIELD_NAMES["error"] = 1
     var impls = []
     var globals = []
+    var traits = {}
     for it in ITEMS
+        if it.k == K_TRAIT
+            traits[it.s] = it
         if it.k == K_STRUCTDEF
             STRUCT_TYPES[it.s] = len(TYPES)
             STRUCT_FIELDS[it.s] = it.c
@@ -3291,6 +3355,24 @@ compile_program()
                     has_self = true
             if has_self
                 METHOD_TBL.push([tidx, const_str(m.name), fidx])
+        # trait default methods, compiled for this type
+        if im.b != None and traits.has(im.b)
+            var defined = {}
+            for m in im.c
+                defined[m.name] = 1
+            for tm in traits[im.b].c
+                if not defined.has(tm.name)
+                    if tm.nstmts <= 0
+                        fail_at(im.ln, "impl " + im.b + " for " + im.s + " is missing method '" + tm.name + "'")
+                    let fidx = add_function(im.s + "." + tm.name, tm, im.s)
+                    PENDING[len(PENDING) - 1].push(false)
+                    USER_METHODS[tm.name] = 1
+                    var has_self = false
+                    for p in tm.params
+                        if p.name == "self"
+                            has_self = true
+                    if has_self
+                        METHOD_TBL.push([tidx, const_str(tm.name), fidx])
     for g in globals
         if (g.n & 1) == 0 and g.a != None
             INLINE[g.s] = literal_cv(g.a)
@@ -3331,20 +3413,24 @@ relex_at(src, pos, line, ind)
     new_stream(new_lexer(src, pos, line, stack, false))
 
 # function body at the current token: block, { ... } or => expression
-func_body_c()
+# function body at the current token: block, { ... } or => expression.
+# Returns the number of statements (-1: none, a trait method signature)
+func_body_c(allow_sig)
     skip_nl()
     if TK.t == T_INDENT
-        block_c()
-    elif TK.t == T_LBRACE
-        brace_c()
-    elif TK.t == T_FAT_ARROW
+        return block_c()
+    if TK.t == T_LBRACE
+        return brace_c()
+    if TK.t == T_FAT_ARROW
         let fat = adv()
         let e = parse_expression()
         if not DRY
             cexpr(e)
             emit_return_value(fat.ln)
-    else
-        perr("Expected function body")
+        return 1
+    if allow_sig
+        return -1
+    perr("Expected function body")
 
 compile_function(pe)
     let rec = FUNCS[pe[0]]
@@ -3401,14 +3487,14 @@ compile_function(pe)
             emit(OP_PANIC, r[0].ln)
             patch_jump(skip)
     # body: script statements first (script mode), then the function's own
-    SEM = not fi.prelude
+    SEM = not fi.prelude and len(pe) < 4
     begin_scope()
     if fi.pre != None
         for item in fi.pre
             script_item_c(item)
     if not fi.synth
         relex_at(fi.src, fi.bpos, fi.bline, fi.bind)
-        func_body_c()
+        func_body_c(false)
     end_scope()
     SEM = false
     emit_return_nil(fi.ln)
@@ -3434,8 +3520,10 @@ stmt_c()
     skip_nl()
     let tok = TK
     let t = tok.t
+    var cls = 0
     if t == T_IF
-        if_c()
+        if if_c(false)
+            cls = 3
     elif t == T_FOR
         for_c(tok.ln)
     elif t == T_WHILE
@@ -3458,8 +3546,12 @@ stmt_c()
             m.ln = tok.ln
         if not DRY
             cmatch(m, false)
-    elif t == T_PERFORM or t == T_INTENT
-        unsupported(tok.ln, tok.v)
+        cls = 2
+    elif t == T_INTENT
+        intent_c(false)
+        cls = 4
+    elif t == T_PERFORM
+        unsupported(tok.ln, "perform (effects)")
     else
         let expr = parse_expression()
         let u = TK.t
@@ -3468,9 +3560,12 @@ stmt_c()
             let value = parse_expression()
             if not DRY
                 cassign(expr, op.v, value, op.ln)
-        elif not DRY
-            cexpr(expr)
-            emit(OP_POP, 0)
+        else
+            cls = 1
+            if not DRY
+                cexpr(expr)
+                emit(OP_POP, 0)
+    LAST_STMT = cls
 
 # body of if/elif/else/for/while/loop (a scope of its own)
 body_c()
@@ -3487,27 +3582,35 @@ body_c()
 
 block_c()
     expect(T_INDENT)
+    var n = 0
     while TK.t != T_DEDENT and TK.t != T_EOF
         skip_nl()
         if TK.t == T_DEDENT or TK.t == T_EOF
             break
         stmt_c()
+        n += 1
         skip_nl()
     if TK.t == T_DEDENT
         adv()
+    return n
 
 brace_c()
     expect(T_LBRACE)
     skip_nl()
+    var n = 0
     while TK.t != T_RBRACE and TK.t != T_EOF
         stmt_c()
+        n += 1
         skip_nl()
         if TK.t == T_SEMICOLON
             adv()
         skip_nl()
     expect(T_RBRACE)
+    return n
 
-if_c()
+# if / elif / else; want_value: the branches are value blocks
+# (compile_if(want_value=True)). Returns whether there was an else branch.
+if_c(want_value)
     adv()
     var cond = parse_expression()
     skip_nl()
@@ -3516,7 +3619,7 @@ if_c()
     if not DRY
         cexpr(cond)
         nxt = emit_jump(OP_JUMP_IF_FALSE, cond.ln)
-    body_c()
+    branch_c(want_value)
     if not DRY
         ends.push(emit_jump(OP_JUMP, 0))
         patch_jump(nxt)
@@ -3530,18 +3633,268 @@ if_c()
         if not DRY
             cexpr(cond)
             nxt = emit_jump(OP_JUMP_IF_FALSE, cond.ln)
-        body_c()
+        branch_c(want_value)
         if not DRY
             ends.push(emit_jump(OP_JUMP, 0))
             patch_jump(nxt)
         skip_nl()
+    var has_else = false
     if TK.t == T_ELSE
         adv()
         skip_nl()
-        body_c()
+        branch_c(want_value)
+        has_else = true
+    elif want_value and not DRY
+        emit(OP_PUSH_NIL, 0)
     if not DRY
         for e in ends
             patch_jump(e)
+    return has_else
+
+branch_c(want_value)
+    if want_value and not DRY
+        value_body_c()
+    else
+        body_c()
+
+# ── blocks used as values (compile_block_value): retry/timeout bodies, the
+#    branches of an if that is the last statement of such a block ──────────
+
+# a copy of the token stream (lexer state included) to read ahead or replay
+fork_stream()
+    let ts = TSG
+    let lx = ts.lx
+    let l2 = Lx { src: lx.src, n: lx.n, pos: lx.pos, line: lx.line, stack: lx.stack.copy(),
+                  atls: lx.atls, paren: lx.paren, q: lx.q.slice(lx.qh, len(lx.q)), qh: 0,
+                  done: lx.done, tsp: lx.tsp, tln: lx.tln }
+    return TS { lx: l2, buf: ts.buf.slice(ts.p, len(ts.buf)), p: 0 }
+
+# dry run on a fork: [number of statements, kind of the last one] of the
+# block / brace block / single statement at the current token
+prescan_body()
+    let saved = TSG
+    let saved_tk = TK
+    let saved_dry = DRY
+    TSG = fork_stream()
+    TK = peek(0)
+    DRY = true
+    var n = 0
+    if TK.t == T_INDENT
+        adv()
+        while TK.t != T_DEDENT and TK.t != T_EOF
+            skip_nl()
+            if TK.t == T_DEDENT or TK.t == T_EOF
+                break
+            stmt_c()
+            n += 1
+            skip_nl()
+    elif TK.t == T_LBRACE
+        adv()
+        skip_nl()
+        while TK.t != T_RBRACE and TK.t != T_EOF
+            stmt_c()
+            n += 1
+            skip_nl()
+            if TK.t == T_SEMICOLON
+                adv()
+            skip_nl()
+    else
+        stmt_c()
+        n = 1
+    let cls = LAST_STMT
+    TSG = saved
+    TK = saved_tk
+    DRY = saved_dry
+    return [n, cls]
+
+value_body_c()
+    let info = prescan_body()
+    let n = info[0]
+    begin_scope()
+    if n == 0
+        emit(OP_PUSH_NIL, 0)
+    if TK.t == T_INDENT
+        adv()
+        var i = 0
+        while TK.t != T_DEDENT and TK.t != T_EOF
+            skip_nl()
+            if TK.t == T_DEDENT or TK.t == T_EOF
+                break
+            if i == n - 1
+                stmt_value_c(info[1])
+            else
+                stmt_c()
+            i += 1
+            skip_nl()
+        if TK.t == T_DEDENT
+            adv()
+    elif TK.t == T_LBRACE
+        adv()
+        skip_nl()
+        var i = 0
+        while TK.t != T_RBRACE and TK.t != T_EOF
+            if i == n - 1
+                stmt_value_c(info[1])
+            else
+                stmt_c()
+            i += 1
+            skip_nl()
+            if TK.t == T_SEMICOLON
+                adv()
+            skip_nl()
+        expect(T_RBRACE)
+    else
+        stmt_value_c(info[1])
+    end_scope()
+
+# the last statement of a value block leaves its value on the stack
+stmt_value_c(cls)
+    skip_nl()
+    let tok = TK
+    if cls == 1
+        cexpr(parse_expression())
+    elif cls == 2
+        let m = parse_match()
+        if m.ln == 0
+            m.ln = tok.ln
+        cmatch(m, true)
+    elif cls == 3
+        if_c(true)
+    elif cls == 4
+        intent_c(true)
+    else
+        stmt_c()
+        emit(OP_PUSH_NIL, 0)
+
+# a block inside an expression (retry/timeout body or else): remember a fork
+# of the token stream to compile it later, and skip it now
+block_ref()
+    var f = None
+    if not DRY
+        f = fork_stream()
+    let saved_dry = DRY
+    DRY = true
+    block_c()
+    DRY = saved_dry
+    let r = mk(K_FORK, 0)
+    r.a = f
+    return r
+
+# compile a remembered block as a value
+replay_value_block(r)
+    let saved = TSG
+    let saved_tk = TK
+    TSG = r.a
+    r.a = fork_stream()
+    TK = peek(0)
+    value_body_c()
+    TSG = saved
+    TK = saved_tk
+
+# intent "goal" body (compile_intent)
+intent_c(want_value)
+    let tok = adv()
+    let desc = expect(T_STRING).v
+    skip_nl()
+    if DRY
+        if TK.t == T_INDENT
+            block_c()
+        else
+            parse_expression()
+        return
+    let handler = emit_jump(OP_TRY, tok.ln)
+    F.tryd += 1
+    if TK.t == T_INDENT
+        if want_value
+            value_body_c()
+        else
+            begin_scope()
+            block_c()
+            end_scope()
+    else
+        cexpr(parse_expression())
+        if not want_value
+            emit(OP_POP, 0)
+    F.tryd -= 1
+    emit(OP_END_TRY, 0)
+    let done = emit_jump(OP_JUMP, 0)
+    patch_jump(handler)
+    emit_h(OP_PUSH_CONST, const_str("intent '" + desc + "' failed: "), tok.ln)
+    emit(OP_SWAP, 0)
+    emit_b(OP_CONCAT, 2, 0)
+    emit(OP_PANIC, tok.ln)
+    patch_jump(done)
+
+guarded_body(b)
+    F.tryd += 1
+    if b.k == K_FORK
+        replay_value_block(b)
+    else
+        cexpr(b)
+    F.tryd -= 1
+
+# `else` branch of retry/timeout: the error message is bound to `error`
+cfallback(fb, err, ln)
+    if fb == None
+        emit_b(OP_LOAD_LOCAL, err, 0)
+        emit(OP_PANIC, ln)
+        return
+    begin_scope()
+    let loc = declare_local("error", false, ln)
+    emit_b(OP_LOAD_LOCAL, err, 0)
+    store_new_local(loc, ln)
+    if fb.k == K_FORK
+        replay_value_block(fb)
+    else
+        cexpr(fb)
+    end_scope()
+
+# retry(n) body else fallback: run the body again after a runtime error
+cretry(node)
+    begin_scope()
+    let limit = hidden_local()
+    let count = hidden_local()
+    let err = hidden_local()
+    cexpr(node.a)
+    emit_b(OP_STORE_LOCAL, limit, 0)
+    emit(OP_PUSH_I8, 0)
+    F.code.push(0)
+    emit_b(OP_STORE_LOCAL, count, 0)
+    let top = here()
+    let handler = emit_jump(OP_TRY, node.ln)
+    guarded_body(node.b)
+    emit(OP_END_TRY, 0)
+    let done = emit_jump(OP_JUMP, 0)
+    patch_jump(handler)
+    emit_b(OP_STORE_LOCAL, err, 0)
+    emit_b(OP_LOAD_LOCAL, count, 0)
+    emit(OP_PUSH_I8, 0)
+    F.code.push(1)
+    emit(OP_ADD, 0)
+    emit(OP_DUP, 0)
+    emit_b(OP_STORE_LOCAL, count, 0)
+    emit_b(OP_LOAD_LOCAL, limit, 0)
+    emit(OP_LT, 0)
+    let again = emit_jump(OP_JUMP_IF_TRUE, node.ln)
+    patch_to(again, top)
+    cfallback(node.c, err, node.ln)
+    patch_jump(done)
+    end_scope()
+
+# timeout(ms) body else fallback
+ctimeout(node)
+    begin_scope()
+    let err = hidden_local()
+    cexpr(node.a)
+    let handler = emit_jump(OP_TRY_TIMEOUT, node.ln)
+    guarded_body(node.b)
+    emit(OP_END_TRY, 0)
+    let done = emit_jump(OP_JUMP, 0)
+    patch_jump(handler)
+    emit_b(OP_STORE_LOCAL, err, 0)
+    cfallback(node.c, err, node.ln)
+    patch_jump(done)
+    end_scope()
 
 while_c(ln)
     adv()
@@ -4190,6 +4543,10 @@ cexpr(node)
         cmatch(node, true)
     elif k == K_LISTCOMP
         ccomprehension(node)
+    elif k == K_RETRY
+        cretry(node)
+    elif k == K_TIMEOUT
+        ctimeout(node)
     else
         fail_at(node.ln, "internal error: cannot compile node kind " + str(k))
 

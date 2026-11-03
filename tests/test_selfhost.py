@@ -41,9 +41,8 @@ SLOW = bool(os.environ.get('TIL_TEST_SLOW'))
 # Constructs outside TIL Core: tilc must reject them with "unsupported: <what>"
 # (see selfhost/README.md). Any other "unsupported" message fails the tests.
 UNSUPPORTED = (
-    "retry", "timeout", "intent", "handle", "perform", "trait", "impl Trait for Type (traits)",
-    "import (tilc compiles one file)", "capability declaration (cap)",
-    "(effect checking; use til check)", "(capabilities)",
+    "handle (effects)", "perform (effects)", "import (tilc compiles one file)",
+    "capability declaration (cap)", "(effect checking; use til check)", "(capabilities)",
 )
 
 # Bytecode may differ from the Python compiler's only through constant folding
@@ -280,7 +279,7 @@ class TestPrograms:
             stats[key] = stats.get(key, 0) + 1
         print("\n[selfhost] corpus:", stats)
         # most of the test-suite is inside TIL Core and compiles to identical bytes
-        assert stats.get('same', 0) >= 200, stats
+        assert stats.get('same', 0) >= 220, stats
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -496,6 +495,55 @@ main()
     print(fns[2](1))
     print((|x: int| -> int { x + 1 })(41))
 """,
+    "recovery": """
+var attempts = 0
+
+flaky() -> int
+    attempts += 1
+    assert attempts >= 3, "warming up"
+    return 42
+
+trait Greeter
+    name(self) -> str
+    greet(self) -> str
+        return "Hello, " + self.name() + "!"
+
+struct Student
+    first: str
+
+impl Greeter for Student
+    name(self) -> str
+        return self.first
+
+main()
+    let reading = retry(5)
+        flaky()
+    print(f"{reading} after {attempts}")
+    let r = timeout(20)
+        var i = 0
+        loop
+            i += 1
+        i
+    else
+        "stopped: " + error
+    print(r)
+    let msg = retry(1)
+        intent "load the class list"
+            let classes = ["7A", "7B"]
+            classes[5]
+    else
+        error
+    print(msg)
+    let v = retry(2)
+        if attempts > 100
+            "many"
+        else
+            "few"
+    print(v)
+    print(Student { first: "Aigerim" }.greet())
+    intent "statement form"
+        print("inside intent")
+""",
     "contracts": """
 #[requires: b != 0]
 safe_div(a: int, b: int) -> int
@@ -579,7 +627,7 @@ ERRORS = [
 UNSUPPORTED_PROGRAMS = [
     ("import math_utils\n", 1, "import (tilc compiles one file)"),
     ("#[pure]\nf(x)\n    return x\n", 2, "#[pure] (effect checking; use til check)"),
-    ("main()\n    let r = retry(3)\n        1\n", 2, "retry"),
+    ("main()\n    perform Log(1)\n", 2, "perform (effects)"),
 ]
 
 
