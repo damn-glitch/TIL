@@ -148,7 +148,7 @@ these glue snippets are starting points and have not been run on hardware):
   `.8xp` build itself is not verified yet — see `ports/ti84ce/README.md`.
 * **TI-83 Plus / TI-84 Plus** (Z80): the 16-bit lean VM fits below 0xC000 and
   runs on a simulated Z80 (`ports/z80/`); on the calculators it needs a
-  three-page Flash application (not done, see `ports/z80/RESULTS.md`). Output
+  four-page Flash application (not done, see `ports/z80/RESULTS.md`). Output
   would use the `_PutC`/`_PutS` bcalls.
 * **Casio fx-CG50 / fx-9860G** (SH4, gint SDK): `vm.write` → `dtext` into a
   scrolling console buffer + `dupdate`; `clock_ms` from `rtc_ticks`.

@@ -54,7 +54,7 @@ All numbers: SDCC 4.2.0 #13081, `-mz80`, VM profile of the `Makefile` (heap
 | TIL 3.0, 32-bit ints, all builtins | 76 KB | no |
 | TIL 3.0, 32-bit ints, `TILVM_LEAN` | 70.7 KB | no |
 | TIL 3.0, 16-bit ints, `TILVM_LEAN` | — | SDCC internal error |
-| 16-bit lean, ICE worked around (`--opt-code-size`) | 57,407 B | no |
+| 16-bit lean, ICE worked around, byte readers as functions (`--opt-code-size`) | 57,407 B | no |
 | + `TILVM_ADDR16` (16-bit offsets/lengths) | 58,314 B¹ | no |
 | + data opcodes in `lean_op()` (loop keeps control flow) | 53,741 B | no |
 | + shared push/pop tails in `lean_op`, `reset_state` memset | 51,631 B | no |
@@ -147,14 +147,20 @@ ignored and duplicate keys in map literals are not merged.
 The simulator gives the program a flat 64 KB. On the calculators, assembly
 programs run from RAM at 0x9D95 and code above 0xC000 cannot execute, so a
 program is limited to ~8.8 KB; larger code must be a Flash application, whose
-16 KB pages are mapped at 0x4000-0x7FFF one at a time (port 6). The VM (47.7 KB)
-would need **three application pages** plus cross-page calls:
+16 KB pages are mapped at 0x4000-0x7FFF one at a time (port 6). The VM (47.7 KB:
+26.5 KB interpreter, arithmetic, objects and GC; 12.0 KB natives and builtin
+methods; 9.2 KB loading, printing and errors) would need **four application
+pages** plus cross-page calls, e.g.
 
-* page 0: startup, `tilvm_run_steps`, `lean_op`, call/return, GC (≈15 KB);
-* page 1: natives and builtin methods (`call_native`, `str_method`,
-  `array_method`, `map_method`, `variant_method`, ≈13 KB);
-* page 2: loading, printing / `to_str`, errors and messages (≈13 KB);
-* RAM 0x8000-0xFFFF: VM state (5.8 KB), program AppVar, OS areas.
+* page 0: startup, `tilvm_run_steps`, `lean_op`, call/return, arithmetic, comparison;
+* page 1: allocation, GC, strings, arrays, maps, structs, indexing;
+* page 2: `call_native` and the builtin methods (`str_method`, `array_method`, ...);
+* page 3: loading, value printing, error reports and message tables;
+* RAM 0x8000-0xFFFF: VM state (5.8 KB), the program AppVar, OS areas.
+
+Calls between pages 0 and 1 are frequent, so every page switch (writing port 6
+through a trampoline, on the order of 100 T-states) would slow the interpreter
+noticeably.
 
 SDCC can call between pages (`__banked` functions through a trampoline that
 writes port 6), but each page must be a separate translation unit, so
