@@ -1,0 +1,68 @@
+# 11_graphics.til
+# TIL 3.1 - screen graphics: shapes, text and a checksum of the pixels.
+# The VM draws every pixel itself, so the picture is the same on every VM,
+# calculator and terminal (docs/TIL_GRAPHICS.md).
+#
+#   til run --vm examples/11_graphics.til                    headless
+#   til run --vm examples/11_graphics.til --screen out.ppm   save the picture
+#   til run --vm examples/11_graphics.til --screen-ansi      show it in the terminal
+
+const W = 96
+const H = 64
+
+const BLACK = 0x000000
+const WHITE = 0xFFFFFF
+const SKY = 0x1E3A5F
+const SUN = 0xFFD23F
+const GRASS = 0x3B7D23
+const WALL = 0xE63946
+const GLASS = 0xA8DADC
+
+# sun rays: [x0, y0, x1, y1] relative to the sun's centre
+const RAYS = [[11, 0, 15, 0], [8, 8, 11, 11], [0, 11, 0, 15], [-8, 8, -11, 11],
+              [-11, 0, -15, 0], [-8, -8, -11, -11], [0, -11, 0, -15], [8, -8, 11, -11]]
+
+# Adler-32 style checksum of every pixel (two sums modulo 65521)
+checksum() -> str
+    var a = 1
+    var b = 0
+    for y in 0..screen_height()
+        for x in 0..screen_width()
+            a = (a + get_pixel(x, y)) % 65521
+            b = (b + a) % 65521
+    return f"{b:04x}{a:04x}"
+
+main()
+    screen_init(W, H)
+    screen_clear(SKY)
+    fill_rect(0, 48, W, 16, GRASS)
+
+    # the sun: a circle with rays (lines in all directions)
+    let sx = 78
+    let sy = 14
+    draw_circle(sx, sy, 8, SUN)
+    draw_circle(sx, sy, 5, SUN)
+    for r in RAYS
+        draw_line(sx + r[0], sy + r[1], sx + r[2], sy + r[3], SUN)
+
+    # a house: filled walls, a roof of lines, a door, a framed window
+    fill_rect(12, 30, 26, 18, WALL)
+    draw_line(9, 30, 25, 16, WHITE)
+    draw_line(25, 16, 41, 30, WHITE)
+    draw_line(9, 30, 41, 30, WHITE)
+    fill_rect(16, 37, 7, 11, BLACK)
+    fill_rect(27, 35, 7, 6, GLASS)
+    draw_rect(26, 34, 9, 8, WHITE)
+
+    # text in the built-in 5x7 font; a ball half outside the screen is clipped
+    draw_text(2, 2, "TIL 3.1", WHITE)
+    draw_text(46, 52, "Salem!", WHITE)
+    draw_circle(W - 2, H - 2, 6, WHITE)
+    screen_show()
+
+    print(f"screen {screen_width()}x{screen_height()}")
+    print(f"sun edge  {get_pixel(sx + 8, sy):06x}")
+    print(f"door      {get_pixel(19, 40):06x}")
+    print(f"window    {get_pixel(30, 38):06x}")
+    print(f"outside   {get_pixel(-1, 5)}")
+    print(f"checksum  {checksum()}")

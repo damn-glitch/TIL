@@ -12,6 +12,9 @@ C99:
 * **snapshots** — pause a running program, save it, resume it after a power cycle
 * **step budgets** — run N steps at a time (UI loops, cooperative multitasking),
   sandbox limits, real `timeout(ms)` blocks
+* **screen and keys** — lines, rectangles, circles and a 5×7 font are drawn
+  inside the VM (identical pixels on every host); a device only stores pixels
+  and reports keys ([docs/TIL_GRAPHICS.md](../docs/TIL_GRAPHICS.md))
 
 The same program produces byte-identical output on the reference VM
 (`til run --vm`), the desktop C VM and the embedded builds below — this is
@@ -71,7 +74,9 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_NO_STDIO` | off | no `<stdio.h>`: built-in number formatting, host sets `write` |
 | `TILVM_NO_TIME` | off | no `<time.h>`: `clock_ms()`/`timeout` count 1 ms per 1000 steps |
 | `TILVM_NO_MATH` | off | no `<math.h>`: built-in `sqrt`/`floor`/`pow` (integer powers) |
-| `TILVM_LEAN` | off | smallest code for 8-bit CPUs: the whole language core, without format specs, snapshots, `input/chr/ord/type_of/clock_ms/random/sleep_ms`, str `split/replace/trim/repeat/count`, array `insert/remove/sort/reverse/slice/copy/join/sum/min/max`, map `values/copy/clear` (calling them reports "not available"). ~20% smaller |
+| `TILVM_LEAN` | off | smallest code for 8-bit CPUs: the whole language core, without format specs, snapshots, `input/chr/ord/type_of/clock_ms/random/sleep_ms`, str `split/replace/trim/repeat/count`, array `insert/remove/sort/reverse/slice/copy/join/sum/min/max`, map `values/copy/clear` (calling them reports "not available"). ~20% smaller. The screen/keys natives stay in |
+| `TILVM_NO_GFX` | off | leave out the screen/keys natives (`screen_init` … `wait_key` report "not available in this VM build"); saves ~2.5 KB on ARM |
+| `TILVM_ROM` | empty | storage qualifier for the 480-byte font table, e.g. `__flash` for avr-gcc (keeps it out of RAM) |
 
 Profiles in the `Makefile`: `make` (desktop), `make small` (32-bit, float,
 16 KB heap), `make tiny` (16-bit, no floats, 2 KB heap, lean), `make check`
@@ -125,15 +130,29 @@ vm/tilvm --snapshot-after 300 state.snap prog.tbc   # run 300 steps, save, exit 
 vm/tilvm --resume state.snap prog.tbc               # continue
 vm/tilvm --max-steps 100000 prog.tbc                # sandbox
 vm/tilvm --stats prog.tbc                           # GC / heap statistics
+vm/tilvm --screen out.ppm prog.tbc                  # graphics: final frame as a PPM image
+vm/tilvm --screen-ansi prog.tbc                     # graphics: frames in a 24-bit colour terminal
+vm/tilvm --keys "UP,UP,ENTER,a,ESC" prog.tbc        # scripted keys (default: the keyboard)
 ```
+
+Without `--screen`/`--screen-ansi` the runner draws into an offscreen
+framebuffer (headless); without `--keys` keys come from the terminal in raw mode
+(restored at exit) or, when stdin is not a terminal, from stdin's bytes. See
+[docs/TIL_GRAPHICS.md](../docs/TIL_GRAPHICS.md).
 
 ## Porting to a device
 
 1. Pick a profile (`TILVM_INT_BITS`, `TILVM_FLOAT`, `TILVM_HEAP_SIZE`, ...).
 2. Compile `tilvm.c` with the device toolchain (it only needs `<stdint.h>`,
-   `<stddef.h>`, `<string.h>`; stdio/time/math are optional).
+   `<stddef.h>`, `<string.h>`, `<limits.h>`; stdio/time/math are optional).
 3. Provide `write` (and `read_line`, `clock_ms` if available).
-4. Embed the program (`til build --target c-vm`, or load a `.tbc` file from the
+4. For a display and keys, set `vm.host.gfx_pixel` / `gfx_get` (and optionally
+   `gfx_init`, `gfx_show`, `key_pressed`, `wait_key`) — the VM does all the
+   drawing and clipping; [docs/TIL_GRAPHICS.md](../docs/TIL_GRAPHICS.md) has a
+   complete host and notes for TI-84 Plus CE (graphx), NumWorks (eadk), Casio
+   (gint), SDL, Linux framebuffer and browser canvas. Without hooks the screen
+   functions report "not available on this device".
+5. Embed the program (`til build --target c-vm`, or load a `.tbc` file from the
    device's file system).
 
 Integration notes for common platforms (the core is verified in simulators;

@@ -3217,7 +3217,7 @@ class SemanticChecker:
     IO_BUILTINS = {'print', 'println', 'input', 'read_file', 'write_file', 'file_exists',
                    'screen_init', 'screen_clear', 'draw_pixel', 'draw_line', 'draw_rect',
                    'fill_rect', 'draw_circle', 'draw_text', 'get_pixel', 'screen_show',
-                   'key_pressed', 'wait_key', 'energy_mode'}
+                   'key_pressed', 'wait_key', 'energy_mode', 'screen_width', 'screen_height'}
 
     def __init__(self, source: str = "", filename: str = "<stdin>"):
         self.reporter = ErrorReporter(source, filename)
@@ -7928,6 +7928,370 @@ def til_format_spec(v, spec: bytes, to_str) -> bytes:
     return b' ' * left + body + b' ' * (pad - left)
 
 
+# ── screen and keys (TIL 3.1, docs/TIL_GRAPHICS.md) ─────────────────────────
+# The VM rasterizes shapes and text and clips them to the screen; the host
+# (TILScreen) only stores pixels. vm/tilvm.c uses the same algorithms, limits
+# and messages, so both VMs produce identical pixels.
+
+# 5x7 font: ASCII 32..126, then the replacement glyph used for every other
+# character. 5 columns per glyph, bit 0 = top row. Same table as FONT5X7 in
+# vm/tilvm.c (the test-suite compares them).
+FONT5X7 = bytes.fromhex(
+    "000000000000004f00000007000700147f147f14242a7f2a12231308646236495522500005030000"
+    "001c2241000041221c0014083e081408083e08080050300000080808080800606000002010080402"
+    "3e5149453e00427f400042615149462141454b311814127f1027454545393c4a4949300171090503"
+    "3649494936064949291e003636000000563600000814224100141414141400412214080201510906"
+    "324979413e7e1111117e7f494949363e414141227f4141221c7f494949417f090909013e4149497a"
+    "7f0808087f00417f41002040413f017f081422417f404040407f020c027f7f0408107f3e4141413e"
+    "7f090909063e4151215e7f09192946464949493101017f01013f4040403f1f2040201f3f4038403f"
+    "631408146307087008076151494543007f41410002040810200041417f0004020102044040404040"
+    "000102040020545454787f484444383844444420384444487f3854545418087e090102085454543c"
+    "7f0804047800447d40002040443d007f1028440000417f40007c041804787c080404783844444438"
+    "7c14141408081414187c7c080404084854545420043f4440203c4040207c1c2040201c3c4030403c"
+    "44281028440c5050503c4464544c44000836410000007f0000004136080008040810087f4141417f")
+GFX_MAX_SIZE = 4096                        # screen_init: 1..4096 pixels per side
+GFX_COORD_MIN, GFX_COORD_MAX = -32768, 32767   # shape coordinates and sizes
+# argument kinds: i any int, c coordinate/size, s screen size, k color 0xRRGGBB,
+# t any value (drawn like print shows it)
+GFX_KINDS = {'screen_init': 'ss', 'screen_clear': 'k', 'draw_pixel': 'iik', 'draw_line': 'cccck',
+             'draw_rect': 'cccck', 'fill_rect': 'cccck', 'draw_circle': 'ccck', 'draw_text': 'cctk',
+             'get_pixel': 'ii', 'screen_show': ''}
+GFX_FIRST_NATIVE, GFX_LAST_NATIVE = NATIVE_ID['screen_init'], NATIVE_ID['screen_height']
+# --keys names (any case); a single character stands for its code point
+KEY_NAMES = {'UP': 1, 'DOWN': 2, 'LEFT': 3, 'RIGHT': 4, 'ENTER': 13, 'ESC': 27, 'SPACE': 32,
+             'TAB': 9, 'BACKSPACE': 8, 'COMMA': 44, 'NONE': 0}
+GFX_RUN_OPTIONS = ('screen', 'keys', 'screen_ansi')     # run options that need the VM
+
+
+def gfx_line_points(x0: int, y0: int, x1: int, y1: int):
+    """Bresenham line, all octants, both end points included."""
+    dx, dy = abs(x1 - x0), -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx + dy
+    while True:
+        yield x0, y0
+        if x0 == x1 and y0 == y1:
+            return
+        e2 = 2 * err
+        if e2 >= dy:
+            err += dy
+            x0 += sx
+        if e2 <= dx:
+            err += dx
+            y0 += sy
+
+
+def gfx_circle_points(cx: int, cy: int, r: int):
+    """Midpoint circle outline (r < 0: nothing, r = 0: the centre)."""
+    x, y, d = 0, r, 1 - r
+    while x <= y:
+        yield cx + x, cy + y
+        yield cx - x, cy + y
+        yield cx + x, cy - y
+        yield cx - x, cy - y
+        yield cx + y, cy + x
+        yield cx - y, cy + x
+        yield cx + y, cy - x
+        yield cx - y, cy - x
+        if d < 0:
+            d += 2 * x + 3
+        else:
+            d += 2 * (x - y) + 5
+            y -= 1
+        x += 1
+
+
+def gfx_text_points(x: int, y: int, text: bytes):
+    """Text in the 5x7 font: 6 px advance, b"\\n" starts a line 8 px lower. One
+    glyph per byte below 0x80 or UTF-8 lead byte (continuation bytes are
+    skipped); characters outside ASCII 32..126 use the replacement glyph."""
+    cx, cy = x, y
+    for c in text:
+        if c == 10:
+            cx, cy = x, cy + 8
+            continue
+        if 0x80 <= c < 0xC0:
+            continue
+        g = 5 * (c - 32 if 32 <= c <= 126 else 95)
+        for col in range(5):
+            bits = FONT5X7[g + col]
+            for row in range(7):
+                if (bits >> row) & 1:
+                    yield cx + col, cy + row
+        cx += 6
+
+
+class TILScreen:
+    """Framebuffer of the reference VM (the host side of the screen natives):
+    w x h pixels, 3 bytes each. With `ansi=True` every screen_show() draws the
+    frame into the program's output with 24-bit colour half blocks, byte for
+    byte like `tilvm --screen-ansi`."""
+
+    def __init__(self, ansi: bool = False):
+        self.w = self.h = 0
+        self.fb = bytearray()
+        self.ansi = ansi
+        self.frames = 0                  # ANSI frames since screen_init
+
+    def init(self, w: int, h: int):
+        self.w, self.h = w, h
+        self.fb = bytearray(3 * w * h)
+        self.frames = 0
+
+    def pixel(self, x: int, y: int, rgb: int):
+        i = 3 * (y * self.w + x)
+        fb = self.fb
+        fb[i] = rgb >> 16
+        fb[i + 1] = (rgb >> 8) & 255
+        fb[i + 2] = rgb & 255
+
+    def get(self, x: int, y: int) -> int:
+        i = 3 * (y * self.w + x)
+        fb = self.fb
+        return (fb[i] << 16) | (fb[i + 1] << 8) | fb[i + 2]
+
+    def fill(self, x0: int, y0: int, x1: int, y1: int, rgb: int):
+        """Fill [x0, x1) x [y0, y1), clipped to the screen."""
+        x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1, self.w), min(y1, self.h)
+        if x0 >= x1 or y0 >= y1:
+            return
+        row = bytes((rgb >> 16, (rgb >> 8) & 255, rgb & 255)) * (x1 - x0)
+        for y in range(y0, y1):
+            i = 3 * (y * self.w + x0)
+            self.fb[i:i + len(row)] = row
+
+    def show(self, write):
+        if self.ansi:
+            write(self.ansi_frame())
+
+    def ansi_frame(self) -> bytes:
+        """One frame: each character cell shows two pixels (U+2580 upper half
+        block: foreground = upper pixel, background = lower pixel)."""
+        out = [b"\x1b[H" if self.frames else b"\x1b[2J\x1b[H"]
+        self.frames += 1
+        w, h, fb = self.w, self.h, self.fb
+        for y in range(0, h, 2):
+            fg = bg = -1
+            row = []
+            for x in range(w):
+                i = 3 * (y * w + x)
+                top = (fb[i] << 16) | (fb[i + 1] << 8) | fb[i + 2]
+                if top != fg:
+                    row.append(b"\x1b[38;2;%d;%d;%dm" % (fb[i], fb[i + 1], fb[i + 2]))
+                if y + 1 < h:
+                    j = i + 3 * w
+                    bot = (fb[j] << 16) | (fb[j + 1] << 8) | fb[j + 2]
+                    if bot != bg:
+                        row.append(b"\x1b[48;2;%d;%d;%dm" % (fb[j], fb[j + 1], fb[j + 2]))
+                else:
+                    bot = -2
+                    if bot != bg:
+                        row.append(b"\x1b[49m")
+                fg, bg = top, bot
+                row.append(b"\xe2\x96\x80")
+            out.append(b"".join(row) + b"\x1b[0m\n")
+        return b"".join(out)
+
+    def ppm(self) -> bytes:
+        return b"P6\n%d %d\n255\n" % (self.w, self.h) + bytes(self.fb)
+
+
+def parse_key_script(spec: str) -> List[int]:
+    """--keys "UP,UP,ENTER,a,ESC": comma-separated names (any case) or single
+    characters -> key codes (NONE = 0); "" = no keys. Raises ValueError."""
+    if not spec.strip(' \t'):
+        return []
+    codes = []
+    for raw in spec.split(','):
+        tok = raw.strip(' \t')
+        name = tok.encode('utf-8', 'surrogateescape').upper().decode('utf-8', 'replace')
+        if len(tok) == 1 and not 0xD800 <= ord(tok) <= 0xDFFF:
+            codes.append(ord(tok))
+        elif name in KEY_NAMES:
+            codes.append(KEY_NAMES[name])
+        else:
+            raise ValueError(f"bad --keys entry '{tok}' (use UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, "
+                             f"TAB, BACKSPACE, COMMA, NONE or one character)")
+    return codes
+
+
+class KeyScript:
+    """Scripted keys (--keys): key_pressed() takes the next entry (0 once the
+    script is used up); wait_key() skips NONE entries and returns 27 (ESC) when
+    the script has ended, so programs that wait for keys always finish."""
+
+    def __init__(self, codes=()):
+        self.codes = list(codes)
+        self.pos = 0
+
+    def pressed(self) -> int:
+        if self.pos < len(self.codes):
+            self.pos += 1
+            return self.codes[self.pos - 1]
+        return 0
+
+    def wait(self) -> int:
+        while self.pos < len(self.codes):
+            self.pos += 1
+            if self.codes[self.pos - 1]:
+                return self.codes[self.pos - 1]
+        return 27
+
+    def close(self):
+        pass
+
+
+class TerminalKeys:
+    """Keys from the terminal (raw mode while the program reads keys, restored
+    by close() and before input()) or, when stdin is not a terminal, from
+    stdin's bytes (at the end: key_pressed() -> 0, wait_key() -> 27). Arrows
+    (ESC [ A..D) -> 1..4, CR/LF -> 13, DEL -> 8, UTF-8 -> code point: the same
+    decoding as vm/main.c."""
+
+    def __init__(self):
+        self.mode = None            # 'tty' (POSIX terminal), 'win' (Windows console), 'stream'
+        self.fd = -1
+        self.saved = None           # termios settings to restore
+        self.pending: List[int] = []    # bytes read ahead
+
+    def _start(self):
+        if self.mode is None:
+            try:
+                self.fd = sys.stdin.fileno()
+                tty = os.isatty(self.fd)
+            except (AttributeError, OSError, ValueError):
+                tty = False
+            self.mode = ('win' if os.name == 'nt' else 'tty') if tty else 'stream'
+        if self.mode == 'tty' and self.saved is None:
+            import termios
+            try:
+                self.saved = termios.tcgetattr(self.fd)
+                raw = termios.tcgetattr(self.fd)
+                raw[3] &= ~(termios.ICANON | termios.ECHO)
+                raw[6][termios.VMIN] = 1
+                raw[6][termios.VTIME] = 0
+                termios.tcsetattr(self.fd, termios.TCSANOW, raw)
+            except termios.error:
+                self.saved = None
+
+    def close(self):
+        """Give the terminal back its normal mode (echo, line editing)."""
+        if self.saved is not None:
+            import termios
+            try:
+                termios.tcsetattr(self.fd, termios.TCSANOW, self.saved)
+            except termios.error:
+                pass
+            self.saved = None
+
+    def cooked(self, read_line):
+        """Wrap input(): the terminal is in normal mode while a line is read."""
+        def read():
+            self.close()
+            return read_line()
+        return read
+
+    def _tty_byte(self, timeout) -> int:
+        """Next byte: -1 = none within `timeout` s (None: wait), -2 = end of input."""
+        if self.pending:
+            return self.pending.pop(0)
+        import select
+        try:
+            if not select.select([self.fd], [], [], timeout)[0]:
+                return -1
+            data = os.read(self.fd, 1)
+        except (OSError, ValueError):
+            return -1
+        return data[0] if data else -2
+
+    def _stream_byte(self, timeout) -> int:
+        """Next byte of a non-terminal stdin; -2 at its end (or if it cannot be read)."""
+        if self.pending:
+            return self.pending.pop(0)
+        stdin = sys.stdin
+        try:
+            buf = getattr(stdin, 'buffer', None)
+            data = buf.read(1) if buf is not None else stdin.read(1).encode('utf-8')
+        except (AttributeError, OSError, ValueError):
+            return -2
+        if not data:
+            return -2
+        self.pending.extend(data[1:])
+        return data[0]
+
+    def _decode(self, nxt, c: int) -> int:
+        """One key from the byte source `nxt`; -1 = bytes that are not a key."""
+        if c == 27:
+            c2 = nxt(0.03)
+            if c2 not in (0x5B, 0x4F):              # '[' 'O'
+                if c2 >= 0:
+                    self.pending.insert(0, c2)       # a lone ESC
+                return 27
+            c3 = nxt(0.03)
+            if 0x41 <= c3 <= 0x44:                   # A B C D
+                return (1, 2, 4, 3)[c3 - 0x41]
+            while c3 >= 0 and not 0x40 <= c3 <= 0x7E:
+                c3 = nxt(0.03)
+            return -1
+        if 0xC0 <= c < 0xF8:
+            extra = 3 if c >= 0xF0 else 2 if c >= 0xE0 else 1
+            cp = c & (0x3F >> extra)
+            for _ in range(extra):
+                b = nxt(0.03)
+                if not 0x80 <= b <= 0xBF:
+                    return -1
+                cp = (cp << 6) | (b & 0x3F)
+            return cp
+        if c >= 0x80:
+            return -1
+        if c in (10, 13):
+            return 13
+        return 8 if c == 127 else c
+
+    def _win_key(self, block: bool) -> int:
+        import msvcrt
+        while True:
+            if not block and not msvcrt.kbhit():
+                return 0
+            ch = msvcrt.getwch()
+            if ch in ('\x00', '\xe0'):               # arrows: prefix + scan code
+                k = {72: 1, 80: 2, 75: 3, 77: 4}.get(ord(msvcrt.getwch()))
+                if k:
+                    return k
+                continue
+            return 13 if ch in ('\r', '\n') else ord(ch)
+
+    def pressed(self) -> int:
+        self._start()
+        if self.mode == 'win':
+            return self._win_key(False)
+        nxt = self._tty_byte if self.mode == 'tty' else self._stream_byte
+        c = nxt(0)
+        if c < 0:
+            return 0
+        k = self._decode(nxt, c)
+        return k if k > 0 else 0
+
+    def wait(self) -> int:
+        self._start()
+        try:
+            sys.stdout.flush()
+        except (AttributeError, OSError, ValueError):
+            pass
+        if self.mode == 'win':
+            return self._win_key(True)
+        nxt = self._tty_byte if self.mode == 'tty' else self._stream_byte
+        while True:
+            c = nxt(None)
+            if c == -2 or (c < 0 and self.mode == 'stream'):
+                return 27
+            if c >= 0:
+                k = self._decode(nxt, c)
+                if k > 0:
+                    return k
+
+
 class TILVM:
     """Reference interpreter for TIL bytecode modules."""
 
@@ -7935,10 +8299,15 @@ class TILVM:
     MAX_FRAMES = 2000
 
     def __init__(self, module: TBCModule, write=None, read_line=None, max_steps: int = 0,
-                 argv: Optional[List[Any]] = None):
+                 argv: Optional[List[Any]] = None, screen: Optional['TILScreen'] = None, keys=None):
         self.m = module
         # program arguments for args(): bytes (str is encoded as UTF-8)
         self.argv = [a.encode('utf-8') if isinstance(a, str) else bytes(a) for a in (argv or [])]
+        # screen and keys: an offscreen framebuffer and no keys unless the host passes
+        # others (keys: a --keys string, a list of key codes, or a key source object)
+        self.screen = screen if screen is not None else TILScreen()
+        self.keys = keys if hasattr(keys, 'pressed') else KeyScript(
+            parse_key_script(keys) if isinstance(keys, str) else (keys or ()))
         self.code = module.code
         self.consts = module.consts
         self._own_stdout = write is None
@@ -8276,6 +8645,8 @@ class TILVM:
         name = NATIVES[nid] if nid < len(NATIVES) else '?'
         if nid < len(NATIVES) and len(args) < NATIVE_MIN_ARGS[nid]:
             self.panic(f"{name}() is missing arguments")
+        if GFX_FIRST_NATIVE <= nid <= GFX_LAST_NATIVE:
+            return self.gfx_native(name, args)
         if name in ('print', 'println'):
             if not args:
                 self.write(b"\n")
@@ -8424,6 +8795,72 @@ class TILVM:
         if not v or len(v) >= 256 or b"\0" in v:
             self.panic(f"{who}(): invalid path")
         return os.fsdecode(v)
+
+    def gfx_native(self, name: str, args: list):
+        """Screen and keys natives (ids 40-53): same checks, order and messages as
+        native_gfx in vm/tilvm.c."""
+        scr = self.screen
+        if name == 'screen_width':
+            return scr.w
+        if name == 'screen_height':
+            return scr.h
+        if name in ('key_pressed', 'wait_key'):
+            k = self.keys.pressed() if name == 'key_pressed' else self.keys.wait()
+            if type(k) is not int or k < 0:
+                self.panic("key code out of range")
+            return k
+        if name != 'screen_init' and not scr.w:
+            self.panic("screen not initialized (call screen_init)")
+        kinds = GFX_KINDS[name]
+        for k, v in enumerate(args[:len(kinds)]):
+            kind = kinds[k]
+            if kind == 't':
+                continue
+            if type(v) is not int:
+                self.panic(f"{name}() argument {k + 1} must be an int, got {self.type_name(v).decode()}")
+            if kind == 's' and not 1 <= v <= GFX_MAX_SIZE:
+                self.panic(f"{name}() argument {k + 1} must be 1..4096, got {v}")
+            if kind == 'c' and not GFX_COORD_MIN <= v <= GFX_COORD_MAX:
+                self.panic(f"{name}() argument {k + 1} must be -32768..32767, got {v}")
+            if kind == 'k' and not 0 <= v <= 0xFFFFFF:
+                self.panic(f"{name}() argument {k + 1} must be a color 0..0xFFFFFF, got {v}")
+        w, h = scr.w, scr.h
+        if name == 'screen_init':
+            scr.init(args[0], args[1])
+        elif name == 'screen_clear':
+            scr.fill(0, 0, w, h, args[0] if args else 0)
+        elif name == 'draw_pixel':
+            if 0 <= args[0] < w and 0 <= args[1] < h:
+                scr.pixel(args[0], args[1], args[2])
+        elif name == 'get_pixel':
+            return scr.get(args[0], args[1]) if 0 <= args[0] < w and 0 <= args[1] < h else 0
+        elif name in ('draw_rect', 'fill_rect'):
+            x, y, rw, rh, c = args[:5]
+            if rw > 0 and rh > 0:
+                if name == 'fill_rect':
+                    scr.fill(x, y, x + rw, y + rh, c)
+                else:
+                    scr.fill(x, y, x + rw, y + 1, c)                    # top
+                    scr.fill(x, y + rh - 1, x + rw, y + rh, c)          # bottom
+                    scr.fill(x, y + 1, x + 1, y + rh - 1, c)            # left
+                    scr.fill(x + rw - 1, y + 1, x + rw, y + rh - 1, c)  # right
+        elif name == 'screen_show':
+            scr.show(self.write)
+            if scr.ansi:
+                self.flush()
+        else:
+            if name == 'draw_line':
+                points, c = gfx_line_points(*args[:4]), args[4]
+            elif name == 'draw_circle':
+                points, c = gfx_circle_points(*args[:3]), args[3]
+            else:                                                       # draw_text
+                text = args[2] if type(args[2]) is bytes else self.to_str(args[2])
+                points, c = gfx_text_points(args[0], args[1], text), args[3]
+            plot = scr.pixel
+            for x, y in points:
+                if 0 <= x < w and 0 <= y < h:
+                    plot(x, y, c)
+        return None
 
     # ── builtin methods ─────────────────────────────────────────────────────
     def call_method(self, mid: int, recv, args: list):
@@ -9536,7 +9973,59 @@ def run_bytecode(module: TBCModule, max_steps: int = 0, argv: Optional[List[str]
                  opts: Optional[Dict[str, Any]] = None) -> int:
     """Run a module on the reference VM. `argv` = program arguments (args()),
     `opts` = run options parsed by main() (see RUN_VALUE_OPTIONS)."""
-    return TILVM(module, max_steps=max_steps, argv=argv).run()
+    opts = opts or {}
+    try:
+        screen, keys = screen_and_keys(opts)
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 2
+    vm = TILVM(module, max_steps=max_steps, argv=argv, screen=screen, keys=keys)
+    if isinstance(keys, TerminalKeys):
+        vm.read_line = keys.cooked(vm.read_line)
+    try:
+        rc = vm.run()
+    except KeyboardInterrupt:       # Ctrl-C (e.g. in a game): quiet, like the C VM
+        rc = 130
+    finally:
+        keys.close()
+    return save_screen(screen, opts.get('screen'), rc)
+
+
+# ── graphics run options: --screen FILE.ppm, --screen-ansi, --keys LIST ──────
+
+def screen_and_keys(opts: Dict[str, Any]) -> Tuple[TILScreen, Any]:
+    """Screen and key source for a run: scripted keys with --keys, else the
+    terminal (or stdin's bytes). Raises ValueError for a bad --keys list."""
+    screen = TILScreen(ansi=bool(opts.get('screen_ansi')))
+    if opts.get('keys') is not None:
+        return screen, KeyScript(parse_key_script(opts['keys']))
+    return screen, TerminalKeys()
+
+
+def save_screen(screen: TILScreen, path: Optional[str], rc: int) -> int:
+    """--screen FILE: the framebuffer at the end of the run as a binary PPM (P6)."""
+    if not path:
+        return rc
+    if not screen.w:
+        print("til: --screen: the program did not call screen_init (no image written)", file=sys.stderr)
+        return rc
+    try:
+        with open(path, 'wb') as f:
+            f.write(screen.ppm())
+    except OSError:
+        print(f"til: cannot write {path}", file=sys.stderr)
+        return rc or 2
+    return rc
+
+
+def cvm_screen_flags(opts: Dict[str, Any]) -> List[str]:
+    """The same graphics options for the C VM runner (vm/main.c)."""
+    flags = ['--screen', opts['screen']] if opts.get('screen') else []
+    if opts.get('screen_ansi'):
+        flags.append('--screen-ansi')
+    if opts.get('keys') is not None:
+        flags += ['--keys', opts['keys']]
+    return flags
 
 
 # ── feature commands and run options (TIL 3.1) ───────────────────────────────
@@ -9916,6 +10405,8 @@ def main():
         if command == 'run' and use_vm is None and compiler.find_c_compiler() is None:
             print("[TIL] No C compiler found - running on the TIL VM", file=sys.stderr)
             use_vm = 'py'
+        if command == 'run' and use_vm is None and any(o in opts for o in GFX_RUN_OPTIONS):
+            use_vm = 'py'           # screen/keys options: the VM implements the graphics natives
 
         if command == 'run' and use_vm:
             module = compile_to_bytecode(source, input_file, compiler.verify)
@@ -9929,7 +10420,8 @@ def main():
             try:
                 with os.fdopen(fd, 'wb') as f:
                     f.write(module.serialize())
-                cmd = [exe] + (['--max-steps', str(max_steps)] if max_steps else []) + [tbc_path] + prog_args
+                cmd = [exe] + (['--max-steps', str(max_steps)] if max_steps else []) + \
+                    cvm_screen_flags(opts) + [tbc_path] + prog_args
                 return subprocess.run(cmd).returncode
             finally:
                 os.unlink(tbc_path)

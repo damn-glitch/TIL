@@ -6,6 +6,7 @@
  */
 #include "tilvm.h"
 #include <string.h>
+#include <limits.h>
 
 #ifndef TILVM_NO_STDIO
 #include <stdio.h>
@@ -1650,6 +1651,283 @@ static int native_write_file(tilvm *vm, uint16_t base) {
 }
 #endif
 
+#ifndef TILVM_NO_GFX
+/* ─── screen and keys (TIL 3.1, docs/TIL_GRAPHICS.md) ──────────────────── */
+/* The VM rasterizes shapes and text and clips them to the screen, so every
+ * host shows identical pixels; hosts only store pixels (vm->host.gfx_*).
+ * TILVM.gfx_native in src/til.py implements the same algorithms, limits and
+ * messages. */
+#ifndef TILVM_ROM
+#define TILVM_ROM
+#endif
+
+#define GFX_MAX_SIZE 4096           /* screen_init: 1..4096 pixels per side */
+#define GFX_COORD_LIM 32768L        /* shape coordinates and sizes: -32768..32767 */
+
+/* 5x7 font: ASCII 32..126, then the replacement glyph used for every other
+ * character. 5 columns per glyph, bit 0 = top row. Same table as FONT5X7 in
+ * src/til.py (the test-suite compares them). */
+static const TILVM_ROM uint8_t FONT5X7[96 * 5] = {
+    0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x4F,0x00,0x00, 0x00,0x07,0x00,0x07,0x00, 0x14,0x7F,0x14,0x7F,0x14, /* sp ! " # */
+    0x24,0x2A,0x7F,0x2A,0x12, 0x23,0x13,0x08,0x64,0x62, 0x36,0x49,0x55,0x22,0x50, 0x00,0x05,0x03,0x00,0x00, /* $ % & ' */
+    0x00,0x1C,0x22,0x41,0x00, 0x00,0x41,0x22,0x1C,0x00, 0x14,0x08,0x3E,0x08,0x14, 0x08,0x08,0x3E,0x08,0x08, /* ( ) * + */
+    0x00,0x50,0x30,0x00,0x00, 0x08,0x08,0x08,0x08,0x08, 0x00,0x60,0x60,0x00,0x00, 0x20,0x10,0x08,0x04,0x02, /* , - . / */
+    0x3E,0x51,0x49,0x45,0x3E, 0x00,0x42,0x7F,0x40,0x00, 0x42,0x61,0x51,0x49,0x46, 0x21,0x41,0x45,0x4B,0x31, /* 0 1 2 3 */
+    0x18,0x14,0x12,0x7F,0x10, 0x27,0x45,0x45,0x45,0x39, 0x3C,0x4A,0x49,0x49,0x30, 0x01,0x71,0x09,0x05,0x03, /* 4 5 6 7 */
+    0x36,0x49,0x49,0x49,0x36, 0x06,0x49,0x49,0x29,0x1E, 0x00,0x36,0x36,0x00,0x00, 0x00,0x56,0x36,0x00,0x00, /* 8 9 : ; */
+    0x08,0x14,0x22,0x41,0x00, 0x14,0x14,0x14,0x14,0x14, 0x00,0x41,0x22,0x14,0x08, 0x02,0x01,0x51,0x09,0x06, /* < = > ? */
+    0x32,0x49,0x79,0x41,0x3E, 0x7E,0x11,0x11,0x11,0x7E, 0x7F,0x49,0x49,0x49,0x36, 0x3E,0x41,0x41,0x41,0x22, /* @ A B C */
+    0x7F,0x41,0x41,0x22,0x1C, 0x7F,0x49,0x49,0x49,0x41, 0x7F,0x09,0x09,0x09,0x01, 0x3E,0x41,0x49,0x49,0x7A, /* D E F G */
+    0x7F,0x08,0x08,0x08,0x7F, 0x00,0x41,0x7F,0x41,0x00, 0x20,0x40,0x41,0x3F,0x01, 0x7F,0x08,0x14,0x22,0x41, /* H I J K */
+    0x7F,0x40,0x40,0x40,0x40, 0x7F,0x02,0x0C,0x02,0x7F, 0x7F,0x04,0x08,0x10,0x7F, 0x3E,0x41,0x41,0x41,0x3E, /* L M N O */
+    0x7F,0x09,0x09,0x09,0x06, 0x3E,0x41,0x51,0x21,0x5E, 0x7F,0x09,0x19,0x29,0x46, 0x46,0x49,0x49,0x49,0x31, /* P Q R S */
+    0x01,0x01,0x7F,0x01,0x01, 0x3F,0x40,0x40,0x40,0x3F, 0x1F,0x20,0x40,0x20,0x1F, 0x3F,0x40,0x38,0x40,0x3F, /* T U V W */
+    0x63,0x14,0x08,0x14,0x63, 0x07,0x08,0x70,0x08,0x07, 0x61,0x51,0x49,0x45,0x43, 0x00,0x7F,0x41,0x41,0x00, /* X Y Z [ */
+    0x02,0x04,0x08,0x10,0x20, 0x00,0x41,0x41,0x7F,0x00, 0x04,0x02,0x01,0x02,0x04, 0x40,0x40,0x40,0x40,0x40, /* bs ] ^ _ */
+    0x00,0x01,0x02,0x04,0x00, 0x20,0x54,0x54,0x54,0x78, 0x7F,0x48,0x44,0x44,0x38, 0x38,0x44,0x44,0x44,0x20, /* ` a b c */
+    0x38,0x44,0x44,0x48,0x7F, 0x38,0x54,0x54,0x54,0x18, 0x08,0x7E,0x09,0x01,0x02, 0x08,0x54,0x54,0x54,0x3C, /* d e f g */
+    0x7F,0x08,0x04,0x04,0x78, 0x00,0x44,0x7D,0x40,0x00, 0x20,0x40,0x44,0x3D,0x00, 0x7F,0x10,0x28,0x44,0x00, /* h i j k */
+    0x00,0x41,0x7F,0x40,0x00, 0x7C,0x04,0x18,0x04,0x78, 0x7C,0x08,0x04,0x04,0x78, 0x38,0x44,0x44,0x44,0x38, /* l m n o */
+    0x7C,0x14,0x14,0x14,0x08, 0x08,0x14,0x14,0x18,0x7C, 0x7C,0x08,0x04,0x04,0x08, 0x48,0x54,0x54,0x54,0x20, /* p q r s */
+    0x04,0x3F,0x44,0x40,0x20, 0x3C,0x40,0x40,0x20,0x7C, 0x1C,0x20,0x40,0x20,0x1C, 0x3C,0x40,0x30,0x40,0x3C, /* t u v w */
+    0x44,0x28,0x10,0x28,0x44, 0x0C,0x50,0x50,0x50,0x3C, 0x44,0x64,0x54,0x4C,0x44, 0x00,0x08,0x36,0x41,0x00, /* x y z { */
+    0x00,0x00,0x7F,0x00,0x00, 0x00,0x41,0x36,0x08,0x00, 0x08,0x04,0x08,0x10,0x08, 0x7F,0x41,0x41,0x41,0x7F  /* | } ~ replacement */
+};
+
+/* Argument kinds of screen_init .. screen_show: i = any int, c = coordinate or
+ * size -32768..32767, s = screen size 1..4096, k = color, t = any value (text). */
+static const char *const GFX_KINDS[] = {
+    "ss", "k", "iik", "cccck", "cccck", "cccck", "ccck", "cctk", "ii", ""
+};
+
+static void gfx_plot(tilvm *vm, long x, long y, unsigned long rgb) {
+    if (x >= 0 && y >= 0 && x < (long)vm->st.scr_w && y < (long)vm->st.scr_h)
+        vm->host.gfx_pixel(vm->ctx, (int)x, (int)y, rgb);
+}
+
+/* Fill [x0, x1) x [y0, y1), clipped to the screen. */
+static void gfx_fill(tilvm *vm, long x0, long y0, long x1, long y1, unsigned long rgb) {
+    long x;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (long)vm->st.scr_w) x1 = (long)vm->st.scr_w;
+    if (y1 > (long)vm->st.scr_h) y1 = (long)vm->st.scr_h;
+    for (; y0 < y1; y0++)
+        for (x = x0; x < x1; x++) vm->host.gfx_pixel(vm->ctx, (int)x, (int)y0, rgb);
+}
+
+/* Bresenham line, all octants, both end points included. */
+static void gfx_line(tilvm *vm, long x0, long y0, long x1, long y1, unsigned long rgb) {
+    long dx = x1 > x0 ? x1 - x0 : x0 - x1, dy = y1 > y0 ? y0 - y1 : y1 - y0;   /* dy = -|y1 - y0| */
+    long sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1, err = dx + dy, e2;
+    for (;;) {
+        gfx_plot(vm, x0, y0, rgb);
+        if (x0 == x1 && y0 == y1) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* Midpoint circle outline (r < 0: nothing, r = 0: one pixel). */
+static void gfx_circle(tilvm *vm, long cx, long cy, long r, unsigned long rgb) {
+    long x = 0, y = r, d = 1 - r;
+    while (x <= y) {
+        gfx_plot(vm, cx + x, cy + y, rgb);
+        gfx_plot(vm, cx - x, cy + y, rgb);
+        gfx_plot(vm, cx + x, cy - y, rgb);
+        gfx_plot(vm, cx - x, cy - y, rgb);
+        gfx_plot(vm, cx + y, cy + x, rgb);
+        gfx_plot(vm, cx - y, cy + x, rgb);
+        gfx_plot(vm, cx + y, cy - x, rgb);
+        gfx_plot(vm, cx - y, cy - x, rgb);
+        if (d < 0) d += 2 * x + 3;
+        else { d += 2 * (x - y) + 5; y--; }
+        x++;
+    }
+}
+
+/* Text: one 5x7 glyph per character, 6 px advance, "\n" starts a new line 8 px
+ * lower. A character is a byte below 0x80 or a UTF-8 lead byte (continuation
+ * bytes 0x80-0xBF are skipped); everything outside ASCII 32..126 is drawn as
+ * the replacement glyph. */
+static void gfx_text(tilvm *vm, long x, long y, const uint8_t *s, uint32_t n, unsigned long rgb) {
+    long cx = x, cy = y;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        unsigned c = s[i];
+        const TILVM_ROM uint8_t *g;
+        int col, row;
+        if (c == '\n') { cx = x; cy += 8; continue; }
+        if (c >= 0x80 && c < 0xC0) continue;
+        g = FONT5X7 + 5u * (c >= 32 && c <= 126 ? c - 32 : 95);
+        if (cx < (long)vm->st.scr_w && cx > -5 && cy < (long)vm->st.scr_h && cy > -7)
+            for (col = 0; col < 5; col++)
+                for (row = 0; row < 7; row++)
+                    if ((g[col] >> row) & 1) gfx_plot(vm, cx + col, cy + row, rgb);
+        cx += 6;
+    }
+}
+
+/* Color argument -> 0xRRGGBB for the host. 16-bit int builds use RGB565
+ * values (the int's 16 bits; e.g. red 0xF800 is -2048). */
+static unsigned long gfx_rgb(const tv_val *v) {
+#if TILVM_INT_BITS == 16
+    unsigned long c = (uint16_t)v->u.i, r = c >> 11, g = (c >> 5) & 63u, b = c & 31u;
+    return (((r << 3) | (r >> 2)) << 16) | (((g << 2) | (g >> 4)) << 8) | ((b << 3) | (b >> 2));
+#else
+    return (unsigned long)v->u.i;
+#endif
+}
+
+/* Host pixel -> get_pixel() value (RGB565 on 16-bit int builds). */
+static tv_int gfx_value(unsigned long rgb) {
+#if TILVM_INT_BITS == 16
+    long c = (long)((((rgb >> 19) & 31u) << 11) | (((rgb >> 10) & 63u) << 5) | ((rgb >> 3) & 31u));
+    return (tv_int)(c > 32767L ? c - 65536L : c);
+#else
+    return (tv_int)(rgb & 0xFFFFFFul);
+#endif
+}
+
+/* Type name for messages; structs by name, like the reference VM. */
+static const char *gfx_type(tilvm *vm, const tv_val *v, char *buf) {
+    if (v->t == TV_STRUCT) {
+        tv_val nv;
+        uint32_t n;
+        const char *p;
+        nv.t = TV_STRK;
+        nv.u.i = 0;
+        nv.u.k = type_name_const(vm, OBJ(vm, v->u.r)->aux);
+        p = str_data(vm, &nv, &n);
+        if (n > 47) n = 47;
+        memcpy(buf, p, n);
+        buf[n] = 0;
+        return buf;
+    }
+    return type_name(vm, v);
+}
+
+static int gfx_arg_error(tilvm *vm, uint8_t id, uint8_t k, const char *what, const char *got) {
+    char num[2];
+    num[0] = (char)('1' + k);
+    num[1] = 0;
+    return failn(vm, NATIVE_NAMES[id], "() argument ", num, what, got, 0);
+}
+
+static int gfx_check(tilvm *vm, uint8_t id, uint16_t base, uint8_t argc) {
+    const char *kinds = GFX_KINDS[id - N_SCREEN_INIT];
+    char buf[48];
+    uint8_t k;
+    for (k = 0; kinds[k] && k < argc; k++) {
+        const tv_val *v = &STK[base + k];
+        tv_int i;
+        if (kinds[k] == 't') continue;
+        if (v->t != TV_INT) return gfx_arg_error(vm, id, k, " must be an int, got ", gfx_type(vm, v, buf));
+        i = v->u.i;
+        if (kinds[k] == 's' && (i < 1 || i > GFX_MAX_SIZE))
+            return gfx_arg_error(vm, id, k, " must be 1..4096, got ", fmt_int(buf, i));
+#if TILVM_INT_BITS > 16
+        if (kinds[k] == 'c' && (i < -GFX_COORD_LIM || i >= GFX_COORD_LIM))
+            return gfx_arg_error(vm, id, k, " must be -32768..32767, got ", fmt_int(buf, i));
+        if (kinds[k] == 'k' && (i < 0 || i > 0xFFFFFFL))
+            return gfx_arg_error(vm, id, k, " must be a color 0..0xFFFFFF, got ", fmt_int(buf, i));
+#endif
+    }
+    return 1;
+}
+
+/* Create the host screen (all black): screen_init, and after a snapshot
+ * restore (snapshots keep the size, not the pixels). */
+static void gfx_open(tilvm *vm) {
+    if (vm->host.gfx_init) vm->host.gfx_init(vm->ctx, (int)vm->st.scr_w, (int)vm->st.scr_h);
+    else gfx_fill(vm, 0, 0, (long)vm->st.scr_w, (long)vm->st.scr_h, 0);
+}
+
+static int gfx_key(tilvm *vm, uint8_t id, tv_val *res) {
+    int k;
+    if (id == N_WAIT_KEY && vm->host.wait_key) k = vm->host.wait_key(vm->ctx);
+    else if (!vm->host.key_pressed)
+        return failn(vm, NATIVE_NAMES[id], "() is not available on this device", 0, 0, 0, 0);
+    else {
+        k = vm->host.key_pressed(vm->ctx);
+        while (id == N_WAIT_KEY && k == 0) {     /* no wait_key hook: poll */
+            if (vm->host.idle) vm->host.idle(vm->ctx, 1);
+            k = vm->host.key_pressed(vm->ctx);
+        }
+    }
+    if (k < 0) return fail(vm, "key code out of range");
+#if TILVM_INT_BITS == 16 && INT_MAX > 32767
+    if (k > 32767) return fail(vm, "key code out of range");
+#endif
+    set_int(res, (tv_int)k);
+    return 1;
+}
+
+static int native_gfx(tilvm *vm, uint8_t id, uint16_t base, uint8_t argc, tv_val *res) {
+    tv_val *a = &STK[base];
+    long w = (long)vm->st.scr_w, h = (long)vm->st.scr_h;
+    switch (id) {
+    case N_SCREEN_WIDTH: set_int(res, (tv_int)w); return 1;
+    case N_SCREEN_HEIGHT: set_int(res, (tv_int)h); return 1;
+    case N_KEY_PRESSED: case N_WAIT_KEY: return gfx_key(vm, id, res);
+    default: break;
+    }
+    if (!vm->host.gfx_pixel || (id == N_GET_PIXEL && !vm->host.gfx_get))
+        return failn(vm, NATIVE_NAMES[id], "() is not available on this device", 0, 0, 0, 0);
+    if (id != N_SCREEN_INIT && !w) return fail(vm, "screen not initialized (call screen_init)");
+    if (!gfx_check(vm, id, base, argc)) return 0;
+    switch (id) {
+    case N_SCREEN_INIT:
+        vm->st.scr_w = (uint16_t)a[0].u.i;
+        vm->st.scr_h = (uint16_t)a[1].u.i;
+        gfx_open(vm);
+        break;
+    case N_SCREEN_CLEAR: gfx_fill(vm, 0, 0, w, h, argc ? gfx_rgb(a) : 0); break;
+    case N_DRAW_PIXEL:
+        if (a[0].u.i >= 0 && a[0].u.i < (tv_int)w && a[1].u.i >= 0 && a[1].u.i < (tv_int)h)
+            vm->host.gfx_pixel(vm->ctx, (int)a[0].u.i, (int)a[1].u.i, gfx_rgb(a + 2));
+        break;
+    case N_GET_PIXEL:
+        if (a[0].u.i >= 0 && a[0].u.i < (tv_int)w && a[1].u.i >= 0 && a[1].u.i < (tv_int)h)
+            set_int(res, gfx_value(vm->host.gfx_get(vm->ctx, (int)a[0].u.i, (int)a[1].u.i)));
+        else
+            set_int(res, 0);
+        break;
+    case N_DRAW_LINE:
+        gfx_line(vm, (long)a[0].u.i, (long)a[1].u.i, (long)a[2].u.i, (long)a[3].u.i, gfx_rgb(a + 4));
+        break;
+    case N_DRAW_RECT: case N_FILL_RECT: {
+        long x = (long)a[0].u.i, y = (long)a[1].u.i, rw = (long)a[2].u.i, rh = (long)a[3].u.i;
+        unsigned long c = gfx_rgb(a + 4);
+        if (rw <= 0 || rh <= 0) break;                    /* empty */
+        if (id == N_FILL_RECT) { gfx_fill(vm, x, y, x + rw, y + rh, c); break; }
+        gfx_fill(vm, x, y, x + rw, y + 1, c);                     /* top */
+        gfx_fill(vm, x, y + rh - 1, x + rw, y + rh, c);           /* bottom */
+        gfx_fill(vm, x, y + 1, x + 1, y + rh - 1, c);             /* left */
+        gfx_fill(vm, x + rw - 1, y + 1, x + rw, y + rh - 1, c);   /* right */
+        break;
+    }
+    case N_DRAW_CIRCLE:
+        gfx_circle(vm, (long)a[0].u.i, (long)a[1].u.i, (long)a[2].u.i, gfx_rgb(a + 3));
+        break;
+    case N_DRAW_TEXT: {
+        uint32_t n;
+        const char *s;
+        if (!to_str_slot(vm, (uint16_t)(base + 2))) return 0;     /* any value, like print */
+        s = str_data(vm, &STK[base + 2], &n);
+        gfx_text(vm, (long)a[0].u.i, (long)a[1].u.i, (const uint8_t *)s, n, gfx_rgb(a + 3));
+        break;
+    }
+    case N_SCREEN_SHOW:
+        if (vm->host.gfx_show) vm->host.gfx_show(vm->ctx);
+        break;
+    default: break;
+    }
+    return 1;
+}
+#endif /* TILVM_NO_GFX */
+
 /* args are STK[base .. base+argc); the result replaces them */
 static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     uint16_t base = (uint16_t)(SP - argc);
@@ -1659,6 +1937,13 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     if (id < sizeof(NATIVE_MIN_ARGS) && argc < NATIVE_MIN_ARGS[id])
         return failn(vm, NATIVE_NAMES[id], "() is missing arguments", 0, 0, 0, 0);
     switch (id) {
+#ifndef TILVM_NO_GFX
+    case N_SCREEN_INIT: case N_SCREEN_CLEAR: case N_DRAW_PIXEL: case N_DRAW_LINE: case N_DRAW_RECT:
+    case N_FILL_RECT: case N_DRAW_CIRCLE: case N_DRAW_TEXT: case N_GET_PIXEL: case N_SCREEN_SHOW:
+    case N_KEY_PRESSED: case N_WAIT_KEY: case N_SCREEN_WIDTH: case N_SCREEN_HEIGHT:
+        if (!native_gfx(vm, id, base, argc, &res)) return 0;
+        break;
+#endif
     case N_PRINT: case N_PRINTLN: {
         uint8_t i;
         if (!argc) out(vm, "\n", 1);
@@ -2379,6 +2664,8 @@ static void reset_state(tilvm *vm) {
     st->halted = 0;
     st->exit_code = 0;
     st->failed = 0;
+    st->scr_w = 0;
+    st->scr_h = 0;
     st->steps = 0;
     st->gc_count = 0;
     st->tick = 0;
@@ -3214,6 +3501,9 @@ int tilvm_restore(tilvm *vm, const uint8_t *data, uint32_t size) {
     if (SNAP_HDR + fixed + stack_bytes + vm->st.heap_top != size) return -4;
     memcpy(vm->st.stack, data + SNAP_HDR + fixed, stack_bytes);
     memcpy(vm->mem.heap, data + SNAP_HDR + fixed + stack_bytes, vm->st.heap_top);
+#ifndef TILVM_NO_GFX
+    if (vm->st.scr_w && vm->host.gfx_pixel) gfx_open(vm);   /* same size, pixels cleared */
+#endif
     return 0;
 }
 #endif /* TILVM_LEAN */

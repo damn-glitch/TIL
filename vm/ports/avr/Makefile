@@ -6,7 +6,8 @@ MCU    ?= atmega1284p
 PROGRAM ?= ../../../examples/01_hello.til
 DEFS    = -DTILVM_INT_BITS=32 -DTILVM_FLOAT=1 -DTILVM_NO_STDIO -DTILVM_NO_TIME \
           -DTILVM_HEAP_SIZE=5120 -DTILVM_STACK_SIZE=160 -DTILVM_MAX_FRAMES=24 \
-          -DTILVM_MAX_CONSTS=160 -DTILVM_MAX_TYPES=24 -DTILVM_MAX_TRY=6 -DTILVM_MARK_STACK=16
+          -DTILVM_MAX_CONSTS=160 -DTILVM_MAX_TYPES=24 -DTILVM_MAX_TRY=6 -DTILVM_MARK_STACK=16 \
+          -DTILVM_ROM=__flash
 CFLAGS  = -mmcu=$(MCU) -Os -std=gnu99 -Wall -ffunction-sections -fdata-sections $(DEFS) -I../.. -Ibuild
 
 all: build/tilvm.elf

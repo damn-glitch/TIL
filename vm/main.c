@@ -6,15 +6,392 @@
  *   tilvm --snapshot-after N FILE p.tbc   run N steps, save the paused program to FILE
  *   tilvm --resume FILE program.tbc       continue a saved program
  *   tilvm --stats program.tbc             print memory / GC statistics to stderr
+ *   tilvm --screen out.ppm program.tbc    save the screen (screen_init, draw_*) as a PPM at exit
+ *   tilvm --screen-ansi program.tbc       draw the screen in the terminal on every screen_show()
+ *   tilvm --keys "UP,UP,ENTER,a" p.tbc    scripted keys (default: the keyboard, or stdin's bytes)
  *
  * Produce bytecode with:  til build --target vm program.til
  */
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L         /* termios, select, isatty: keys from the terminal */
+#endif
 #include "tilvm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <conio.h>
+#include <io.h>
+#else
+#include <signal.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 static tilvm vm;   /* the whole VM state: one static block, no other allocations */
+
+/* ─── screen and keys: the desktop host of the graphics natives ─────────────
+ * The VM rasterizes and clips (docs/TIL_GRAPHICS.md); this host keeps the
+ * framebuffer (3 bytes per pixel), writes it as a PPM image at exit (--screen),
+ * draws it in a 24-bit colour terminal on every screen_show() (--screen-ansi)
+ * and supplies keys: scripted (--keys), from the terminal in raw mode, or from
+ * stdin's bytes when stdin is not a terminal. `til run --vm` does the same in
+ * src/til.py (TILScreen, KeyScript, TerminalKeys) - byte for byte. */
+static unsigned char *fb;
+static int fb_w, fb_h, ansi_screen, ansi_frames;
+
+static void gfx_init(void *ctx, int w, int h) {
+    unsigned char *p = (unsigned char *)calloc((size_t)w * (size_t)h, 3);
+    (void)ctx;
+    if (!p) {
+        fprintf(stderr, "tilvm: not enough memory for a %dx%d screen\n", w, h);
+        exit(2);
+    }
+    free(fb);
+    fb = p;
+    fb_w = w;
+    fb_h = h;
+    ansi_frames = 0;                    /* the next frame clears the terminal */
+}
+
+static void gfx_pixel(void *ctx, int x, int y, unsigned long rgb) {
+    unsigned char *p = fb + 3 * ((size_t)y * (size_t)fb_w + (size_t)x);
+    (void)ctx;
+    p[0] = (unsigned char)(rgb >> 16);
+    p[1] = (unsigned char)(rgb >> 8);
+    p[2] = (unsigned char)rgb;
+}
+
+static unsigned long gfx_get(void *ctx, int x, int y) {
+    const unsigned char *p = fb + 3 * ((size_t)y * (size_t)fb_w + (size_t)x);
+    (void)ctx;
+    return ((unsigned long)p[0] << 16) | ((unsigned long)p[1] << 8) | (unsigned long)p[2];
+}
+
+/* --screen-ansi: one character cell shows two pixels (U+2580 upper half block:
+ * foreground = upper pixel, background = lower pixel); colours only change
+ * when they differ from the previous cell. */
+static void gfx_show(void *ctx) {
+    int x, y;
+    if (!ansi_screen) return;
+    fputs(ansi_frames++ ? "\033[H" : "\033[2J\033[H", stdout);
+    for (y = 0; y < fb_h; y += 2) {
+        long fg = -1, bg = -1;
+        for (x = 0; x < fb_w; x++) {
+            const unsigned char *t = fb + 3 * ((size_t)y * (size_t)fb_w + (size_t)x);
+            const unsigned char *b = y + 1 < fb_h ? t + 3 * (size_t)fb_w : NULL;
+            long top = (long)gfx_get(ctx, x, y), bot = b ? (long)gfx_get(ctx, x, y + 1) : -2;
+            if (top != fg) printf("\033[38;2;%d;%d;%dm", t[0], t[1], t[2]);
+            if (bot != bg) {
+                if (b) printf("\033[48;2;%d;%d;%dm", b[0], b[1], b[2]);
+                else fputs("\033[49m", stdout);
+            }
+            fg = top;
+            bg = bot;
+            fputs("\342\226\200", stdout);
+        }
+        fputs("\033[0m\n", stdout);
+    }
+    fflush(stdout);
+}
+
+/* --screen FILE: the framebuffer as it is when the program ends (binary PPM). */
+static int save_screen(const char *path, int rc) {
+    FILE *f;
+    size_t n = (size_t)fb_w * (size_t)fb_h;
+    int ok;
+    if (!path) return rc;
+    if (!fb) {
+        fprintf(stderr, "tilvm: --screen: the program did not call screen_init (no image written)\n");
+        return rc;
+    }
+    f = fopen(path, "wb");
+    ok = f != NULL && fprintf(f, "P6\n%d %d\n255\n", fb_w, fb_h) > 0 && fwrite(fb, 3, n, f) == n;
+    if (f && fclose(f) != 0) ok = 0;
+    if (!ok) {
+        fprintf(stderr, "tilvm: cannot write %s\n", path);
+        return rc ? rc : 2;
+    }
+    return rc;
+}
+
+/* Keys: 0 = none, UP=1 DOWN=2 LEFT=3 RIGHT=4, ENTER=13, ESC=27, otherwise the
+ * character's code point. */
+static int *keys;                       /* --keys script (NULL: keyboard / stdin) */
+static size_t n_keys, key_pos;
+static int key_source = -1, pending = -1;
+
+static const struct { const char *name; int code; } KEY_NAMES[] = {
+    {"UP", 1}, {"DOWN", 2}, {"LEFT", 3}, {"RIGHT", 4}, {"ENTER", 13}, {"ESC", 27},
+    {"SPACE", 32}, {"TAB", 9}, {"BACKSPACE", 8}, {"COMMA", 44}, {"NONE", 0}
+};
+
+/* Code point of a token that is exactly one UTF-8 character, else -1. */
+static long utf8_char(const unsigned char *s, size_t n) {
+    size_t len, i;
+    long c;
+    if (!n) return -1;
+    c = s[0];
+    len = c < 0x80 ? 1 : c < 0xC0 ? 0 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : c < 0xF8 ? 4 : 0;
+    if (!len || len != n) return -1;
+    if (len > 1) c &= 0x3F >> (len - 1);
+    for (i = 1; i < len; i++) {
+        if ((s[i] & 0xC0) != 0x80) return -1;
+        c = (c << 6) | (s[i] & 0x3F);
+    }
+    if ((len == 2 && c < 0x80) || (len == 3 && c < 0x800) || (len == 4 && c < 0x10000) ||
+        c > 0x10FFFF || (c >= 0xD800 && c <= 0xDFFF))
+        return -1;                       /* overlong, out of range, surrogate */
+    return c;
+}
+
+static int key_code(const char *s, size_t n) {
+    size_t i, j;
+    long c = utf8_char((const unsigned char *)s, n);
+    if (c >= 0) return (int)c;
+    for (i = 0; i < sizeof(KEY_NAMES) / sizeof(KEY_NAMES[0]); i++) {
+        const char *name = KEY_NAMES[i].name;
+        for (j = 0; j < n && name[j]; j++)
+            if ((s[j] >= 'a' && s[j] <= 'z' ? s[j] - 32 : s[j]) != name[j]) break;
+        if (j == n && !name[j]) return KEY_NAMES[i].code;
+    }
+    return -1;
+}
+
+/* --keys "UP,UP,ENTER,a,ESC": comma-separated names (any case) or single
+ * characters; "" = no keys at all. Returns 0, or -1 after printing an error. */
+static int parse_keys(const char *spec) {
+    size_t cap = 1;
+    const char *p;
+    for (p = spec; *p; p++)
+        if (*p == ',') cap++;
+    free(keys);
+    keys = (int *)malloc(cap * sizeof(int));
+    n_keys = key_pos = 0;
+    if (!keys) return -1;
+    for (p = spec; *p == ' ' || *p == '\t'; p++) { }
+    if (!*p) return 0;
+    for (p = spec;;) {
+        const char *end = strchr(p, ','), *a = p, *b;
+        int code;
+        if (!end) end = p + strlen(p);
+        b = end;
+        while (a < b && (*a == ' ' || *a == '\t')) a++;
+        while (b > a && (b[-1] == ' ' || b[-1] == '\t')) b--;
+        code = key_code(a, (size_t)(b - a));
+        if (code < 0) {
+            fprintf(stderr, "tilvm: bad --keys entry '%.*s' (use UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, "
+                            "TAB, BACKSPACE, COMMA, NONE or one character)\n", (int)(b - a), a);
+            return -1;
+        }
+        keys[n_keys++] = code;
+        if (!*end) return 0;
+        p = end + 1;
+    }
+}
+
+/* Next byte of stdin when it is not a terminal (a file or a pipe): -2 at the end. */
+static int stream_byte(int ms) {
+    int c;
+    (void)ms;
+    if (pending >= 0) { c = pending; pending = -1; return c; }
+    c = getchar();
+    return c == EOF ? -2 : c;
+}
+
+#ifndef _WIN32
+static struct termios saved_tio;
+static int raw_mode;
+
+static void term_restore(void) {
+    if (raw_mode) {
+        tcsetattr(0, TCSANOW, &saved_tio);
+        raw_mode = 0;
+    }
+}
+
+static void term_signal(int sig) {
+    term_restore();
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* Keys arrive without Enter and without echo while the program reads them;
+ * the terminal is restored at exit, on Ctrl-C and before input(). */
+static void term_raw(void) {
+    static int hooked;
+    struct termios t;
+    if (raw_mode || tcgetattr(0, &saved_tio) != 0) return;
+    t = saved_tio;
+    t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+    if (tcsetattr(0, TCSANOW, &t) != 0) return;
+    raw_mode = 1;
+    if (!hooked) {
+        hooked = 1;
+        atexit(term_restore);
+        signal(SIGINT, term_signal);
+        signal(SIGTERM, term_signal);
+    }
+}
+
+/* Next byte of the terminal: -1 = none within `ms` milliseconds (ms < 0: wait),
+ * -2 = end of input. */
+static int term_byte(int ms) {
+    fd_set set;
+    struct timeval tv;
+    unsigned char c;
+    if (pending >= 0) { int p = pending; pending = -1; return p; }
+    FD_ZERO(&set);
+    FD_SET(0, &set);
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000L;
+    if (select(1, &set, NULL, NULL, ms < 0 ? NULL : &tv) <= 0) return -1;
+    return read(0, &c, 1) == 1 ? c : -2;
+}
+#else
+/* Windows console: arrows come as 0 / 0xE0 followed by a scan code. */
+static int win_key(int block) {
+    for (;;) {
+        int c;
+        if (!block && !_kbhit()) return 0;
+        c = (int)_getwch();
+        if (c == 0 || c == 0xE0) {
+            c = (int)_getwch();
+            if (c == 72) return 1;
+            if (c == 80) return 2;
+            if (c == 75) return 3;
+            if (c == 77) return 4;
+            continue;
+        }
+        if (c == '\r' || c == '\n') return 13;
+        return c;
+    }
+}
+#endif
+
+/* One key from a byte source: ESC [ A..D (or ESC O A..D) -> UP DOWN RIGHT LEFT,
+ * UTF-8 -> code point, CR and LF -> ENTER (13), DEL -> BACKSPACE (8).
+ * -1 = bytes that are not a key (other escape sequences, broken UTF-8). */
+static int decode_key(int (*next)(int ms), int c) {
+    if (c == 27) {
+        int c2 = next(30), c3;
+        if (c2 != '[' && c2 != 'O') {
+            if (c2 >= 0) pending = c2;          /* a lone ESC */
+            return 27;
+        }
+        c3 = next(30);
+        if (c3 >= 'A' && c3 <= 'D') return "\1\2\4\3"[c3 - 'A'];
+        while (c3 >= 0 && (c3 < 0x40 || c3 > 0x7E)) c3 = next(30);
+        return -1;
+    }
+    if (c >= 0xC0 && c < 0xF8) {
+        int extra = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : 1, i;
+        long cp = c & (0x3F >> extra);
+        for (i = 0; i < extra; i++) {
+            int b = next(30);
+            if (b < 0x80 || b > 0xBF) return -1;
+            cp = (cp << 6) | (b & 0x3F);
+        }
+        return (int)cp;
+    }
+    if (c >= 0x80) return -1;
+    if (c == '\r' || c == '\n') return 13;
+    return c == 127 ? 8 : c;
+}
+
+static int pick_key_source(void) {        /* 0 script, 1 terminal, 2 stdin bytes */
+    if (key_source < 0) {
+#ifdef _WIN32
+        key_source = keys ? 0 : _isatty(_fileno(stdin)) ? 1 : 2;
+#else
+        key_source = keys ? 0 : isatty(0) ? 1 : 2;
+#endif
+    }
+    return key_source;
+}
+
+/* key_pressed(): the next scripted entry (0 when the script is used up), or
+ * a key that is already waiting (0 if none; stdin bytes: 0 at the end). */
+static int host_key_pressed(void *ctx) {
+    int c, k;
+    (void)ctx;
+    switch (pick_key_source()) {
+    case 0: return key_pos < n_keys ? keys[key_pos++] : 0;
+#ifdef _WIN32
+    case 1: return win_key(0);
+#else
+    case 1:
+        term_raw();
+        c = term_byte(0);
+        if (c < 0) return 0;
+        k = decode_key(term_byte, c);
+        return k < 0 ? 0 : k;
+#endif
+    default:
+        c = stream_byte(0);
+        if (c < 0) return 0;
+        k = decode_key(stream_byte, c);
+        return k < 0 ? 0 : k;
+    }
+}
+
+/* wait_key(): the next key (scripted NONE entries are skipped); 27 (ESC) when
+ * the script or the input has ended, so programs can always finish. */
+static int host_wait_key(void *ctx) {
+    int c, k;
+    (void)ctx;
+    if (pick_key_source() == 0) {
+        while (key_pos < n_keys)
+            if (keys[key_pos++]) return keys[key_pos - 1];
+        return 27;
+    }
+    fflush(stdout);
+#ifdef _WIN32
+    if (key_source == 1) return win_key(1);
+#else
+    if (key_source == 1) {
+        term_raw();
+        for (;;) {
+            c = term_byte(-1);
+            if (c == -2) return 27;
+            if (c >= 0 && (k = decode_key(term_byte, c)) > 0) return k;
+        }
+    }
+#endif
+    for (;;) {
+        c = stream_byte(-1);
+        if (c < 0) return 27;
+        if ((k = decode_key(stream_byte, c)) > 0) return k;
+    }
+}
+
+/* input(): same as the VM's default, but with the terminal back in normal mode. */
+static int read_line_cooked(void *ctx, char *buf, size_t cap) {
+    size_t n;
+    (void)ctx;
+#ifndef _WIN32
+    term_restore();
+#endif
+    fflush(stdout);
+    if (!fgets(buf, (int)cap, stdin)) return -1;
+    n = strlen(buf);
+    if (n && buf[n - 1] == '\n') buf[--n] = 0;
+    return (int)n;
+}
+
+static void install_screen_and_keys(tilvm *v) {
+    v->host.gfx_init = gfx_init;
+    v->host.gfx_pixel = gfx_pixel;
+    v->host.gfx_get = gfx_get;
+    v->host.gfx_show = gfx_show;
+    v->host.key_pressed = host_key_pressed;
+    v->host.wait_key = host_wait_key;
+    v->read_line = read_line_cooked;
+}
 
 static unsigned char *read_file(const char *path, long *size) {
     FILE *f = fopen(path, "rb");
@@ -33,11 +410,11 @@ static unsigned char *read_file(const char *path, long *size) {
 
 static void usage(void) {
     fprintf(stderr, "usage: tilvm [--max-steps N] [--snapshot-after N FILE] [--resume FILE] [--stats] "
-                    "program.tbc [args...]\n");
+                    "[--screen FILE.ppm] [--screen-ansi] [--keys LIST] program.tbc [args...]\n");
 }
 
 int main(int argc, char **argv) {
-    const char *path = NULL, *snap_out = NULL, *resume = NULL;
+    const char *path = NULL, *snap_out = NULL, *resume = NULL, *screen_out = NULL;
     unsigned long snap_after = 0, max_steps = 0;
     int stats = 0, i, rc, prog_argc = 0;
     char **prog_argv = NULL;
@@ -51,6 +428,9 @@ int main(int argc, char **argv) {
             snap_out = argv[++i];
         } else if (!strcmp(argv[i], "--resume") && i + 1 < argc) resume = argv[++i];
         else if (!strcmp(argv[i], "--stats")) stats = 1;
+        else if (!strcmp(argv[i], "--screen") && i + 1 < argc) screen_out = argv[++i];
+        else if (!strcmp(argv[i], "--screen-ansi")) ansi_screen = 1;
+        else if (!strcmp(argv[i], "--keys") && i + 1 < argc) { if (parse_keys(argv[++i]) != 0) return 2; }
         else if (!strcmp(argv[i], "--version")) { printf("tilvm %s (bytecode v%d, int%d, heap %ld bytes)\n",
                                                         TILVM_VERSION, TILVM_BYTECODE_VERSION, TILVM_INT_BITS,
                                                         (long)TILVM_HEAP_SIZE); return 0; }
@@ -75,6 +455,7 @@ int main(int argc, char **argv) {
     vm.max_steps = (uint32_t)max_steps;
     vm.host.argc = prog_argc;
     vm.host.argv = (const char *const *)prog_argv;
+    install_screen_and_keys(&vm);       /* before --resume: it re-creates a saved screen */
 
     if (resume) {
         long ssize = 0;
@@ -101,7 +482,7 @@ int main(int argc, char **argv) {
             free(buf);
             fprintf(stderr, "[tilvm] paused after %lu steps; snapshot saved to %s (%lu bytes)\n",
                     snap_after, snap_out, (unsigned long)n);
-            return 3;
+            return save_screen(screen_out, 3);
         }
         rc = rc == TILVM_EXIT ? vm.st.exit_code : rc == TILVM_DONE ? 0 : 1;
     } else {
@@ -113,6 +494,9 @@ int main(int argc, char **argv) {
                 (unsigned long)vm.st.steps, (unsigned long)vm.st.gc_count,
                 (unsigned long)tilvm_heap_used(&vm), (long)TILVM_HEAP_SIZE);
     }
+    rc = save_screen(screen_out, rc);
     free(code);
+    free(fb);
+    free(keys);
     return rc;
 }

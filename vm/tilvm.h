@@ -33,7 +33,12 @@
  *                      without format specs, snapshots, input/chr/ord/type_of/clock/
  *                      random/sleep, and str split/replace/trim/repeat/count,
  *                      array insert/remove/sort/reverse/slice/copy/join/sum/min/max,
- *                      map values/copy/clear (they report "not available")
+ *                      map values/copy/clear (they report "not available");
+ *                      the screen/keys natives ARE included
+ *   TILVM_NO_GFX       leave out the screen/keys natives (screen_init ... wait_key
+ *                      report "not available in this VM build")
+ *   TILVM_ROM          storage qualifier for the 5x7 font table, e.g. __flash with
+ *                      avr-gcc (gnu99) to keep it out of RAM (default: empty)
  */
 #ifndef TILVM_H
 #define TILVM_H
@@ -146,6 +151,7 @@ typedef struct tilvm_state {
     uint16_t sp, n_frames, n_try, n_deadlines;
     tv_size heap_top;
     uint8_t halted, exit_code, failed, _pad;
+    uint16_t scr_w, scr_h;      /* screen size in pixels (0 = no screen_init yet) */
     uint32_t steps, gc_count, tick;
 #if TILVM_INT_BITS == 64
     uint64_t rng;
@@ -171,12 +177,19 @@ typedef struct tilvm_host {
      * 0 on success, -1 on failure */
     long (*read_file)(void *ctx, const char *path, char *buf, unsigned long cap);
     int (*write_file)(void *ctx, const char *path, const char *data, unsigned long len);
-    /* screen: pixels are 0xRRGGBB; the VM rasterizes lines, shapes and text */
+    /* screen: pixels are 0xRRGGBB; the VM rasterizes lines, shapes and text and
+     * clips them, so gfx_pixel/gfx_get only ever see 0 <= x < w, 0 <= y < h.
+     * gfx_pixel is required for a screen (gfx_get for get_pixel); gfx_init
+     * (create or resize a w x h screen, all black) and gfx_show (present the
+     * frame) are optional: without gfx_init the VM clears the screen pixel by
+     * pixel. See docs/TIL_GRAPHICS.md. */
     void (*gfx_init)(void *ctx, int w, int h);
     void (*gfx_pixel)(void *ctx, int x, int y, unsigned long rgb);
     unsigned long (*gfx_get)(void *ctx, int x, int y);
     void (*gfx_show)(void *ctx);
-    /* keys: 0 = none; UP=1 DOWN=2 LEFT=3 RIGHT=4, otherwise ASCII (ENTER=13, ESC=27) */
+    /* keys: 0 = none; UP=1 DOWN=2 LEFT=3 RIGHT=4, otherwise ASCII (ENTER=13, ESC=27)
+     * or a Unicode code point. key_pressed must not block; wait_key blocks (when it
+     * is NULL the VM polls key_pressed and calls idle(1) between polls). */
     int (*key_pressed)(void *ctx);
     int (*wait_key)(void *ctx);
     /* battery saving: sleep / halt the CPU for about `ms` milliseconds */
