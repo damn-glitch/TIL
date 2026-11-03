@@ -37,30 +37,37 @@ def main():
     src_path = sys.argv[1]
     os.makedirs(BUILD, exist_ok=True)
     if not os.path.exists(os.path.join(BUILD, 'tilvm.rel')):
-        sh(['make', '-C', HERE])
+        sh(['make', '-C', HERE])     # compiles the VM once (several minutes with SDCC)
     with open(src_path, encoding='utf-8') as f:
         module = til.compile_to_bytecode(f.read(), src_path)
     tbc = module.serialize(strip=True)
     with open(os.path.join(BUILD, 'program.h'), 'w') as f:
         f.write(til.bytes_to_c_array('til_program', tbc))
-    sh(['sdcc', '-mz80', '--std-c99', '--code-loc', '0x0200', '--data-loc', '0x8000',
-        '-DTILVM_INT_BITS=32', '-DTILVM_FLOAT=0', '-DTILVM_NO_STDIO', '-DTILVM_NO_TIME',
+    sh(['sdcc', '-mz80', '--std-c99', '--code-loc', '0x0200', '--data-loc', '0xC000',
+        '-DTILVM_LEAN', '-DTILVM_INT_BITS=32', '-DTILVM_FLOAT=0', '-DTILVM_NO_STDIO', '-DTILVM_NO_TIME',
         '-DTILVM_HEAP_SIZE=4096', '-DTILVM_STACK_SIZE=192', '-DTILVM_MAX_FRAMES=32',
         '-DTILVM_MAX_CONSTS=192', '-DTILVM_MAX_TYPES=24', '-DTILVM_MAX_TRY=8', '-DTILVM_MARK_STACK=16',
         '-I', os.path.join(HERE, '..', '..'), '-I', BUILD,
         os.path.join(HERE, 'main_z80.c'), os.path.join(BUILD, 'tilvm.rel'),
         '-o', os.path.join(BUILD, 'prog.ihx')], cwd=BUILD)
-    cmds = "run\ndump rom 0x9ffc 0x9fff\ndump rom 0xa000 0xb7ff\ninfo registers\nquit\n"
+    code_end = 0
+    for line in open(os.path.join(BUILD, 'prog.map'), errors='replace'):
+        m = re.match(r'^_CODE\s+([0-9A-F]{8})\s+([0-9A-F]{8})', line)
+        if m:
+            code_end = int(m.group(1), 16) + int(m.group(2), 16)
+    if code_end > 0xC000:
+        raise SystemExit(f"code ends at 0x{code_end:X}: does not fit below the VM data at 0xC000")
+    cmds = "run\ndump rom 0xdbf0 0xdbf3\ndump rom 0xdc00 0xf3ff\ninfo registers\nquit\n"
     out = subprocess.run(['sz80', '-b', '-c', '-', os.path.join(BUILD, 'prog.ihx')],
                          input=cmds, capture_output=True, text=True, timeout=600).stdout
-    hdr = dump(out, 0x9ffc, 3)
+    hdr = dump(out, 0xdbf0, 3)
     n = hdr[0] | (hdr[1] << 8)
-    text = dump(out, 0xa000, n)
+    text = dump(out, 0xdc00, n)
     sys.stdout.write(text.decode('utf-8', 'replace'))
     ticks = re.search(r'Simulated (\d+) ticks', out)
     code_size = os.path.getsize(os.path.join(BUILD, 'prog.ihx'))
-    sys.stderr.write(f"[z80] exit={hdr[2]} bytecode={len(tbc)} bytes, "
-                     f"cycles={ticks.group(1) if ticks else '?'}\n")
+    sys.stderr.write(f"[z80] exit={hdr[2]} code=0x0200-0x{code_end:04X} ({code_end - 0x200} bytes) "
+                     f"bytecode={len(tbc)} bytes cycles={ticks.group(1) if ticks else '?'}\n")
     return 0 if hdr[2] == 0 else 1
 
 

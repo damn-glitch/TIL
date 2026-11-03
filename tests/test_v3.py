@@ -67,7 +67,7 @@ def cvm_binary(profile: str = "host") -> str:
         return _CVM[profile]
     flags = {
         "host": [],
-        "tiny": ['-DTILVM_INT_BITS=16', '-DTILVM_FLOAT=0', '-DTILVM_HEAP_SIZE=2048',
+        "tiny": ['-DTILVM_LEAN', '-DTILVM_INT_BITS=16', '-DTILVM_FLOAT=0', '-DTILVM_HEAP_SIZE=2048',
                  '-DTILVM_STACK_SIZE=128', '-DTILVM_MAX_FRAMES=24', '-DTILVM_MAX_CONSTS=128',
                  '-DTILVM_MAX_TYPES=16', '-DTILVM_MAX_TRY=4'],
         "small": ['-DTILVM_INT_BITS=32', '-DTILVM_FLOAT=1', '-DTILVM_HEAP_SIZE=16384',

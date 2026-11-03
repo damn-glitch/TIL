@@ -72,10 +72,14 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_NO_STDIO` | off | no `<stdio.h>`: built-in number formatting, host sets `write` |
 | `TILVM_NO_TIME` | off | no `<time.h>`: `clock_ms()`/`timeout` count 1 ms per 1000 steps |
 | `TILVM_NO_MATH` | off | no `<math.h>`: built-in `sqrt`/`floor`/`pow` (integer powers) |
+| `TILVM_LEAN` | off | smallest code for 8-bit CPUs: the whole language core, without format specs, snapshots, `input/chr/ord/type_of/clock_ms/random/sleep_ms`, str `split/replace/trim/repeat/count`, array `insert/remove/sort/reverse/slice/copy/join/sum/min/max`, map `values/copy/clear` (calling them reports "not available"). ~20% smaller |
 
 Profiles in the `Makefile`: `make` (desktop), `make small` (32-bit, float,
-16 KB heap), `make tiny` (16-bit, no floats, 2 KB heap), `make check`
+16 KB heap), `make tiny` (16-bit, no floats, 2 KB heap, lean), `make check`
 (AddressSanitizer + UBSan with a 4 KB heap — exercises the compacting GC).
+
+Code size of the whole VM (`arm-none-eabi-gcc -Os`, Cortex-M0, 32-bit ints, no
+floats): **24.5 KB**, or **19.4 KB** with `TILVM_LEAN`.
 
 ## API
 

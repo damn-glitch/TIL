@@ -381,6 +381,7 @@ static tv_ref new_str(tilvm *vm, uint32_t len) {
     return r;
 }
 
+#ifndef TILVM_LEAN
 static int make_str(tilvm *vm, tv_val *dst, const char *s, uint32_t len) {
     tv_ref r;
     if (len > 0xFFFF) return fail(vm, "string too long");
@@ -390,6 +391,7 @@ static int make_str(tilvm *vm, tv_val *dst, const char *s, uint32_t len) {
     set_ref(dst, TV_STR, r);
     return 1;
 }
+#endif
 
 static int str_eq(tilvm *vm, const tv_val *a, const tv_val *b) {
     uint32_t la, lb;
@@ -889,7 +891,9 @@ static tv_float F_POW(tv_float x, tv_float y) {
 #endif
 #endif
 
+#ifndef TILVM_LEAN
 static int tv_array_concat(tilvm *vm);
+#endif
 
 /* binary arithmetic: a = a OP b (a, b are stack slots; may allocate for strings) */
 static int arith(tilvm *vm, int op) {
@@ -958,7 +962,9 @@ static int arith(tilvm *vm, int op) {
         SP--;
         return 1;
     }
+#ifndef TILVM_LEAN
     if (op == OP_ADD && a->t == TV_ARRAY && b->t == TV_ARRAY) return tv_array_concat(vm);
+#endif
     {
         static const char *const names[] = {"+", "-", "*", "/", "%", "**"};
         size_t pos = 0, cap = sizeof(vm->errbuf) - 1;
@@ -1038,6 +1044,7 @@ static int array_push(tilvm *vm, uint16_t arr_slot, uint16_t val_slot) {
     return 1;
 }
 
+#ifndef TILVM_LEAN
 static int tv_array_concat(tilvm *vm) {    /* [.., a, b] -> [.., a+b] */
     uint32_t la = ARROBJ(vm, STK[SP - 2].u.r)->len, lb = ARROBJ(vm, STK[SP - 1].u.r)->len, i;
     if (SP + 1 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
@@ -1053,6 +1060,8 @@ static int tv_array_concat(tilvm *vm) {    /* [.., a, b] -> [.., a+b] */
     SP -= 2;
     return 1;
 }
+
+#endif
 
 /* normalize map keys: 2.0 -> 2 */
 static void map_key(tv_val *k) {
@@ -1369,6 +1378,7 @@ static int cast_slot(tilvm *vm, uint16_t slot, int kind) {
 #endif
 }
 
+#ifndef TILVM_LEAN
 /* ─── f-string format specs ─────────────────────────────────────────────── */
 static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
     /* [<>^][0][width][.prec][fdxXobe%] - same rules as til_format_spec() */
@@ -1478,6 +1488,8 @@ static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
     return 1;
 }
 
+#endif /* TILVM_LEAN */
+
 /* ─── natives ───────────────────────────────────────────────────────────── */
 #if TILVM_FLOAT
 static tv_float f_round(tv_float x) {
@@ -1486,6 +1498,7 @@ static tv_float f_round(tv_float x) {
 }
 #endif
 
+#ifndef TILVM_LEAN
 static uint32_t rng_next(tilvm *vm) {
 #if TILVM_INT_BITS == 64
     uint64_t x = vm->st.rng;
@@ -1503,6 +1516,7 @@ static uint32_t rng_next(tilvm *vm) {
     return vm->st.rng;
 #endif
 }
+#endif
 
 /* args are STK[base .. base+argc); the result replaces them */
 static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
@@ -1613,6 +1627,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         res = best;
         break;
     }
+#ifndef TILVM_LEAN
     case N_INPUT: {
         char buf[256];
         int n = -1;
@@ -1651,6 +1666,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         set_int(&res, (tv_int)c);
         break;
     }
+#endif
     case N_RANGE: {
         tv_int lo, hi, i;
         uint32_t n;
@@ -1664,6 +1680,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         for (i = 0; i < (tv_int)n; i++) set_int(&STK[SP++], lo + i);
         return make_array(vm, OBJ_ARRAY, n);
     }
+#ifndef TILVM_LEAN
     case N_TYPE_OF: {
         const char *s = type_name(vm, a);
         if (a->t == TV_STRUCT) {
@@ -1672,10 +1689,16 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         } else if (!make_str(vm, &res, s, (uint32_t)strlen(s))) return 0;
         break;
     }
+#endif
     case N_FORMAT:
+#ifndef TILVM_LEAN
         if (!format_slot(vm, base, (uint16_t)(base + 1))) return 0;
+#else
+        if (!to_str_slot(vm, base)) return 0;       /* lean build: specs ignored */
+#endif
         res = STK[base];
         break;
+#ifndef TILVM_LEAN
     case N_CLOCK_MS: set_int(&res, (tv_int)now_ms(vm)); break;
     case N_RANDOM:
         if (argc >= 2) {
@@ -1703,6 +1726,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         if (vm->clock_ms) while ((int32_t)(now_ms(vm) - until) < 0) { }
         break;
     }
+#endif
     case N_EXIT:
         vm->st.exit_code = (uint8_t)(argc && a->t == TV_INT ? a->u.i : 0);
         vm->st.halted = 2;
@@ -1764,7 +1788,10 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         if (a1->u.i < 0 || (tv_uint)a1->u.i >= n) return bounds_error(vm, a1->u.i, n);
         set_int(res, (tv_int)(uint8_t)s[a1->u.i]);
         return 1;
-    case M_TRIM: case M_TO_UPPER: case M_TO_LOWER: case M_SLICE: case M_REPEAT: {
+#ifndef TILVM_LEAN
+    case M_TRIM: case M_REPEAT:
+#endif
+    case M_TO_UPPER: case M_TO_LOWER: case M_SLICE: {
         uint32_t lo = 0, hi = n, i, times = 1;
         tv_ref r;
         if (mid == M_TRIM) {
@@ -1798,6 +1825,7 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         set_ref(res, TV_STR, r);
         return 1;
     }
+#ifndef TILVM_LEAN
     case M_REPLACE: {
         const char *t, *u;
         uint32_t ul, count = 0, i, w;
@@ -1869,12 +1897,16 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         *res = STK[--SP];
         return 1;
     }
+#endif
     case M_TO_INT: if (!cast_slot(vm, base, 0)) return 0; *res = STK[base]; return 1;
+#ifndef TILVM_LEAN
     case M_TO_FLOAT: if (!cast_slot(vm, base, 1)) return 0; *res = STK[base]; return 1;
+#endif
     default: return failn(vm, "no method '", mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on str", 0, 0, 0);
     }
 }
 
+#ifndef TILVM_LEAN
 static void sort_array(tilvm *vm, tv_ref arr, int *err) {
     /* stable insertion sort (small, no recursion, no malloc) */
     tv_arrobj *a = ARROBJ(vm, arr);
@@ -1900,6 +1932,8 @@ static void sort_array(tilvm *vm, tv_ref arr, int *err) {
     }
 }
 
+#endif
+
 static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_val *res) {
     tv_arrobj *a = ARROBJ(vm, STK[base].u.r);
     uint32_t n = a->len, i;
@@ -1916,7 +1950,10 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
         set_nil(&v[n - 1]);
         a->len = (tv_size)(n - 1);
         return 1;
-    case M_GET: case M_SET: case M_REMOVE: case M_INSERT: {
+#ifndef TILVM_LEAN
+    case M_REMOVE: case M_INSERT:
+#endif
+    case M_GET: case M_SET: {
         tv_int k;
         if (!argc || a1->t != TV_INT) return fail(vm, "index must be an integer");
         k = a1->u.i;
@@ -1958,6 +1995,7 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
         else set_int(res, c);
         return 1;
     }
+#ifndef TILVM_LEAN
     case M_REVERSE:
         for (i = 0; i < n / 2; i++) { tv_val t; t = v[i]; v[i] = v[n - 1 - i]; v[n - 1 - i] = t; }
         return 1;
@@ -1967,12 +2005,14 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
         if (err) return fail(vm, "sort() needs an array of numbers or of strings");
         return 1;
     }
+#endif
     case M_FIRST: if (n) *res = v[0]; return 1;
     case M_LAST: if (n) *res = v[n - 1]; return 1;
     case M_CLEAR:
         for (i = 0; i < n; i++) set_nil(&v[i]);
         a->len = 0;
         return 1;
+#ifndef TILVM_LEAN
     case M_SUM: case M_MIN: case M_MAX:
         SP = (uint16_t)(base + 1);
         if (!call_native(vm, mid == M_SUM ? N_SUM : mid == M_MIN ? N_MIN : N_MAX, 1)) return 0;
@@ -2020,6 +2060,7 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
         set_ref(res, TV_STR, r);
         return 1;
     }
+#endif
     default: return failn(vm, "no method '", mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on array", 0, 0, 0);
     }
 }
@@ -2043,7 +2084,10 @@ static int map_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         if (k >= 0) { *res = VALS(vm, ARROBJ(vm, m)->buf)[2 * k + 1]; return 1; }
         if (mid == M_GET_OR) { *res = STK[base + 2]; return 1; }
         return key_not_found(vm, (uint16_t)(base + 1));
-    case M_KEYS: case M_VALUES: case M_COPY: {
+#ifndef TILVM_LEAN
+    case M_VALUES: case M_COPY:
+#endif
+    case M_KEYS: {
         uint32_t per = mid == M_COPY ? 2 : 1;
         if (SP + per * n + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
         for (i = 0; i < n; i++) {
@@ -2055,12 +2099,14 @@ static int map_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         *res = STK[--SP];
         return 1;
     }
+#ifndef TILVM_LEAN
     case M_CLEAR: {
         tv_val *v = VALS(vm, ARROBJ(vm, m)->buf);
         for (i = 0; i < 2 * n; i++) set_nil(&v[i]);
         ARROBJ(vm, m)->len = 0;
         return 1;
     }
+#endif
     default: return failn(vm, "no method '", mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on map", 0, 0, 0);
     }
 }
@@ -2500,6 +2546,7 @@ static int push_frame(tilvm *vm, uint16_t fidx, uint8_t argc, uint8_t extra, tv_
     return 1;
 }
 
+#ifndef TILVM_LEAN
 /* {k: v, ...} literal on top of the stack: normalise keys, later duplicates win */
 static int map_literal_fixup(tilvm *vm) {
     tv_ref m = TOP.u.r;
@@ -2522,6 +2569,8 @@ static int map_literal_fixup(tilvm *vm) {
     ARROBJ(vm, m)->len = (tv_size)len;
     return 1;
 }
+
+#endif
 
 /* replace the top n values by one string (f-strings) */
 static int concat_values(tilvm *vm, uint8_t n) {
@@ -2784,7 +2833,9 @@ resume:
             uint16_t n = READ16();
             CHECK_STACK(2);
             PANIC_IF(!make_array(vm, op == OP_NEW_MAP ? OBJ_MAP : OBJ_ARRAY, n));
+#ifndef TILVM_LEAN
             if (op == OP_NEW_MAP && n) PANIC_IF(!map_literal_fixup(vm));
+#endif
             break;
         }
         case OP_NEW_STRUCT: {
@@ -2925,6 +2976,11 @@ int tilvm_run(tilvm *vm) {
 }
 
 /* ─── snapshots ─────────────────────────────────────────────────────────── */
+#ifdef TILVM_LEAN
+uint32_t tilvm_snapshot_size(const tilvm *vm) { (void)vm; return 0; }
+uint32_t tilvm_snapshot(const tilvm *vm, uint8_t *outp, uint32_t cap) { (void)vm; (void)outp; (void)cap; return 0; }
+int tilvm_restore(tilvm *vm, const uint8_t *data, uint32_t size) { (void)vm; (void)data; (void)size; return -9; }
+#else
 #define SNAP_HDR 16
 
 uint32_t tilvm_snapshot_size(const tilvm *vm) {
@@ -2964,3 +3020,4 @@ int tilvm_restore(tilvm *vm, const uint8_t *data, uint32_t size) {
     memcpy(vm->mem.heap, data + SNAP_HDR + fixed + stack_bytes, vm->st.heap_top);
     return 0;
 }
+#endif /* TILVM_LEAN */

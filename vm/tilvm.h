@@ -28,6 +28,11 @@
  *   TILVM_NO_STDIO     no <stdio.h>: the host must set vm->write
  *   TILVM_NO_TIME      no <time.h>: timeouts count steps (1 ms = 1000 steps)
  *   TILVM_NO_MATH      no <math.h>: sqrt/sin/... use built-in approximations
+ *   TILVM_LEAN         smallest code for 8-bit CPUs: the whole language core, but
+ *                      without format specs, snapshots, input/chr/ord/type_of/clock/
+ *                      random/sleep, and str split/replace/trim/repeat/count,
+ *                      array insert/remove/sort/reverse/slice/copy/join/sum/min/max,
+ *                      map values/copy/clear (they report "not available")
  */
 #ifndef TILVM_H
 #define TILVM_H

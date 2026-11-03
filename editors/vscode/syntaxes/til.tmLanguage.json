@@ -38,11 +38,11 @@
       "patterns": [
         {
           "name": "keyword.control.til",
-          "match": "\\b(if|else|elif|for|while|loop|match|in|return|break|continue)\\b"
+          "match": "\\b(if|else|elif|for|while|loop|match|in|return|break|continue|retry|timeout|intent|assert|invariant|perform|handle)\\b"
         },
         {
           "name": "keyword.declaration.til",
-          "match": "\\b(fn|let|var|const|mut|struct|enum|impl|trait|type|pub)\\b"
+          "match": "\\b(fn|let|var|const|mut|struct|enum|impl|trait|type|pub|cap)\\b"
         },
         {
           "name": "keyword.operator.logical.til",

@@ -2,7 +2,7 @@
 #
 #   make            host VM (64-bit ints, double floats, 256 KB heap)
 #   make small      calculator-class profile: 32-bit ints, float, 16 KB heap
-#   make tiny       microcontroller profile: 16-bit ints, no floats, 2 KB heap
+#   make tiny       microcontroller profile: lean, 16-bit ints, no floats, 2 KB heap
 #   make check      sanitizer build (ASan + UBSan) with a 4 KB heap (GC stress)
 #   make z80        cross-compile for the Z80 (TI-83/84 CPU) with SDCC
 #   make cortex-m   cross-compile for ARM Cortex-M (NumWorks / STM32 class)
@@ -24,7 +24,7 @@ small: tilvm.c tilvm.h main.c
 	  -o tilvm-small $(SRC) -lm
 
 tiny: tilvm.c tilvm.h main.c
-	$(CC) $(CFLAGS) -DTILVM_INT_BITS=16 -DTILVM_FLOAT=0 -DTILVM_HEAP_SIZE=2048 \
+	$(CC) $(CFLAGS) -DTILVM_LEAN -DTILVM_INT_BITS=16 -DTILVM_FLOAT=0 -DTILVM_HEAP_SIZE=2048 \
 	  -DTILVM_STACK_SIZE=128 -DTILVM_MAX_FRAMES=24 -DTILVM_MAX_CONSTS=128 -DTILVM_MAX_TYPES=16 \
 	  -DTILVM_MAX_TRY=4 -o tilvm-tiny $(SRC) -lm
 

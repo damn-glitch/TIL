@@ -9,10 +9,11 @@
 #include "tilvm.h"
 #include "program.h"   /* generated: til_program[] (the .tbc bytes, kept in ROM) */
 
+/* memory map: code 0x0200-0xBFFF | VM state 0xC000- | output 0xDC00-0xF3FF | C stack */
 #define OUT_MAX 0x1800
-volatile __at(0x9FFC) unsigned int out_len;
-volatile __at(0x9FFE) unsigned char exit_code;
-volatile __at(0xA000) char out_buf[OUT_MAX];
+volatile __at(0xDBF0) unsigned int out_len;
+volatile __at(0xDBF2) unsigned char exit_code;
+volatile __at(0xDC00) char out_buf[OUT_MAX];
 
 static void z80_write(void *ctx, const char *data, size_t len) {
     (void)ctx;
