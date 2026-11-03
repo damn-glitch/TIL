@@ -209,10 +209,15 @@ def test_committed_compiler_or_fallback_examples():
     with open(os.path.join(PG, 'examples', 'index.json'), encoding='utf-8') as f:
         assert sorted(e['id'] for e in json.load(f)) == examples
     tbc = sorted(f[:-4] for f in os.listdir(os.path.join(PG, 'examples')) if f.endswith('.tbc'))
-    if os.path.exists(os.path.join(ROOT, 'selfhost', 'tilc.til')):
+    tilc_til = os.path.join(ROOT, 'selfhost', 'tilc.til')
+    if os.path.exists(tilc_til):
         assert info['compiler'] == 'tilc', STALE.format(what='tilc.tbc')
         assert info['outputs'].get('tilc.tbc') == sha256(os.path.join(PG, 'tilc.tbc')), STALE.format(what='tilc.tbc')
         assert tbc == [], "examples/*.tbc are only a fallback while there is no tilc.tbc"
+        with open(tilc_til, encoding='utf-8') as f:
+            want = til.compile_to_bytecode(f.read(), tilc_til).serialize()
+        with open(os.path.join(PG, 'tilc.tbc'), 'rb') as f:
+            assert f.read() == want, STALE.format(what='tilc.tbc') + " (src/til.py compiles it differently now)"
     else:
         assert info['compiler'] == 'precompiled-examples'
         assert not os.path.exists(os.path.join(PG, 'tilc.tbc'))
