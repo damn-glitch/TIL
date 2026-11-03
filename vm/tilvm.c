@@ -489,6 +489,13 @@ typedef struct sink {
 } sink;
 
 static void sink_put(sink *s, const char *p, uint32_t n) {
+    if (s->mode == 0) {
+        /* measuring: the text of a value can exceed 4 GB (arrays sharing big
+           sub-arrays), so the count stops just above TV_STR_MAX instead of
+           wrapping (callers fail with "string too long") */
+        s->len = (s->len > TV_STR_MAX || n > TV_STR_MAX - s->len) ? (uint32_t)(TV_STR_MAX + 1) : s->len + n;
+        return;
+    }
     if (s->mode == 1) memcpy(s->dst + s->len, p, n);
     else if (s->mode == 2) out(s->vm, p, n);
     s->len += n;
@@ -661,6 +668,7 @@ static void emit_value(sink *s, const tv_val *v, int depth, int quote) {
     tilvm *vm = s->vm;
     char buf[48];
     uint32_t n, i;
+    if (s->mode == 0 && s->len > TV_STR_MAX) return;   /* already too long: stop the walk */
     switch (v->t) {
     case TV_NIL: sink_cstr(s, "None"); return;
     case TV_BOOL: sink_cstr(s, v->u.i ? "true" : "false"); return;
