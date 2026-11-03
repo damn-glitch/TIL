@@ -34,6 +34,10 @@ What is measured per program
 * native: TILCompiler.compile -> C compiler (same driver as `til run`) ->
   run the executable (empty stdin, timeout) -> exit code and stdout.
 
+Both runs use the same scratch working directory (deleted afterwards), so a
+program that writes files (`write_file("NOTE", ...)`) never touches the
+checkout.
+
 Status: `native-ok` (same exit code and stdout as the VM), `native-mismatch`,
 `fallback` (the native backend cannot compile it: `til run` uses the VM), or
 `vm-limit` (the VM did not finish within the step budget or stopped with a
@@ -65,14 +69,13 @@ NATIVE_TIMEOUT = 20           # seconds
 
 
 class Program:
-    __slots__ = ('id', 'label', 'source', 'filename', 'cwd')
+    __slots__ = ('id', 'label', 'source', 'filename')
 
-    def __init__(self, label: str, source: str, filename: str = "<test>", cwd: str = ROOT):
+    def __init__(self, label: str, source: str, filename: str = "<test>"):
         self.id = hashlib.sha1(source.encode('utf-8')).hexdigest()[:12]
         self.label = label
         self.source = source
-        self.filename = filename
-        self.cwd = cwd
+        self.filename = filename        # imports are resolved next to it
 
 
 # ── corpus extraction ───────────────────────────────────────────────────────
@@ -179,7 +182,7 @@ def collect_corpus(test_files=None, examples=True):
                 with open(path, encoding='utf-8') as f:
                     text = f.read()
                 if is_program(text, path):
-                    add(Program(os.path.relpath(path, ROOT), text, path, dirpath))
+                    add(Program(os.path.relpath(path, ROOT), text, path))
     return programs
 
 
@@ -235,8 +238,9 @@ def run_native(prog, workdir, opt=0):
     out_path = exe + '.out'
     try:
         with open(out_path, 'wb') as out:
+            # same working directory as the in-process VM run (measure(): a scratch one)
             r = subprocess.run([exe], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
-                               timeout=NATIVE_TIMEOUT, cwd=prog.cwd)
+                               timeout=NATIVE_TIMEOUT)
         with open(out_path, 'rb') as f:
             data = f.read(OUTPUT_CAP + 1)
         return ('ok', r.returncode, data)
@@ -280,10 +284,20 @@ def measure_one(prog, workdir, opt=0):
 
 
 def measure(programs, jobs=None, opt=0):
+    """Measure every program. The programs run in a scratch working directory
+    (the VM in this process, the executables as child processes), so files
+    they write never land in the checkout."""
     jobs = jobs or max(1, min(8, os.cpu_count() or 1))
     with tempfile.TemporaryDirectory(prefix='til-cov-') as workdir:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
-            return list(pool.map(lambda p: measure_one(p, workdir, opt), programs))
+        rundir = os.path.join(workdir, 'cwd')
+        os.mkdir(rundir)
+        saved = os.getcwd()
+        os.chdir(rundir)
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+                return list(pool.map(lambda p: measure_one(p, workdir, opt), programs))
+        finally:
+            os.chdir(saved)
 
 
 def summarize(results):

@@ -152,6 +152,12 @@ In particular the native code reproduces:
   `2 ** -1 == 0`, wrapping overflow, shifts, `int(x)` of floats, Python-exact
   comparisons between ints and floats (`2**53 + 1 != 2.0**53`);
 * the VMs' constant folding where it differs from run time (`true == 1`);
+* where the VMs produce `None` implicitly: `var x` without a value, a
+  declaration or struct field that is not given and whose annotation is not a
+  primitive type (`var p: Point`, `var xs: [int]`; primitive annotations start
+  as `0`, `0.0`, `""`, `false`), a global without a value, and a function that
+  ends (or uses a bare `return`) without returning a value — also one declared
+  `-> str`;
 * run-time error messages (`index out of bounds: index 5, length 2`,
   `key not found: q`, `invalid integer: "x1"`, `pop() from empty array`,
   `unwrap() called on None`, contract and assertion messages,
@@ -171,8 +177,15 @@ says why) and `til build` reports the reason. Never a silent wrong result.
 * a closure used as a value that captures a variable which changes after the
   closure is created (the VMs share captured variables; a copy would differ),
   or a loop variable;
+* a `None` that a native `int`, `float`, `bool` or C-like enum cannot hold:
+  `var x` used as an `int` before it is assigned, a global `var n: int`
+  without a value, a struct field of an enum type that is not given, a
+  function declared `-> int` that can end without returning a value (the VMs
+  return `None` there);
 * `bytes_to_str()` and strings containing NUL bytes (native strings are C
-  strings); graphics, keys and `energy_mode()` natives; `handle` (effects);
+  strings); graphics, keys and `energy_mode()` natives; `handle ... with` /
+  `resume` (effect handlers); `perform E(...)` when no function `E` exists
+  (the default handler);
 * generic functions used with more than 32 type combinations.
 
 A function that is never called (dead code) does not force a fallback.
@@ -269,8 +282,11 @@ fails (the self-hosted compiler, 5600 lines, is inferred in about 0.6 s).
 `src/til.py` hooks: `NativeUnsupported(CompileError)`, `types_module()`,
 `type_errors()` (used by `compile_to_bytecode` and `til check`), the typed
 backend in `TILCompiler.compile`, the VM fallback in `compile_to_executable`,
-`-fwrapv` for native builds, `--no-types`, and the `name<T>(...)` syntax in the
-parser. `TIL_DEBUG_TYPES=1` re-raises internal errors of the typed backend
+`-fwrapv` for native builds (plus, for C from the typed backend built with gcc
+or clang, `-Werror=int-conversion -Werror=incompatible-pointer-types`: if the
+generated C ever mixed up an integer and a pointer, the build fails and
+`til run` uses the VM instead of running wrong code), `--no-types`, and the
+`name<T>(...)` syntax in the parser. `TIL_DEBUG_TYPES=1` re-raises internal errors of the typed backend
 (normally they make `til run` use the VM). Python code must stay 3.9
 compatible (`vermin -t=3.9-`).
 

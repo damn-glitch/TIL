@@ -9438,6 +9438,7 @@ class TILCompiler:
                 raise CompileError("\n\n".join(errors))
 
         tt = types_module() if self.typed else None
+        self.typed_c = tt is not None
         if tt is not None:
             if self.verbose:
                 print(f"[TIL] Inferring types...")
@@ -9509,6 +9510,9 @@ class TILCompiler:
             opt_flags = ["-O0", "-O1", "-O2", "-O3"][min(self.optimize, 3)]
             # -fwrapv: TIL int arithmetic wraps around (two's complement), like the VMs
             cmd = [cc, c_file, "-o", output, opt_flags, "-fwrapv", "-lm"]
+            if getattr(self, 'typed_c', False) and os.path.basename(cc) in ('gcc', 'clang'):
+                # typed backend: mixing up ints and pointers is a bug -> fall back to the VM
+                cmd[4:4] = ["-Werror=int-conversion", "-Werror=incompatible-pointer-types"]
             
             if self.verbose:
                 print(f"[TIL] Compiling: {' '.join(cmd)}")

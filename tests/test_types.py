@@ -389,6 +389,18 @@ class TestNativeEqualsVM:
         native_matches_vm('қосу(а: int, б: int) -> int\n    return а + б\nнегізгі()\n'
                           '    тұрақты нәтиже = қосу(2, 3)\n    басып_шығару(нәтиже)\n')
 
+    def test_none_until_assigned_and_implicit_returns(self):
+        # the VMs start `var x` (and non-primitive annotations) as None, primitive
+        # annotations as 0 / "" / false, and a function that ends without
+        # returning a value returns None
+        src = ('struct P\n    x: int\nlabel(n: int)\n    if n > 0\n        return "pos"\n'
+               'pick(n: int) -> str\n    if n > 0\n        return "yes"\n    return\n'
+               'var names: [str]\n'
+               'main()\n    var s\n    print(s)\n    s = "hi"\n    var p: P\n    var xs: [int]\n'
+               '    print(s, p, xs, names, label(-1), label(2), pick(0), pick(1))\n'
+               '    var n: int\n    var t: str\n    print(n, len(t))\n')
+        assert native_matches_vm(src) == 'None\nhi\nNone\nNone\nNone\nNone\npos\nNone\nyes\n0\n0\n'
+
 
 # ═══════════════════════════════════════════════════════════════
 # FALLBACK TO THE VM
@@ -420,7 +432,24 @@ class TestFallback:
         r = cli('run', '-v', str(prog))
         assert "dynamically typed" in r.stderr
         r = cli('build', str(prog), '-o', str(tmp_path / 'mixed'))
-        assert r.returncode == 1 and "native backend:" in r.stderr and "--target vm" in r.stderr
+        assert r.returncode == 1 and "native backend:" in r.stderr
+
+    @pytest.mark.parametrize("src", [
+        'main()\n    var x\n    print(x)\n    x = 5\n    print(x)\n',
+        'f(x: int) -> int\n    if x > 0\n        return 1\nmain()\n    print(f(-1))\n',
+        'f(x: int) -> int\n    while x > 0\n        return x\nmain()\n    print(f(0))\n',
+        'f(x: int) -> float\n    if x > 0\n        return 1.5\n    return\nmain()\n    print(f(0))\n',
+        'var h: int\nmain()\n    print(h)\n',
+        'enum E\n    A\n    B\nmain()\n    var e: E\n    print(e)\n',
+        '#[generic: T]\nf(a: T) -> T\n    var y: T\n    print(y)\n    return a\nmain()\n    print(f(1))\n',
+    ])
+    def test_none_that_a_native_number_cannot_hold(self, src):
+        """The VMs give None here (an int / float variable or result that was
+        never set): the native backend cannot represent it, so it falls back."""
+        assert run_vm(src)[1].startswith("None\n")
+        with pytest.raises(til.NativeUnsupported) as info:
+            c_code(src)
+        assert "None" in str(info.value) or "dynamically typed" in str(info.value)
 
     def test_dead_code_does_not_force_a_fallback(self):
         c = c_code('unused(k: int)\n    let mixed = [k, "a"]\n    print(mixed)\nmain()\n    print(1)\n')

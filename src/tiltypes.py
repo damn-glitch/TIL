@@ -312,6 +312,7 @@ class Solver:
         if cur is other or other is UNK or cur is DYN:
             return
         if cur is UNK:
+            self.bind(r, other)           # "unknown" was only a default: be specific
             return
         if other is DYN:
             self.bind(r, DYN)
@@ -1420,6 +1421,8 @@ class FuncCtx:
                 self.flow(vt, t, n)
         elif declared is not None:
             self.s.bind(t, declared)        # zero value of the declared type
+        elif n.type_ann is None:
+            self.flow(NIL, t, n)            # `var x`: None until something is assigned (VMs)
         self.declare(n.name, t, n.mutable, declared)
         self.decls[id(n)] = t
 
@@ -3751,6 +3754,10 @@ class TypedCGen(til.CCodeGenerator):
     def ret_ct(self, t) -> str:
         return "void" if t is NIL else self.ct(t, None, "a return value")
 
+    def typed_zero(self, t) -> str:
+        z = self.none_value(t)
+        return f"({self.ct(t)}){z}" if z == "NULL" else z
+
     def zero(self, t) -> str:
         if t is INT or t is UNK:
             return "0"
@@ -3848,8 +3855,13 @@ class TypedCGen(til.CCodeGenerator):
     def coerce(self, code: str, src, dst, node=None) -> str:
         """Convert a value for a place of type dst (the VM converts numbers at
         annotated declarations, parameters and returns)."""
-        if dst is UNK or src is dst:
+        if src is dst:
             return code
+        if dst is UNK:
+            if src in (INT, BOOL):
+                return code
+            if src is not UNK:
+                self.unsupported(f"a {show(src)} value in a place whose type was never determined", node)
         if dst.name == 'strish':
             if src is STR or (src.name == 'strish' and src.args[0] is dst.args[0]):
                 return code
@@ -3871,7 +3883,13 @@ class TypedCGen(til.CCodeGenerator):
                 return f"((void)({code}), ({self.ct(dst)})NULL)" if code not in ('NULL',) else "NULL"
             if dst.name == 'option':
                 return f"{self.option_ctor(dst, node)}()"
-        if src is UNK and dst is not NIL:
+        if src is UNK:
+            # a value whose type nothing ever determined cannot exist at run time
+            # (an element of an always-empty array, ...): keep its effects, give dst's zero
+            if dst in (INT, BOOL, FLOAT):
+                return f"({self.ct(dst)})({code})"
+            return f"((void)({code}), {self.typed_zero(dst)})"
+        if dst is UNK:
             return code
         if self.ct(src, node) == self.ct(dst, node):
             return code
@@ -4135,6 +4153,15 @@ class TypedCGen(til.CCodeGenerator):
 
     # ── driver ──────────────────────────────────────────────────────────────
     def generate(self, program) -> str:
+        # effect handlers with resumption (TIL 3.1, effects feature) only run on
+        # the VMs; same check and message as the classic CCodeGenerator
+        for st in program.statements:
+            for n in walk(st):
+                if type(n).__name__ in ('EffectHandler', 'ResumeExpr'):
+                    raise NativeUnsupported(
+                        f"line {n.line}: the native backend does not support effect handlers "
+                        "(handle ... with / resume); run it on the TIL VM (til run, til run --vm) "
+                        "or build bytecode (til build --target vm)")
         self.module_names = set(getattr(program, 'module_names', set()) or ())
         self._uses_timeout = any(isinstance(n, til.TimeoutExpr) for st in program.statements for n in walk(st))
         self._globals = []
@@ -4328,6 +4355,10 @@ class TypedCGen(til.CCodeGenerator):
             t = g.frozen
             c = self.ct(t, decl, f"global '{decl.name}'")
             cname = c_global(decl.name)
+            if decl.value is None and not (t.name == 'option' or is_ptr(t)):
+                # the VMs start a global without a value as None (whatever its annotation)
+                self.unsupported(f"global '{decl.name}' starts as None, which a native {show(t)} "
+                                 "cannot hold", decl)
             if decl.value is not None and not decl.deferred and \
                     isinstance(decl.value, (til.IntLit, til.FloatLit, til.StringLit, til.BoolLit, til.CharLit)):
                 lines.append(f"static {c} {cname} = {self.x(decl.value)};")
@@ -4436,7 +4467,7 @@ class TypedCGen(til.CCodeGenerator):
         self.propagates = isinstance(fdef.ret_type, (til.OptionType, til.ResultType))
         self.stmts(fdef.body)
         if not is_main and inst.ret is not NIL and falls_through(fdef.body):
-            self.emit(f"return {self.zero(inst.ret)};")
+            self.emit(f"return {self.none_return(inst.ret, fdef)};")
         self.indent = 0
         self.emit_raw("}")
         self.emit_raw("")
@@ -4513,10 +4544,20 @@ class TypedCGen(til.CCodeGenerator):
         c = self.ct(t, n, f"variable '{n.name}'")
         if n.value is not None:
             code = self.coerce(self.x(n.value), self.T(n.value), t, n)
+        elif isinstance(n.type_ann, til.PrimitiveType):
+            code = self.zero(t)             # the VMs: 0, 0.0, "", false
         else:
-            code = self.zero(t)
+            code = self.none_init(t, n)     # `var x`, `var p: Point`, `var y: T`: None
         cname = self.declare_var(n.name, t, n)
         self.emit(f"{c} {cname} = {code};")
+
+    def none_init(self, t, node) -> str:
+        """The value None in t's representation, for a declaration without a value
+        whose annotation is not a primitive type (the VMs start it as None)."""
+        if t.name == 'option' or is_ptr(t):
+            return self.none_value(t)
+        self.unsupported(f"variable '{getattr(node, 'name', '?')}' starts as None, which a "
+                         f"native {show(t)} cannot hold", node)
 
     def g_GlobalInit(self, n):
         decl = n.decl
@@ -4713,7 +4754,7 @@ class TypedCGen(til.CCodeGenerator):
             if self.cur_ret is NIL or self.inst.key == 'main':
                 self.emit("return;")
             else:
-                self.emit(f"return {self.zero(self.cur_ret)};")
+                self.emit(f"return {self.none_return(self.cur_ret, n)};")
             return
         val = self.coerce(self.x(n.value), self.T(n.value), self.cur_ret, n)
         if self.cur_ret is NIL:
@@ -4732,6 +4773,14 @@ class TypedCGen(til.CCodeGenerator):
             self.emit("  return _result; }")
         else:
             self.emit(f"return {val};")
+
+    def none_return(self, t, node) -> str:
+        """`return` without a value, or the end of the body reached: the VMs
+        return None (also from a function declared `-> int`)."""
+        if t.name == 'option' or is_ptr(t):
+            return self.none_value(t)
+        self.unsupported(f"'{self.inst.key}' can end without returning a value (None), which a "
+                         f"native {show(t)} cannot hold", node)
 
     def g_Break(self, n):
         self._leave_guarded_regions_in_loop()
@@ -5180,7 +5229,14 @@ class TypedCGen(til.CCodeGenerator):
             ft = info.frozen[info.order[i]]
             self.ct(ft, n, f"field '{info.order[i]}'")
             if nd is None:
-                return self.zero(ft), ft
+                # a field that is not given: 0 / 0.0 / "" / false for primitive
+                # annotations, None for anything else (the VMs)
+                if isinstance(fields[info.order[i]].type, til.PrimitiveType):
+                    return self.zero(ft), ft
+                if ft.name == 'option' or is_ptr(ft):
+                    return self.none_value(ft), ft
+                self.unsupported(f"field '{info.order[i]}' of '{n.name}' is not given and starts as None, "
+                                 f"which a native {show(ft)} cannot hold", n)
             return self.coerce(self.x(nd), self.T(nd), ft, nd), ft
         prelude, codes = self.seq(nodes, gen)
         return self.wrap(prelude, f"{self.mangle_name(n.name)}_create({', '.join(codes)})")
@@ -5481,6 +5537,11 @@ class TypedCGen(til.CCodeGenerator):
         self.unsupported("`handle` (effect handlers run on the VM)", n)
 
     def e_PerformEffect(self, n):
+        """A program without `handle`: `perform E(args)` calls the top-level
+        function E, its default handler (TIL 3.0 behaviour)."""
+        if n.name not in self.ti.funcs:
+            raise NativeUnsupported(f"line {n.line}: effect '{n.name}' has no default handler "
+                                    "function; the TIL VM reports unhandled effects at run time")
         return self.call_user(n, n.args)
 
     def none_value(self, t) -> str:
@@ -6164,12 +6225,13 @@ class TypedCGen(til.CCodeGenerator):
             return w(f"(til_seed({self.cast_code(a0, t0, INT, n)}), NULL)")
         if name == 'sleep_ms':
             return w(f"(til_sleep_ms({self.cast_code(a0, t0, INT, n)}), NULL)")
-        if name == 'exit':
+        never = self.typed_zero(self.T(n)) if self.T(n) not in (UNK, INT) else "(int64_t)0"
+        if name == 'exit':                  # never returns: its "value" has the type of its context
             code = self.cast_code(a0, t0, INT, n) if codes else "0"
-            return w(f"(fflush(stdout), exit((int)({code})), NULL)")
+            return w(f"(fflush(stdout), exit((int)({code})), {never})")
         if name == 'panic':
             msg = self.to_s(a0, t0, n) if codes else '"panic"'
-            return w(f"(til_panic({msg}), NULL)")
+            return w(f"(til_panic({msg}), {never})")
         if name in ('read_file', 'write_file', 'file_exists'):
             if t0 is not STR:
                 return w(f"(til_panic(\"{name}() expects a path string, got {self.vm_type_name(t0)}\"), "
