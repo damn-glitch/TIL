@@ -1272,6 +1272,8 @@ def test_ctrl_c_writes_the_image_and_ends_by_sigint(tmp_path):
             _out, err = p.communicate(timeout=60)
         finally:
             if p.poll() is None:
+                if group:
+                    os.killpg(p.pid, signal.SIGKILL)
                 p.kill()
         assert p.returncode == -signal.SIGINT, (cmd, err)
         assert b"Traceback" not in err, err
