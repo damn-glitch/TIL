@@ -1141,6 +1141,12 @@ class VarDecl(ASTNode):
     value: Optional[ASTNode] = None
     mutable: bool = True
     is_const: bool = False
+    deferred: bool = False      # script mode: initialized where it appears (GlobalInit)
+
+@dataclass
+class GlobalInit(ASTNode):
+    """Script mode: initialize a top-level variable at its position in the program."""
+    decl: Optional['VarDecl'] = None
 
 @dataclass
 class Assignment(ASTNode):
@@ -1442,13 +1448,25 @@ class Parser:
 
     @staticmethod
     def hoist_script_statements(statements: List[ASTNode]) -> List[ASTNode]:
-        """Script mode: executable statements written at the top level run first.
-        Without a `main()` they *are* the program (so `print("hi")` is a complete
-        TIL program); with a `main()` they run before its body."""
-        script = [s for s in statements if not isinstance(s, DEFINITION_NODES)]
-        if not script:
+        """Script mode: executable statements written at the top level run first,
+        in source order. Without a `main()` they *are* the program (so `print("hi")`
+        is a complete TIL program); with a `main()` they run before its body.
+        Top-level variables declared after a script statement stay globals (so
+        functions can use them) but are initialized at their position."""
+        if not any(not isinstance(s, DEFINITION_NODES) for s in statements):
             return statements
-        rest = [s for s in statements if isinstance(s, DEFINITION_NODES)]
+        script, rest, seen_stmt = [], [], False
+        for st in statements:
+            if not isinstance(st, DEFINITION_NODES):
+                seen_stmt = True
+                script.append(st)
+            elif (isinstance(st, VarDecl) and seen_stmt and st.value is not None and
+                  not isinstance(st.value, (IntLit, FloatLit, StringLit, BoolLit, CharLit))):
+                st.deferred = True
+                rest.append(st)
+                script.append(GlobalInit(decl=st, line=st.line, col=st.col))
+            else:
+                rest.append(st)
         main = next((s for s in rest if isinstance(s, FuncDef) and s.name == "main"), None)
         if main is None:
             main = FuncDef(name="main", params=[], ret_type=T_VOID,
@@ -4109,6 +4127,9 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 self._global_float_vars.add(var.name)
             elif c_type == "bool":
                 self._global_bool_vars.add(var.name)
+            if var.deferred:
+                self.emit_raw(f"static {c_type} {c_name};")
+                continue
             if var.value and not self._is_c_constant(var.value):
                 # Not a C constant expression (calls, other globals, string ops):
                 # declare here, initialize at program start (inside main).
@@ -4642,6 +4663,10 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             self.float_vars.add(name)
         elif elem_c == "bool":
             self.bool_vars.add(name)
+
+    def gen_GlobalInit(self, node: GlobalInit) -> str:
+        self.emit(f"{self.mangle_name(node.decl.name)} = {self.generate_node(node.decl.value)};")
+        return ""
 
     def gen_While(self, node: While) -> str:
         cond = self.generate_node(node.condition)
@@ -6509,7 +6534,7 @@ class BytecodeCompiler:
         m.funcs.append(start)
         self.fs = _FuncState(start, None)
         for g in globals_:
-            if g.name in self.global_slots:
+            if g.name in self.global_slots and not g.deferred:
                 self.compile_expr(g.value, g) if g.value is not None else self.emit(Op.PUSH_NIL)
                 self.emit(Op.STORE_GLOBAL, self.global_slots[g.name], node=g)
         if "main" in self.funcs:
@@ -6768,6 +6793,12 @@ class BytecodeCompiler:
             self.patch_jump(ok)
         elif t is IntentBlock:
             self.compile_intent(node, False)
+        elif t is GlobalInit:
+            self.compile_expr(node.decl.value, node)
+            cast = self.numeric_cast_for(node.decl.type_ann)
+            if cast is not None:
+                self.emit(Op.CAST, cast, node=node)
+            self.emit(Op.STORE_GLOBAL, self.global_slots[node.decl.name], node=node)
         elif t is Block:
             self.compile_block_stmts(node)
         elif t in (FuncDef, StructDef, EnumDef, ImplBlock, TraitDef):
@@ -9111,7 +9142,8 @@ class TILCompiler:
         
         return c_code
     
-    def compile_to_executable(self, source: str, output: str, filename: str = "<stdin>") -> bool:
+    def compile_to_executable(self, source: str, output: str, filename: str = "<stdin>",
+                              quiet: bool = False) -> bool:
         """Compile TIL source to native executable"""
         
         c_code = self.compile(source, filename)
@@ -9140,7 +9172,11 @@ class TILCompiler:
                                    encoding='utf-8', errors='replace')
             
             if result.returncode != 0:
-                print(f"C compilation failed:\n{result.stderr}", file=sys.stderr)
+                self.last_c_error = result.stderr
+                if not quiet:
+                    print(f"C compilation failed:\n{result.stderr}", file=sys.stderr)
+                    print("hint: this program may use features only the TIL VM supports; "
+                          "try `til run --vm` or `til build --target vm`", file=sys.stderr)
                 return False
             
             if self.verbose:
@@ -9589,8 +9625,13 @@ def main():
             fd, tmp_exe = tempfile.mkstemp(suffix='.exe' if sys.platform == 'win32' else '')
             os.close(fd)
             try:
-                if not compiler.compile_to_executable(source, tmp_exe, input_file):
-                    return 1
+                if not compiler.compile_to_executable(source, tmp_exe, input_file, quiet=True):
+                    # The native backend covers a subset of TIL; the VM runs everything.
+                    print("[TIL] native backend cannot compile this program; running it on the TIL VM",
+                          file=sys.stderr)
+                    if compiler.verbose:
+                        print(getattr(compiler, 'last_c_error', ''), file=sys.stderr)
+                    return run_bytecode(compile_to_bytecode(source, input_file, compiler.verify), max_steps)
                 return subprocess.run([tmp_exe]).returncode
             finally:
                 try:

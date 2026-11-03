@@ -41,3 +41,17 @@ Thumbs.db
 *.tmp
 *.log
 *.temp
+
+# TIL VM build outputs
+vm/tilvm
+vm/tilvm-small
+vm/tilvm-tiny
+vm/tilvm-check
+vm/ports/*/build/
+*.tbc
+*.snap
+
+# AI assistant files (kept out of the repository)
+CLAUDE.md
+.claude/
+claude/
