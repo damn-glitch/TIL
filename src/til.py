@@ -3214,7 +3214,10 @@ class SemanticChecker:
     * Arity: calls to known functions must pass a valid number of arguments.
     """
 
-    IO_BUILTINS = {'print', 'println', 'input'}
+    IO_BUILTINS = {'print', 'println', 'input', 'read_file', 'write_file', 'file_exists',
+                   'screen_init', 'screen_clear', 'draw_pixel', 'draw_line', 'draw_rect',
+                   'fill_rect', 'draw_circle', 'draw_text', 'get_pixel', 'screen_show',
+                   'key_pressed', 'wait_key', 'energy_mode'}
 
     def __init__(self, source: str = "", filename: str = "<stdin>"):
         self.reporter = ErrorReporter(source, filename)
@@ -6188,7 +6191,8 @@ import math as _math
 import time as _time
 
 TBC_MAGIC = b"TILB"
-TBC_VERSION = 1
+TBC_VERSION = 2          # written by the compiler (TIL 3.1)
+TBC_MIN_VERSION = 1      # oldest version the VMs still load (TIL 3.0)
 
 
 class Op:
@@ -6211,7 +6215,10 @@ class Op:
     MATCH_TYPE = 0x6C; CAST = 0x6D; IS_ARRAY_LEN = 0x6E
     TRY = 0x70; TRY_TIMEOUT = 0x71; END_TRY = 0x72; PANIC = 0x73
     UNWRAP_OR_RETURN = 0x74; UNWRAP_OR_PANIC = 0x75
+    # effects with resumption (TIL 3.1, see docs/dev/TIL_3_1_DESIGN.md §8)
+    HANDLE = 0x76; END_HANDLE = 0x77; PERFORM = 0x78; RESUME = 0x79
     HALT = 0x7F
+    # 0x80-0xBF: reserved for superinstructions (§13)
 
 
 OP_NAMES = {v: k for k, v in vars(Op).items() if not k.startswith('_')}
@@ -6228,6 +6235,7 @@ OP_OPERANDS = {
     Op.SET_FIELD: 'h', Op.GET_SLOT: 'b', Op.MAKE_CLOSURE: 'hb', Op.PUSH_FUNC: 'h',
     Op.CONCAT: 'b', Op.FOR_ITER: 'bs', Op.MATCH_TYPE: 'h', Op.CAST: 'b',
     Op.IS_ARRAY_LEN: 'h', Op.TRY: 's', Op.TRY_TIMEOUT: 's',
+    Op.HANDLE: 'bs', Op.PERFORM: 'hhb',
 }
 _OPERAND_SIZE = {'b': 1, 'c': 1, 'h': 2, 's': 2}
 
@@ -6238,8 +6246,36 @@ NATIVES = [
     'tan', 'log', 'exp', 'floor', 'ceil', 'round', 'min', 'max', 'input', 'chr',
     'ord', 'range', 'type_of', 'format', 'clock_ms', 'random', 'seed', 'sleep_ms',
     'exit', 'bool', 'sum', 'panic', 'iter', 'println',
+    # TIL 3.1 (bytecode v2): files and bytes
+    'read_file', 'write_file', 'file_exists', 'args', 'bytes_to_str', 'str_bytes',
+    # screen and keys (calculators, terminals, browser canvas)
+    'screen_init', 'screen_clear', 'draw_pixel', 'draw_line', 'draw_rect', 'fill_rect',
+    'draw_circle', 'draw_text', 'get_pixel', 'screen_show', 'key_pressed', 'wait_key',
+    'screen_width', 'screen_height',
+    # battery saving
+    'energy_mode',
 ]
 NATIVE_ID = {name: i for i, name in enumerate(NATIVES)}
+
+# (min, max) argument counts; max None = any number. The compiler checks both,
+# the VMs check the minimum (bytecode may come from other compilers).
+NATIVE_ARITY = {
+    'print': (0, None), 'len': (1, 1), 'str': (1, 1), 'int': (1, 1), 'float': (1, 1),
+    'abs': (1, 1), 'sqrt': (1, 1), 'pow': (2, 2), 'sin': (1, 1), 'cos': (1, 1),
+    'tan': (1, 1), 'log': (1, 1), 'exp': (1, 1), 'floor': (1, 1), 'ceil': (1, 1),
+    'round': (1, 1), 'min': (1, None), 'max': (1, None), 'input': (0, 1), 'chr': (1, 1),
+    'ord': (1, 1), 'range': (1, 3), 'type_of': (1, 1), 'format': (2, 2), 'clock_ms': (0, 0),
+    'random': (0, 2), 'seed': (1, 1), 'sleep_ms': (1, 1), 'exit': (0, 1), 'bool': (1, 1),
+    'sum': (1, None), 'panic': (0, 1), 'iter': (1, 1), 'println': (0, None),
+    'read_file': (1, 1), 'write_file': (2, 2), 'file_exists': (1, 1), 'args': (0, 0),
+    'bytes_to_str': (1, 1), 'str_bytes': (1, 1),
+    'screen_init': (2, 2), 'screen_clear': (0, 1), 'draw_pixel': (3, 3), 'draw_line': (5, 5),
+    'draw_rect': (5, 5), 'fill_rect': (5, 5), 'draw_circle': (4, 4), 'draw_text': (4, 4),
+    'get_pixel': (2, 2), 'screen_show': (0, 0), 'key_pressed': (0, 0), 'wait_key': (0, 0),
+    'screen_width': (0, 0), 'screen_height': (0, 0), 'energy_mode': (0, 1),
+}
+# runtime minimum (range always gets 2..3 arguments from the compiler)
+NATIVE_MIN_ARGS = [2 if n == 'range' else NATIVE_ARITY[n][0] for n in NATIVES]
 
 # Builtin methods (INVOKE ... <method id> ...) of str / array / map / Option / Result.
 METHODS = [
@@ -6274,6 +6310,8 @@ class TBCFunction:
     FLAG_METHOD = 1      # param 0 is `self`
     FLAG_PROPAGATE = 2   # `?` inside returns None/Err from this function
     FLAG_LAMBDA = 4
+    FLAG_ENERGY_LOW = 8      # #[energy: low]: the VM idles while running it
+    FLAG_EFFECT_CLAUSE = 16  # a `handle ... with E(x) => ...` clause
 
     def __init__(self, name: str):
         self.name = name
@@ -6302,6 +6340,7 @@ class TBCModule:
         self.code = b""
         self.lines: List[Tuple[int, int]] = []
         self.uses_float = False
+        self.version = TBC_VERSION           # of a loaded file (written files: TBC_VERSION)
 
     def const(self, value) -> int:
         if isinstance(value, str):
@@ -6387,8 +6426,10 @@ class TBCModule:
         m.types = []
         if data[:4] != TBC_MAGIC:
             raise ValueError("not a TIL bytecode file (bad magic)")
-        if data[4] != TBC_VERSION:
-            raise ValueError(f"unsupported bytecode version {data[4]}")
+        if not TBC_MIN_VERSION <= data[4] <= TBC_VERSION:
+            raise ValueError(f"unsupported bytecode version {data[4]} "
+                             f"(this VM loads versions {TBC_MIN_VERSION}..{TBC_VERSION})")
+        m.version = data[4]
         flags = data[5]
         m.uses_float = bool(flags & 1)
         pos = 6
@@ -7641,6 +7682,17 @@ class BytecodeCompiler:
                 self.emit(Op.CALL_VALUE, argc, node=node)
                 return
             if name in NATIVE_ID:
+                lo, hi = NATIVE_ARITY[name]
+                if argc < lo or (hi is not None and argc > hi):
+                    want = (f"{lo}" if lo == hi else f"{lo} to {hi}" if hi is not None
+                            else f"at least {lo}")
+                    self.error(node, f"'{name}' takes {want} argument(s), got {argc}")
+                if name == 'range' and argc == 1:          # range(n) = range(0, n)
+                    self.emit(Op.PUSH_I8, 0, node=node)
+                    self.compile_args(node.args, node)
+                    self.emit(Op.PUSH_FALSE)
+                    self.emit(Op.NATIVE, NATIVE_ID['range'], 3, node=node)
+                    return
                 self.compile_args(node.args, node)
                 self.emit(Op.NATIVE, NATIVE_ID[name], argc, node=node)
                 return
@@ -7882,8 +7934,11 @@ class TILVM:
     CHECK_INTERVAL = 256
     MAX_FRAMES = 2000
 
-    def __init__(self, module: TBCModule, write=None, read_line=None, max_steps: int = 0):
+    def __init__(self, module: TBCModule, write=None, read_line=None, max_steps: int = 0,
+                 argv: Optional[List[Any]] = None):
         self.m = module
+        # program arguments for args(): bytes (str is encoded as UTF-8)
+        self.argv = [a.encode('utf-8') if isinstance(a, str) else bytes(a) for a in (argv or [])]
         self.code = module.code
         self.consts = module.consts
         self._own_stdout = write is None
@@ -8218,7 +8273,9 @@ class TILVM:
 
     # ── natives ─────────────────────────────────────────────────────────────
     def call_native(self, nid: int, args: list):
-        name = NATIVES[nid]
+        name = NATIVES[nid] if nid < len(NATIVES) else '?'
+        if nid < len(NATIVES) and len(args) < NATIVE_MIN_ARGS[nid]:
+            self.panic(f"{name}() is missing arguments")
         if name in ('print', 'println'):
             if not args:
                 self.write(b"\n")
@@ -8326,7 +8383,47 @@ class TILVM:
             raise TILExit(int(args[0]) if args else 0)
         if name == 'panic':
             self.panic(self.to_str(args[0]) if args else b"panic")
-        self.panic(f"native '{name}' is not available")
+        if name in ('read_file', 'write_file', 'file_exists'):
+            path = self.path_arg(name, args[0])
+            if name == 'file_exists':
+                try:
+                    with open(path, 'rb'):
+                        return True
+                except (OSError, ValueError):
+                    return False
+            if name == 'read_file':
+                try:
+                    with open(path, 'rb') as f:
+                        return f.read()
+                except (OSError, ValueError):
+                    self.panic(b"cannot read file: " + args[0])
+            data = args[1] if type(args[1]) is bytes else self.to_str(args[1])
+            try:
+                with open(path, 'wb') as f:
+                    f.write(data)
+            except (OSError, ValueError):
+                self.panic(b"cannot write file: " + args[0])
+            return None
+        if name == 'args':
+            return list(self.argv)
+        if name == 'bytes_to_str':
+            arr = args[0]
+            if type(arr) is not list or any(type(x) is not int or not 0 <= x <= 255 for x in arr):
+                self.panic("bytes_to_str() expects an array of ints 0..255")
+            return bytes(arr)
+        if name == 'str_bytes':
+            if type(args[0]) is not bytes:
+                self.panic(f"str_bytes() expects a string, got {self.type_name(args[0]).decode()}")
+            return list(args[0])
+        self.panic(f"{name}() is not available in this VM build")
+
+    def path_arg(self, who: str, v) -> str:
+        """A file path argument (same rules as the C VM: non-empty, < 256 bytes, no NUL)."""
+        if type(v) is not bytes:
+            self.panic(f"{who}() expects a path string, got {self.type_name(v).decode()}")
+        if not v or len(v) >= 256 or b"\0" in v:
+            self.panic(f"{who}(): invalid path")
+        return os.fsdecode(v)
 
     # ── builtin methods ─────────────────────────────────────────────────────
     def call_method(self, mid: int, recv, args: list):
@@ -8976,7 +9073,7 @@ def disassemble(m: TBCModule) -> str:
     """Human-readable listing of a bytecode module (`til dis`)."""
     if not m.code:
         m.link()
-    out = [f"; TIL bytecode v{TBC_VERSION}: {len(m.funcs)} functions, {len(m.consts)} constants, "
+    out = [f"; TIL bytecode v{getattr(m, 'version', TBC_VERSION)}: {len(m.funcs)} functions, {len(m.consts)} constants, "
            f"{len(m.globals)} globals, {len(m.code)} bytes of code"]
     for i, (name, fields) in enumerate(m.types):
         if i > TYPE_ERR:
@@ -8994,7 +9091,8 @@ def disassemble(m: TBCModule) -> str:
         return repr(c)
 
     for i, f in enumerate(m.funcs):
-        flags = [n for bit, n in ((1, 'method'), (2, 'propagates'), (4, 'lambda')) if f.flags & bit]
+        flags = [n for bit, n in ((1, 'method'), (2, 'propagates'), (4, 'lambda'), (8, 'energy-low'),
+                                  (16, 'effect-clause')) if f.flags & bit]
         out.append("")
         out.append(f"fn #{i} {f.name}  params={f.n_params} required={f.n_required} "
                    f"locals={f.n_locals} upvals={f.n_upvals}" + (f" [{', '.join(flags)}]" if flags else ""))
@@ -9027,12 +9125,14 @@ def disassemble(m: TBCModule) -> str:
                 note = NATIVES[vals[0]] + "()" if vals[0] < len(NATIVES) else "?"
             elif op in (Op.NEW_STRUCT, Op.MATCH_TYPE):
                 note = m.types[vals[0]][0] if vals[0] < len(m.types) else "?"
-            elif op in (Op.JUMP, Op.JUMP_IF_FALSE, Op.JUMP_IF_TRUE, Op.TRY, Op.TRY_TIMEOUT):
+            elif op in (Op.JUMP, Op.JUMP_IF_FALSE, Op.JUMP_IF_TRUE, Op.TRY, Op.TRY_TIMEOUT, Op.HANDLE):
                 note = f"-> {p + vals[-1] - f.offset:04d}"
             elif op in (Op.FOR_ITER, Op.ARG_DEFAULT):
                 note = f"-> {p + vals[-1] - f.offset:04d}"
             elif op == Op.CAST:
                 note = {v: k for k, v in CAST_KINDS.items()}.get(vals[0], "?")
+            elif op == Op.PERFORM:
+                note = m.consts[vals[0]].decode('utf-8', 'replace') if vals[0] < len(m.consts) else "?"
             line = f"  {pc - f.offset:04d}  {name:<18}{' '.join(str(v) for v in vals):<12}"
             if note:
                 line += f"; {note}"
@@ -9350,6 +9450,7 @@ class TILCompiler:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def print_help():
+    extra_commands = "".join(f"  {name + ' ...':<24}{text}\n" for name, (_mod, text) in EXTRA_COMMANDS.items())
     print(f"""
 TIL {TIL_VERSION} - The Intelligent Language
 Author: Alisher Beisembekov
@@ -9365,7 +9466,7 @@ Commands:
   check <file.til>        Parse + verify effects, capabilities, contracts
   translate <file.til>    Translate keywords: --to en | kk | kk-latn | ru
   repl                    Interactive REPL (runs on the VM, no C compiler needed)
-  version                 Show version
+{extra_commands}  version                 Show version
 
 Options:
   -o <file>               Output file name
@@ -9381,6 +9482,9 @@ Options:
   --no-check              Disable type warnings
   --no-verify             Disable effect/capability/contract verification
   -v, --verbose           Verbose output
+  --                      Everything after it is passed to the program (args())
+
+Program arguments:        til run prog.til a b c   ->  args() == ["a", "b", "c"]
 
 Multi-Level Programming:  #[level: 0..4]  Hardware, Systems, Safe (default), Script, Formal
 Languages:                English + Kazakh always; #[lang: ru] / #[lang: kk-latn] per file
@@ -9421,8 +9525,73 @@ def _cvm_binary(verbose: bool = False) -> Optional[str]:
     return exe
 
 
-def run_bytecode(module: TBCModule, max_steps: int = 0) -> int:
-    return TILVM(module, max_steps=max_steps).run()
+def run_bytecode(module: TBCModule, max_steps: int = 0, argv: Optional[List[str]] = None,
+                 opts: Optional[Dict[str, Any]] = None) -> int:
+    """Run a module on the reference VM. `argv` = program arguments (args()),
+    `opts` = run options parsed by main() (see RUN_VALUE_OPTIONS)."""
+    return TILVM(module, max_steps=max_steps, argv=argv).run()
+
+
+# ── feature commands and run options (TIL 3.1) ───────────────────────────────
+# Larger tools live in their own modules next to til.py (src/); each exposes
+# main(argv) -> exit code. `til <command> ...` dispatches to them.
+EXTRA_COMMANDS: Dict[str, Tuple[str, str]] = {
+    'pkg': ('tilpkg', "Packages: init | add NAME SPEC | install | remove NAME | list | verify"),
+    'prove': ('tilprove', "Prove #[requires]/#[ensures] for all inputs (needs z3-solver)"),
+    'fit': ('tilfit', "Will the program fit a device?  --device NAME [--run]"),
+    'debug': ('tildebug', "Time-travel debugger: breakpoints, step, step back, reverse-continue"),
+}
+
+# Options of run/exec/build that take a value (stored in opts[key]) or are flags.
+RUN_VALUE_OPTIONS = {
+    '--screen': 'screen',            # graphics: write the final frame as a PPM image
+    '--keys': 'keys',                # graphics: scripted key presses "UP,UP,ENTER,a"
+    '--pause-after': 'pause_after',  # portable snapshots: pause after N steps ...
+    '--save': 'save',                # ... and save the running program (.tilp)
+    '--resume': 'resume',            # continue a saved program
+    '--lang': 'lang',                # messages: en | ru | kk
+    '--device': 'device',            # build --target vm: check the program fits a device
+}
+RUN_FLAG_OPTIONS = {
+    '--screen-ansi': 'screen_ansi',  # graphics: draw the screen in the terminal
+    '--prove': 'prove',              # check: prove contracts for all inputs
+}
+
+
+def feature_module(name: str):
+    """Import a TIL tool module that lives next to til.py (src/tilpkg.py, ...).
+    The tools `import til`; make that the module that is already running."""
+    sys.modules.setdefault('til', sys.modules[__name__])
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import importlib
+    return importlib.import_module(name)
+
+
+def run_extra_command(command: str, argv: List[str]) -> int:
+    module_name = EXTRA_COMMANDS[command][0]
+    try:
+        module = feature_module(module_name)
+    except ImportError as e:
+        if getattr(e, 'name', None) != module_name:
+            raise
+        print(f"til {command}: not available in this installation ({module_name}.py is missing)",
+              file=sys.stderr)
+        return 1
+    return module.main(argv)
+
+
+def run_proofs(program: 'Program', source: str, filename: str, explicit: bool) -> List[str]:
+    """`til check`: prove the contracts of #[level: 4] functions (of every function
+    with --prove). Returns formatted errors (empty = everything proved)."""
+    try:
+        prover = feature_module('tilprove')
+    except ImportError as e:
+        if getattr(e, 'name', None) != 'tilprove':
+            raise
+        return ["til check --prove: the prover (tilprove.py) is not installed"] if explicit else []
+    return prover.check_program(program, source, filename, explicit)
 
 
 # ── translate ────────────────────────────────────────────────────────────────
@@ -9597,6 +9766,9 @@ def main():
         print("Backends: native (C via gcc/clang), TIL VM (bytecode: Python, C99 / calculators)")
         return 0
 
+    if args[0] in EXTRA_COMMANDS:
+        return run_extra_command(args[0], args[1:])
+
     command = None
     if args and args[0] in ('run', 'build', 'check', 'repl', 'exec', 'dis', 'translate'):
         command = args[0]
@@ -9613,10 +9785,28 @@ def main():
     max_steps = 0
     strip = False
     lang_to = None
+    opts: Dict[str, Any] = {}       # RUN_VALUE_OPTIONS / RUN_FLAG_OPTIONS
+    prog_args: List[str] = []       # arguments for the program (args())
 
     i = 0
     while i < len(args):
         arg = args[i]
+        if arg == '--':
+            prog_args.extend(args[i + 1:])
+            break
+        if arg in RUN_VALUE_OPTIONS and i + 1 < len(args):
+            opts[RUN_VALUE_OPTIONS[arg]] = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith('--') and arg.split('=', 1)[0] in RUN_VALUE_OPTIONS and '=' in arg:
+            key, value = arg.split('=', 1)
+            opts[RUN_VALUE_OPTIONS[key]] = value
+            i += 1
+            continue
+        if arg in RUN_FLAG_OPTIONS:
+            opts[RUN_FLAG_OPTIONS[arg]] = True
+            i += 1
+            continue
         if arg == '-o' and i + 1 < len(args):
             output_file = args[i + 1]
             i += 2
@@ -9655,8 +9845,10 @@ def main():
             compiler.verbose = True
         elif arg in ('-O0', '-O1', '-O2', '-O3'):
             compiler.optimize = int(arg[2])
-        elif not arg.startswith('-'):
+        elif input_file is None and not arg.startswith('-'):
             input_file = arg
+        elif input_file is not None:
+            prog_args.append(arg)        # after the program file: the program's arguments
         else:
             print(f"Error: unknown option {arg}", file=sys.stderr)
             return 1
@@ -9677,7 +9869,7 @@ def main():
             if command == 'dis':
                 print(disassemble(module))
                 return 0
-            return run_bytecode(module, max_steps)
+            return run_bytecode(module, max_steps, prog_args, opts)
 
         with open(input_file, 'r', encoding='utf-8') as f:
             source = f.read()
@@ -9690,6 +9882,11 @@ def main():
                     print(err, file=sys.stderr)
                 return 1
             BytecodeCompiler(source, input_file).compile_program(ast)   # names, arity, immutability
+            proof_errors = run_proofs(ast, source, input_file, bool(opts.get('prove')))
+            if proof_errors:
+                for err in proof_errors:
+                    print(err, file=sys.stderr)
+                return 1
             print(f"OK: {input_file}")
             return 0
 
@@ -9716,7 +9913,7 @@ def main():
         if command == 'run' and use_vm:
             module = compile_to_bytecode(source, input_file, compiler.verify)
             if use_vm == 'py':
-                return run_bytecode(module, max_steps)
+                return run_bytecode(module, max_steps, prog_args, opts)
             exe = _cvm_binary(compiler.verbose)
             if exe is None:
                 print("Error: cannot build the C VM (need vm/ sources and a C compiler)", file=sys.stderr)
@@ -9725,7 +9922,7 @@ def main():
             try:
                 with os.fdopen(fd, 'wb') as f:
                     f.write(module.serialize())
-                cmd = [exe] + (['--max-steps', str(max_steps)] if max_steps else []) + [tbc_path]
+                cmd = [exe] + (['--max-steps', str(max_steps)] if max_steps else []) + [tbc_path] + prog_args
                 return subprocess.run(cmd).returncode
             finally:
                 os.unlink(tbc_path)
@@ -9778,8 +9975,9 @@ def main():
                           file=sys.stderr)
                     if compiler.verbose:
                         print(getattr(compiler, 'last_c_error', ''), file=sys.stderr)
-                    return run_bytecode(compile_to_bytecode(source, input_file, compiler.verify), max_steps)
-                return subprocess.run([tmp_exe]).returncode
+                    return run_bytecode(compile_to_bytecode(source, input_file, compiler.verify), max_steps,
+                                        prog_args, opts)
+                return subprocess.run([tmp_exe] + prog_args).returncode
             finally:
                 try:
                     os.unlink(tmp_exe)

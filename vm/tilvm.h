@@ -42,7 +42,8 @@
 #include <stddef.h>
 
 #define TILVM_VERSION "3.0.0"
-#define TILVM_BYTECODE_VERSION 1
+#define TILVM_BYTECODE_VERSION 2        /* newest .tbc version this VM loads */
+#define TILVM_BYTECODE_MIN_VERSION 1    /* oldest (TIL 3.0) */
 
 #ifndef TILVM_INT_BITS
 #define TILVM_INT_BITS 64
@@ -160,6 +161,31 @@ typedef void (*tilvm_write_fn)(void *ctx, const char *data, size_t len);
 typedef int (*tilvm_read_fn)(void *ctx, char *buf, size_t cap);   /* returns length or -1 */
 typedef uint32_t (*tilvm_clock_fn)(void *ctx);                    /* milliseconds */
 
+/* Optional device services (TIL 3.1). A NULL hook means "not available on this
+ * device": the native that needs it reports "<name>() is not available ...".
+ * tilvm_load() resets the struct; with stdio it installs read_file/write_file.
+ * All hooks receive vm->ctx. */
+typedef struct tilvm_host {
+    /* files: read_file returns the file size (or -1) and copies at most `cap`
+     * bytes into buf (buf may be NULL to ask for the size); write_file returns
+     * 0 on success, -1 on failure */
+    long (*read_file)(void *ctx, const char *path, char *buf, unsigned long cap);
+    int (*write_file)(void *ctx, const char *path, const char *data, unsigned long len);
+    /* screen: pixels are 0xRRGGBB; the VM rasterizes lines, shapes and text */
+    void (*gfx_init)(void *ctx, int w, int h);
+    void (*gfx_pixel)(void *ctx, int x, int y, unsigned long rgb);
+    unsigned long (*gfx_get)(void *ctx, int x, int y);
+    void (*gfx_show)(void *ctx);
+    /* keys: 0 = none; UP=1 DOWN=2 LEFT=3 RIGHT=4, otherwise ASCII (ENTER=13, ESC=27) */
+    int (*key_pressed)(void *ctx);
+    int (*wait_key)(void *ctx);
+    /* battery saving: sleep / halt the CPU for about `ms` milliseconds */
+    void (*idle)(void *ctx, unsigned long ms);
+    /* program arguments (args()) */
+    int argc;
+    const char *const *argv;
+} tilvm_host;
+
 typedef struct tilvm {
     /* ---- host bindings (set after tilvm_load; not part of snapshots) ---- */
     tilvm_write_fn write;       /* program output */
@@ -168,6 +194,7 @@ typedef struct tilvm {
     tilvm_clock_fn clock_ms;    /* clock_ms(), timeout() */
     void *ctx;
     uint32_t max_steps;         /* 0 = unlimited (sandbox) */
+    tilvm_host host;            /* files, screen, keys, idle, args (TIL 3.1) */
 
     /* ---- program (read-only, may live in ROM) ---- */
     const uint8_t *bc;

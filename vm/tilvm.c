@@ -41,7 +41,10 @@ enum {
     OP_MATCH_TYPE = 0x6C, OP_CAST = 0x6D, OP_IS_ARRAY_LEN = 0x6E,
     OP_TRY = 0x70, OP_TRY_TIMEOUT = 0x71, OP_END_TRY = 0x72, OP_PANIC = 0x73,
     OP_UNWRAP_OR_RETURN = 0x74, OP_UNWRAP_OR_PANIC = 0x75,
+    /* effects with resumption (TIL 3.1, docs/dev/TIL_3_1_DESIGN.md section 8) */
+    OP_HANDLE = 0x76, OP_END_HANDLE = 0x77, OP_PERFORM = 0x78, OP_RESUME = 0x79,
     OP_HALT = 0x7F
+    /* 0x80-0xBF: reserved for superinstructions */
 };
 
 /* NATIVES (order = NATIVES in src/til.py) */
@@ -49,7 +52,12 @@ enum {
     N_PRINT, N_LEN, N_STR, N_INT, N_FLOAT, N_ABS, N_SQRT, N_POW, N_SIN, N_COS,
     N_TAN, N_LOG, N_EXP, N_FLOOR, N_CEIL, N_ROUND, N_MIN, N_MAX, N_INPUT, N_CHR,
     N_ORD, N_RANGE, N_TYPE_OF, N_FORMAT, N_CLOCK_MS, N_RANDOM, N_SEED, N_SLEEP_MS,
-    N_EXIT, N_BOOL, N_SUM, N_PANIC, N_ITER, N_PRINTLN
+    N_EXIT, N_BOOL, N_SUM, N_PANIC, N_ITER, N_PRINTLN,
+    /* TIL 3.1 (bytecode v2) */
+    N_READ_FILE, N_WRITE_FILE, N_FILE_EXISTS, N_ARGS, N_BYTES_TO_STR, N_STR_BYTES,
+    N_SCREEN_INIT, N_SCREEN_CLEAR, N_DRAW_PIXEL, N_DRAW_LINE, N_DRAW_RECT, N_FILL_RECT,
+    N_DRAW_CIRCLE, N_DRAW_TEXT, N_GET_PIXEL, N_SCREEN_SHOW, N_KEY_PRESSED, N_WAIT_KEY,
+    N_SCREEN_WIDTH, N_SCREEN_HEIGHT, N_ENERGY_MODE
 };
 
 /* METHODS (order = METHODS in src/til.py) */
@@ -68,6 +76,15 @@ enum {
 #define TYPE_ERR  2
 
 #define FLAG_PROPAGATE 2
+#define FLAG_ENERGY_LOW 8
+#define FLAG_EFFECT_CLAUSE 16
+
+/* Longest string: 64 KB - 1 with 16-bit heap references, else 16 MB */
+#if TILVM_HEAP_SIZE <= 65535L
+#define TV_STR_MAX 0xFFFFul
+#else
+#define TV_STR_MAX 0xFFFFFFul
+#endif
 
 /* ─── heap objects ──────────────────────────────────────────────────────── */
 enum { OBJ_STR = 1, OBJ_ARRAY, OBJ_MAP, OBJ_VALS, OBJ_STRUCT, OBJ_CLOSURE, OBJ_CELL };
@@ -113,7 +130,11 @@ static const char *const NATIVE_NAMES[] = {
     "print", "len", "str", "int", "float", "abs", "sqrt", "pow", "sin", "cos",
     "tan", "log", "exp", "floor", "ceil", "round", "min", "max", "input", "chr",
     "ord", "range", "type_of", "format", "clock_ms", "random", "seed", "sleep_ms",
-    "exit", "bool", "sum", "panic", "iter", "println"
+    "exit", "bool", "sum", "panic", "iter", "println",
+    "read_file", "write_file", "file_exists", "args", "bytes_to_str", "str_bytes",
+    "screen_init", "screen_clear", "draw_pixel", "draw_line", "draw_rect", "fill_rect",
+    "draw_circle", "draw_text", "get_pixel", "screen_show", "key_pressed", "wait_key",
+    "screen_width", "screen_height", "energy_mode"
 };
 static const char *const METHOD_NAMES[] = {
     "len", "push", "pop", "get", "set", "contains", "starts_with", "ends_with",
@@ -207,6 +228,35 @@ static int default_read_line(void *ctx, char *buf, size_t cap) {
     n = strlen(buf);
     if (n && buf[n - 1] == '\n') buf[--n] = 0;
     return (int)n;
+}
+/* files: the size is measured with fseek/ftell; a directory or unreadable file is -1 */
+static long default_read_file(void *ctx, const char *path, char *buf, unsigned long cap) {
+    FILE *f = fopen(path, "rb");
+    long n;
+    int c;
+    (void)ctx;
+    if (!f) return -1;
+    c = getc(f);                                   /* fails for directories */
+    if (c == EOF && ferror(f)) { fclose(f); return -1; }
+    if (fseek(f, 0, SEEK_END) != 0 || (n = ftell(f)) < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return -1;
+    }
+    if (buf && cap) {
+        size_t want = (unsigned long)n < cap ? (size_t)n : (size_t)cap;
+        if (fread(buf, 1, want, f) != want) { fclose(f); return -1; }
+    }
+    fclose(f);
+    return n;
+}
+static int default_write_file(void *ctx, const char *path, const char *data, unsigned long len) {
+    FILE *f = fopen(path, "wb");
+    int ok;
+    (void)ctx;
+    if (!f) return -1;
+    ok = fwrite(data, 1, (size_t)len, f) == (size_t)len;
+    if (fclose(f) != 0) ok = 0;
+    return ok ? 0 : -1;
 }
 #else
 void tilvm_default_write(void *ctx, const char *data, size_t len) { (void)ctx; (void)data; (void)len; }
@@ -384,7 +434,7 @@ static tv_ref new_str(tilvm *vm, uint32_t len) {
 #ifndef TILVM_LEAN
 static int make_str(tilvm *vm, tv_val *dst, const char *s, uint32_t len) {
     tv_ref r;
-    if (len > 0xFFFF) return fail(vm, "string too long");
+    if (len > TV_STR_MAX) return fail(vm, "string too long");
     r = new_str(vm, len);
     if (!r) return 0;
     memcpy(STROBJ(vm, r)->data, s, len);
@@ -686,7 +736,7 @@ static int to_str_slot(tilvm *vm, uint16_t slot) {
     if (is_str(v)) return 1;
     s.vm = vm; s.mode = 0; s.dst = 0; s.len = 0;
     emit_value(&s, v, 0, 0);
-    if (s.len > 0xFFFF) return fail(vm, "string too long");
+    if (s.len > TV_STR_MAX) return fail(vm, "string too long");
     r = new_str(vm, s.len);           /* GC may move objects: re-read the slot */
     if (!r) return 0;
     s.mode = 1; s.dst = STROBJ(vm, r)->data; s.len = 0;
@@ -934,7 +984,7 @@ static int arith(tilvm *vm, int op) {
         if (!to_str_slot(vm, (uint16_t)(SP - 2)) || !to_str_slot(vm, (uint16_t)(SP - 1))) return 0;
         str_data(vm, &STK[SP - 2], &la);
         str_data(vm, &STK[SP - 1], &lb);
-        if (la + lb > 0xFFFF) return fail(vm, "string too long");
+        if (la + lb > TV_STR_MAX) return fail(vm, "string too long");
         r = new_str(vm, la + lb);
         if (!r) return 0;
         {
@@ -951,7 +1001,7 @@ static int arith(tilvm *vm, int op) {
         uint32_t la, k, times = b->u.i > 0 ? (uint32_t)b->u.i : 0;
         tv_ref r;
         str_data(vm, a, &la);
-        if ((uint32_t)la * times > 0xFFFF) return fail(vm, "string too long");
+        if (times && la > TV_STR_MAX / times) return fail(vm, "string too long");
         r = new_str(vm, la * times);
         if (!r) return 0;
         {
@@ -1518,12 +1568,96 @@ static uint32_t rng_next(tilvm *vm) {
 }
 #endif
 
+/* Minimum argument count of each native (the compiler also checks the maximum).
+ * Bytecode from other compilers cannot make a native read past its arguments. */
+static const uint8_t NATIVE_MIN_ARGS[] = {
+    0, 1, 1, 1, 1, 1, 1, 2, 1, 1,      /* print len str int float abs sqrt pow sin cos */
+    1, 1, 1, 1, 1, 1, 1, 1, 0, 1,      /* tan log exp floor ceil round min max input chr */
+    1, 2, 1, 2, 0, 0, 1, 1, 0, 1,      /* ord range type_of format clock_ms random seed sleep_ms exit bool */
+    1, 0, 1, 0,                        /* sum panic iter println */
+    1, 2, 1, 0, 1, 1,                  /* read_file write_file file_exists args bytes_to_str str_bytes */
+    2, 0, 3, 5, 5, 5, 4, 4, 2, 0,      /* screen_init screen_clear draw_pixel draw_line draw_rect
+                                          fill_rect draw_circle draw_text get_pixel screen_show */
+    0, 0, 0, 0, 0                      /* key_pressed wait_key screen_width screen_height energy_mode */
+};
+
+/* compile-time check: one entry per native */
+typedef char tv_check_native_tables[(sizeof(NATIVE_MIN_ARGS) == N_NATIVES) ? 1 : -1];
+
+#ifndef TILVM_LEAN
+/* ─── files, bytes, program arguments (TIL 3.1) ────────────────────────── */
+#define TV_PATH_MAX 256
+
+/* Copy a string value into a NUL-terminated C path. */
+static int c_path(tilvm *vm, const tv_val *v, char *buf, const char *who) {
+    uint32_t n;
+    const char *p;
+    if (!is_str(v)) return failn(vm, who, "() expects a path string, got ", type_name(vm, v), 0, 0, 0);
+    p = str_data(vm, v, &n);
+    if (n == 0 || n >= TV_PATH_MAX || memchr(p, 0, n)) return failn(vm, who, "(): invalid path", 0, 0, 0, 0);
+    memcpy(buf, p, n);
+    buf[n] = 0;
+    return 1;
+}
+
+/* Push a new array of n nil values. */
+static int push_new_array(tilvm *vm, uint32_t n) {
+    tv_ref buf, arr;
+    if (n > 0xFFFF) return fail(vm, "array too large");
+    if (SP + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+    buf = new_vals(vm, n < 4 ? 4 : n);
+    if (!buf) return 0;
+    set_ref(&STK[SP], TV_CELL, buf);          /* keep the buffer rooted */
+    SP++;
+    arr = alloc_obj(vm, OBJ_ARRAY, sizeof(tv_arrobj));
+    SP--;
+    if (!arr) return 0;
+    ARROBJ(vm, arr)->buf = STK[SP].u.r;
+    ARROBJ(vm, arr)->len = (tv_size)n;
+    set_ref(&STK[SP], TV_ARRAY, arr);
+    SP++;
+    return 1;
+}
+
+static int native_read_file(tilvm *vm, uint16_t base, tv_val *res) {
+    char path[TV_PATH_MAX];
+    long n, got;
+    tv_ref r;
+    if (!c_path(vm, &STK[base], path, "read_file")) return 0;
+    if (!vm->host.read_file) return fail(vm, "read_file() is not available on this device");
+    n = vm->host.read_file(vm->ctx, path, 0, 0);
+    if (n < 0) return failn(vm, "cannot read file: ", path, 0, 0, 0, 0);
+    if ((unsigned long)n > TV_STR_MAX) return failn(vm, "file too large: ", path, 0, 0, 0, 0);
+    r = new_str(vm, (uint32_t)n);
+    if (!r) return 0;
+    got = vm->host.read_file(vm->ctx, path, STROBJ(vm, r)->data, (unsigned long)n);
+    if (got != n) return failn(vm, "cannot read file: ", path, 0, 0, 0, 0);
+    set_ref(res, TV_STR, r);
+    return 1;
+}
+
+static int native_write_file(tilvm *vm, uint16_t base) {
+    char path[TV_PATH_MAX];
+    uint32_t n;
+    const char *d;
+    if (!c_path(vm, &STK[base], path, "write_file")) return 0;
+    if (!vm->host.write_file) return fail(vm, "write_file() is not available on this device");
+    if (!to_str_slot(vm, (uint16_t)(base + 1))) return 0;
+    d = str_data(vm, &STK[base + 1], &n);
+    if (vm->host.write_file(vm->ctx, path, d, (unsigned long)n) != 0)
+        return failn(vm, "cannot write file: ", path, 0, 0, 0, 0);
+    return 1;
+}
+#endif
+
 /* args are STK[base .. base+argc); the result replaces them */
 static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     uint16_t base = (uint16_t)(SP - argc);
     tv_val *a = &STK[base];
     tv_val res;
     set_nil(&res);
+    if (id < sizeof(NATIVE_MIN_ARGS) && argc < NATIVE_MIN_ARGS[id])
+        return failn(vm, NATIVE_NAMES[id], "() is missing arguments", 0, 0, 0, 0);
     switch (id) {
     case N_PRINT: case N_PRINTLN: {
         uint8_t i;
@@ -1727,6 +1861,63 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         break;
     }
 #endif
+#ifndef TILVM_LEAN
+    case N_READ_FILE:
+        if (!native_read_file(vm, base, &res)) return 0;
+        break;
+    case N_WRITE_FILE:
+        if (!native_write_file(vm, base)) return 0;
+        break;
+    case N_FILE_EXISTS: {
+        char path[TV_PATH_MAX];
+        if (!c_path(vm, a, path, "file_exists")) return 0;
+        set_bool(&res, vm->host.read_file && vm->host.read_file(vm->ctx, path, 0, 0) >= 0);
+        break;
+    }
+    case N_ARGS: {
+        int i, n = vm->host.argv ? vm->host.argc : 0;
+        if (n < 0) n = 0;
+        if ((uint32_t)SP + (uint32_t)n + 2 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
+        SP = base;
+        for (i = 0; i < n; i++) {
+            const char *s = vm->host.argv[i] ? vm->host.argv[i] : "";
+            if (!make_str(vm, &STK[SP], s, (uint32_t)strlen(s))) return 0;
+            SP++;
+        }
+        return make_array(vm, OBJ_ARRAY, (uint32_t)n);
+    }
+    case N_BYTES_TO_STR: {
+        uint32_t n, i;
+        tv_ref r;
+        if (a->t != TV_ARRAY) return fail(vm, "bytes_to_str() expects an array of ints 0..255");
+        n = ARROBJ(vm, a->u.r)->len;
+        for (i = 0; i < n; i++) {
+            const tv_val *e = &VALS(vm, ARROBJ(vm, a->u.r)->buf)[i];
+            if (e->t != TV_INT || e->u.i < 0 || e->u.i > 255)
+                return fail(vm, "bytes_to_str() expects an array of ints 0..255");
+        }
+        r = new_str(vm, n);                       /* may move the array: re-read it */
+        if (!r) return 0;
+        for (i = 0; i < n; i++)
+            STROBJ(vm, r)->data[i] = (char)(unsigned char)VALS(vm, ARROBJ(vm, STK[base].u.r)->buf)[i].u.i;
+        set_ref(&res, TV_STR, r);
+        break;
+    }
+    case N_STR_BYTES: {
+        uint32_t n, i;
+        const uint8_t *p;
+        tv_ref buf;
+        if (!is_str(a)) return failn(vm, "str_bytes() expects a string, got ", type_name(vm, a), 0, 0, 0, 0);
+        str_data(vm, a, &n);
+        if (!push_new_array(vm, n)) return 0;   /* GC may move the string: re-read it */
+        p = (const uint8_t *)str_data(vm, &STK[base], &n);
+        buf = ARROBJ(vm, STK[SP - 1].u.r)->buf;
+        for (i = 0; i < n; i++) set_int(&VALS(vm, buf)[i], (tv_int)p[i]);
+        STK[base] = STK[SP - 1];
+        SP = (uint16_t)(base + 1);
+        return 1;
+    }
+#endif
     case N_EXIT:
         vm->st.exit_code = (uint8_t)(argc && a->t == TV_INT ? a->u.i : 0);
         vm->st.halted = 2;
@@ -1809,7 +2000,7 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         } else if (mid == M_REPEAT) {
             if (!argc || a1->t != TV_INT) return fail(vm, "repeat() needs an integer");
             times = a1->u.i > 0 ? (uint32_t)a1->u.i : 0;
-            if ((uint32_t)n * times > 0xFFFF) return fail(vm, "string too long");
+            if (times && n > TV_STR_MAX / times) return fail(vm, "string too long");
         }
         r = new_str(vm, (hi - lo) * times);
         if (!r) return 0;
@@ -1839,7 +2030,7 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         str_data(vm, &STK[base + 2], &ul);
         at = 0;
         while ((at = find_bytes(s, n, t, m, (uint32_t)at)) >= 0) { count++; at += (int)m; }
-        if (n + count * ul - count * m > 0xFFFF) return fail(vm, "string too long");
+        if (ul > m && (uint32_t)count > (TV_STR_MAX - n) / (ul - m)) return fail(vm, "string too long");
         r = new_str(vm, n + count * ul - count * m);
         if (!r) return 0;
         s = str_data(vm, &STK[base], &n);
@@ -2045,7 +2236,7 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
             { uint32_t l; str_data(vm, &STK[SP - 1], &l); total += l; }
         }
         if (n) total += sl * (n - 1);
-        if (total > 0xFFFF) return fail(vm, "string too long");
+        if (total > TV_STR_MAX) return fail(vm, "string too long");
         r = new_str(vm, total);
         if (!r) return 0;
         for (i = 0, k = 0; i < n; i++) {
@@ -2213,7 +2404,7 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
     uint32_t p = 6, i;
     uint16_t n;
     if (size < 16 || bc[0] != 'T' || bc[1] != 'I' || bc[2] != 'L' || bc[3] != 'B') return -1;
-    if (bc[4] != TILVM_BYTECODE_VERSION) return -2;
+    if (bc[4] < TILVM_BYTECODE_MIN_VERSION || bc[4] > TILVM_BYTECODE_VERSION) return -2;
     vm->bc = bc;
     vm->bc_size = size;
     vm->flags = bc[5];
@@ -2285,6 +2476,11 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
 #endif
     vm->ctx = 0;
     vm->max_steps = 0;
+    memset(&vm->host, 0, sizeof(vm->host));
+#ifndef TILVM_NO_STDIO
+    vm->host.read_file = default_read_file;
+    vm->host.write_file = default_write_file;
+#endif
     reset_state(vm);
     return 0;
 }
@@ -2583,7 +2779,7 @@ static int concat_values(tilvm *vm, uint8_t n) {
         str_data(vm, &STK[first + i], &l);
         total += l;
     }
-    if (total > 0xFFFF) return fail(vm, "string too long");
+    if (total > TV_STR_MAX) return fail(vm, "string too long");
     r = new_str(vm, total);
     if (!r) return 0;
     for (i = 0; i < n; i++) {

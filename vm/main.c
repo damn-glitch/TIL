@@ -1,7 +1,7 @@
 /*
  * tilvm - command-line runner for TIL bytecode (.tbc)
  *
- *   tilvm program.tbc                     run a program
+ *   tilvm program.tbc [args...]           run a program (args() returns the args)
  *   tilvm --max-steps N program.tbc       sandbox: stop after N loop iterations/calls
  *   tilvm --snapshot-after N FILE p.tbc   run N steps, save the paused program to FILE
  *   tilvm --resume FILE program.tbc       continue a saved program
@@ -32,13 +32,15 @@ static unsigned char *read_file(const char *path, long *size) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: tilvm [--max-steps N] [--snapshot-after N FILE] [--resume FILE] [--stats] program.tbc\n");
+    fprintf(stderr, "usage: tilvm [--max-steps N] [--snapshot-after N FILE] [--resume FILE] [--stats] "
+                    "program.tbc [args...]\n");
 }
 
 int main(int argc, char **argv) {
     const char *path = NULL, *snap_out = NULL, *resume = NULL;
     unsigned long snap_after = 0, max_steps = 0;
-    int stats = 0, i, rc;
+    int stats = 0, i, rc, prog_argc = 0;
+    char **prog_argv = NULL;
     long size = 0;
     unsigned char *code;
 
@@ -53,7 +55,12 @@ int main(int argc, char **argv) {
                                                         TILVM_VERSION, TILVM_BYTECODE_VERSION, TILVM_INT_BITS,
                                                         (long)TILVM_HEAP_SIZE); return 0; }
         else if (argv[i][0] == '-') { usage(); return 2; }
-        else path = argv[i];
+        else {
+            path = argv[i];                     /* everything after the program is for it */
+            prog_argv = argv + i + 1;
+            prog_argc = argc - i - 1;
+            break;
+        }
     }
     if (!path) { usage(); return 2; }
     code = read_file(path, &size);
@@ -66,6 +73,8 @@ int main(int argc, char **argv) {
         return 2;
     }
     vm.max_steps = (uint32_t)max_steps;
+    vm.host.argc = prog_argc;
+    vm.host.argv = (const char *const *)prog_argv;
 
     if (resume) {
         long ssize = 0;
