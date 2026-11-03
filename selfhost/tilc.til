@@ -1977,10 +1977,12 @@ parse_global(tok)
     if SC_ON
         sci = SCI { calls: {}, refs: {} }
     SC_CUR = sci
-    node.c = [TK.sp, TK.ln, capt, sci, TSG.lx.sf]
+    node.c = [TK.sp, TK.ln, None, sci, TSG.lx.sf]
     let v = parse_expression()
     CAPT = None
     SC_CUR = None
+    if len(capt) > 0
+        node.c[2] = capt
     if is_literal(v)
         node.a = v
     if node.n != 1
@@ -2106,9 +2108,18 @@ parse_func_body(name_tok, src, ind, allow_sig)
             for c in a.slice(4, len(a)).split(",")
                 if len(strip_ws(c)) > 0
                     caps.push(strip_ws(c))
+    # (empty lists and maps are left out: they would cost memory per function)
     let fi = FI { name: name_tok.v, params: params, ret: ret, ln: name_tok.ln, src: src,
-                  bpos: bpos, bline: bline, bind: ind, capt: CAPT, req: req, ens: ens,
-                  nstmts: nstmts, decl: decl, pure: pure, caps: caps, sc: sci }
+                  bpos: bpos, bline: bline, bind: ind, nstmts: nstmts, decl: decl, pure: pure,
+                  sc: sci }
+    if len(CAPT) > 0
+        fi.capt = CAPT
+    if len(req) > 0
+        fi.req = req
+    if len(ens) > 0
+        fi.ens = ens
+    if len(caps) > 0
+        fi.caps = caps
     CAPT = save_capt
     let node = mk(K_FUNC, name_tok.ln)
     node.a = fi
@@ -2898,10 +2909,12 @@ hoist()
         rest.push(node)
     else
         main.pre = script
+    if main.capt == None
+        main.capt = {}
     for k in SCRIPT_CAPT
         main.capt[k] = 1
     for it in script
-        if it.k == K_GINIT
+        if it.k == K_GINIT and it.a.c[2] != None
             for k in it.a.c[2]
                 main.capt[k] = 1
     if SC_ON
@@ -2915,19 +2928,39 @@ hoist()
         main.sc = merged
     ITEMS = rest
 
-# any #[pure] / #[effects: ...] / #[cap: ...] in the source? (a quick scan;
-# a false positive only costs memory)
-has_effect_attributes(src)
-    var i = src.find("#[")
-    while i >= 0
-        var j = skip_ws_any(src, i + 2)
-        let rest = src.slice(j, j + 7)
-        if rest.starts_with("pure") or rest.starts_with("effects") or rest.starts_with("cap")
+# does a line start with `import ` or `from X import`? (modules may use
+# effect attributes, so the call graph is then recorded everywhere)
+has_imports(src)
+    let n = len(src)
+    var i = 0
+    while i < n
+        var j = i
+        while j < n and (src[j] == 32 or src[j] == 9)
+            j += 1
+        let w = src.slice(j, j + 7)
+        if w == "import " or (w.starts_with("from ") and src.slice(j, j + 200).split("\n")[0].contains(" import "))
             return true
-        let next = src.slice(i + 2, len(src)).find("#[")
-        if next < 0
-            return false
-        i = i + 2 + next
+        while i < n and src[i] != 10
+            i += 1
+        i += 1
+    return false
+
+# does a line start with an effect / capability attribute (pure, effects,
+# cap)? A false positive only costs memory.
+has_effect_attributes(src)
+    let n = len(src)
+    var i = 0
+    while i < n
+        var j = i
+        while j < n and (src[j] == 32 or src[j] == 9)
+            j += 1
+        if j + 1 < n and src[j] == 35 and src[j + 1] == 91
+            let rest = src.slice(skip_ws_any(src, j + 2), j + 12)
+            if rest.starts_with("pure") or rest.starts_with("effects") or rest.starts_with("cap")
+                return true
+        while i < n and src[i] != 10
+            i += 1
+        i += 1
     return false
 
 # ── SemanticChecker.check_effects / check_capabilities ─────────────────────
@@ -2985,7 +3018,7 @@ sc_check()
                         for c in cands
                             es.push([c, r[3], len(cands) == 1])
             for name in sc.refs
-                if funcs.has(name) and len(funcs[name].caps) > 0
+                if funcs.has(name) and funcs[name].caps != None
                     es.push([name, sc.refs[name], true])
         edges[key] = es
         inferred[key] = base
@@ -3039,10 +3072,11 @@ sc_check()
     for key in funcs
         if key != "main"
             var held = {}
-            for c in funcs[key].caps
-                held[c] = 1
+            if funcs[key].caps != None
+                for c in funcs[key].caps
+                    held[c] = 1
             for e in edges[key]
-                if e[2]
+                if e[2] and funcs[e[0]].caps != None
                     for c in funcs[e[0]].caps
                         if not held.has(c)
                             fail_at(e[1], "'" + key + "' uses '" + e[0] + "', which requires capability '" + c + "', but '" + key + "' does not hold it")
@@ -5564,6 +5598,7 @@ serialize()
     radd(out, u32s(off))
     for f in FUNCS
         radd(out, f.code)
+        f.code = None
     if nlines > 65535
         nlines = 65535
     radd(out, u16s(nlines))
@@ -5596,7 +5631,7 @@ main()
     if src.contains("\r")
         src = src.replace("\r\n", "\n").replace("\r", "\n")
     MAIN_SF = setup_languages(src, a[0])
-    SC_ON = has_effect_attributes(src) or src.contains("import")
+    SC_ON = has_effect_attributes(src) or has_imports(src)
     parse_program(MAIN_SF)
     hoist()
     resolve_imports()
@@ -5605,4 +5640,13 @@ main()
     TSG = None
     TK = None
     compile_program()
+    # the sources and the declarations are not needed any more
+    ITEMS = []
+    PENDING = []
+    FDEFS = {}
+    MODULE_CACHE = {}
+    MAIN_SF = None
+    TSG = None
+    TK = None
+    F = None
     write_file(a[1], serialize())
