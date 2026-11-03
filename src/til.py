@@ -9167,54 +9167,185 @@ class TILCompiler:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def print_help():
-    print("""
-TIL v2.0 Compiler - The Intelligent Language
+    print(f"""
+TIL {TIL_VERSION} - The Intelligent Language
 Author: Alisher Beisembekov
 
-Usage: til [options] <input.til>
-
-Options:
-  -o <file>       Output file name
-  -c              Output C code only (don't compile)
-  -O0, -O1, -O2, -O3  Optimization level (default: -O2)
-  --keep-c        Keep generated C file
-  --no-check      Disable type checking
-  -v, --verbose   Verbose output
-  -h, --help      Show this help
-  --version       Show version
-
-Multi-Level Programming:
-  Use #[level: N] attribute to set function level:
-    0 = Hardware (SIMD, assembly)
-    1 = Systems (like C)
-    2 = Safe (like Rust) [DEFAULT]
-    3 = Script (like Python)
-    4 = Formal (contracts, proofs)
-
-Examples:
-  til program.til              # Compile to ./program
-  til -o myapp program.til     # Compile to ./myapp
-  til -c program.til           # Output C code to stdout
-  til -O3 program.til          # Compile with max optimization
+Usage: til <command> [options] <file>
 
 Commands:
-  run <file>        Compile and run
-  build <file>      Compile to executable
-  check <file>      Syntax check only
-  repl              Interactive REPL
+  run <file.til>          Compile and run (native via C; falls back to the VM
+                          automatically when no C compiler is installed)
+  build <file.til>        Build: --target native (default) | vm | c-vm | c
+  exec <file.tbc>         Run a compiled bytecode file on the TIL VM
+  dis <file>              Disassemble a program (.til or .tbc)
+  check <file.til>        Parse + verify effects, capabilities, contracts
+  translate <file.til>    Translate keywords: --to en | kk | kk-latn | ru
+  repl                    Interactive REPL (runs on the VM, no C compiler needed)
+  version                 Show version
+
+Options:
+  -o <file>               Output file name
+  -c                      Output C code only (same as --target c)
+  --vm                    run: execute on the portable TIL VM (pure Python)
+  --cvm                   run: execute on the C VM (vm/tilvm.c, built on demand)
+  --target <t>            build: native | vm (.tbc) | c-vm (one C file: VM +
+                          program, for calculators/MCUs) | c (generated C)
+  --strip                 vm/c-vm: drop line tables (smallest bytecode)
+  --max-steps <n>         VM sandbox: stop after n loop iterations/calls
+  -O0, -O1, -O2, -O3      Optimization level for native builds (default -O2)
+  --keep-c                Keep generated C file
+  --no-check              Disable type warnings
+  --no-verify             Disable effect/capability/contract verification
+  -v, --verbose           Verbose output
+
+Multi-Level Programming:  #[level: 0..4]  Hardware, Systems, Safe (default), Script, Formal
+Languages:                English + Kazakh always; #[lang: ru] / #[lang: kk-latn] per file
+
+Examples:
+  til run hello.til                     # native (or VM if no C compiler)
+  til run --vm hello.til                # portable VM
+  til build --target vm game.til        # -> game.tbc (runs on any TIL VM)
+  til build --target c-vm game.til      # -> game_vm.c (compile for a calculator)
+  til translate --to ru hello.til       # Russian keywords
 """)
 
-def run_repl():
-    """Interactive REPL for TIL"""
-    print("TIL v2.0 REPL - The Intelligent Language")
-    print("Author: Alisher Beisembekov")
-    print('Type expressions or statements. Use "exit" or Ctrl+D to quit.')
-    print()
 
-    compiler = TILCompiler()
-    compiler.check_types = False  # Less strict for REPL
-    history_funcs = []  # Accumulated function definitions
-    history_vars = []   # Accumulated variable assignments
+# ── VM helpers ───────────────────────────────────────────────────────────────
+
+def _cvm_binary(verbose: bool = False) -> Optional[str]:
+    """Build (once) and return the host C VM executable."""
+    vm_dir = find_vm_sources()
+    cc = TILCompiler().find_c_compiler()
+    if vm_dir is None or cc is None:
+        return None
+    cache = os.path.join(os.path.expanduser('~'), '.til', 'cache')
+    try:
+        os.makedirs(cache, exist_ok=True)
+    except OSError:
+        cache = tempfile.gettempdir()
+    exe = os.path.join(cache, 'tilvm' + ('.exe' if sys.platform == 'win32' else ''))
+    sources = [os.path.join(vm_dir, n) for n in ('tilvm.c', 'tilvm.h', 'main.c')]
+    newest = max(os.path.getmtime(f) for f in sources if os.path.exists(f))
+    if not os.path.exists(exe) or os.path.getmtime(exe) < newest:
+        cmd = [cc, '-O2', '-std=c99', '-o', exe, sources[0], sources[2], '-lm']
+        if verbose:
+            print(f"[TIL] Building C VM: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"C VM build failed:\n{result.stderr}", file=sys.stderr)
+            return None
+    return exe
+
+
+def run_bytecode(module: TBCModule, max_steps: int = 0) -> int:
+    return TILVM(module, max_steps=max_steps).run()
+
+
+# ── translate ────────────────────────────────────────────────────────────────
+
+def translate_source(source: str, target: str, filename: str = "<stdin>") -> str:
+    """Rewrite TIL source with the keywords of another language (en, kk,
+    kk-latn, ru). Identifiers, strings and comments are kept as they are."""
+    if target not in LANGUAGES:
+        raise CompileError(f"unknown language '{target}' (use: {', '.join(LANGUAGES)})")
+    tokens = Lexer(source, filename).tokenize()
+    kw_table = ENGLISH_KEYWORDS if target == 'en' else LANGUAGES[target][0]
+    alias_table = LANGUAGES[target][1]
+    word_for: Dict[TokenType, str] = {}
+    for word, ttype in ENGLISH_KEYWORDS.items():
+        word_for.setdefault(ttype, word)
+    if target != 'en':
+        for word, ttype in kw_table.items():
+            if ttype not in word_for or word_for[ttype] in ENGLISH_KEYWORDS:
+                word_for[ttype] = word
+    true_word = next((w for w, t in kw_table.items() if t == TokenType.BOOL and w in TRUE_WORDS), 'true')
+    false_word = next((w for w, t in kw_table.items() if t == TokenType.BOOL and w not in TRUE_WORDS), 'false')
+    if target == 'en':
+        true_word, false_word = 'true', 'false'
+    canonical_to_alias: Dict[str, str] = {}
+    for alias, canon in alias_table.items():
+        canonical_to_alias.setdefault(canon, alias)      # first spelling is preferred
+    replacements = []
+    skip = set()
+    for k, tok in enumerate(tokens):
+        if tok.start < 0 or tok.end <= tok.start or k in skip:
+            continue
+        text = source[tok.start:tok.end]
+        nxt = tokens[k + 1] if k + 1 < len(tokens) else None
+        if (target == 'en' and tok.type == TokenType.ELSE and nxt is not None
+                and nxt.type == TokenType.IF and nxt.line == tok.line):
+            replacements.append((tok.start, nxt.end, "elif"))   # else if -> elif
+            skip.add(k + 1)
+            continue
+        if tok.type == TokenType.BOOL:
+            new = true_word if tok.value else false_word
+        elif tok.type == TokenType.ELIF and target != 'en':
+            new = f"{word_for[TokenType.ELSE]} {word_for[TokenType.IF]}"
+        elif tok.type == TokenType.IDENT:
+            canon = tok.value
+            new = canonical_to_alias.get(canon, canon) if target != 'en' or text != canon else text
+            if target == 'en':
+                new = canon
+        elif text in ENGLISH_KEYWORDS or text in KEYWORDS or any(text in LANGUAGES[c][0] for c in LANGUAGES):
+            new = word_for.get(tok.type, text)
+        else:
+            continue
+        if new != text:
+            replacements.append((tok.start, tok.end, new))
+    out = source
+    for start, end, new in sorted(replacements, reverse=True):
+        out = out[:start] + new + out[end:]
+    out = _LANG_PRAGMA_RE.sub('', out).lstrip('\n')
+    if target in ('ru', 'kk-latn'):
+        out = f"#[lang: {target}]\n" + out
+    return out
+
+
+# ── REPL (on the VM: instant, no C compiler needed) ─────────────────────────
+
+_REPL_MARK = "\x00til-repl\x00"
+_REPL_DEF_RE = re.compile(r'^(struct|enum|impl|trait|fn|pub|cap)\b|^#\[|'
+                          r'^[^\W\d]\w*\s*\([^)]*\)\s*->|^[^\W\d]\w*\s*\(\s*\w+\s*:')
+
+
+def repl_program(definitions: List[str], history: List[str], block: str) -> Tuple[str, bool]:
+    """Build the program for one REPL input. Returns (source, is_expression)."""
+    body = "\n".join("    " + l for l in block.split("\n"))
+    probe = parse_source("main()\n" + body + "\n", "<repl>")
+    stmts = next(s for s in probe.statements if isinstance(s, FuncDef) and s.name == "main").body.statements
+    is_expr = (len(stmts) == 1 and isinstance(stmts[0], ExprStmt) and not (
+        isinstance(stmts[0].expr, Call) and isinstance(stmts[0].expr.func, Identifier)
+        and stmts[0].expr.func.name in ('print', 'println')))
+    if is_expr:
+        body = f"    let __v = {block.strip()}\n    if __v != None\n        print(__v)"
+    replay = "\n".join("    " + l for h in history for l in h.split("\n"))
+    source = "\n".join(definitions) + "\nmain()\n" + (replay + "\n" if replay else "") + \
+        f'    print("{_REPL_MARK}")\n' + body + "\n"
+    return source, is_expr
+
+
+def run_repl():
+    """Interactive REPL on the VM (instant, no C compiler needed).
+    Definitions persist; earlier statements are replayed silently so that
+    variables persist too."""
+    print(f"TIL {TIL_VERSION} REPL - The Intelligent Language (VM)")
+    print('Expressions print their value. A blank line ends a multi-line block. "exit" quits.')
+    definitions: List[str] = []
+    history: List[str] = []
+    out = getattr(sys.stdout, 'buffer', None)
+
+    def read_block(first: str) -> str:
+        lines = [first]
+        while True:
+            try:
+                more = input("...  ")
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not more.strip():
+                break
+            lines.append(more)
+        return "\n".join(lines)
 
     while True:
         try:
@@ -9222,89 +9353,53 @@ def run_repl():
         except (EOFError, KeyboardInterrupt):
             print("\nBye!")
             return 0
-
-        line = line.strip()
-        if not line or line.startswith('#'):
+        stripped = line.strip()
+        if not stripped or (stripped.startswith('#') and not stripped.startswith('#[')):
             continue
-        if line in ('exit', 'quit', 'exit()', 'quit()'):
+        if stripped in ('exit', 'quit', 'exit()', 'quit()'):
             print("Bye!")
             return 0
-
-        # Build a program from accumulated state + current input
-        parts = []
-        for func_def in history_funcs:
-            parts.append(func_def)
-
-        # Check if this looks like a function definition
-        if ('(' in line and line.endswith(':') and not line.startswith(' ') and
-                not line.startswith('if') and not line.startswith('while') and
-                not line.startswith('for')):
-            # Multi-line function definition
-            func_lines = [line]
-            while True:
-                try:
-                    cont = input("...  ")
-                except (EOFError, KeyboardInterrupt):
-                    print("\nBye!")
-                    return 0
-                if cont.strip() == '':
-                    break
-                func_lines.append(cont)
-            func_def = '\n'.join(func_lines)
-            history_funcs.append(func_def)
-            print("OK")
+        if re.match(r'^(import|from|type)\b', stripped) or _REPL_DEF_RE.match(stripped):
+            block = line if re.match(r'^(import|from|type)\b', stripped) else read_block(line)
+            try:
+                compile_to_bytecode("\n".join(definitions + [block]) + "\n", "<repl>")
+            except (SyntaxError, CompileError) as e:
+                print(e)
+                continue
+            definitions.append(block)
+            print("ok")
             continue
-
-        # Build main function with accumulated vars + current line
-        main_lines = ["main()"]
-        for var_line in history_vars:
-            main_lines.append(f"    {var_line}")
-
-        # Determine if this is a print, assignment, or expression
-        is_assignment = False
-        if '=' in line and not line.startswith('print') and not '==' in line.split('=')[0]:
-            # Likely an assignment like "let x = 5" or "x = 5"
-            is_assignment = True
-            main_lines.append(f"    {line}")
-            # Also print result for let statements
-            if line.startswith('let '):
-                var_name = line.split('=')[0].replace('let ', '').strip()
-                if ':' in var_name:
-                    var_name = var_name.split(':')[0].strip()
-                main_lines.append(f"    print({var_name})")
-        elif line.startswith('print'):
-            main_lines.append(f"    {line}")
+        if re.match(r'^(if|for|while|loop|match|intent)\b', stripped):
+            block = read_block(line)
         else:
-            # Treat as expression - wrap in print
-            main_lines.append(f"    print({line})")
-
-        source = '\n'.join(parts + main_lines) + '\n'
-
+            block = line
         try:
-            success = compiler.compile_to_executable(source, '/tmp/til_repl', '<repl>')
-            if success:
-                result = subprocess.run(['/tmp/til_repl'], capture_output=True, text=True,
-                                       encoding='utf-8', errors='replace')
-                if result.stdout:
-                    print(result.stdout, end='')
-                if result.stderr:
-                    print(result.stderr, end='', file=sys.stderr)
-                if result.returncode != 0 and not result.stdout and not result.stderr:
-                    print(f"[exit code: {result.returncode}]")
+            source, is_expr = repl_program(definitions, history, block)
+            module = compile_to_bytecode(source, "<repl>")
+        except (SyntaxError, CompileError) as e:
+            print(e)
+            continue
+        state = {'live': False, 'buf': b""}
+        mark = _REPL_MARK.encode() + b"\n"
 
-                # If assignment succeeded, remember it
-                if is_assignment:
-                    history_vars.append(line)
+        def write(data: bytes):
+            if state['live']:
+                out.write(data) if out else sys.stdout.write(data.decode('utf-8', 'replace'))
+                return
+            state['buf'] += data
+            if mark in state['buf']:
+                state['live'] = True
+                rest = state['buf'].split(mark, 1)[1]
+                if rest:
+                    write(rest)
 
-                try:
-                    os.remove('/tmp/til_repl')
-                except:
-                    pass
-        except Exception as e:
-            print(f"Error: {e}")
+        rc = TILVM(module, write=write, max_steps=50_000_000).run()
+        sys.stdout.flush()
+        if rc == 0 and not is_expr:
+            history.append(block)
 
-    return 0
 
+# ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
     args = sys.argv[1:]
@@ -9313,68 +9408,97 @@ def main():
         print_help()
         return 0
 
-    if '--version' in args:
-        print("TIL Compiler v2.0.0")
+    if '--version' in args or args[0] == 'version':
+        print(f"TIL Compiler v{TIL_VERSION}")
         print("Author: Alisher Beisembekov")
-        print("Multi-Level Programming: Mixed Martial Programming")
+        print("Backends: native (C via gcc/clang), TIL VM (bytecode: Python, C99 / calculators)")
         return 0
 
-    # Check for command (run, build, check, repl)
     command = None
-    if args and args[0] in ('run', 'build', 'check', 'repl'):
+    if args and args[0] in ('run', 'build', 'check', 'repl', 'exec', 'dis', 'translate'):
         command = args[0]
         args = args[1:]
 
     if command == 'repl':
         return run_repl()
-    
+
     compiler = TILCompiler()
     input_file = None
     output_file = None
-    c_only = False
-    
+    target = None
+    use_vm = None          # None = auto, 'py', 'c'
+    max_steps = 0
+    strip = False
+    lang_to = None
+
     i = 0
     while i < len(args):
         arg = args[i]
-        
         if arg == '-o' and i + 1 < len(args):
             output_file = args[i + 1]
             i += 2
             continue
+        if arg == '--target' and i + 1 < len(args):
+            target = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith('--target='):
+            target = arg.split('=', 1)[1]
+        elif arg == '--to' and i + 1 < len(args):
+            lang_to = args[i + 1]
+            i += 2
+            continue
+        elif arg.startswith('--to='):
+            lang_to = arg.split('=', 1)[1]
+        elif arg == '--max-steps' and i + 1 < len(args):
+            max_steps = int(args[i + 1])
+            i += 2
+            continue
         elif arg == '-c':
-            c_only = True
+            target = 'c'
+        elif arg == '--vm':
+            use_vm = 'py'
+        elif arg == '--cvm':
+            use_vm = 'c'
+        elif arg == '--strip':
+            strip = True
         elif arg == '--keep-c':
             compiler.keep_c = True
         elif arg == '--no-check':
             compiler.check_types = False
+        elif arg == '--no-verify':
+            compiler.verify = False
         elif arg in ('-v', '--verbose'):
             compiler.verbose = True
-        elif arg == '-O0':
-            compiler.optimize = 0
-        elif arg == '-O1':
-            compiler.optimize = 1
-        elif arg == '-O2':
-            compiler.optimize = 2
-        elif arg == '-O3':
-            compiler.optimize = 3
+        elif arg in ('-O0', '-O1', '-O2', '-O3'):
+            compiler.optimize = int(arg[2])
         elif not arg.startswith('-'):
             input_file = arg
-        
+        else:
+            print(f"Error: unknown option {arg}", file=sys.stderr)
+            return 1
         i += 1
-    
+
     if not input_file:
         print("Error: No input file specified", file=sys.stderr)
         return 1
-    
     if not os.path.exists(input_file):
         print(f"Error: File not found: {input_file}", file=sys.stderr)
         return 1
-    
-    with open(input_file, 'r', encoding='utf-8') as f:
-        source = f.read()
-    
+
     try:
-        # Check command - just syntax check
+        # bytecode files
+        if input_file.endswith('.tbc'):
+            with open(input_file, 'rb') as f:
+                module = TBCModule.from_bytes(f.read())
+            if command == 'dis':
+                print(disassemble(module))
+                return 0
+            return run_bytecode(module, max_steps)
+
+        with open(input_file, 'r', encoding='utf-8') as f:
+            source = f.read()
+
         if command == 'check':
             ast = resolve_imports(parse_source(source, input_file), input_file)
             errors = SemanticChecker(source, input_file).check(ast)
@@ -9382,10 +9506,66 @@ def main():
                 for err in errors:
                     print(err, file=sys.stderr)
                 return 1
+            BytecodeCompiler(source, input_file).compile_program(ast)   # names, arity, immutability
             print(f"OK: {input_file}")
             return 0
-        
-        if c_only:
+
+        if command == 'translate':
+            text = translate_source(source, lang_to or 'en', input_file)
+            if output_file:
+                with open(output_file, 'w', encoding='utf-8', newline='\n') as f:
+                    f.write(text)
+                print(f"Translated: {output_file}")
+            else:
+                sys.stdout.write(text)
+            return 0
+
+        if command == 'dis':
+            print(disassemble(compile_to_bytecode(source, input_file, compiler.verify)))
+            return 0
+
+        base = os.path.splitext(os.path.basename(input_file))[0]
+
+        if command == 'run' and use_vm is None and compiler.find_c_compiler() is None:
+            print("[TIL] No C compiler found - running on the TIL VM", file=sys.stderr)
+            use_vm = 'py'
+
+        if command == 'run' and use_vm:
+            module = compile_to_bytecode(source, input_file, compiler.verify)
+            if use_vm == 'py':
+                return run_bytecode(module, max_steps)
+            exe = _cvm_binary(compiler.verbose)
+            if exe is None:
+                print("Error: cannot build the C VM (need vm/ sources and a C compiler)", file=sys.stderr)
+                return 1
+            fd, tbc_path = tempfile.mkstemp(suffix='.tbc')
+            try:
+                with os.fdopen(fd, 'wb') as f:
+                    f.write(module.serialize())
+                cmd = [exe] + (['--max-steps', str(max_steps)] if max_steps else []) + [tbc_path]
+                return subprocess.run(cmd).returncode
+            finally:
+                os.unlink(tbc_path)
+
+        if target in ('vm', 'tbc'):
+            module = compile_to_bytecode(source, input_file, compiler.verify)
+            data = module.serialize(strip=strip)
+            out = output_file or base + '.tbc'
+            with open(out, 'wb') as f:
+                f.write(data)
+            print(f"Built: {out} ({len(data)} bytes of TIL bytecode)")
+            return 0
+
+        if target in ('c-vm', 'calc', 'embed'):
+            module = compile_to_bytecode(source, input_file, compiler.verify)
+            text = amalgamate_c_vm(module.serialize(strip=strip), input_file)
+            out = output_file or base + '_vm.c'
+            with open(out, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(text)
+            print(f"Built: {out} (TIL VM + program in one C file; compile with any C99 compiler)")
+            return 0
+
+        if target == 'c':
             c_code = compiler.compile(source, input_file)
             if output_file:
                 with open(output_file, 'w', encoding='utf-8', newline='\n') as f:
@@ -9393,50 +9573,49 @@ def main():
                 print(f"Generated: {output_file}")
             else:
                 print(c_code)
-        else:
-            if not output_file:
-                output_file = os.path.splitext(os.path.basename(input_file))[0]
-            
-            # Add .exe on Windows
-            exe_file = output_file
-            if sys.platform == 'win32' and not exe_file.endswith('.exe'):
-                exe_file = output_file + '.exe'
-            
-            success = compiler.compile_to_executable(source, output_file, input_file)
-            if not success:
-                return 1
-            
-            # Run command - compile and execute
-            if command == 'run':
-                # Determine executable path
-                if sys.platform == 'win32':
-                    exe_path = exe_file if os.path.exists(exe_file) else output_file + '.exe'
-                else:
-                    exe_path = './' + output_file if not output_file.startswith('./') else output_file
-                
-                # Run the executable
-                try:
-                    result = subprocess.run([exe_path], capture_output=False)
-                    
-                    # Clean up executable after running
-                    try:
-                        os.remove(exe_path)
-                    except:
-                        pass
-                    
-                    return result.returncode
-                except Exception as e:
-                    print(f"Error running {exe_path}: {e}", file=sys.stderr)
+            return 0
+
+        if target not in (None, 'native'):
+            print(f"Error: unknown target '{target}' (native, vm, c-vm, c)", file=sys.stderr)
+            return 1
+
+        # native build (C backend)
+        if not output_file:
+            output_file = base
+        exe_file = output_file
+        if sys.platform == 'win32' and not exe_file.endswith('.exe'):
+            exe_file = output_file + '.exe'
+        if command == 'run':
+            fd, tmp_exe = tempfile.mkstemp(suffix='.exe' if sys.platform == 'win32' else '')
+            os.close(fd)
+            try:
+                if not compiler.compile_to_executable(source, tmp_exe, input_file):
                     return 1
-            else:
-                # Build command - just compile
-                print(f"Compiled: {output_file}")
-    
+                return subprocess.run([tmp_exe]).returncode
+            finally:
+                try:
+                    os.unlink(tmp_exe)
+                except OSError:
+                    pass
+        if not compiler.compile_to_executable(source, output_file, input_file):
+            return 1
+        print(f"Compiled: {exe_file}")
+        return 0
+
     except SyntaxError as e:
         print(f"Syntax Error: {e}", file=sys.stderr)
         return 1
     except CompileError as e:
         print(str(e), file=sys.stderr)
+        return 1
+    except BrokenPipeError:
+        try:
+            sys.stdout = open(os.devnull, 'w')
+        except OSError:
+            pass
+        return 0
+    except (ValueError, OSError) as e:
+        print(f"Error: {e}", file=sys.stderr)
         return 1
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -9444,8 +9623,7 @@ def main():
             import traceback
             traceback.print_exc()
         return 1
-    
-    return 0
+
 
 if __name__ == '__main__':
     sys.exit(main())
