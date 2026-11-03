@@ -213,9 +213,6 @@ class _BVDomain:
     def range(self, z):
         return None
 
-    def is_value(self, z) -> bool:
-        return z3.is_bv_value(z)
-
     def value(self, z) -> int:
         return z.as_signed_long()
 
@@ -308,9 +305,6 @@ class _IntDomain:
 
     def range(self, z):
         return z3.And(z >= INT_MIN, z <= INT_MAX)
-
-    def is_value(self, z) -> bool:
-        return z3.is_int_value(z)
 
     def value(self, z) -> int:
         return z.as_long()
