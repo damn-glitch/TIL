@@ -20,7 +20,7 @@ inc(x: int) -> int
 
 ```
 $ til prove inc.til
-Proving inc.til with Z3 4.x (64-bit integers, 10000 ms per query)
+Proving inc.til with Z3 5.3.3 (64-bit integers, 10000 ms per query)
   inc: counterexample: x = 9223372036854775807 (#[ensures: result > x] fails, line 1)
 error[E-PROVE]: 'inc': #[ensures: result > x] fails for x = 9223372036854775807
  --> inc.til:1:1
@@ -204,17 +204,20 @@ division with its defining property, a caller (`pages`) proved through the
 callee's contract, `sum_to` and `gcd` with loop invariants (`#[level: 4]`, so
 plain `til check` proves them), and `square_by_odds` with a `for` loop.
 
-Things the prover found while that example was written:
+Things the prover found while that example was written (the exact numbers
+it prints depend on the Z3 version):
 
 * `midpoint(a, b) = a + (b - a) / 2` with only `#[requires: a <= b]` breaks
-  for `a = -6425787866654150400, b = 8024048470302220032`: `b - a` does not
-  fit in 64 bits. The fix is `#[requires: 0 <= a and a <= b]`.
-* `#[ensures: result * b + a % b == a]` does not let a caller conclude
-  `result >= 0`: multiplication modulo 2^64 is not invertible for even `b`
-  (`result = -4611686018427387905, b = 2` satisfies it). A bound
-  (`result >= 0 and result <= a`) makes it useful.
-* `fact(n) = n * fact(n - 1)` with `#[ensures: result >= 1]` breaks for
-  `n = 32`: 32! wraps around to a value below 1.
+  for a very negative `a` and a very positive `b` (for example
+  `a = -4099999696230465528, b = 7531179661242482695`): `b - a` does not fit
+  in 64 bits. The fix is `#[requires: 0 <= a and a <= b]`.
+* An `#[ensures]` that multiplies the unknown result, like
+  `result * b + a % b == a`, tells a caller little: in 64-bit arithmetic such
+  an equation has more solutions than the intended one, so callers could not
+  conclude `result >= 0`. A bound (`result >= 0 and result <= a`) makes the
+  contract useful.
+* `fact(n) = n * fact(n - 1)` with `#[ensures: result >= 1]` breaks for large
+  `n` (for example `n = 100`: 100! is a multiple of 2^64, so it wraps to 0).
 
 ## Limitations
 

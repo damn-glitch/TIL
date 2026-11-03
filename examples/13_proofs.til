@@ -24,8 +24,8 @@ divide(a: int, b: int) -> int
     return a / b
 
 # (a + b) / 2 wraps around for large a and b; this version cannot.
-# Without `0 <= a`, til prove finds a = -6425787866654150400,
-# b = 8024048470302220032: then b - a does not fit in 64 bits.
+# Without `0 <= a`, til prove finds inputs (a very negative, b very
+# positive) for which b - a does not fit in 64 bits.
 #[requires: 0 <= a and a <= b]
 #[ensures: a <= result and result <= b]
 midpoint(a: int, b: int) -> int
