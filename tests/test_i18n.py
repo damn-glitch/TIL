@@ -968,3 +968,82 @@ class TestRunnerAndWarnings:
         capfd.readouterr()
         assert til.run_localized([sys.executable, '-c', script]) == 2
         assert capfd.readouterr().err == "tilvm: " + self.KEYS_RU + "\n"
+
+
+class TestMergedBranches:
+    """Messages of the branches merged after this one (effects, typed, prove, vmcore, gfx, z80):
+    translated ahead of the merge, and extracted correctly by tools/i18n_coverage.py."""
+
+    @pytest.mark.parametrize("en,ru,kk", [
+        ("Syntax Error: error: Expected IDENT, got MATCH ('match' is a reserved word and cannot be used as a name)",
+         "Синтаксическая ошибка: ожидалось IDENT, получено MATCH ('match' — зарезервированное слово, его нельзя "
+         "использовать как имя)",
+         "Синтаксистік қате: IDENT күтілді, бірақ MATCH кездесті ('match' — резервтелген сөз, оны атау ретінде "
+         "қолдануға болмайды)"),
+        ("  = hint: `perform Log(...)` calls the function 'Log' when no handler is active; add #[cap: Net] to 'f' "
+         "(only main holds every capability)",
+         "  = подсказка: `perform Log(...)` вызывает функцию 'Log', когда нет активного обработчика; добавьте "
+         "#[cap: Net] к 'f' (все полномочия есть только у main)",
+         "  = кеңес: белсенді өңдеуші болмаса, `perform Log(...)` 'Log' функциясын шақырады; 'f' функциясына "
+         "#[cap: Net] қосыңыз (барлық өкілеттік тек main функциясында бар)"),
+        ("Syntax Error: error: 'resume' is reserved inside an effect clause",
+         "Синтаксическая ошибка: 'resume' — зарезервированное слово внутри ветви эффекта",
+         "Синтаксистік қате: әсер тармағының ішінде 'resume' сөзі резервтелген"),
+        ("error[E-PROVE]: 'f': could not prove #[ensures: result > 0] (unknown: timeout, 500 ms per query)",
+         "ошибка[E-PROVE]: 'f': не удалось доказать #[ensures: result > 0] (неизвестно: истекло время, 500 мс на "
+         "запрос)",
+         "қате[E-PROVE]: 'f': #[ensures: result > 0] дәлелденбеді (белгісіз: уақыт бітті, бір сұрауға 500 мс)"),
+    ])
+    def test_translated_ahead(self, en, ru, kk):
+        assert tilmsg.localize(en, 'ru') == ru
+        assert tilmsg.localize(en, 'kk') == kk
+
+    def test_free_text_at_the_start_of_a_template(self):
+        saved = (list(tilmsg.RUNTIME_MESSAGES), list(tilmsg.COMPILER_MESSAGES))
+        try:
+            tilmsg.RUNTIME_MESSAGES.append(("{what:text} is broken beyond any repair whatsoever",
+                                            "{what} сломано", "{what} бұзылған"))
+            tilmsg.COMPILER_MESSAGES.append(("{what:msg} (x)", "{what} (х)", "{what} (х)"))
+            problems = tilmsg.check_catalog()
+            assert any("runtime entry" in p and "a program's own sentence" in p for p in problems), problems
+            assert any("compiler entry" in p and "too little text" in p for p in problems), problems
+        finally:
+            tilmsg.RUNTIME_MESSAGES[:], tilmsg.COMPILER_MESSAGES[:] = saved
+
+    def test_a_self_referential_hint_is_expanded_once(self):
+        src = ("class SemanticChecker:\n"
+               "    def error(self, node, msg, code='', hint=''):\n        pass\n"
+               "    def check(self, node, key, callee, cap):\n"
+               "        hint = f\"add #[cap: {cap}] to '{key}'\"\n"
+               "        if node:\n"
+               "            hint = f\"`perform {callee}(...)` calls '{callee}'; \" + hint\n"
+               "        self.error(node, 'no capability', 'E-CAP', hint)\n")
+        texts = _texts(i18n_coverage.PyExtractor(src, os.path.join(SRC, 'tilnew.py')).run())
+        assert texts == {"no capability", "add #[cap: {}] to '{}'", "`perform {}(...)` calls '{}'; add #[cap: {}] to '{}'"}
+
+    def test_methods_returning_text_are_expanded(self):
+        src = ("class Parser:\n"
+               "    def error(self, msg):\n        pass\n"
+               "    def note(self):\n"
+               "        if self.x:\n            return f\" ('{self.x}' is reserved)\"\n"
+               "        return ''\n"
+               "    def parse(self):\n"
+               "        self.error('Expected a name' + self.note())\n")
+        texts = _texts(i18n_coverage.PyExtractor(src, os.path.join(SRC, 'tilnew.py')).run())
+        assert texts == {"Expected a name", "Expected a name ('{}' is reserved)"}
+
+    def test_c_string_constants(self, tmp_path):
+        # the z80 branch shares message text in constants to save ROM
+        path = write(tmp_path, 'vm.c', 'static const char E_NO_METHOD[] = "no method \'";\n'
+                                       'static int f(tilvm *vm, int mid) {\n'
+                                       '    return failn(vm, E_NO_METHOD, METHOD_NAMES[mid], "\' on str", 0, 0, 0);\n}\n')
+        assert _texts(i18n_coverage.extract_c(path)) == {"no method '{}' on str"}
+
+    def test_nested_messages_must_be_covered(self):
+        outer = tilmsg.Entry("intent '{intent}' failed: {error:msg}", "a {intent} {error}", "b {intent} {error}",
+                             scope='runtime')
+        inner = tilmsg.Entry("division by zero", "деление на ноль", "нөлге бөлу", scope='runtime')
+        broken = i18n_coverage.Template(["intent '", None, "' failed: the flux capacitor broke"], 'runtime', 'x:1')
+        known = i18n_coverage.Template(["intent '", None, "' failed: division by zero"], 'runtime', 'x:1')
+        assert i18n_coverage.coverage_of(tilmsg, broken, [outer, inner])[0] is False
+        assert i18n_coverage.coverage_of(tilmsg, known, [outer, inner])[0] is True

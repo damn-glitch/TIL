@@ -126,6 +126,23 @@ COMPILER_MESSAGES: List[Tuple[str, str, str]] = [
     ("Unexpected token: {token}",
      "неожиданный токен: {token}",
      "күтілмеген токен: {token}"),
+    # generic functions and type inference (written against the til31/typed branch)
+    ("Expected a type parameter name",
+     "ожидалось имя параметра типа",
+     "тип параметрінің атауы күтілді"),
+    ("Expected '>' after the type parameters",
+     "после параметров типа ожидалась '>'",
+     "тип параметрлерінен кейін '>' күтілді"),
+    ("check the spelling, or add the field / method to the struct",
+     "проверьте написание или добавьте поле / метод в структуру",
+     "жазылуын тексеріңіз немесе өрісті / әдісті құрылымға қосыңыз"),
+    ("convert the value explicitly (str(x), int(x), float(x)) or change the annotation",
+     "преобразуйте значение явно (str(x), int(x), float(x)) или измените аннотацию типа",
+     "мәнді анық түрлендіріңіз (str(x), int(x), float(x)) немесе тип аннотациясын өзгертіңіз"),
+    # appended by the parser of til31/effects when a keyword stands where a name is expected
+    ("{message:msg} ('{word}' is a reserved word and cannot be used as a name)",
+     "{message} ('{word}' — зарезервированное слово, его нельзя использовать как имя)",
+     "{message} ('{word}' — резервтелген сөз, оны атау ретінде қолдануға болмайды)"),
 
     # ── hints for syntax errors (ERROR_HINTS) ──────────────────────────────
     ("Variable or function name expected here",
@@ -192,6 +209,30 @@ COMPILER_MESSAGES: List[Tuple[str, str, str]] = [
      "на этапе компиляции доказано, что условие ложно; исправьте аргументы",
      "шарттың жалған екені компиляция кезінде дәлелденді; аргументтерді түзетіңіз"),
 
+    # ── contract proofs (E-PROVE; written against the til31/prove branch) ──
+    ("cannot prove '{func}': unsupported: {reason:text}",
+     "нельзя доказать '{func}': не поддерживается: {reason}",
+     "'{func}' функциясын дәлелдеу мүмкін емес: қолдау жоқ: {reason}"),
+    ("the prover models int and bool values, if/elif/else, loops with `invariant`, and calls; "
+     "see docs/TIL_PROOFS.md (til prove --allow-unsupported skips such functions)",
+     "модуль доказательства моделирует значения int и bool, if/elif/else, циклы с `invariant` и вызовы; "
+     "см. docs/TIL_PROOFS.md (til prove --allow-unsupported пропускает такие функции)",
+     "дәлелдеу модулі int және bool мәндерін, if/elif/else, `invariant` бар циклдерді және шақыруларды "
+     "модельдейді; docs/TIL_PROOFS.md қараңыз (til prove --allow-unsupported мұндай функцияларды "
+     "өткізіп жібереді)"),
+    ("'{func}': {what:text} fails for {inputs:text}",
+     "'{func}': {what} нарушается при {inputs}",
+     "'{func}': {inputs} кезінде {what} орындалмайды"),
+    ("'{func}': cannot prove {what:text}",
+     "'{func}': не удаётся доказать {what}",
+     "'{func}': {what} дәлелденбеді"),
+    ("'{func}': could not prove {what:text} (unknown: timeout, {ms:int} ms per query)",
+     "'{func}': не удалось доказать {what} (неизвестно: истекло время, {ms} мс на запрос)",
+     "'{func}': {what} дәлелденбеді (белгісіз: уақыт бітті, бір сұрауға {ms} мс)"),
+    ("'{func}': could not prove {what:text} (unknown: {why:text}, {ms:int} ms per query)",
+     "'{func}': не удалось доказать {what} (неизвестно: {why}, {ms} мс на запрос)",
+     "'{func}': {what} дәлелденбеді (белгісіз: {why}, бір сұрауға {ms} мс)"),
+
     # ── effects with resumption: handle / with / resume (TIL 3.1) ──────────
     # (written against the til31/effects branch, so its diagnostics are
     # translated as soon as it is merged; run-time ones: RUNTIME_MESSAGES)
@@ -229,11 +270,32 @@ COMPILER_MESSAGES: List[Tuple[str, str, str]] = [
      "недостижимый код после resume(...)",
      "resume(...) кейінгі код ешқашан орындалмайды"),
     ("resume ends the clause and continues the handled body at once (tail resumption); "
-     "move this code before resume",
+     "it does not return here, so move this code before resume "
+     "(write resume(v) as the clause's last statement)",
      "resume сразу завершает ветвь и продолжает обрабатываемое тело (хвостовое возобновление); "
-     "перенесите этот код до resume",
+     "сюда управление не возвращается, поэтому перенесите этот код до resume "
+     "(resume(v) должен быть последней инструкцией ветви)",
      "resume тармақты бірден аяқтап, өңделетін денені жалғастырады (соңғы жалғастыру); "
-     "бұл кодты resume алдына жылжытыңыз"),
+     "басқару бұл жерге оралмайды, сондықтан бұл кодты resume алдына жылжытыңыз "
+     "(resume(v) тармақтың соңғы нұсқауы болсын)"),
+    ("Expected the effect name after 'perform'",
+     "после 'perform' ожидалось имя эффекта",
+     "'perform' сөзінен кейін әсер атауы күтілді"),
+    ("'{word}' is reserved inside an effect clause",
+     "'{word}' — зарезервированное слово внутри ветви эффекта",
+     "әсер тармағының ішінде '{word}' сөзі резервтелген"),
+    ("there it always means resume(...); choose another name",
+     "там это слово всегда означает resume(...); выберите другое имя",
+     "онда бұл сөз әрқашан resume(...) дегенді білдіреді; басқа атау таңдаңыз"),
+    ("there it always means resume(...); use another variable name",
+     "там это слово всегда означает resume(...); используйте другое имя переменной",
+     "онда бұл сөз әрқашан resume(...) дегенді білдіреді; айнымалыға басқа атау беріңіз"),
+    ("unknown function '{name}': resume(...) outside an effect clause",
+     "неизвестная функция '{name}': resume(...) вне ветви эффекта",
+     "'{name}' функциясы белгісіз: resume(...) әсер тармағынан тыс"),
+    ("`perform {callee}(...)` calls the function '{callee}' when no handler is active; {hint:msg}",
+     "`perform {callee}(...)` вызывает функцию '{callee}', когда нет активного обработчика; {hint}",
+     "белсенді өңдеуші болмаса, `perform {callee}(...)` '{callee}' функциясын шақырады; {hint}"),
     ("resume(...) outside an effect clause",
      "resume(...) вне ветви эффекта",
      "resume(...) әсер тармағынан тыс"),
@@ -680,6 +742,9 @@ RUNTIME_MESSAGES: List[Tuple[str, str, str]] = [
     ("bad opcode",
      "неверный код операции",
      "қате операция коды"),
+    ("bad opcode (comparison 0x{op})",                  # til31/vmcore: compare-and-branch
+     "неверный код операции (сравнение 0x{op})",
+     "қате операция коды (салыстыру 0x{op})"),
 
     # ── effects with resumption (TIL 3.1; the til31/effects branch) ────────
     ("unhandled effect '{effect}'",
@@ -1324,8 +1389,13 @@ def _entry_problems(e: Entry, row: Tuple[str, ...]) -> List[str]:
         if not isinstance(p, str) and p[1] and p[1] != e.kinds[p[0]]:
             problems.append(f"placeholder {p[0]} is used with kinds {e.kinds[p[0]]!r} and {p[1]!r}")
     if e.leading is not None and e.kinds[e.leading] in ('text', 'msg'):
-        problems.append(f"it starts with the free-text placeholder {e.leading} (it would match any "
-                        f"sentence with that ending)")
+        after = e.parts[1] if len(e.parts) > 1 and isinstance(e.parts[1], str) else ''
+        if e.scope == 'runtime':
+            problems.append(f"it starts with the free-text placeholder {e.leading}: a program's own "
+                            f"sentence with that ending would match")
+        elif len(after) < 3 or e.literal_size < 30:
+            problems.append(f"it starts with the free-text placeholder {e.leading}, followed by too "
+                            f"little text to tell it apart")
     for lang in COLUMNS[1:]:
         text = e.texts[lang]
         if not text.strip():

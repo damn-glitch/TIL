@@ -22,15 +22,19 @@ Message templates are extracted statically:
   before a PANIC: contracts, asserts, intents), the `ERROR_HINTS` table, and
   `print(..., file=sys.stderr)` (category 'cli': reported, not enforced).
   f-strings, `+` concatenations and conditional expressions are followed;
-  local variables holding message text (`msg = f"..."`, `hint = ...`) and
-  parameters that only ever receive literal values (`what="name"`) are
-  expanded; every other interpolated expression becomes a placeholder.
+  local variables holding message text (`msg = f"..."`, `hint = ...`; inside
+  `hint = "x; " + hint` the name stands for its other values), parameters that
+  only ever receive literal values (`what="name"`) and methods of the same
+  class that only return text (`self.reserved_note()`) are expanded; every
+  other interpolated expression becomes a placeholder.
 * vm/tilvm.c, with regular expressions: `fail(vm, "...")`, `failn(vm, ...)`,
   `failf(vm, ...)`, `type_error2(vm, "...", ...)`, `invalid_number(vm, ...,
   "...")` and the few messages assembled by hand in `vm->errbuf` (C_HANDBUILT
   below; each is used only while its anchor literal is still in the source).
   A helper that passes one of its `const char *` parameters on to
-  fail/failn/failf is expanded at each of its call sites.
+  fail/failn/failf is expanded at each of its call sites, and a string
+  constant (`static const char E_NO_METHOD[] = "no method '";`) passed to
+  them stands for its text.
 
 A template is covered when the catalog translates it: each of its lines is
 rendered with placeholder markers and looked up exactly as `til` does at run
@@ -159,6 +163,7 @@ class PyExtractor(ast.NodeVisitor):
         # per class: method name -> (FunctionDef, [Call nodes of self.<method>(...)])
         self.methods: Dict[str, Dict[str, ast.FunctionDef]] = {}
         self.self_calls: Dict[str, Dict[str, List[ast.Call]]] = {}
+        self.resolving: List[str] = []           # variables whose values are being expanded
         for node in ast.walk(self.tree):
             if isinstance(node, ast.ClassDef):
                 meths = {f.name: f for f in node.body if isinstance(f, ast.FunctionDef)}
@@ -304,9 +309,36 @@ class PyExtractor(ast.NodeVisitor):
         if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) \
                 and expr.func.attr in ('strip', 'rstrip', 'lstrip') and self.is_text(expr.func.value):
             return self.flatten(expr.func.value, depth + 1)
+        if isinstance(expr, ast.Call):
+            returned = self.method_texts(expr)
+            if returned is not None:
+                method, values = returned
+                alts = []
+                self.func_stack.append(method)
+                try:
+                    for v in values:
+                        alts.extend(self.flatten(v, depth + 1))
+                finally:
+                    self.func_stack.pop()
+                return _dedupe(alts)[:MAX_ALTERNATIVES]
         if isinstance(expr, ast.Name):
             return self.resolve_name(expr.id, depth)
         return [[PH]]
+
+    def method_texts(self, call: ast.Call) -> Optional[Tuple[ast.FunctionDef, List[ast.AST]]]:
+        """`self.reserved_note()`: a method of the same class whose every `return`
+        gives text (literals, f-strings, ...) stands for those texts."""
+        f = call.func
+        if not (self.class_stack and isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                and f.value.id == 'self'):
+            return None
+        method = self.methods.get(self.class_stack[-1].name, {}).get(f.attr)
+        if method is None or method in self.func_stack:
+            return None
+        values = [n.value for n in ast.walk(method) if isinstance(n, ast.Return)]
+        if not values or not all(v is not None and self.is_text(v) for v in values):
+            return None
+        return method, values
 
     def flatten_value(self, expr: ast.AST, depth: int) -> List[List[Optional[str]]]:
         """An interpolated value: text-valued variables are expanded, the rest is a placeholder."""
@@ -328,11 +360,21 @@ class PyExtractor(ast.NodeVisitor):
             elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) \
                     and node.target.id == name and node.value is not None:
                 values.append(node.value)
+        if values and name in self.resolving:
+            # `hint = "prefix; " + hint`: inside its own value, a name has its other values
+            values = [v for v in values if not any(isinstance(n, ast.Name) and n.id == name
+                                                   for n in ast.walk(v))]
+            if not values:
+                return [[PH]]
         if values:
             if all(self.is_text(v) for v in values):
                 alts: List[List[Optional[str]]] = []
-                for v in values:
-                    alts.extend(self.flatten(v, depth + 1))
+                self.resolving.append(name)
+                try:
+                    for v in values:
+                        alts.extend(self.flatten(v, depth + 1))
+                finally:
+                    self.resolving.pop()
                 return _dedupe([self.letterless_as_placeholder(a) for a in alts])[:MAX_ALTERNATIVES]
             return [[PH]]
         literals = self.parameter_literals(func, name)
@@ -503,6 +545,8 @@ def _is_null(arg: str) -> bool:
 
 
 _C_FAIL_CALL = re.compile(r'\b(fail|failn|failf|type_error2|invalid_number)\s*\(')
+_C_STRING_CONST = re.compile(r'\bstatic\s+const\s+char\s+(?:\*\s*const\s+(\w+)|(\w+)\s*\[\s*\])\s*=\s*'
+                             r'((?:"(?:[^"\\\n]|\\.)*"\s*)+);')
 _C_HELPER = re.compile(r'\bstatic\s+int\s+(\w+)\s*\(\s*tilvm\s*\*\s*vm\s*,([^)]*)\)\s*\{')
 
 
@@ -575,11 +619,18 @@ def extract_c(path: str = TILVM_C) -> List[Template]:
             if any(p is not PH and re.search(r'[A-Za-z]', p) for p in t.parts):
                 out.append(t)
 
+    # string constants shared by several messages (`static const char E_NO_METHOD[] = "no method '";`)
+    consts = {(c.group(1) or c.group(2)): c.group(3).strip() for c in _C_STRING_CONST.finditer(text)}
+
+    def c_args(start: int) -> List[str]:
+        args, _end = split_c_args(text, start)
+        return [consts.get(a.strip(), a) for a in args]
+
     def fail_calls(lo: int, hi: int):
         for m in _C_FAIL_CALL.finditer(text, lo, hi):
             if re.search(r'(?:int|static|void)\s+$', text[max(0, m.start() - 20):m.start()]):
                 continue                                   # the definition itself
-            args, _end = split_c_args(text, m.end() - 1)
+            args = c_args(m.end() - 1)
             if args and args[0] == 'vm':
                 yield m, args[1:]
 
@@ -602,7 +653,7 @@ def extract_c(path: str = TILVM_C) -> List[Template]:
         for m in re.finditer(r'\b' + name + r'\s*\(', text):
             if lo - 200 <= m.start() < hi:
                 continue                                   # the definition (and recursion)
-            args, _end = split_c_args(text, m.end() - 1)
+            args = c_args(m.end() - 1)
             if not args or args[0] != 'vm':
                 continue
             given = dict(zip(params, args[1:]))
@@ -666,14 +717,23 @@ def coverage_of(cat, t: Template, entries=None) -> Tuple[bool, List[str]]:
         kind, message = cat.split_frame(line)
         if kind in ('source', 'at') or not re.search(r'[A-Za-z]', message.replace(MARK, '')):
             continue                                     # pure frame: "Error: {}", "Syntax Error: {}"
-        if entries is None:
-            hit = cat.find(message, scope_of(t), any_value=MARK)
-        else:
-            hit = _find_in(entries, message)
-        if hit is None or _absorbs_text(hit[0], hit[1]):
+        if not _translated(cat, message, scope_of(t), entries, used):
             return False, used
-        used.append(hit[0].en)
     return True, used
+
+
+def _translated(cat, message: str, scope: Optional[str], entries, used: List[str], depth: int = 0) -> bool:
+    """Does `message` (placeholders marked) come out fully translated? A nested
+    {x:msg} value is looked up too, as `til` does."""
+    hit = cat.find(message, scope, any_value=MARK) if entries is None else _find_in(entries, message)
+    if hit is None or _absorbs_text(hit[0], hit[1]):
+        return False
+    used.append(hit[0].en)
+    for name, value in hit[1].items():
+        if hit[0].kinds.get(name) == 'msg' and depth < 8 and re.search(r'[A-Za-z]', value.replace(MARK, '')):
+            if not _translated(cat, value, scope, entries, used, depth + 1):
+                return False
+    return True
 
 
 def _find_in(entries, message: str):

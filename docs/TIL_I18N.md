@@ -185,8 +185,12 @@ Every translation uses exactly the placeholders of the English template; their
 text is copied unchanged. Choose the narrowest kind that fits every real
 value: that is what keeps a program's own sentences out (`cannot compare
 {left:type} and {right:type}` translates `cannot compare str and int`, not
-`cannot compare apples and oranges`). A template must not start with a
-`text` or `msg` placeholder, and two placeholders must not touch.
+`cannot compare apples and oranges`). Two placeholders must not touch. A
+run-time template must not start with a `text` or `msg` placeholder (it would
+take a program's own sentence with that ending); a compiler or command-line
+template may, when distinctive text follows it, e.g. the parser's
+`{message:msg} ('{word}' is a reserved word and cannot be used as a name)`,
+which translates any "Expected ..." message with that note appended.
 
 Lookup:
 
@@ -224,9 +228,10 @@ bad kinds, duplicates and untranslated entries (a test runs it).
    lookup `til` uses (run-time messages against `RUNTIME_MESSAGES` only).
    `tests/test_i18n.py` fails while a message of the enforced categories has
    no entry; plain `print(..., file=sys.stderr)` messages are reported but
-   not enforced. Entries may exist ahead of the code (the effects and
-   graphics messages were written against their branches before those were
-   merged); `--unused` lists them, they do no harm.
+   not enforced. Entries may exist ahead of the code (the messages of the
+   effects, graphics, typed, prove and vmcore branches were written against
+   those branches before they were merged); `--unused` lists them, they do
+   no harm.
 3. Add the entry to the list that `--skeleton` names (`COMPILER_MESSAGES`,
    `RUNTIME_MESSAGES` or `COMMAND_LINE_MESSAGES`), in the section of its
    subsystem, with the Russian and Kazakh text, following the conventions
