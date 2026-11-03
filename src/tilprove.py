@@ -1867,10 +1867,12 @@ class Prover:
         return 'unknown', None, s.reason_unknown()
 
     def _int_encoding(self, key: str, fdef, n_regular: int):
+        """The integer encoding, usable only when every overflow obligation
+        is proved; (None, None) otherwise (the bit-vector results stand)."""
         try:
             enc = _Encoder(self, key, fdef, _IntDomain())
             obs = enc.encode()
-        except (_NotTranslatable, Unsupported):
+        except Exception:               # _NotTranslatable (bit operations...), Unsupported
             return None, None
         regular = [o for o in obs if o.kind != 'overflow']
         if len(regular) != n_regular:
@@ -1881,6 +1883,15 @@ class Prover:
         return regular, enc
 
     def prove_function(self, key: str) -> FunctionReport:
+        try:
+            return self._prove_function(key)
+        except Exception as e:          # never crash `til check`: report it, prove nothing
+            rep = FunctionReport(key, self.funcs[key])
+            rep.status = 'unsupported'
+            rep.reason = f"internal error in the prover ({type(e).__name__}: {e})"
+            return rep
+
+    def _prove_function(self, key: str) -> FunctionReport:
         fdef = self.funcs[key]
         rep = FunctionReport(key, fdef)
         t0 = time.time()
@@ -2205,12 +2216,12 @@ def format_errors(rep: FunctionReport, reporter, timeout_ms: int) -> List[str]:
         extras = _assignments(fail.extras)
         if fail.status == 'counterexample':
             msg = f"'{rep.key}': {ob.what} fails for {_inputs_text(fail)}"
-            hint = (f"with these inputs {extras}" if extras else "")
+            parts = [f"with these inputs {extras}"] if extras else []
             if fail.confirmed:
-                hint += ("; " if hint else "") + f"confirmed on the TIL VM ({fail.outcome[0].lower()}" \
-                    f"{fail.outcome[1:]})"
-            if ob.kind in ('ensures', 'assert', 'invariant', 'call') and not fail.confirmed:
-                hint += ("; " if hint else "") + "ints are 64-bit and wrap around"
+                parts.append(f"confirmed on the TIL VM ({fail.outcome})")
+            else:                     # exact encoding, but it could not be run here
+                parts.append(f"not run on the VM: {fail.outcome}" if fail.outcome else "not run on the VM")
+            hint = "; ".join(parts)
         elif fail.status == 'not proved':
             msg = f"'{rep.key}': cannot prove {ob.what}"
             found = f"the solver found {_inputs_text(fail)}" + (f" ({extras})" if extras else "")

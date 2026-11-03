@@ -13,7 +13,6 @@ Run: python3 -m pytest tests/test_prove.py -v
      TIL_TEST_SLOW=1 python3 -m pytest tests/test_prove.py -k fuzz   (more random cases)
 """
 
-import importlib.util
 import os
 import random
 
@@ -23,7 +22,7 @@ from tilhelpers import ROOT, cli, run_both, til   # importing tilhelpers puts sr
 
 import tilprove  # noqa: E402
 
-HAVE_Z3 = importlib.util.find_spec('z3') is not None
+HAVE_Z3 = tilprove.load_z3()          # False when z3-solver is missing or broken
 needs_z3 = pytest.mark.skipif(not HAVE_Z3, reason="z3-solver is not installed")
 SLOW = os.environ.get('TIL_TEST_SLOW') == '1'
 
@@ -552,6 +551,13 @@ class TestUnsupported:
         rep = next(iter(reps.values()))
         assert rep.status == 'unsupported', (rep.status, rep.reason)
         assert reason in rep.reason, rep.reason
+
+    def test_internal_errors_are_reported_not_raised(self, monkeypatch):
+        def boom(self):
+            raise RuntimeError("boom")
+        monkeypatch.setattr(tilprove._Encoder, 'encode', boom)
+        rep = prove('#[ensures: result == 1]\nf() -> int\n    return 1\n')['f']
+        assert rep.status == 'unsupported' and "internal error in the prover (RuntimeError: boom)" in rep.reason
 
     def test_unmodeled_values_are_fine_when_contracts_do_not_use_them(self):
         src = ('#[requires: b != 0]\ndiv(a: int, b: int) -> int\n    return a / b\n'
