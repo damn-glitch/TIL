@@ -3453,6 +3453,8 @@ def c_format_spec(spec: str, ptype: str) -> Tuple[str, str]:
     if not m:
         return ("%g", "float") if ptype == "float" else ("%lld", "int")
     align, width, prec, conv = m.groups()
+    if conv == '%':
+        return (f"%.{prec or 6}f%%", "percent")
     flags = '-' if align == '<' else ''
     if width.startswith('0') and len(width) > 1:
         flags += '0'
@@ -5560,7 +5562,9 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 expr_val = self.generate_node(value)
                 if spec:
                     cspec = c_format_spec(spec, ptype)
-                    if cspec[1] == "float":
+                    if cspec[1] == "percent":
+                        val = f"til_fmt_float((double)({expr_val}) * 100.0, {c_string_literal(cspec[0])})"
+                    elif cspec[1] == "float":
                         val = f"til_fmt_float((double)({expr_val}), {c_string_literal(cspec[0])})"
                     else:
                         val = f"til_fmt_int((int64_t)({expr_val}), {c_string_literal(cspec[0])})"
@@ -5965,14 +5969,20 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         return expr
 
     def _guarded_value_type(self, node) -> str:
-        """C type of a retry/timeout expression: its body's value, or the fallback's."""
-        expr = self._block_value_expr(node.body)
-        if expr is None and node.fallback is not None:
-            expr = self._block_value_expr(node.fallback)
-        if expr is None:
+        """C type of a retry/timeout expression: common type of body and fallback
+        (the VM is dynamically typed; C needs one type: str > float > int)."""
+        types = []
+        for part in (node.body, node.fallback):
+            expr = self._block_value_expr(part) if part is not None else None
+            if expr is not None:
+                types.append({"str": "const char*", "float": "double", "bool": "bool"}.get(
+                    self._infer_expr_print_type(expr), "int64_t"))
+        if not types:
             return "int64_t"
-        return {"str": "const char*", "float": "double", "bool": "bool"}.get(
-            self._infer_expr_print_type(expr), "int64_t")
+        for preferred in ("const char*", "double"):
+            if preferred in types:
+                return preferred
+        return types[0]
 
     def _is_void_call(self, expr) -> bool:
         if not isinstance(expr, Call):
@@ -5981,7 +5991,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             return True
         return self._infer_call_ret_type(expr) == "void"
 
-    def _emit_guarded_body(self, body, result_var: str):
+    def _emit_guarded_body(self, body, result_var: str, ctype: str = ""):
         """Body of retry/timeout; its value (last expression) goes to result_var."""
         if not isinstance(body, Block) and self._is_void_call(body):
             body = Block(statements=[ExprStmt(expr=body)])
@@ -5994,15 +6004,19 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 if isinstance(last, ExprStmt) and not self._is_void_call(last.expr):
                     val = self.generate_node(last.expr)
                     if val:
+                        if ctype == "const char*":
+                            val = self._to_c_string(last.expr, val)
                         self.emit(f"{result_var} = {val};")
                 else:
                     self.generate_node(last)
         else:
             val = self.generate_node(body)
             if val:
+                if ctype == "const char*":
+                    val = self._to_c_string(body, val)
                 self.emit(f"{result_var} = {val};")
 
-    def _emit_fallback(self, fallback, result_var: str):
+    def _emit_fallback(self, fallback, result_var: str, ctype: str = ""):
         if fallback is None:
             self.emit("til_panic(til_panic_msg);   /* re-raise */")
             return
@@ -6011,7 +6025,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         self.emit("const char* error = til_panic_msg;")
         self.emit("(void)error;")
         self.string_vars.add("error")
-        self._emit_guarded_body(fallback, result_var)
+        self._emit_guarded_body(fallback, result_var, ctype)
         self.indent -= 1
         self.emit("}")
 
@@ -6036,7 +6050,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         self.emit(f"if (setjmp({rec}.env) == 0) {{")
         self.indent += 1
         self._recover_stack.append((rec, self._loop_depth))
-        self._emit_guarded_body(node.body, result_var)
+        self._emit_guarded_body(node.body, result_var, ctype)
         self._recover_stack.pop()
         self.emit(f"til_recover_top = {rec}.prev;")
         self.indent -= 1
@@ -6044,7 +6058,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         self.indent += 1
         self.emit(f"til_recover_top = {rec}.prev;")
         self.emit(f"if (++_retry_i_{k} < _retry_limit_{k}) goto _retry_again_{k};")
-        self._emit_fallback(node.fallback, result_var)
+        self._emit_fallback(node.fallback, result_var, ctype)
         self.indent -= 1
         self.emit("}")
         self.indent -= 1
@@ -6068,14 +6082,14 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         self.emit(f"if (setjmp({rec}.env) == 0) {{")
         self.indent += 1
         self._recover_stack.append((rec, self._loop_depth))
-        self._emit_guarded_body(node.body, result_var)
+        self._emit_guarded_body(node.body, result_var, ctype)
         self._recover_stack.pop()
         self.emit(f"til_recover_top = {rec}.prev;")
         self.indent -= 1
         self.emit("} else {")
         self.indent += 1
         self.emit(f"til_recover_top = {rec}.prev;")
-        self._emit_fallback(node.fallback, result_var)
+        self._emit_fallback(node.fallback, result_var, ctype)
         self.indent -= 1
         self.emit("}")
         self.indent -= 1
@@ -6375,15 +6389,19 @@ class TBCModule:
         for _ in range(rd('H')):
             tag = rd('B')
             if tag == 1:
-                m.consts.append(rd('q'))
+                value = rd('q')
             elif tag == 2:
-                m.consts.append(rd('d'))
+                value = rd('d')
             elif tag == 3:
                 n = rd('H')
-                m.consts.append(bytes(data[pos:pos + n]))
+                value = bytes(data[pos:pos + n])
                 pos += n
             else:
                 raise ValueError(f"bad constant tag {tag}")
+            key = (('f', _struct.pack('<d', value)) if isinstance(value, float) else
+                   ('i', value) if isinstance(value, int) else ('s', value))
+            m._const_index.setdefault(key, len(m.consts))
+            m.consts.append(value)
         for _ in range(rd('H')):
             name, np_, nr, nl, nu, fl, off = rd('HBBBBBI')
             f = TBCFunction(m.consts[name].decode('utf-8', 'replace'))
@@ -6403,6 +6421,13 @@ class TBCModule:
         pos += n
         for _ in range(rd('H')):
             m.lines.append(rd('IH'))
+        # split the code section back into functions (so the module can be re-linked)
+        order = sorted(range(len(m.funcs)), key=lambda i: m.funcs[i].offset)
+        for k, i in enumerate(order):
+            f = m.funcs[i]
+            end = m.funcs[order[k + 1]].offset if k + 1 < len(order) else len(m.code)
+            f.code = bytearray(m.code[f.offset:end])
+            f.lines = [(pc - f.offset, line) for pc, line in m.lines if f.offset <= pc < end]
         return m
 
 
@@ -9189,14 +9214,16 @@ def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
                     continue  # a module's own entry point / script code is not imported
                 if stmt.items is not None and _definition_name(mod_stmt) not in stmt.items:
                     continue
-                if id(mod_stmt) in seen_defs:
-                    continue  # same module imported twice
-                seen_defs.add(id(mod_stmt))
                 out.append(mod_stmt)
         return out
 
-    program.statements = merge(program, filename, (os.path.abspath(filename)
-                                                   if not filename.startswith("<") else filename,))
+    merged = merge(program, filename, (os.path.abspath(filename)
+                                       if not filename.startswith("<") else filename,))
+    program.statements = []
+    for stmt in merged:                 # a module imported several times is merged once
+        if id(stmt) not in seen_defs:
+            seen_defs.add(id(stmt))
+            program.statements.append(stmt)
     program.module_names = module_names
     return program
 
