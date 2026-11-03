@@ -123,8 +123,9 @@ They never change the behaviour of a valid program unless stated:
   ~1,800 mutated corpus programs that the Python compiler rejects, tilc
   reported the same first message at the same line for 99.7% of them; every
   difference was of this kind or the missing-module case below. No mutant
-  crashed tilc, and every mutant one compiler accepted the other accepted too
-  (with identical bytes).
+  (nor any of ~1,500 truncated corpus programs) crashed tilc, and apart from
+  the missing-module case every program one compiler accepted the other
+  accepted too, with identical bytes.
 * Expressions nested more than ~50 levels deep exceed the VM's call depth
   (`fatal error: stack overflow (recursion too deep)`); the Python compiler
   stops even earlier (Python recursion limit).
@@ -211,15 +212,18 @@ tables.
 
 ### Performance and memory
 
-Compiling `tilc.til` itself (5,600 lines, 164 KB of source; 98 KB of
-bytecode; 2.33 million VM steps — loop iterations and calls):
+Compiling `tilc.til` itself (5,600 lines, 165 KB of source; 98.5 KB of
+bytecode; 2.73 million VM steps — loop iterations and calls). CPU time on the
+development machine (a shared x86-64 server):
 
-| compiler / VM | time |
+| compiler / VM | CPU time |
 |---|---|
-| Python compiler (stage 1) | 0.7 s |
+| Python compiler (stage 1) | 0.6 s |
 | tilc on the C VM, 64-bit, `-O2`, 1 MB heap | 0.4 s |
-| tilc on the C VM, int32 + float32, 1 MB heap | 0.5 s |
-| tilc on the reference VM (Python) | 32 s |
+| tilc on the C VM, int32 + float32, 1 MB heap | 0.4 s |
+| tilc on the reference VM (Python) | 37 s |
+
+All of them produce the same 98,538 bytes.
 
 Self-compilation needs a heap of about 1 MB (the default C VM heap is
 256 KB: build `tilvm` with `-DTILVM_HEAP_SIZE=1048576` or more).
@@ -237,18 +241,18 @@ cc -std=c99 -O2 -DTILVM_INT_BITS=32 -DTILVM_FLOAT=1 -DTILVM_HEAP_SIZE=65536 \
 ./tilvm-calc --stats tilc.tbc examples/07_multilevel.til out.tbc
 ```
 
-Smallest heap that compiles each program (int32/float32 VM), VM steps, and
-time on a desktop CPU:
+Smallest heap (in steps of 4-8 KB) that compiles each program on the
+int32/float32 VM, VM steps, and CPU time on the development machine:
 
-| program | lines | heap needed | steps | desktop time |
+| program | lines | heap needed | steps | CPU time |
 |---|---|---|---|---|
-| `print(1)` | 1 | 20 KB | 639 | < 1 ms |
-| `TestCalculator` program (structs, loops, f-strings) | 36 | 24 KB | 15,349 | 5 ms |
-| `examples/03_functions.til` | 56 | 24 KB | 14,379 | 4 ms |
-| `examples/04_structs.til` | 81 | 32 KB | 27,691 | — |
-| `examples/basic/control_flow.til` | 77 | 40 KB | 21,400 | — |
-| `examples/07_multilevel.til` | 147 | 40 KB | 51,920 | 12 ms |
-| `examples/09_v3_features.til` | 112 | 56 KB | 49,612 | 11 ms |
+| `print(1)` | 1 | 20 KB | 684 | < 1 ms |
+| `TestCalculator` program (structs, loops, f-strings) | 36 | 24 KB | 19,507 | 6 ms |
+| `examples/03_functions.til` | 56 | 24 KB | 16,870 | 4 ms |
+| `examples/04_structs.til` | 81 | 32 KB | 34,643 | 6 ms |
+| `examples/basic/control_flow.til` | 77 | 40 KB | 24,844 | 5 ms |
+| `examples/07_multilevel.til` | 147 | 40 KB | 64,071 | 9 ms |
+| `examples/09_v3_features.til` | 112 | 56 KB | 58,421 | 10 ms |
 
 tilc's own data (keyword tables etc.) takes about 11 KB of that heap. A
 calculator CPU is roughly 100-1000 times slower than a desktop one, so these
