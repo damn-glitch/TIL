@@ -24,7 +24,7 @@
 
 TIL (The Intelligent Language) is a compiled programming language with a unique **Multi-Level Architecture**. Instead of forcing one paradigm, TIL lets you pick the right level of abstraction for each function — what we call **Mixed Martial Programming**.
 
-TIL has **two backends**: it compiles to C (native binaries via GCC/Clang), and — new in 3.0 — to compact **bytecode** for the **TIL VM**, a tiny portable virtual machine that runs the same programs on PCs without a C compiler, on **graphing-calculator CPUs** (Z80, ARM Cortex-M) and on **8-bit microcontrollers**. The entire compiler is still a single Python file.
+TIL has **two backends**: it compiles to C (native binaries via GCC/Clang), and — new in 3.0 — to compact **bytecode** for the **TIL VM**, a tiny portable virtual machine that runs the same programs on PCs without a C compiler, on **calculator-class ARM CPUs** and on **8-bit microcontrollers** (both verified in emulators). The entire compiler is still a single Python file.
 
 TIL supports **Kazakh** (Cyrillic and Latin) and **Russian** keywords natively, and translates programs between them.
 
@@ -106,7 +106,7 @@ running program and resume it later, even after a power cycle).
 |---|---|---|
 | ARM Cortex-M3, 64 KB RAM (NumWorks / STM32 class, QEMU) | 44.7 KB flash, 24 KB RAM | all examples identical |
 | 8-bit AVR ATmega1284P, 16 KB RAM (Arduino class, simavr) | 53.8 KB flash, 10.5 KB RAM | all examples identical |
-| Z80 (TI-83/84 class, ucsim) | see [vm/ports/z80](vm/ports/z80/RESULTS.md) | |
+| Z80 (TI-83/84 class, ucsim) | compiles, but 70 KB of SDCC code exceeds the 64 KB address space — [status](vm/ports/z80/RESULTS.md) | not yet |
 
 Every program in the test-suite runs on three engines — native C, the Python
 VM and the C VM — and must produce byte-identical output. Details:
@@ -778,7 +778,7 @@ TIL/
 ### New in v3.0
 
 - [x] **TIL VM** — bytecode backend, Python reference VM, portable C VM (no malloc, compacting GC)
-- [x] **Calculators & microcontrollers** — verified on emulated ARM Cortex-M3 and AVR; Z80 port
+- [x] **Calculators & microcontrollers** — verified on emulated ARM Cortex-M3 and 8-bit AVR (Z80: compiles, does not fit 64 KB yet)
 - [x] **Snapshots** — pause a running program and resume it later
 - [x] **Closures as values**, `map` / `filter` / `reduce` / `each` / `any` / `all`, pipeline `|>`
 - [x] **Algebraic data types** — enum variants with data, destructuring `match`

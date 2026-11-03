@@ -12,9 +12,10 @@
  *   - snapshot / resume of a running program (hibernate on power-off)
  *   - step budgets (cooperative multitasking, sandboxing) and real timeouts
  *
- * Targets: desktop (gcc/clang/MSVC), graphing calculators (Z80 / eZ80 via SDCC or
- * the TI-84 CE toolchain, SH4 Casio via gint, ARM NumWorks / TI-Nspire),
- * microcontrollers (AVR, ARM Cortex-M, ESP32, RP2040).
+ * Targets: desktop (gcc/clang/MSVC), calculator-class CPUs (ARM: NumWorks,
+ * TI-Nspire; eZ80: TI-84 Plus CE toolchain; SH4: Casio via gint) and
+ * microcontrollers (AVR, ARM Cortex-M, ESP32, RP2040). Verified in emulators:
+ * ARM Cortex-M3 and 8-bit AVR. Classic Z80: see ports/z80/RESULTS.md.
  *
  * Configuration (define before including, or with -D):
  *   TILVM_INT_BITS     16 | 32 | 64           (default 64)

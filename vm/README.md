@@ -42,7 +42,7 @@ output of every example is compared with the reference VM.
 |---|---|---|---|---|---|---|
 | ARM Cortex-M (NumWorks/STM32 class) | Cortex-M3, 64 KB RAM | QEMU `lm3s6965evb` | int32, float32, 16 KB heap | 44.7 KB | 24 KB | 17/17 programs identical¹ |
 | 8-bit AVR (Arduino Mega class) | ATmega1284P, 16 KB RAM | simavr | int32, float32, 5 KB heap | 53.8 KB | 10.5 KB | 17/17 programs identical |
-| Z80 (TI-83/84 class) | Z80, 64 KB address space | ucsim `sz80` | int32, no floats, 4 KB heap | see `ports/z80` | ~7 KB | see `ports/z80/RESULTS.md` |
+| Z80 (TI-83/84 class) | Z80, 64 KB address space | ucsim `sz80` | int32, lean | 70.7 KB (SDCC) | ~7 KB | **does not fit** the 64 KB address space yet — see `ports/z80/RESULTS.md` |
 | Desktop | x86-64 | native | int64, double, 256 KB heap | 80 KB | ~400 KB | all 255 + 81 tests |
 
 ¹ Single-precision builds print the last digit of some floats differently
@@ -53,7 +53,6 @@ Reproduce:
 ```bash
 make -C vm/ports/cortex-m PROGRAM=../../../examples/03_functions.til run
 python3 vm/ports/avr/run_sim.py examples/03_functions.til
-python3 vm/ports/z80/run_sim.py examples/03_functions.til      # SDCC compile is slow
 ```
 
 ## Configuration
@@ -143,9 +142,10 @@ these glue snippets are starting points and have not been run on hardware):
 * **TI-84 Plus CE** (eZ80, CE C toolchain): `vm.write` → `os_PutStrFull` /
   `os_NewLine`; keep `TILVM_HEAP_SIZE` ≤ 32 KB; `tilvm_run_steps` +
   `os_GetCSC()` between slices lets [ON] stop a program. Use `TILVM_FLOAT=1`.
-* **TI-83 Plus / TI-84 Plus** (Z80): as an Flash application built with SDCC/z88dk,
-  `TILVM_INT_BITS=32` (or 16), `TILVM_FLOAT=0`, `TILVM_NO_STDIO`, `TILVM_NO_TIME`,
-  4 KB heap; output with the `_PutC`/`_PutS` bcalls.
+* **TI-83 Plus / TI-84 Plus** (Z80): not yet — with SDCC the VM is ~70 KB of
+  code, more than the Z80's 64 KB address space; it needs a banked Flash
+  application or a 16-bit build (see `ports/z80/RESULTS.md`). Output would use
+  the `_PutC`/`_PutS` bcalls.
 * **Casio fx-CG50 / fx-9860G** (SH4, gint SDK): `vm.write` → `dtext` into a
   scrolling console buffer + `dupdate`; `clock_ms` from `rtc_ticks`.
 * **NumWorks** (Cortex-M7, external apps / `eadk`): `vm.write` →

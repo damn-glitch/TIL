@@ -627,12 +627,6 @@ class TestCrossTargets:
                            capture_output=True, text=True, timeout=600)
         assert r.stdout == self.reference()
 
-    @pytest.mark.skipif(not shutil.which('sz80'), reason="no SDCC ucsim")
-    def test_z80(self):
-        r = subprocess.run([sys.executable, os.path.join(VM_DIR, 'ports', 'z80', 'run_sim.py'), self.PROGRAM],
-                           capture_output=True, text=True, timeout=7200)
-        assert r.stdout == self.reference()
-
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
