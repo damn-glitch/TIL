@@ -452,23 +452,45 @@ static void fmt_g(char *buf, tv_float x) {
     if (buf[0] == '-' && buf[1] == 'n') strcpy(buf, "nan");
 }
 #else
-/* %g with 6 significant digits, without printf (freestanding builds). */
-static void fmt_g(char *buf, tv_float x) {
-    char digits[8];
-    long m;
-    int e = 0, i, nd, pos = 0;
-    if (x != x) { strcpy(buf, "nan"); return; }
+/* printf-free float formatting for freestanding builds (calculators, MCUs). */
+static int fmt_special(char *buf, tv_float x) {
+    if (x != x) { strcpy(buf, "nan"); return 1; }
+    if (x - x != x - x) { strcpy(buf, x < 0 ? "-inf" : "inf"); return 1; }
+    return 0;
+}
+
+/* normalize |x| to [1, 10): returns the decimal exponent */
+static int fnorm(tv_float *x) {
+    int e = 0;
+    if (*x == 0) return 0;
+    while (*x >= 10) { *x /= 10; e++; }
+    while (*x < 1) { *x *= 10; e--; }
+    return e;
+}
+
+/* %.{sig}g */
+static void fmt_gp(char *buf, tv_float x, int sig) {
+    char digits[24];
+    int e, i, nd, pos = 0;
+    tv_float m;
+    if (fmt_special(buf, x)) return;
+    if (sig < 1) sig = 1;
+    if (sig > 17) sig = 17;
     if (x < 0) { buf[pos++] = '-'; x = -x; }
-    if (x > (tv_float)1e38 * (tv_float)1e38) { strcpy(buf + pos, "inf"); return; }
     if (x == 0) { strcpy(buf + pos, "0"); return; }
-    while (x >= 10) { x /= 10; e++; }
-    while (x < 1) { x *= 10; e--; }
-    m = (long)(x * (tv_float)100000 + (tv_float)0.5);
-    if (m >= 1000000L) { m /= 10; e++; }
-    for (i = 5; i >= 0; i--) { digits[i] = (char)('0' + (int)(m % 10)); m /= 10; }
-    nd = 6;
+    e = fnorm(&x);
+    m = x;
+    for (i = 0; i < sig; i++) { int d = (int)m; if (d > 9) d = 9; digits[i] = (char)('0' + d); m = (m - (tv_float)d) * 10; }
+    if (m >= 5) {                                   /* round half up */
+        for (i = sig - 1; i >= 0; i--) {
+            if (digits[i] < '9') { digits[i]++; break; }
+            digits[i] = '0';
+        }
+        if (i < 0) { for (i = sig - 1; i > 0; i--) digits[i] = digits[i - 1]; digits[0] = '1'; e++; }
+    }
+    nd = sig;
     while (nd > 1 && digits[nd - 1] == '0') nd--;
-    if (e < -4 || e >= 6) {
+    if (e < -4 || e >= sig) {
         buf[pos++] = digits[0];
         if (nd > 1) { buf[pos++] = '.'; for (i = 1; i < nd; i++) buf[pos++] = digits[i]; }
         buf[pos++] = 'e';
@@ -485,6 +507,77 @@ static void fmt_g(char *buf, tv_float x) {
         for (i = 0; i < -e - 1; i++) buf[pos++] = '0';
         for (i = 0; i < nd; i++) buf[pos++] = digits[i];
     }
+    buf[pos] = 0;
+}
+
+static void fmt_g(char *buf, tv_float x) { fmt_gp(buf, x, 6); }
+
+/* %.{prec}f  (exact ties round to even, like printf) */
+static void fmt_fixed(char *buf, tv_float x, int prec) {
+    char dig[72];
+    int pos = 0, n = 0, i, intlen;
+    tv_float ipart, frac, p10 = 1;
+    if (fmt_special(buf, x)) return;
+    if (prec > 20) prec = 20;
+    if (x < 0) { buf[pos++] = '-'; x = -x; }
+    ipart = x;
+    dig[n++] = '0';                       /* spare leading digit for carries */
+    {
+        int k = 0;
+        while (p10 * 10 <= ipart && k < 40) { p10 *= 10; k++; }
+        for (; k >= 0; k--) {
+            int d = 0;
+            while (ipart >= p10 && d < 9) { ipart -= p10; d++; }
+            dig[n++] = (char)('0' + d);
+            p10 /= 10;
+        }
+    }
+    intlen = n;
+    frac = ipart < 1 ? ipart : 0;
+    for (i = 0; i < prec; i++) {
+        int d;
+        frac *= 10;
+        d = (int)frac;
+        if (d > 9) d = 9;
+        dig[n++] = (char)('0' + d);
+        frac -= (tv_float)d;
+    }
+    if (frac > (tv_float)0.5 || (frac == (tv_float)0.5 && ((dig[n - 1] - '0') & 1))) {
+        for (i = n - 1; i >= 0; i--) {
+            if (dig[i] < '9') { dig[i]++; break; }
+            dig[i] = '0';
+        }
+    }
+    i = dig[0] == '0' ? 1 : 0;            /* drop the spare digit if unused */
+    for (; i < intlen; i++) buf[pos++] = dig[i];
+    if (prec > 0) {
+        buf[pos++] = '.';
+        for (i = intlen; i < n; i++) buf[pos++] = dig[i];
+    }
+    buf[pos] = 0;
+}
+
+/* %.{prec}e */
+static void fmt_exp(char *buf, tv_float x, int prec) {
+    int e, pos = 0, i;
+    tv_float m;
+    char mant[32];
+    if (fmt_special(buf, x)) return;
+    if (x < 0) { buf[pos++] = '-'; x = -x; }
+    e = fnorm(&x);
+    m = x;
+    fmt_fixed(mant, m, prec);
+    if (mant[0] == '1' && mant[1] == '0') {        /* 9.99 rounded up to 10.0 */
+        m /= 10; e++;
+        fmt_fixed(mant, m, prec);
+    }
+    for (i = 0; mant[i]; i++) buf[pos++] = mant[i];
+    buf[pos++] = 'e';
+    buf[pos++] = e < 0 ? '-' : '+';
+    if (e < 0) e = -e;
+    if (e >= 100) buf[pos++] = (char)('0' + e / 100);
+    buf[pos++] = (char)('0' + (e / 10) % 10);
+    buf[pos++] = (char)('0' + e % 10);
     buf[pos] = 0;
 }
 #endif
@@ -1309,7 +1402,8 @@ static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
 #ifndef TILVM_NO_STDIO
         snprintf(body, 80, kind == 'e' ? "%.*e" : "%.*f", prec < 0 ? 6 : prec, (double)x);
 #else
-        fmt_g(body, x);
+        if (kind == 'e') fmt_exp(body, x, prec < 0 ? 6 : prec);
+        else fmt_fixed(body, x, prec < 0 ? 6 : prec);
 #endif
         if (kind == '%') strcat(body, "%");
 #else
@@ -1340,7 +1434,7 @@ static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
 #ifndef TILVM_NO_STDIO
             snprintf(body, 80, "%.*g", prec, (double)v->u.f);
 #else
-            fmt_g(body, v->u.f);
+            fmt_gp(body, v->u.f, prec == 0 ? 1 : prec);
 #endif
         } else
 #endif
@@ -1530,7 +1624,10 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     case N_CHR: {
         char buf[4];
         uint32_t c, n;
-        if (a->t != TV_INT || a->u.i < 0 || (long)a->u.i > 0x10FFFFL) return fail(vm, "chr() argument out of range");
+        if (a->t != TV_INT || a->u.i < 0) return fail(vm, "chr() argument out of range");
+#if TILVM_INT_BITS > 16
+        if (a->u.i > 0x10FFFF) return fail(vm, "chr() argument out of range");
+#endif
         c = (uint32_t)a->u.i;
         if (c < 0x80) { buf[0] = (char)c; n = 1; }
         else if (c < 0x800) { buf[0] = (char)(0xC0 | (c >> 6)); buf[1] = (char)(0x80 | (c & 0x3F)); n = 2; }
@@ -1862,7 +1959,7 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
         return 1;
     }
     case M_REVERSE:
-        for (i = 0; i < n / 2; i++) { tv_val t = v[i]; v[i] = v[n - 1 - i]; v[n - 1 - i] = t; }
+        for (i = 0; i < n / 2; i++) { tv_val t; t = v[i]; v[i] = v[n - 1 - i]; v[n - 1 - i] = t; }
         return 1;
     case M_SORT: {
         int err = 0;
@@ -2312,7 +2409,7 @@ resume:
         case OP_POP: SP--; break;
         case OP_DUP: CHECK_STACK(1); STK[SP] = STK[SP - 1]; SP++; break;
         case OP_DUP2: CHECK_STACK(2); STK[SP] = STK[SP - 2]; STK[SP + 1] = STK[SP - 1]; SP += 2; break;
-        case OP_SWAP: { tv_val t = STK[SP - 1]; STK[SP - 1] = STK[SP - 2]; STK[SP - 2] = t; break; }
+        case OP_SWAP: { tv_val t; t = STK[SP - 1]; STK[SP - 1] = STK[SP - 2]; STK[SP - 2] = t; break; }
         case OP_LOAD_LOCAL: CHECK_STACK(1); STK[SP] = STK[base + READ8()]; SP++; break;
         case OP_STORE_LOCAL: STK[base + READ8()] = STK[--SP]; break;
         case OP_LOAD_GLOBAL: CHECK_STACK(1); STK[SP] = STK[READ16()]; SP++; break;
@@ -2455,7 +2552,7 @@ resume:
                     else if (t > TYPE_ERR) {
                         int slot = field_slot(vm, t, name_c);
                         if (slot >= 0) {
-                            tv_val fv = STRUCTOBJ(vm, recv->u.r)->v[slot];
+                            tv_val fv; fv = STRUCTOBJ(vm, recv->u.r)->v[slot];
                             if (fv.t == TV_FUNC) { fidx = fv.u.k; found = 1; extra = 1; }
                             else if (fv.t == TV_CLOSURE) { clos = fv.u.r; fidx = CLOSOBJ(vm, clos)->func; found = 1; extra = 1; }
                             else { no_field(vm, name_c, recv); goto panic; }

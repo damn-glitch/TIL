@@ -3507,6 +3507,9 @@ class CCodeGenerator:
         self._current_ret_type: Optional[Type] = None   # TIL return type of the function being generated
         self.optresult_vars: Dict[str, str] = {}        # var -> TIL_Option_x / TIL_Result_x
         self.module_names: Set[str] = set()             # imported module names (for mod.func())
+        self._recover_stack: List[Tuple[str, int]] = []  # active retry/timeout recovery points
+        self._loop_depth = 0
+        self._uses_timeout = False
     
     @staticmethod
     def mangle_name(name: str) -> str:
@@ -3535,6 +3538,7 @@ class CCodeGenerator:
     def generate(self, program: Program) -> str:
         self.output = []
         self.module_names = set(getattr(program, 'module_names', set()) or ())
+        self._uses_timeout = any(isinstance(n, TimeoutExpr) for st in program.statements for n in walk(st))
         
         # First pass: collect definitions
         self._globals: List[VarDecl] = []
@@ -3725,7 +3729,6 @@ typedef struct TIL_Recover { jmp_buf env; double deadline; struct TIL_Recover* p
 static TIL_Recover* til_recover_top = NULL;
 static const char* til_panic_msg = "";
 static char til_panic_buf[256];
-static int til_deadline_active = 0;
 static void til_panic(const char* msg) {
     til_panic_msg = msg;
     if (til_recover_top) longjmp(til_recover_top->env, 1);
@@ -3734,11 +3737,21 @@ static void til_panic(const char* msg) {
     exit(1);
 }
 static double til_now_ms(void) { return (double)clock() * 1000.0 / (double)CLOCKS_PER_SEC; }
-// Called at loop back-edges and function entries when the program uses `timeout`
+// Called at loop back-edges and function entries when the program uses `timeout`:
+// unwinds straight to the OUTERMOST expired timeout block.
 static void til_check_deadline(void) {
-    if (!til_deadline_active) return;
+    static unsigned til_tick = 0;
+    TIL_Recover* expired = NULL;
+    double now;
+    if (!til_recover_top || (++til_tick & 255u) != 0) return;
+    now = til_now_ms();
     for (TIL_Recover* r = til_recover_top; r; r = r->prev)
-        if (r->deadline > 0 && til_now_ms() > r->deadline) { til_panic("timeout"); return; }
+        if (r->deadline > 0 && now > r->deadline) expired = r;
+    if (expired) {
+        til_panic_msg = "timeout";
+        til_recover_top = expired;
+        longjmp(expired->env, 1);
+    }
 }
 
 // Value -> string conversions (for "text" + number, f-strings, str())
@@ -4384,6 +4397,9 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         if cross_level_info:
             self.emit(f'// Cross-level contract: {cross_level_info}')
 
+        if self._uses_timeout and func.name != "main":
+            self.emit("til_check_deadline();")
+
         # Program start: initialize globals whose values are not C constants
         if func.name == "main":
             for var in self._deferred_global_inits:
@@ -4648,7 +4664,11 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         
         self.indent += 1
         self.declared_vars.add(node.var)
+        if self._uses_timeout:
+            self.emit("til_check_deadline();")
+        self._loop_depth += 1
         self.generate_node(node.body)
+        self._loop_depth -= 1
         self.indent -= 1
         self.emit("}")
         return ""
@@ -4672,7 +4692,11 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         cond = self.generate_node(node.condition)
         self.emit(f"while ({cond}) {{")
         self.indent += 1
+        if self._uses_timeout:
+            self.emit("til_check_deadline();")
+        self._loop_depth += 1
         self.generate_node(node.body)
+        self._loop_depth -= 1
         self.indent -= 1
         self.emit("}")
         return ""
@@ -4680,12 +4704,18 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
     def gen_Loop(self, node: Loop) -> str:
         self.emit("while (1) {")
         self.indent += 1
+        if self._uses_timeout:
+            self.emit("til_check_deadline();")
+        self._loop_depth += 1
         self.generate_node(node.body)
+        self._loop_depth -= 1
         self.indent -= 1
         self.emit("}")
         return ""
     
     def gen_Return(self, node: Return) -> str:
+        if self._recover_stack:
+            self.emit(f"til_recover_top = {self._recover_stack[0][0]}.prev;")
         if node.value:
             if isinstance(node.value, Identifier) and node.value.name == "NULL":
                 suffix = self._optresult_suffix_from_context('None')
@@ -4710,11 +4740,19 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             self.emit("return;")
         return ""
     
+    def _leave_guarded_regions_in_loop(self):
+        """break/continue out of retry/timeout blocks opened inside the loop."""
+        inner = [rec for rec, depth in self._recover_stack if depth == self._loop_depth]
+        if inner:
+            self.emit(f"til_recover_top = {inner[0]}.prev;")
+
     def gen_Break(self, node: Break) -> str:
+        self._leave_guarded_regions_in_loop()
         self.emit("break;")
         return ""
     
     def gen_Continue(self, node: Continue) -> str:
+        self._leave_guarded_regions_in_loop()
         self.emit("continue;")
         return ""
     
@@ -4732,6 +4770,9 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
     
     def _infer_expr_print_type(self, arg) -> str:
         """Infer the C print type for an expression: 'str', 'float', 'bool', or 'int'."""
+        if isinstance(arg, (RetryExpr, TimeoutExpr)):
+            return {"const char*": "str", "double": "float", "bool": "bool"}.get(
+                self._guarded_value_type(arg), "int")
         if isinstance(arg, StringLit):
             return "str"
         if isinstance(arg, FStringLit):
@@ -4926,6 +4967,10 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             if name in builtins:
                 return f"{builtins[name]}({args_str})"
 
+            if name == 'panic':
+                return f"til_panic({self._to_c_string(node.args[0], args[0]) if node.args else chr(34) + 'panic' + chr(34)})"
+            if name == 'exit':
+                return f"exit((int)({args[0] if args else '0'}))"
             if name == 'min':
                 return f"til_min_int({args_str})"
             if name == 'max':
@@ -5836,6 +5881,8 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 if node.value.op == 'not':
                     return 'bool'
                 return self.infer_c_type(VarDecl(value=node.value.operand))
+            if isinstance(node.value, (RetryExpr, TimeoutExpr)):
+                return self._guarded_value_type(node.value)
             if isinstance(node.value, FStringLit):
                 return 'const char*'
             if isinstance(node.value, CharLit):
@@ -5906,73 +5953,133 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         self.emit(f"static uint64_t _cap_{cap_name}_mask = {bits};")
         return ""
 
-    def gen_RetryExpr(self, node: RetryExpr) -> str:
-        """Generate retry loop in C."""
-        self._retry_counter = getattr(self, '_retry_counter', 0) + 1
-        count_code = self.generate_node(node.count)
-        result_var = f"_retry_result_{self._retry_counter}"
-        counter_var = f"_retry_i_{self._retry_counter}"
-        success_var = f"_retry_ok_{self._retry_counter}"
-
-        self.emit(f"int64_t {result_var} = 0;")
-        self.emit(f"bool {success_var} = false;")
-        self.emit(f"for (int {counter_var} = 0; {counter_var} < {count_code}; {counter_var}++) {{")
-        self.indent += 1
-
-        # Extract value from block body
-        body = node.body
-        if isinstance(body, Block) and len(body.statements) == 1 and isinstance(body.statements[0], ExprStmt):
-            body = body.statements[0].expr
-
+    # ── retry / timeout: real semantics via recovery points (setjmp/longjmp) ──
+    def _block_value_expr(self, body):
+        expr = body
         if isinstance(body, Block):
-            self.generate_node(body)
+            if not body.statements or not isinstance(body.statements[-1], ExprStmt):
+                return None
+            expr = body.statements[-1].expr
+        if self._is_void_call(expr):
+            return None
+        return expr
+
+    def _guarded_value_type(self, node) -> str:
+        """C type of a retry/timeout expression: its body's value, or the fallback's."""
+        expr = self._block_value_expr(node.body)
+        if expr is None and node.fallback is not None:
+            expr = self._block_value_expr(node.fallback)
+        if expr is None:
+            return "int64_t"
+        return {"str": "const char*", "float": "double", "bool": "bool"}.get(
+            self._infer_expr_print_type(expr), "int64_t")
+
+    def _is_void_call(self, expr) -> bool:
+        if not isinstance(expr, Call):
+            return False
+        if isinstance(expr.func, Identifier) and expr.func.name in ("print", "println", "panic", "exit"):
+            return True
+        return self._infer_call_ret_type(expr) == "void"
+
+    def _emit_guarded_body(self, body, result_var: str):
+        """Body of retry/timeout; its value (last expression) goes to result_var."""
+        if not isinstance(body, Block) and self._is_void_call(body):
+            body = Block(statements=[ExprStmt(expr=body)])
+        if isinstance(body, Block):
+            stmts = body.statements
+            for st in stmts[:-1]:
+                self.generate_node(st)
+            if stmts:
+                last = stmts[-1]
+                if isinstance(last, ExprStmt) and not self._is_void_call(last.expr):
+                    val = self.generate_node(last.expr)
+                    if val:
+                        self.emit(f"{result_var} = {val};")
+                else:
+                    self.generate_node(last)
         else:
             val = self.generate_node(body)
             if val:
                 self.emit(f"{result_var} = {val};")
-        self.emit(f"{success_var} = true;")
-        self.emit("break;")
+
+    def _emit_fallback(self, fallback, result_var: str):
+        if fallback is None:
+            self.emit("til_panic(til_panic_msg);   /* re-raise */")
+            return
+        self.emit("{")
+        self.indent += 1
+        self.emit("const char* error = til_panic_msg;")
+        self.emit("(void)error;")
+        self.string_vars.add("error")
+        self._emit_guarded_body(fallback, result_var)
         self.indent -= 1
         self.emit("}")
 
-        if node.fallback:
-            self.emit(f"if (!{success_var}) {{")
-            self.indent += 1
-            if isinstance(node.fallback, Block):
-                self.generate_node(node.fallback)
-            else:
-                val = self.generate_node(node.fallback)
-                if val:
-                    self.emit(f"{result_var} = {val};")
-            self.indent -= 1
-            self.emit("}")
-
+    def gen_RetryExpr(self, node: RetryExpr) -> str:
+        """retry(n) { body } else { fallback }: on a runtime error (assert, contract,
+        bounds, unwrap, panic, timeout) the body really runs again, up to n times."""
+        self._retry_counter = getattr(self, '_retry_counter', 0) + 1
+        k = self._retry_counter
+        ctype = self._guarded_value_type(node)
+        result_var, rec = f"_retry_result_{k}", f"_rec_{k}"
+        zero = '""' if ctype == "const char*" else "0"
+        self.emit(f"{ctype} volatile {result_var} = {zero};")
+        self.emit("{")
+        self.indent += 1
+        self.emit(f"volatile int64_t _retry_limit_{k} = {self.generate_node(node.count)};")
+        self.emit(f"volatile int64_t _retry_i_{k} = 0;")
+        self.emit(f"TIL_Recover {rec};")
+        # labels instead of a C loop, so `break`/`continue` in the body still
+        # refer to the enclosing TIL loop
+        self.emit(f"_retry_again_{k}:")
+        self.emit(f"{rec}.prev = til_recover_top; {rec}.deadline = 0; til_recover_top = &{rec};")
+        self.emit(f"if (setjmp({rec}.env) == 0) {{")
+        self.indent += 1
+        self._recover_stack.append((rec, self._loop_depth))
+        self._emit_guarded_body(node.body, result_var)
+        self._recover_stack.pop()
+        self.emit(f"til_recover_top = {rec}.prev;")
+        self.indent -= 1
+        self.emit("} else {")
+        self.indent += 1
+        self.emit(f"til_recover_top = {rec}.prev;")
+        self.emit(f"if (++_retry_i_{k} < _retry_limit_{k}) goto _retry_again_{k};")
+        self._emit_fallback(node.fallback, result_var)
+        self.indent -= 1
+        self.emit("}")
+        self.indent -= 1
+        self.emit("}")
         return result_var
 
     def gen_TimeoutExpr(self, node: TimeoutExpr) -> str:
-        """Generate timeout wrapper using alarm/signal (simplified for demo)."""
+        """timeout(ms) { body } else { fallback }: the body is interrupted once it
+        runs longer than ms milliseconds (checked at loop back-edges / calls)."""
         self._timeout_counter = getattr(self, '_timeout_counter', 0) + 1
-        dur_code = self.generate_node(node.duration)
-        result_var = f"_timeout_result_{self._timeout_counter}"
-
-        self.emit(f"int64_t {result_var} = 0;")
-        self.emit(f"// Timeout: {dur_code}ms")
+        k = self._timeout_counter
+        ctype = self._guarded_value_type(node)
+        result_var, rec = f"_timeout_result_{k}", f"_trec_{k}"
+        zero = '""' if ctype == "const char*" else "0"
+        self.emit(f"{ctype} volatile {result_var} = {zero};")
         self.emit("{")
         self.indent += 1
-
-        body = node.body
-        if isinstance(body, Block) and len(body.statements) == 1 and isinstance(body.statements[0], ExprStmt):
-            body = body.statements[0].expr
-
-        if isinstance(body, Block):
-            self.generate_node(body)
-        else:
-            val = self.generate_node(body)
-            if val:
-                self.emit(f"{result_var} = {val};")
+        self.emit(f"TIL_Recover {rec};")
+        self.emit(f"{rec}.prev = til_recover_top; {rec}.deadline = til_now_ms() + (double)({self.generate_node(node.duration)});")
+        self.emit(f"til_recover_top = &{rec};")
+        self.emit(f"if (setjmp({rec}.env) == 0) {{")
+        self.indent += 1
+        self._recover_stack.append((rec, self._loop_depth))
+        self._emit_guarded_body(node.body, result_var)
+        self._recover_stack.pop()
+        self.emit(f"til_recover_top = {rec}.prev;")
+        self.indent -= 1
+        self.emit("} else {")
+        self.indent += 1
+        self.emit(f"til_recover_top = {rec}.prev;")
+        self._emit_fallback(node.fallback, result_var)
         self.indent -= 1
         self.emit("}")
-
+        self.indent -= 1
+        self.emit("}")
         return result_var
 
     def gen_IntentBlock(self, node: IntentBlock) -> str:
