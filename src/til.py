@@ -3635,10 +3635,10 @@ class CCodeGenerator:
                 suffix = "," if i < len(enum_def.variants) - 1 else ""
                 if variant.value is not None:
                     val = self.generate_node(variant.value)
-                    self.emit_raw(f"    {name}_{variant.name} = {val}{suffix}")
+                    self.emit_raw(f"    {self.mangle_name(name)}_{self.mangle_name(variant.name)} = {val}{suffix}")
                 else:
-                    self.emit_raw(f"    {name}_{variant.name} = {i}{suffix}")
-            self.emit_raw(f"}} {name};")
+                    self.emit_raw(f"    {self.mangle_name(name)}_{self.mangle_name(variant.name)} = {i}{suffix}")
+            self.emit_raw(f"}} {self.mangle_name(name)};")
             self.emit_raw("")
 
     def emit_lambdas(self):
@@ -3683,12 +3683,12 @@ class CCodeGenerator:
                 has_self = any(p.name == "self" for p in method.params)
                 params = []
                 if has_self:
-                    params.append(f"{type_name}* self")
+                    params.append(f"{self.mangle_name(type_name)}* self")
                 for p in method.params:
                     if p.name != "self":
-                        params.append(f"{self.type_to_c(p.type)} {p.name}")
+                        params.append(f"{self.type_to_c(p.type)} {self.mangle_name(p.name)}")
                 params_str = ", ".join(params) if params else "void"
-                self.emit_raw(f"static {ret} {type_name}_{method.name}({params_str});")
+                self.emit_raw(f"static {ret} {self.mangle_name(type_name)}_{self.mangle_name(method.name)}({params_str});")
 
         self.emit_raw("")
     
@@ -4201,7 +4201,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         self.emit_raw("// Struct Definitions")
         
         for name, struct in self.structs.items():
-            self.emit_raw(f"struct {name} {{")
+            self.emit_raw(f"struct {self.mangle_name(name)} {{")
             for fld in struct.fields:
                 c_type = self.type_to_c(fld.type)
                 self.emit_raw(f"    {c_type} {fld.name};")
@@ -4210,8 +4210,9 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
 
             # Constructor
             params = ", ".join(f"{self.type_to_c(f.type)} _{f.name}" for f in struct.fields)
-            self.emit_raw(f"static {name} {name}_create({params}) {{")
-            self.emit_raw(f"    {name} _self;")
+            cname = self.mangle_name(name)
+            self.emit_raw(f"static {cname} {cname}_create({params}) {{")
+            self.emit_raw(f"    {cname} _self;")
             for fld in struct.fields:
                 self.emit_raw(f"    _self.{fld.name} = _{fld.name};")
             self.emit_raw(f"    return _self;")
@@ -4230,14 +4231,14 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         # Build parameter list
         params = []
         if has_self:
-            params.append(f"{type_name}* self")
+            params.append(f"{self.mangle_name(type_name)}* self")
         for p in method.params:
             if p.name != "self":
-                params.append(f"{self.type_to_c(p.type)} {p.name}")
+                params.append(f"{self.type_to_c(p.type)} {self.mangle_name(p.name)}")
 
         params_str = ", ".join(params) if params else "void"
 
-        self.emit_raw(f"static {ret} {type_name}_{method.name}({params_str}) {{")
+        self.emit_raw(f"static {ret} {self.mangle_name(type_name)}_{self.mangle_name(method.name)}({params_str}) {{")
         self.indent += 1
 
         # Save and set context
@@ -4409,15 +4410,19 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
 
         # Emit requires contract checks at function entry
         if func.requires:
-            for req_expr in func.requires:
+            for k, req_expr in enumerate(func.requires):
                 req_code = self.generate_node(req_expr)
-                self.emit(f'if (!({req_code})) {{ til_panic("Contract violation: requires failed"); }}')
+                text = func.requires_text[k] if k < len(func.requires_text) else ""
+                msg = f"contract violation: {func.name} requires {text}".strip()
+                self.emit(f'if (!({req_code})) {{ til_panic({c_string_literal(msg)}); }}')
 
         # Set up ensures for gen_Return to use
         old_ensures = self._current_ensures
         old_ensures_ret = self._current_ensures_ret_type
         old_ret_type = self._current_ret_type
         self._current_ensures = func.ensures if func.ensures else []
+        self._current_ensures_text = func.ensures_text or []
+        self._current_func_name = func.name
         self._current_ensures_ret_type = ret
         self._current_ret_type = func.ret_type
 
@@ -4534,9 +4539,10 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 self.struct_vars[node.name] = node.value.func.name
         elif node.type_ann and isinstance(node.type_ann, StructType):
             self.struct_vars[node.name] = node.type_ann.name
-        # Check c_type against known struct names
-        if c_type in self.structs:
-            self.struct_vars[node.name] = c_type
+        # Check c_type against known struct names (C names may be mangled)
+        sname = self._struct_of_ctype(c_type)
+        if sname:
+            self.struct_vars[node.name] = sname
         # Track enum types
         if c_type in self.enums:
             pass  # enums are int-like in C
@@ -4731,9 +4737,12 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                 self.emit(f"{{ {ret_type} _result = {val};")
                 old_in_ensures = self._in_ensures
                 self._in_ensures = True
-                for ens_expr in self._current_ensures:
+                texts = self._current_ensures_text
+                for k, ens_expr in enumerate(self._current_ensures):
                     ens_code = self.generate_node(ens_expr)
-                    self.emit(f'  if (!({ens_code})) {{ til_panic("Contract violation: ensures"); }}')
+                    msg = f"contract violation: {self._current_func_name} ensures " \
+                          f"{texts[k] if k < len(texts) else ''}"
+                    self.emit(f'  if (!({ens_code})) {{ til_panic({c_string_literal(msg.strip())}); }}')
                 self._in_ensures = old_in_ensures
                 self.emit(f"  return _result; }}")
             else:
@@ -5099,7 +5108,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             if resolved_type:
                 if resolved_type in self.enums:
                     # Enum member access: Color.Red -> Color_Red
-                    return f"{resolved_type}_{method_name}"
+                    return f"{self.mangle_name(resolved_type)}_{self.mangle_name(method_name)}"
                 # Check if method has self parameter (instance method vs static)
                 is_instance = False
                 if resolved_type in self.impl_methods:
@@ -5116,7 +5125,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                     args_str = ", ".join([self_arg] + args)
                 else:
                     args_str = ", ".join(args)
-                return f"{resolved_type}_{method_name}({args_str})"
+                return f"{self.mangle_name(resolved_type)}_{self.mangle_name(method_name)}({args_str})"
 
             # Module-qualified call: `math_utils.square(5)` (imports are merged,
             # so this is a call of the imported top-level function)
@@ -5220,16 +5229,20 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
                     if fld.name == node.attr:
                         if isinstance(fld.type, StructType):
                             return fld.type.name
-                        ct = self.type_to_c(fld.type)
-                        if ct in self.structs:
-                            return ct
+                        return self._struct_of_ctype(self.type_to_c(fld.type))
             return None
         if isinstance(node, Call):
             # Method call result: e.g., v1.add(v2) -> Vector2D
-            ret = self._infer_call_ret_type(node)
-            if ret in self.structs:
-                return ret
-            return None
+            return self._struct_of_ctype(self._infer_call_ret_type(node))
+        return None
+
+    def _struct_of_ctype(self, c_type: str) -> Optional[str]:
+        """TIL struct name for a C type name (struct names are mangled in C)."""
+        if c_type in self.structs:
+            return c_type
+        for name in self.structs:
+            if self.mangle_name(name) == c_type:
+                return name
         return None
 
     def _is_string_expr(self, node) -> bool:
@@ -5294,7 +5307,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             return f"self->{node.attr}"
         # Check if it's an enum member access: Color.Red -> Color_Red
         if isinstance(node.obj, Identifier) and node.obj.name in self.enums:
-            return f"{node.obj.name}_{node.attr}"
+            return f"{self.mangle_name(node.obj.name)}_{self.mangle_name(node.attr)}"
         return f"{obj}.{node.attr}"
     
     def gen_ListComprehension(self, node: ListComprehension) -> str:
@@ -5627,7 +5640,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         else:
             args = [self.generate_node(v) for v in node.fields.values()]
 
-        return f"{node.name}_create({', '.join(args)})"
+        return f"{self.mangle_name(node.name)}_create({', '.join(args)})"
     
     def gen_MatchExpr(self, node: MatchExpr) -> str:
         val = self.generate_node(node.value)
@@ -5813,7 +5826,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             return f"{inner}*"
         
         if isinstance(t, StructType):
-            return t.name
+            return self.mangle_name(t.name)
 
         if isinstance(t, OptionType):
             inner_c = self.type_to_c(t.inner)
@@ -5862,7 +5875,7 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
             if isinstance(node.value, ArrayLit):
                 return self.infer_array_elem_type(node.value) + '*'
             if isinstance(node.value, StructInit):
-                return node.value.name  # Return struct name as C type
+                return self.mangle_name(node.value.name)  # struct name as C type
             if isinstance(node.value, Cast):
                 return self.type_to_c(node.value.target_type)
             if isinstance(node.value, Call):

@@ -1,0 +1,54 @@
+# 10_verified.til
+# TIL 3.0 - guarantees checked by the compiler (try breaking them!)
+#
+#   * effects:      #[pure] / #[effects: ...] are checked against the body
+#   * capabilities: only functions holding #[cap: X] (or main) may use X
+#   * contracts:    #[requires] with constant arguments is checked at compile time,
+#                   otherwise at run time (and failures can be caught with retry)
+
+cap Storage { read, write }
+
+#[pure]
+#[requires: b != 0]
+safe_div(a: int, b: int) -> int
+    return a / b
+
+#[pure]
+#[ensures: result >= 0]
+abs_diff(a: int, b: int) -> int
+    if a > b
+        return a - b
+    return b - a
+
+#[effects: io]
+report(label: str, value: int)
+    print(f"{label}: {value}")
+
+#[cap: Storage]
+#[effects: io]
+save(name: str, value: int)
+    print(f"[storage] {name} = {value}")
+
+#[cap: Storage]
+#[effects: io]
+backup(value: int)
+    save("backup", value)      # allowed: backup also holds Storage
+
+main()
+    report("10 / 2", safe_div(10, 2))
+    report("|3 - 8|", abs_diff(3, 8))
+    save("score", 99)          # main holds every capability
+    backup(42)
+
+    # A contract violation with a value known only at run time:
+    var zero = 0
+    let r = retry(1)
+        safe_div(1, zero)
+    else
+        print(error)
+        -1
+    report("fallback", r)
+
+    # These lines would NOT compile - uncomment one to see the error:
+    # report("x", safe_div(1, 0))       error[E-CONTRACT]: breaks #[requires: b != 0]
+    # print(abs_diff(1, 2, 3))          error[E-ARITY]
