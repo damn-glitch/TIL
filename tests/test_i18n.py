@@ -441,6 +441,27 @@ class TestCommandLine:
         assert capsys.readouterr().err.split('\n')[0] == IMMUTABLE_HEADER['kk']
         assert til.MESSAGE_LANG is None and til.localize("error: x") == "error: x"
 
+    def test_extra_commands(self, monkeypatch, capsys):
+        # `til pkg/fit/debug/prove ... --lang ru`: the option is the compiler's, the tool
+        # reads the language from til.MESSAGE_LANG (and its own arguments stay intact)
+        seen = {}
+
+        class Tool:
+            @staticmethod
+            def main(argv):
+                seen['argv'], seen['lang'] = argv, til.MESSAGE_LANG
+                print(til.localize("error: Unexpected token: COLON"), file=sys.stderr)
+                return 0
+        monkeypatch.setitem(til.EXTRA_COMMANDS, 'zzz', ('til_zzz_tool', 'test'))
+        monkeypatch.setitem(sys.modules, 'til_zzz_tool', Tool)
+        monkeypatch.setattr(sys, 'argv', ['til', 'zzz', 'add', '--lang', 'kk', 'x', '--lang=ru', '--',
+                                          '--lang', 'en'])
+        monkeypatch.setenv('TIL_LANG', '')
+        assert til.main() == 0
+        assert seen == {'argv': ['add', 'x', '--', '--lang', 'en'], 'lang': 'ru'}
+        assert capsys.readouterr().err == "ошибка: неожиданный токен: COLON\n"
+        assert til.without_lang_option(['--lang']) == ['--lang']      # no value: left to the tool
+
     def test_repl(self):
         r = run_til('repl', input_text="print(y)\nlet z = 1 / 0\nexit\n", til_lang='ru')
         assert "ошибка[E-VM]: неизвестное имя 'y'" in r.stdout

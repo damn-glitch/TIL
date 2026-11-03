@@ -9685,6 +9685,23 @@ def set_message_language(args: List[str]) -> Optional[str]:
     return None
 
 
+def without_lang_option(args: List[str]) -> List[str]:
+    """The arguments for an extra command (`til pkg`, `til debug`, ...): --lang is
+    the compiler's option (the tool finds the language in til.MESSAGE_LANG)."""
+    out: List[str] = []
+    i = 0
+    while i < len(args):
+        if args[i] == '--':
+            return out + args[i:]
+        if args[i] == '--lang' and i + 1 < len(args):
+            i += 2
+            continue
+        if not args[i].startswith('--lang='):
+            out.append(args[i])
+        i += 1
+    return out
+
+
 def scoped_message_language(func):
     """Decorator for main(): the message language it chooses lasts for that call
     only (main() also runs in-process, e.g. in tests; library use stays English)."""
@@ -9938,7 +9955,7 @@ def main():
         return 1
 
     if args[0] in EXTRA_COMMANDS:
-        return run_extra_command(args[0], args[1:])
+        return run_extra_command(args[0], without_lang_option(args[1:]))
 
     command = None
     if args and args[0] in ('run', 'build', 'check', 'repl', 'exec', 'dis', 'translate'):
