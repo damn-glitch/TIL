@@ -146,7 +146,7 @@ class TILAnalyzer:
         'struct', 'enum', 'impl', 'trait', 'match', 'type', 'pub',
         'as', 'and', 'or', 'not', 'true', 'false', 'True', 'False',
         'self', 'None',
-        'retry', 'timeout', 'intent', 'assert', 'invariant', 'cap', 'perform', 'handle'
+        'retry', 'timeout', 'intent', 'assert', 'invariant', 'cap', 'perform', 'handle', 'with', 'resume'
     ]
     
     TYPES = [
