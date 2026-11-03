@@ -788,7 +788,9 @@ class Analysis:
         self._line_nums = [line for _pc, line in m.lines]
         self.methods_by_name: Dict[str, List[int]] = {}
         for _t, name_k, fidx in m.methods:
-            self.methods_by_name.setdefault(self.const_text(name_k), []).append(fidx)
+            if 0 <= fidx < len(m.funcs):
+                self.methods_by_name.setdefault(self.const_text(name_k), []).append(fidx)
+        m.prelude = {mid: f for mid, f in m.prelude.items() if 0 <= f < len(m.funcs)}
         self.field_names = {fld for _n, fields in m.types[til.TYPE_ERR + 1:] for fld in fields}
         self._facts: Dict[int, FuncFacts] = {}
         self.has_maps = self._program_has_maps()
@@ -813,7 +815,11 @@ class Analysis:
     def where(self, fidx: int, pc: int) -> str:
         """'line 12 in main' or, without line tables, 'main+26' (offset in the function)."""
         name = self.module.funcs[fidx].name
+        if name.startswith('__prelude_'):            # .map()/.filter()/... are written in TIL
+            return f"in .{name[len('__prelude_'):]}()"
         line = self.line_of(pc) if self.has_lines else 0
+        if fidx == self.module.entry:
+            return f"line {line} (global initialization)" if line else "the global initialization"
         if line:
             return f"line {line} in {name}"
         return f"{name}+{pc - self.ranges[fidx][0]}"
@@ -1044,8 +1050,10 @@ class Analysis:
         """(function, pc) of the reachable PUSH_CONST k instructions."""
         return [(ff.index, pc) for ff in self.reachable_facts() for pc in ff.const_uses.get(k, ())]
 
-    def worst_path(self) -> List[int]:
-        """The call chain that needs the most value-stack slots (recursion cut)."""
+    def worst_path(self, table: Optional[Dict[int, Optional[int]]] = None) -> List[int]:
+        """The call chain behind a worst case (value-stack need by default; recursion cut)."""
+        table = self.func_need if table is None else table
+        by_slots = table is self.func_need
         path, f, seen = [self.module.entry], self.module.entry, set()
         while f not in seen:
             seen.add(f)
@@ -1053,17 +1061,25 @@ class Analysis:
             best, best_val = None, -1
             for s in ff.calls:
                 for g, c in s.targets:
-                    v = self.func_need.get(g)
+                    v = table.get(g)
                     if g in seen or v is None:
                         continue
-                    v += ff.n_locals + s.depth - c
+                    v += (ff.n_locals + s.depth - c) if by_slots else 0
                     if v > best_val:
                         best, best_val = g, v
-            if best is None or best_val < ff.n_locals + ff.max_need:
+            if best is None or (by_slots and best_val < ff.n_locals + ff.max_need):
                 break
             path.append(best)
             f = best
         return path
+
+    def display_name(self, fidx: int) -> str:
+        name = self.module.funcs[fidx].name
+        if fidx == self.module.entry:
+            return "(start)"
+        if name.startswith('__prelude_'):
+            return f".{name[len('__prelude_'):]}()"
+        return name
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1228,7 +1244,9 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
     if 'to_float' in methods:
         fl_natives.append('to_float')
     uses_float = bool(an.uses_float_consts or casts or fl_natives)
-    used = ("constants" if an.uses_float_consts else "conversions") if uses_float else "none"
+    kinds = [k for k, on in (("constants", an.uses_float_consts), ("conversions", casts),
+                             ("math", fl_natives)) if on]
+    used = ", ".join(kinds) if kinds else "none"
     has = {0: "none", 1: "float32", 2: "float64"}[dev.float]
     fail = dev.float == 0 and uses_float
     r.row('floats', "floats", used, has, "FAIL" if fail else "ok")
@@ -1242,11 +1260,12 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
             r.error(f"values are converted to float at {_places(an, casts)} (float(), `: float` / "
                     f"`-> float` annotations, `as float`); a VM without floats stops there",
                     "float conversions (the device has no floats)")
-        names = [n for n in fl_natives if n not in ('float',)]
-        if names:
-            sites = [s for n in names for s in natives.get(n, methods.get(n, []))]
-            r.error(f"{', '.join(n + '()' for n in names)} need floats ({_places(an, sites)}); the device's VM "
-                    f"reports \"not available\"", f"{', '.join(n + '()' for n in names)} need floats")
+        if fl_natives:
+            sites = [s for n in fl_natives for s in natives.get(n, methods.get(n, []))]
+            listed = ", ".join(n + "()" for n in fl_natives)
+            verb = "needs" if len(fl_natives) == 1 else "need"
+            r.error(f"{listed} {verb} floats ({_places(an, sites)}); a VM without floats stops there",
+                    f"{listed} {verb} floats")
         if 'random' in natives and not dev.lean:
             r.warn("random() returns an integer 0..32767 instead of a float on a VM without floats")
     elif dev.float == 1 and uses_float:
@@ -1329,25 +1348,28 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
         if an.recursions:
             per = max(rc.slots_per_level for rc in an.recursions)
             rec_note = f"+{per} per recursion level" if per else "recursion"
-        path = [m.funcs[f].name for f in an.worst_path()]
-        for key, label, need, limit, unit in (
-                ('stack', "value stack", an.slots_need, dev.stack, "slots"),
-                ('frames', "call frames", an.frames, dev.frames, ""),
-                ('try', "recovery points", an.tries, dev.try_depth, "")):
+        chains = {'stack': an.worst_path(), 'frames': an.worst_path(an.func_frames)}
+        for key, label, need, limit, unit, what in (
+                ('stack', "value stack", an.slots_need, dev.stack, "slots", "value-stack slots"),
+                ('frames', "call frames", an.frames, dev.frames, "", "call frames"),
+                ('try', "recovery points", an.tries, dev.try_depth, "", "nested retry/timeout/intent blocks")):
             ok = need <= limit
             note = rec_note if key == 'stack' else ("+1 per recursion level" if key == 'frames' and an.recursions
                                                     else "")
             r.row(key, label, f"{need} {unit}".strip(), str(limit), "ok" if ok else "FAIL", note,
                   need_value=need, limit_value=limit)
+            path = [an.display_name(f) for f in chains.get(key, [])]
+            if len(path) > 8:
+                path = path[:3] + [f"... {len(path) - 6} more ..."] + path[-3:]
+            chain = f" (deepest call chain: {' -> '.join(path)})" if len(path) > 2 else ""
             if not ok:
-                chain = f" (deepest call chain: {' -> '.join(path)})" if key == 'stack' and len(path) > 1 else ""
-                r.error(f"the {label} needs {need} {unit or 'levels'} in the worst case{chain}; the device "
-                        f"allows {limit}", f"{label} {need} > {limit}")
+                r.error(f"the worst case needs {need} {what}{chain}; the device has {limit}",
+                        f"{label} {need} > {limit}")
             elif need > 0.8 * limit and need > 4:
-                r.warn(f"the {label} uses {need} of {limit} in the worst case: little room left")
+                r.warn(f"the worst case uses {need} of the {limit} {what}: little room left")
         for rec in an.recursions:
             levels, limiter = recursion_levels(rec, dev)
-            names = [m.funcs[f].name for f in rec.members]
+            names = [an.display_name(f) for f in rec.members]
             who = (f"{names[0]} calls itself" if len(names) == 1 else
                    f"{', '.join(names)} call each other")
             at = an.where(*rec.call_pc) if rec.call_pc else names[0]
@@ -1368,8 +1390,8 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
             for pc, text in ff.data_dependent:
                 dd.setdefault(text, []).append((ff.index, pc))
         for text, sites in dd.items():
-            r.warn(f"stack use grows with the data: {text} ({_places(an, sites, 2)}); it needs that many "
-                   f"free slots of the {dev.stack}")
+            r.warn(f"stack use grows with the data: {text} ({_places(an, sites, 2)}): one free slot per "
+                   f"element of the {dev.stack} on this device")
         for ff in facts:
             for pc, n in ff.range_consts.items():
                 if n > dev.stack // 2:
@@ -1579,15 +1601,19 @@ def apply_run(r: Report, run: Dict[str, Any], compared: bool, why_not: str = "")
                                     ('frames', 'peak_frames', dev.frames, "call frames")):
         v = st.get(stat)
         if v is not None and err is None and v > 0.8 * limit and v > 4:
-            r.warn(f"the run used {v} of {limit} {label} entries: little room left")
+            r.warn(f"the run used {v} of the {limit} {label}{' slots' if key == 'stack' else ''}: "
+                   f"little room left")
     live = st.get('peak_live')
     if live and live > 0.75 * dev.heap:
         r.warn(f"live data reached {human(live)} of the {human(dev.heap)} heap after a collection: "
                f"a little more data will exhaust it")
-    if an.complete and not an.recursions and err is None:
-        if an.slots_occ is not None and st.get('peak_stack', 0) > an.slots_occ:
-            r.warn(f"measured stack use ({st['peak_stack']}) exceeds the static bound ({an.slots_occ}): "
-                   f"please report this (til fit analysis bug)")
+    # self-check: without recursion and data-dependent builtins the static numbers are upper bounds
+    if an.complete and not an.recursions and err is None and \
+            not any(ff.data_dependent for ff in an.reachable_facts()):
+        for stat, bound in (('peak_stack', an.slots_occ), ('peak_frames', an.frames), ('peak_try', an.tries)):
+            if bound is not None and st.get(stat, 0) > bound:
+                r.warn(f"measured {stat[5:]} ({st[stat]}) exceeds the static bound ({bound}): please "
+                       f"report this (til fit analysis bug)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

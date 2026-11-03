@@ -231,6 +231,47 @@ def test_struct_model_matches_cross_compilers(name, cmd, sdcc, tmp_path):
     assert got == (want['tilvm'], want['tv_val'])
 
 
+cross = pytest.mark.skipif(not os.environ.get('TIL_TEST_CROSS'), reason="set TIL_TEST_CROSS=1")
+
+PORT_BUILDS = [
+    ('atmega1284', ['avr-gcc', '-mmcu=atmega1284p', '-Os', '-std=gnu99'], 'avr', 'avr-size'),
+    ('arduino-mega', ['avr-gcc', '-mmcu=atmega2560', '-Os', '-std=gnu99'], 'avr', 'avr-size'),
+    ('cortex-m3-64k', ['arm-none-eabi-gcc', '-mcpu=cortex-m3', '-mthumb', '-Os', '-std=c99'], 'cortex-m',
+     'arm-none-eabi-size'),
+]
+
+
+@cross
+@pytest.mark.parametrize("name, cmd, port, size_tool", PORT_BUILDS, ids=[b[0] for b in PORT_BUILDS])
+def test_ram_model_matches_the_linked_port(name, cmd, port, size_tool, tmp_path):
+    """Link the real port with a program: its static RAM (.data + .bss) is what the
+    model counts (VM struct + VM tables [+ bytecode copied to RAM])."""
+    if shutil.which(cmd[0]) is None:
+        pytest.skip(f"{cmd[0]} not installed")
+    dev = fit.DEVICES[name]
+    data = compile_vm(open(os.path.join(ROOT, 'examples', '05_control_flow.til')).read()).serialize(strip=True)
+    (tmp_path / "program.h").write_text(til.bytes_to_c_array('til_program', data))
+    pdir = os.path.join(VM_DIR, 'ports', port)
+    srcs = [os.path.join(pdir, 'main_avr.c')] if port == 'avr' else \
+        [os.path.join(pdir, 'main_arm.c'), os.path.join(pdir, 'startup.c')]
+    extra = [] if port == 'avr' else ['-T', os.path.join(pdir, 'lm3s6965.ld'), '-nostartfiles',
+                                      '--specs=nano.specs', '--specs=nosys.specs']
+    elf = tmp_path / "t.elf"
+    r = subprocess.run(cmd + ['-ffunction-sections', '-fdata-sections', '-Wl,--gc-sections'] + dev.c_flags() +
+                       ['-I', VM_DIR, '-I', str(tmp_path)] + extra + ['-o', str(elf)] + srcs +
+                       [os.path.join(VM_DIR, 'tilvm.c'), '-lm'], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    sizes = dict((m.group(1), int(m.group(2))) for m in re.finditer(
+        r'^\.(data|bss|text)\s+(\d+)', subprocess.run([size_tool, '-A', str(elf)], capture_output=True,
+                                                     text=True).stdout, re.M))
+    layout = fit.vm_struct_layout(dev)
+    assert sizes['bss'] >= layout['tilvm'] and sizes['bss'] - layout['tilvm'] < 512
+    static = sizes['data'] - (len(data) if dev.bytecode_in_ram else 0)
+    assert abs(static - dev.vm_static_ram) <= 160, (static, dev.vm_static_ram)
+    assert sizes['text'] + (0 if dev.bytecode_in_ram else len(data)) + (dev.storage or 0) <= \
+        (128 if name == 'atmega1284' else 256) * 1024 + len(data)
+
+
 # ═══════════════════════════════════════════════════════════════
 # STATIC ANALYSIS
 # ═══════════════════════════════════════════════════════════════
@@ -422,6 +463,24 @@ class TestStaticVersusMeasured:
         assert "recursion too deep" in bad.stderr
 
 
+    def test_stack_limited_recursion_is_exact(self, tmp_path):
+        """Same when the value stack (not the call depth) limits the recursion."""
+        values = fit.DEVICES['desktop'].as_dict()
+        del values['name']
+        values.update(stack=300, heap=8192, title="small stack")
+        dev = fit.Device('small-stack', **values)
+        src = ('deep(n: int) -> int\n    let a = n + 1\n    let b = a * 2\n    let c = b - 1\n'
+               '    if n == 0\n        return c\n    return deep(n - 1) + a + b + c\nprint(deep(N))\n')
+        rec = fit.check(analyze(src.replace('N', '1')), dev).recursion[0]
+        assert rec["limited_by"] == "value stack" and rec["slots_per_level"] == 4   # n, a, b, c
+        exe, err = fit.build_device_vm(dev)
+        assert exe, err
+        ok, _ = measure(compile_vm(src.replace('N', str(rec['levels'] - 1))).serialize(), tmp_path, exe)
+        bad, _ = measure(compile_vm(src.replace('N', str(rec['levels']))).serialize(), tmp_path, exe)
+        assert ok.returncode == 0, ok.stderr
+        assert bad.returncode == 1 and "stack overflow" in bad.stderr and "too deep" not in bad.stderr
+
+
 # ═══════════════════════════════════════════════════════════════
 # VERDICTS (static)
 # ═══════════════════════════════════════════════════════════════
@@ -467,7 +526,9 @@ class TestVerdicts:
         r = report('half(x: float) -> float\n    return x / 2\nprint(half(3))\n', 'z80-16')
         assert "float" in r.verdict()
         r = report('print(sqrt(16))\n', 'z80-16')
-        assert "sqrt() need floats" in r.verdict()
+        assert "sqrt() needs floats" in r.verdict()
+        r = report('print(float(3))\n', 'z80-16')
+        assert "float() needs floats" in r.verdict()
         assert report('print(sqrt(16))\n', 'arduino-mega').fits     # float32 there
 
     @pytest.mark.parametrize("device", ['z80-16', 'arduino-mega'])

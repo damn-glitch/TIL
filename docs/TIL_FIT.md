@@ -109,7 +109,9 @@ and `TILVM_NO_TIME` (the port provides output and, where noted, a clock).
 * **AVR keeps constant data in RAM** (Harvard architecture, no `PROGMEM` in the
   VM): the VM's string tables and error messages take 3130 bytes of RAM (full
   build) or 2480 bytes (lean build), measured as `.data` minus the program with
-  avr-gcc. The AVR port also copies the bytecode into RAM (`program.h`), so on
+  avr-gcc (`TIL_TEST_CROSS=1 pytest tests/test_fit.py` links the AVR and Cortex-M
+  ports and compares their `.data`/`.bss` with the model). The AVR port also
+  copies the bytecode into RAM (`program.h`), so on
   `atmega1284` and `arduino-mega` the bytecode counts against RAM, not only
   against flash — on the ATmega1284P that leaves about 4.3 KB for bytecode.
 * **`arduino-mega`** (ATmega2560: 8 KB RAM, 256 KB flash): a lean 16-bit build in
@@ -389,6 +391,17 @@ like a linker whose memory region overflows. `--strip` is taken into account.
 `--target c-vm --device NAME` checks the same way (compile the generated C file
 with the device's flags; `til fit --json` lists them under `vm.c_flags`).
 `--device` with any other target or command is an error.
+
+## Tests
+
+`tests/test_fit.py`: profiles and the struct model (host compiler; avr-gcc,
+arm-none-eabi-gcc and SDCC when installed), the analysis on hand-made and
+patched bytecode, static bounds against measured high-water marks (exact on
+the corpus), recursion levels against the device builds, verdicts, `--run`,
+the lean tables against a real lean build, the C VM macros (strict builds,
+packed layout, console runner) and `til build --device`. Opt-in:
+`TIL_TEST_SLOW=1` (every device VM built and run) and `TIL_TEST_CROSS=1`
+(linked ports).
 
 ## Limitations
 
