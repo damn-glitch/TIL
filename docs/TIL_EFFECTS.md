@@ -55,8 +55,26 @@ resume(v)   resume()   resume       # only inside a clause; resume() == resume(N
   carry a type (`x: float` converts like a function parameter). Clauses for
   different effects may appear in any order; **two clauses for one effect in
   one handle are a compile error**.
-* `with` and `resume` are keywords since TIL 3.1 (they cannot be variable
-  names any more; `perform` and `handle` were already reserved in 3.0).
+* `perform` and `handle` have been reserved words since TIL 3.0. Every other
+  effect word is a **contextual keyword**: it is an ordinary name everywhere
+  except in the one position where it introduces effect syntax, so no TIL 3.0
+  program changes meaning (variables, functions, methods and fields may still be
+  called `with`, `resume`, `с`, `орындау`, ...):
+
+  | word | is the keyword ... | elsewhere |
+  |---|---|---|
+  | `with` (all languages) | right after the body of a `handle` | a name: `let with = 1`, `t.with(2)` |
+  | `resume` (all languages) | anywhere inside an effect clause (not in a lambda in it) | a name: `t.resume()`, `resume(x)` calls a function |
+  | localized `perform` | when an identifier follows on the same line (`орындау Сұрау(1)`) | `орындау(x)` is a call, `орындау(x) -> int` a definition |
+  | localized `handle` | when a newline and an indented body follow, or (same line) an identifier, a literal, `perform`, `handle`, `match`, `retry` or `timeout` | `өңдеу(x)` is a call (use the block form for a parenthesized body) |
+
+  Inside a clause the resume word always means resume: a clause parameter or a
+  `let`/`var`/`for` variable with that name is a compile error (`'resume' is
+  reserved inside an effect clause`), and a function named `resume` cannot be
+  called from a clause. Outside clauses, a call of an undefined `resume(...)`
+  reports `unknown function 'resume': resume(...) outside an effect clause`.
+  A real reserved word used as a name names itself in the error
+  (`'handle' is a reserved word and cannot be used as a name`).
 
 | English | Kazakh (always on) | Kazakh Latin (`#[lang: kk-latn]`) | Russian (`#[lang: ru]`) |
 |---|---|---|---|
@@ -65,15 +83,24 @@ resume(v)   resume()   resume       # only inside a clause; resume() == resume(N
 | `with` | `арқылы` | `arqyly` | `с` |
 | `resume` | `жалғау` | `zhalgau` | `возобновить` |
 
-`til translate --to kk|kk-latn|ru|en` converts all four and round-trips.
+`til translate --to kk|kk-latn|ru|en` converts all four and round-trips (it
+parses the file to tell the keyword uses of these words from names; a file that
+does not parse keeps the contextual words as they are). The REPL (`til repl`)
+reads a multi-line block after a line that starts with `handle` or ends with a
+`handle` word (`let r = handle`, `тұрақты r = өңдеу`); a bare `handle ... with`
+block is evaluated like an expression (its value is printed unless it is
+`None`).
 
 ### Compile-time errors
 
 | Program | Error |
 |---|---|
 | two clauses `A(...)` in one handle | `duplicate clause for effect 'A' in one handle` |
-| `resume` outside a clause (also in a lambda inside a clause) | `resume(...) outside an effect clause` |
-| a statement directly after `resume(...)` in the same block | `unreachable code after resume(...)` |
+| `resume` outside a clause (also in a lambda inside a clause), no function `resume` | `unknown function 'resume': resume(...) outside an effect clause` (E-VM) |
+| a statement after a statement that always resumes (`resume(1)`, `if c` / `else` both resuming, ...) | `unreachable code after resume(...)` |
+| using the value of `resume(...)`: `let v = resume(1)`, `print(resume(1))`, `resume(1) + 1`, `f(resume(x))` | `the value of resume(...) is never available: resume ends the clause` |
+| a condition or match subject that always resumes (`if resume(1)`, `match resume(1)`) | `unreachable code after resume(...)` / `the match arms are never reached: ...` |
+| a clause parameter or variable named `resume` | `'resume' is reserved inside an effect clause` |
 | `return` in a clause | `'return' is not allowed in an effect clause` |
 | `break` / `continue` that would leave a clause | `'break' cannot leave an effect clause` |
 | `perform A(1, 2)` lexically inside a handle whose clause `A` takes 1 parameter | `effect 'A' expects 1 argument(s), got 2` (E-VM) |
@@ -95,9 +122,14 @@ whole body (deep handlers): every perform in the body finds it again.
 
 **`resume(v)` - one-shot tail resumption.** `resume(v)` immediately returns `v`
 as the value of the `perform` expression and the body continues; the clause is
-finished at that point. Statements after `resume` in the clause never run (a
-statement directly after it is a compile error; code reachable only through
-other paths, e.g. after an `if` that resumes in one branch, is fine). The body
+finished at that point. Code that could only run after a `resume` is a compile
+error, never silently dropped: a statement after a statement that always
+resumes (`resume(1)`, an `if`/`else` whose branches all resume), and any
+expression that would use the value of `resume(...)` (`let v = resume(1)`,
+`print(resume(1))`, `resume(1) + 1`). Code reachable through other paths is
+fine: after an `if` that resumes in one branch, the other operand of `and`/`or`,
+the arms of a `match`, loop bodies, and `retry`/`timeout`/nested `handle`
+blocks (a runtime error or a clause abort may skip their `resume`). The body
 can be resumed at most once per perform.
 
 **No resume - abort.** When a clause finishes without `resume`, its value (the
@@ -163,8 +195,13 @@ with
 ```
 
 **Leaving a handle body** with `return`, `break`, `continue` or `?` removes its
-handler. `retry`/`timeout` may be used inside clauses; `resume` from inside
-them drops their recovery points.
+handler - also when the handle is part of a larger expression
+(`total += handle ... continue ...`): the values that expression had already
+computed are dropped, so a loop never accumulates stack slots (the same now
+holds for `retry`, `timeout` and `match` blocks inside expressions, which
+leaked one slot per `break`/`continue` in TIL 3.0).
+`retry`/`timeout` may be used inside clauses; `resume` from inside them drops
+their recovery points.
 
 **Closures.** Clauses are closures: they see the variables in scope at the
 `handle` expression (not the variables declared inside its body) and may
@@ -195,6 +232,19 @@ total(xs) -> int
     with
         Weight(x) => resume(x * 2)       # pure: Weight is handled here
 ```
+
+The builtin effect `io` is never handled: `print`, `input` and the other I/O
+builtins do not perform an effect a clause could intercept, so a clause named
+`io` does not make a callee's printing pure (`perform io()` still counts as
+`io` too).
+
+**Capabilities.** `perform E(...)` calls the top-level function `E` when no
+handler is active, so for `#[cap: X]` it is a use of `E`: a function that
+performs `E` needs the capabilities of `E` (error E-CAP, hint "`perform E(...)`
+calls the function 'E' when no handler is active") - unless a `handle` with a
+clause for `E` surrounds the perform in the same function, *not* through a
+lambda (a lambda may escape the handle and perform later, when the default
+function runs). This check is sound; the effect check above stays lexical.
 
 ### Native backend
 
@@ -229,9 +279,17 @@ end:
   `MAKE_CLOSURE` when it captures variables (captured locals live in cells,
   like for lambdas). Its last instruction is `RETURN` of the clause value.
 * `resume(v)` compiles to `<v> RESUME` (`resume()` pushes nil).
-* `break`/`continue` leaving k handle bodies emit `PUSH_NIL`, `END_HANDLE` x k,
-  `POP` before the jump. `return` and `?` need nothing: returning drops the
-  handler entries of the frame.
+* `break`/`continue` leaving k handle bodies emit `END_TRY` for every
+  `retry`/`timeout` they leave, then `PUSH_NIL`, `END_HANDLE` x k, `POP`, then
+  one `POP` for every value the enclosing expression had pushed before the
+  outermost left handle (or before the `break`, when no handle is left), and
+  then the jump. Example, `total += handle ... continue ... with ...` in a loop:
+  `LOAD_LOCAL total` is pushed before the pairs, so the `continue` path is
+  `PUSH_NIL END_HANDLE POP POP JUMP`. The compiler knows these counts because it
+  follows the operand stack depth of everything it emits (`_STACK_EFFECT` in
+  `src/til.py`; a test checks that every statement is stack-neutral and every
+  expression pushes one value). `return` and `?` need nothing: returning drops
+  the handler entries and the stack of the frame.
 
 ### Handler stack
 
@@ -333,8 +391,16 @@ inlining), AVR about +3 KB. `TILVM_NO_EFFECTS` brings the size back to the
 * **Tail resumption only.** A clause cannot do work after `resume`, so the VMs
   never copy or keep a continuation: `resume` is a return to the perform site
   and an abort is a jump to the handle's end. Multi-shot or non-tail
-  resumption would need first-class continuations (not supported - and a
-  statement after `resume` is rejected rather than silently ignored).
+  resumption would need first-class continuations (not supported - and code
+  after `resume`, or code using its value, is rejected rather than silently
+  ignored).
+* **The pairs are part of the operand stack depth.** HANDLE leaves its 2n
+  values on the stack (the design table in `docs/dev/TIL_3_1_DESIGN.md` §1 says
+  so too), so tools that compute stack depths (`til fit`, the debugger,
+  portable snapshots) count 2n slots per active handle.
+* **No new reserved words.** `with`, `resume` and the localized
+  `perform`/`handle` words are contextual keywords (see Syntax), so TIL 3.0
+  programs that use them as names keep compiling unchanged.
 * **Errors in clauses propagate from the perform site** (see Semantics): a
   clause behaves like a dynamically bound function called by `perform`, which
   is what TIL 3.0's `perform` was. Handler *effects* are masked, recovery

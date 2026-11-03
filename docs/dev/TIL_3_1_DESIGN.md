@@ -107,11 +107,16 @@ otherwise (`ENTER=13 ESC=27 SPACE=32`, letters/digits as ASCII).
 
 | op | hex | operands | meaning |
 |---|---|---|---|
-| HANDLE | 76 | b n, s rel_end | pops n (clause closure, effect-name string) pairs; pushes a handler record; `rel_end` = abort target |
-| END_HANDLE | 77 | | body finished: pop the handler record |
-| PERFORM | 78 | h name, h default_fn, b argc | perform an effect (see §8) |
+| HANDLE | 76 | b n, s rel_end | pushes a handler record for the n (clause closure, effect-name string) pairs on top of the value stack; the pairs **stay on the value stack** under the body (stack effect 0; the record holds their index). `rel_end` = abort target; there the stack is cut back to below the pairs and holds the clause value (depth before the pairs + 1) |
+| END_HANDLE | 77 | | body finished: pops the value, the handler record and its 2n pairs, pushes the value again (stack effect −2n) |
+| PERFORM | 78 | h name, h default_fn, b argc | perform an effect (see §8); stack like `CALL`: argc arguments → 1 result |
 | RESUME | 79 | | inside a clause: return TOS to the `perform` site |
 | 0x80–0xBF | | | reserved for superinstructions (§13) |
+
+Exact semantics of the four effect opcodes (handler entries, masking, aborts,
+interaction with `TRY`, snapshots): `docs/TIL_EFFECTS.md` §3. Stack-depth tools
+(`til fit`, debugger, portable snapshots) must count the 2n pair slots of every
+active `handle`.
 
 ### Function flags (byte in the function record)
 

@@ -764,9 +764,12 @@ class TestCompileErrors:
         expect_compile_error('let r = handle\n    perform A()\nwith\n    A() => resume(1, 2)\n',
                              "resume takes at most one value")
 
-    def test_with_and_resume_are_keywords(self):
-        expect_compile_error('let with = 1\n', "Expected IDENT")
-        expect_compile_error('let resume = 1\n', "Expected IDENT")
+    def test_with_and_resume_are_contextual_keywords(self):
+        # (review round 1: hard keywords broke TIL 3.0 programs; outside a clause
+        # `with` / `resume` are ordinary names again - more in test_effects_review.py)
+        assert both('let with = 1\nlet resume = with + 1\nprint(resume)\n') == "2\n"
+        expect_compile_error('let r = handle\n    perform A()\nwith\n    A() =>\n        let resume = 1\n'
+                             '        resume(resume)\n', "'resume' is reserved inside an effect clause")
 
 
 class TestEffectChecker:
