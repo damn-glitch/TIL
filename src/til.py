@@ -9511,17 +9511,24 @@ def _cvm_binary(verbose: bool = False) -> Optional[str]:
         os.makedirs(cache, exist_ok=True)
     except OSError:
         cache = tempfile.gettempdir()
-    exe = os.path.join(cache, 'tilvm' + ('.exe' if sys.platform == 'win32' else ''))
     sources = [os.path.join(vm_dir, n) for n in ('tilvm.c', 'tilvm.h', 'main.c')]
-    newest = max(os.path.getmtime(f) for f in sources if os.path.exists(f))
-    if not os.path.exists(exe) or os.path.getmtime(exe) < newest:
-        cmd = [cc, '-O2', '-std=c99', '-o', exe, sources[0], sources[2], '-lm']
+    # one cached binary per VM source version (several checkouts can share ~/.til/cache)
+    import hashlib
+    digest = hashlib.sha256()
+    for path in sources:
+        with open(path, 'rb') as f:
+            digest.update(f.read())
+    exe = os.path.join(cache, f"tilvm-{digest.hexdigest()[:16]}" + ('.exe' if sys.platform == 'win32' else ''))
+    if not os.path.exists(exe):
+        tmp_exe = f"{exe}.{os.getpid()}.tmp"
+        cmd = [cc, '-O2', '-std=c99', '-o', tmp_exe, sources[0], sources[2], '-lm']
         if verbose:
             print(f"[TIL] Building C VM: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             print(f"C VM build failed:\n{result.stderr}", file=sys.stderr)
             return None
+        os.replace(tmp_exe, exe)        # atomic: parallel builds never see half a file
     return exe
 
 
