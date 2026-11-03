@@ -195,6 +195,64 @@ def check_program(tilc: Tilc, name: str, src: str):
 
 
 # ═══════════════════════════════════════════════════════════════
+# TABLES SHARED WITH src/til.py
+# ═══════════════════════════════════════════════════════════════
+
+def tilc_text() -> str:
+    with open(TILC_SRC, encoding='utf-8') as f:
+        return f.read()
+
+
+def til_literal(text: str, name: str, fn: bool = False):
+    """The value of `var NAME = <literal>` (or `NAME()` returning one) in tilc.til,
+    with T_* / OP_* constants resolved to their names."""
+    src = tilc_text()
+    if fn:
+        m = re.search(r'^' + name + r'\(\)\n    return (\{.*?\}|\[.*?\])\n', src, re.S | re.M)
+    else:
+        m = re.search(r'^var ' + name + r' = (\{.*?\}|\[.*?\])\n', src, re.S | re.M)
+    assert m, name
+    lit = re.sub(r'\b(T|OP)_([A-Z_0-9]+)\b', r'"\1_\2"', m.group(1))
+    import ast
+    return ast.literal_eval(lit.replace('\n    ', ' '))
+
+
+class TestTablesInSync:
+    """tilc.til keeps copies of tables of src/til.py: when one changes (a new
+    native, keyword, prelude function...), tilc.til must be updated too."""
+
+    def test_natives_and_arity(self):
+        assert til_literal(tilc_text(), 'NATIVES') == til.NATIVES
+        lo, hi = til_literal(tilc_text(), 'NAT_MIN'), til_literal(tilc_text(), 'NAT_MAX')
+        assert [(a, None if b < 0 else b) for a, b in zip(lo, hi)] == [til.NATIVE_ARITY[n] for n in til.NATIVES]
+
+    def test_methods_and_prelude(self):
+        assert til_literal(tilc_text(), 'METHODS') == til.METHODS
+        assert til_literal(tilc_text(), 'PRELUDE_SRC') == til.PRELUDE_SOURCE
+
+    def test_keywords(self):
+        def names(table):
+            return {k: v.name for k, v in table.items()}
+        def mine(name, fn=False):
+            return {k: v[2:] for k, v in til_literal(tilc_text(), name, fn).items()}
+        assert mine('KW_EN') == names(til.ENGLISH_KEYWORDS)
+        assert mine('KW_KK') == names(til.KAZAKH_KEYWORDS)
+        assert mine('kw_kk_latn', True) == names(til.KAZAKH_LATIN_KEYWORDS)
+        assert mine('kw_ru', True) == names(til.RUSSIAN_KEYWORDS)
+        assert set(til_literal(tilc_text(), 'TRUE_WORDS')) == til.TRUE_WORDS
+        assert til_literal(tilc_text(), 'AL_KK') == til.KAZAKH_ALIASES
+        tt = til_literal(tilc_text(), 'TT_NAMES')
+        assert tt == [t.name for t in til.TokenType], "token types (TT_NAMES)"
+
+    def test_opcodes_and_io_builtins(self):
+        consts = dict(re.findall(r'^const OP_([A-Z_0-9]+) = (\d+)$', tilc_text(), re.M))
+        for name, value in consts.items():
+            assert getattr(til.Op, name) == int(value), name
+        assert set(til_literal(tilc_text(), 'IO_BUILTINS')) == til.SemanticChecker.IO_BUILTINS
+        assert set(til_literal(tilc_text(), 'PRIM')) == set(til.TYPE_MAP)
+
+
+# ═══════════════════════════════════════════════════════════════
 # BOOTSTRAP
 # ═══════════════════════════════════════════════════════════════
 
