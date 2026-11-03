@@ -69,7 +69,8 @@ int main(int argc, char **argv) {
     if (rc != 0) {
         fprintf(stderr, "tilvm: cannot load %s (error %d%s)\n", path, rc,
                 rc == -3 ? ": program uses floats, VM built without them" :
-                rc == -6 ? ": integer constant too large for this VM" : "");
+                rc == -6 ? ": integer constant too large for this VM" :
+                rc == -10 ? ": too many functions for this VM build (TILVM_MAX_FUNCS)" : "");
         return 2;
     }
     vm.max_steps = (uint32_t)max_steps;

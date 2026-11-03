@@ -33,6 +33,8 @@
  *                      default 64, TILVM_LEAN: 0 = no cache)
  *   TILVM_COMPUTED_GOTO 1 = dispatch with GCC/Clang "labels as values" (default with
  *                      __GNUC__, except TILVM_LEAN and -Os builds), 0 = portable switch
+ *   TILVM_FAST_PATHS   1 = inline integer fast paths in the interpreter (default, except
+ *                      TILVM_LEAN and -Os builds), 0 = smaller code, same results
  *   TILVM_NO_STDIO     no <stdio.h>: the host must set vm->write
  *   TILVM_NO_TIME      no <time.h>: timeouts count steps (1 ms = 1000 steps)
  *   TILVM_NO_MATH      no <math.h>: sqrt/sin/... use built-in approximations

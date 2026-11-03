@@ -20,6 +20,17 @@
 #define TV_HAVE_MATH 1
 #endif
 
+/* Integer fast paths of the interpreter and of map lookups / int formatting:
+ * pure optimizations (the general paths give the same results). Off for
+ * TILVM_LEAN and for builds optimized for size (-Os), where they cost the most. */
+#ifndef TILVM_FAST_PATHS
+#if defined(TILVM_LEAN) || defined(__OPTIMIZE_SIZE__)
+#define TILVM_FAST_PATHS 0
+#else
+#define TILVM_FAST_PATHS 1
+#endif
+#endif
+
 /* ─── opcodes (must match class Op in src/til.py) ───────────────────────── */
 enum {
     OP_NOP = 0x00, OP_PUSH_NIL = 0x01, OP_PUSH_TRUE = 0x02, OP_PUSH_FALSE = 0x03,
@@ -772,7 +783,7 @@ static int to_str_slot(tilvm *vm, uint16_t slot) {
     tv_ref r;
     tv_val *v = &vm->st.stack[slot];
     if (is_str(v)) return 1;
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
     if (v->t == TV_INT) {             /* common case: format once, allocate once */
         char num[32];
         const char *p = fmt_int(num, v->u.i);
@@ -1175,7 +1186,7 @@ static void map_key(tv_val *k) {
 static int map_find(tilvm *vm, tv_ref map, const tv_val *key) {
     tv_arrobj *m = ARROBJ(vm, map);
     uint32_t i, n = m->len;
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
     /* the usual key types, compared without the general equal() (same results) */
     const tv_val *v = VALS(vm, m->buf);
     if (key->t == TV_INT) {            /* only ints and floats can equal an int */
@@ -2979,7 +2990,8 @@ static int expired_try(tilvm *vm) {
  *
  * Superinstructions (0x80-0xBF) behave exactly like the sequences they replace
  * (same results, errors, error lines and steps); their slow paths push the
- * operands and run the plain handler. TILVM_LEAN keeps only those slow paths.
+ * operands and run the plain handler. Without TILVM_FAST_PATHS (TILVM_LEAN,
+ * -Os) only those slow paths are compiled.
  */
 #ifndef TILVM_COMPUTED_GOTO
 #if defined(__GNUC__) && !defined(TILVM_LEAN) && !defined(__SDCC) && !defined(__OPTIMIZE_SIZE__)
@@ -3038,7 +3050,7 @@ static int cmp_values(tilvm *vm, unsigned c, const tv_val *a, const tv_val *b) {
     return r;
 }
 
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
 /* does the program replace builtin array method `mid` by a prelude function? */
 static int prelude_has(tilvm *vm, uint8_t mid) {
     uint8_t k;
@@ -3172,7 +3184,7 @@ dispatch_op:
     }
 
     /* ── arithmetic ── */
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
     CASE(OP_ADD)
         if (sp[-2].t == TV_INT && sp[-1].t == TV_INT) { sp[-2].u.i = iwrap_add(sp[-2].u.i, sp[-1].u.i); sp--; NEXT; }
         goto arith_op;
@@ -3192,7 +3204,7 @@ dispatch_op:
         }
         goto arith_op;
 #endif
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
     CASE(OP_DIV)
         if (sp[-2].t == TV_INT && sp[-1].t == TV_INT && sp[-1].u.i != 0) {
             sp[-2].u.i = idiv(sp[-2].u.i, sp[-1].u.i); sp--; NEXT;
@@ -3237,7 +3249,7 @@ dispatch_op:
         NEXT;
     }
     CASE(OP_EQ) CASE(OP_NE) {
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         int e = sp[-2].t == TV_INT && sp[-1].t == TV_INT ? sp[-2].u.i == sp[-1].u.i
                                                          : equal(vm, &sp[-2], &sp[-1], 0);
 #else
@@ -3294,7 +3306,7 @@ dispatch_op:
     }
     CASE(OP_INVOKE) {
         uint32_t pc;
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         const tv_val *recv;
         name_c = RD16(ip);
         argc = ip[3];
@@ -3418,7 +3430,7 @@ do_return:
     }
     CASE(OP_GET_INDEX)
     get_index:
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         if (sp[-2].t == TV_ARRAY && sp[-1].t == TV_INT) {
             tv_arrobj *a = ARROBJ(vm, sp[-2].u.r);
             if ((tv_uint)sp[-1].u.i < a->len) { sp[-2] = VALS(vm, a->buf)[sp[-1].u.i]; sp--; NEXT; }
@@ -3427,7 +3439,7 @@ do_return:
         HELPER(get_index(vm));
         NEXT;
     CASE(OP_SET_INDEX)
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         if (sp[-3].t == TV_ARRAY && sp[-2].t == TV_INT) {
             tv_arrobj *a = ARROBJ(vm, sp[-3].u.r);
             if ((tv_uint)sp[-2].u.i < a->len) { VALS(vm, a->buf)[sp[-2].u.i] = sp[-1]; sp -= 3; NEXT; }
@@ -3577,7 +3589,7 @@ do_return:
         goto get_field;
     CASE(OP_INC_LOCAL) {                     /* LOAD_LOCAL a; PUSH_I8 k; ADD; STORE_LOCAL a */
         tv_val *v = &bp[ip[0]];
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         if (v->t == TV_INT) { v->u.i = iwrap_add(v->u.i, (tv_int)(int8_t)ip[1]); ip += 2; NEXT; }
 #endif
         CHECK_STACK(2);
@@ -3593,7 +3605,7 @@ do_return:
         tv_val *v = &bp[ip[0]];
         uint8_t kind = ip[1];
         ip += 2;
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         if (kind == 0 && v->t == TV_INT) NEXT;
 #if TILVM_FLOAT
         if (kind == 1 && v->t == TV_FLOAT) NEXT;
@@ -3607,7 +3619,7 @@ do_return:
     }
     CASE(OP_CAST_RETURN) {                   /* CAST kind; RETURN */
         uint8_t kind = *ip++;
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         if (!(kind == 0 && sp[-1].t == TV_INT))
 #endif
             HELPER(cast_slot(vm, TOPSLOT(1), kind));
@@ -3618,7 +3630,7 @@ do_return:
         result = bp[*ip++];
         goto do_return;
     CASE(OP_ADD_STORE_LOCAL)                 /* ADD; STORE_LOCAL a */
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         if (sp[-2].t == TV_INT && sp[-1].t == TV_INT) {
             set_int(&bp[*ip++], iwrap_add(sp[-2].u.i, sp[-1].u.i));
             sp -= 2;
@@ -3629,7 +3641,7 @@ do_return:
         bp[*ip++] = *--sp;
         NEXT;
     CASE(OP_INDEX_L)                         /* LOAD_LOCAL b; GET_INDEX */
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         if (sp[-1].t == TV_ARRAY && bp[*ip].t == TV_INT) {
             tv_arrobj *a = ARROBJ(vm, sp[-1].u.r);
             if ((tv_uint)bp[*ip].u.i < a->len) { sp[-1] = VALS(vm, a->buf)[bp[*ip].u.i]; ip++; NEXT; }
@@ -3639,7 +3651,7 @@ do_return:
         *sp++ = bp[*ip++];
         goto get_index;
     CASE(OP_INDEX_LL)                        /* LOAD_LOCAL a; LOAD_LOCAL b; GET_INDEX */
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         if (bp[ip[0]].t == TV_ARRAY && bp[ip[1]].t == TV_INT && sp < stk_end) {
             tv_arrobj *a = ARROBJ(vm, bp[ip[0]].u.r);
             if ((tv_uint)bp[ip[1]].u.i < a->len) { *sp++ = VALS(vm, a->buf)[bp[ip[1]].u.i]; ip += 2; NEXT; }
@@ -3665,7 +3677,7 @@ do_return:
         goto cmp_branch;
     CASE(OP_JUMP_IF_NOT_LL)                  /* LOAD_LOCAL a; LOAD_LOCAL b; <cmp>; JUMP_IF_FALSE */
         cmp_a = &bp[ip[1]]; cmp_b = &bp[ip[2]]; cmp_pop = 0; cmp = ip[0];
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         if (cmp_a->t == TV_INT && cmp_b->t == TV_INT && IS_CMP(cmp)) {
             int16_t rel = RDS16(ip + 3);
             ip += 5;
@@ -3677,7 +3689,7 @@ do_return:
         goto cmp_branch;
     CASE(OP_JUMP_IF_NOT_LI)                  /* LOAD_LOCAL a; PUSH_I8/I16 k; <cmp>; JUMP_IF_FALSE */
         cmp_a = &bp[ip[1]]; cmp = ip[0];
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
         if (cmp_a->t == TV_INT && IS_CMP(cmp)) {
             int16_t rel = RDS16(ip + 4);
             tv_int k = (tv_int)RDS16(ip + 2);
@@ -3704,7 +3716,7 @@ cmp_branch:   /* ip at the i16 offset */
     }
 
     /* <op>_I k = PUSH_I8/PUSH_I16 k; <op> (k: i16)     <op>_L b = LOAD_LOCAL b; <op> */
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
 #define FAST_I(expr) \
         if (sp[-1].t == TV_INT) { tv_int x = sp[-1].u.i, k = (tv_int)RDS16(ip); ip += 2; sp[-1].u.i = (expr); NEXT; } \
         goto fused_i;
@@ -3762,7 +3774,7 @@ cmp_branch:   /* ip at the i16 offset */
         ip += 2;
         op = FUSED_BINOP[op & 15];
         DISPATCH_OP();
-#ifndef TILVM_LEAN
+#if TILVM_FAST_PATHS
     CASE(OP_SHL_L) CASE(OP_SHR_L)
     fused_l:
 #else

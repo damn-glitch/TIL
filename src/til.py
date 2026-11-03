@@ -8991,6 +8991,10 @@ class TILVM:
         CAST_RETURN, ADD_STORE_LOCAL, NATIVE_POP, RETURN_LOCAL = \
             Op.CAST_RETURN, Op.ADD_STORE_LOCAL, Op.NATIVE_POP, Op.RETURN_LOCAL
         INDEX_L, INDEX_LL, FOR_ITER_STORE = Op.INDEX_L, Op.INDEX_LL, Op.FOR_ITER_STORE
+        NATIVE, FOR_ITER, LOAD_UPVAL, GET_INDEX, POP = Op.NATIVE, Op.FOR_ITER, Op.LOAD_UPVAL, Op.GET_INDEX, Op.POP
+        LOAD_GLOBAL, STORE_GLOBAL, GET_FIELD, SET_FIELD = Op.LOAD_GLOBAL, Op.STORE_GLOBAL, Op.GET_FIELD, Op.SET_FIELD
+        EQ, NE, DIV, MOD, POW, CONCAT, NEW_STRUCT = Op.EQ, Op.NE, Op.DIV, Op.MOD, Op.POW, Op.CONCAT, Op.NEW_STRUCT
+        BAND, BXOR = Op.BAND, Op.BXOR
         JUMP_IF_NOT, JUMP_IF_NOT_L, JUMP_IF_NOT_I, JUMP_IF_NOT_LL, JUMP_IF_NOT_LI = \
             Op.JUMP_IF_NOT, Op.JUMP_IF_NOT_L, Op.JUMP_IF_NOT_I, Op.JUMP_IF_NOT_LL, Op.JUMP_IF_NOT_LI
         try:
@@ -9001,6 +9005,27 @@ class TILVM:
                 if op == LOAD_LOCAL:
                     stack.append(stack[base + code[pc]])
                     pc += 1
+                elif op == JUMP:
+                    rel = code[pc] | (code[pc + 1] << 8)
+                    if rel >= 0x8000:
+                        rel -= 0x10000
+                        self.check_budget(op_pc)
+                    pc += 2 + rel
+                elif op == INC_LOCAL:
+                    # LOAD_LOCAL a; PUSH_I8 k; ADD; STORE_LOCAL a
+                    slot = base + code[pc]
+                    k = code[pc + 1]
+                    if k > 127:
+                        k -= 256
+                    a = stack[slot]
+                    if type(a) is int:
+                        r = a + k
+                        if not -0x8000000000000000 <= r <= 0x7FFFFFFFFFFFFFFF:
+                            r = wrap_int64(r)
+                        stack[slot] = r
+                    else:
+                        stack[slot] = self.arith(ADD, a, k)
+                    pc += 2
                 elif op == JUMP_IF_NOT_LL:
                     # LOAD_LOCAL a; LOAD_LOCAL b; <cmp>; JUMP_IF_FALSE
                     cmp = code[pc]
@@ -9019,30 +9044,26 @@ class TILVM:
                             rel -= 0x10000
                             self.check_budget(op_pc)
                         pc += 5 + rel
-                elif op == STORE_LOCAL:
-                    stack[base + code[pc]] = stack.pop()
-                    pc += 1
-                elif op == INC_LOCAL:
-                    # LOAD_LOCAL a; PUSH_I8 k; ADD; STORE_LOCAL a
-                    slot = base + code[pc]
-                    k = code[pc + 1]
-                    if k > 127:
-                        k -= 256
-                    a = stack[slot]
-                    if type(a) is int:
-                        r = a + k
+                elif op == LOAD_LOCAL_FIELD:
+                    # LOAD_LOCAL a; GET_FIELD name
+                    stack.append(self.get_field(stack[base + code[pc]], code[pc + 1] | (code[pc + 2] << 8)))
+                    pc += 3
+                elif op == ADD_STORE_LOCAL:
+                    # ADD; STORE_LOCAL a
+                    b = stack.pop()
+                    a = stack.pop()
+                    if type(a) is int and type(b) is int:
+                        r = a + b
                         if not -0x8000000000000000 <= r <= 0x7FFFFFFFFFFFFFFF:
                             r = wrap_int64(r)
-                        stack[slot] = r
                     else:
-                        stack[slot] = self.arith(ADD, a, k)
+                        r = self.arith(ADD, a, b)
+                    stack[base + code[pc]] = r
+                    pc += 1
+                elif op == LOAD_LOCAL2:
+                    stack.append(stack[base + code[pc]])
+                    stack.append(stack[base + code[pc + 1]])
                     pc += 2
-                elif op == JUMP:
-                    rel = code[pc] | (code[pc + 1] << 8)
-                    if rel >= 0x8000:
-                        rel -= 0x10000
-                        self.check_budget(op_pc)
-                    pc += 2 + rel
                 elif op >= 0xA0:
                     # <op>_I k = PUSH_I8/PUSH_I16 k; <op>      <op>_L b = LOAD_LOCAL b; <op>
                     if op >= 0xB0:
@@ -9067,6 +9088,15 @@ class TILVM:
                             continue
                         elif bop == MUL:
                             r = a * b
+                        elif bop == MOD and a >= 0 and b > 0:
+                            stack[-1] = a % b           # C and Python agree here
+                            continue
+                        elif bop == BAND:
+                            stack[-1] = a & b
+                            continue
+                        elif bop == BXOR:
+                            stack[-1] = a ^ b
+                            continue
                         else:
                             stack[-1] = self.binop(bop, a, b)
                             continue
@@ -9075,13 +9105,8 @@ class TILVM:
                         stack[-1] = r
                     else:
                         stack[-1] = self.binop(bop, a, b)
-                elif op == LOAD_LOCAL2:
-                    stack.append(stack[base + code[pc]])
-                    stack.append(stack[base + code[pc + 1]])
-                    pc += 2
-                elif op == PUSH_I8:
-                    v = code[pc]
-                    stack.append(v - 256 if v > 127 else v)
+                elif op == STORE_LOCAL:
+                    stack[base + code[pc]] = stack.pop()
                     pc += 1
                 elif op == ADD or op == SUB or op == MUL:
                     b = stack.pop()
@@ -9093,6 +9118,9 @@ class TILVM:
                         stack[-1] = r
                     else:
                         stack[-1] = self.arith(op, a, b)
+                elif op == PUSH_CONST:
+                    stack.append(consts[code[pc] | (code[pc + 1] << 8)])
+                    pc += 2
                 elif op == CALL or op == CALL_VALUE or op == INVOKE:
                     if op == CALL:
                         fidx = code[pc] | (code[pc + 1] << 8)
@@ -9184,10 +9212,13 @@ class TILVM:
                     pc = frame[1]
                     base = frame[2]
                     closure = frame[3]
-                elif op == LOAD_LOCAL_FIELD:
-                    # LOAD_LOCAL a; GET_FIELD name
-                    stack.append(self.get_field(stack[base + code[pc]], code[pc + 1] | (code[pc + 2] << 8)))
-                    pc += 3
+                elif op == CAST_LOCAL:
+                    # LOAD_LOCAL a; CAST kind; STORE_LOCAL a
+                    slot = base + code[pc]
+                    v = stack[slot]
+                    if not (type(v) is int and code[pc + 1] == 0):
+                        stack[slot] = self.cast(code[pc + 1], v)
+                    pc += 2
                 elif op == JUMP_IF_NOT_LI or op == JUMP_IF_NOT_L or op == JUMP_IF_NOT_I or op == JUMP_IF_NOT:
                     cmp = code[pc]
                     if op == JUMP_IF_NOT_LI:
@@ -9231,36 +9262,50 @@ class TILVM:
                             rel -= 0x10000
                             self.check_budget(op_pc)
                         pc += 2 + rel
-                elif op == CAST_LOCAL:
-                    # LOAD_LOCAL a; CAST kind; STORE_LOCAL a
-                    slot = base + code[pc]
-                    v = stack[slot]
-                    if not (type(v) is int and code[pc + 1] == 0):
-                        stack[slot] = self.cast(code[pc + 1], v)
-                    pc += 2
-                elif op == ADD_STORE_LOCAL:
-                    # ADD; STORE_LOCAL a
-                    b = stack.pop()
-                    a = stack.pop()
-                    if type(a) is int and type(b) is int:
-                        r = a + b
-                        if not -0x8000000000000000 <= r <= 0x7FFFFFFFFFFFFFFF:
-                            r = wrap_int64(r)
-                    else:
-                        r = self.arith(ADD, a, b)
-                    stack[base + code[pc]] = r
+                elif op == PUSH_I8:
+                    v = code[pc]
+                    stack.append(v - 256 if v > 127 else v)
                     pc += 1
-                elif op == PUSH_CONST:
-                    stack.append(consts[code[pc] | (code[pc + 1] << 8)])
+                elif op == NATIVE or op == NATIVE_POP:
+                    nid, argc = code[pc], code[pc + 1]
                     pc += 2
-                elif op == LT or op == LE or op == GT or op == GE:
-                    b = stack.pop()
-                    a = stack[-1]
-                    if type(a) is int and type(b) is int:
-                        stack[-1] = (a < b if op == LT else a <= b if op == LE else
-                                     a > b if op == GT else a >= b)
+                    args = stack[len(stack) - argc:] if argc else []
+                    if argc:
+                        del stack[len(stack) - argc:]
+                    frame[1] = pc
+                    v = self.call_native(nid, args)
+                    if op != NATIVE_POP:
+                        stack.append(v)
+                elif op == INDEX_LL:
+                    # LOAD_LOCAL a; LOAD_LOCAL b; GET_INDEX
+                    stack.append(self.index_get(stack[base + code[pc]], stack[base + code[pc + 1]]))
+                    pc += 2
+                elif op == FOR_ITER or op == FOR_ITER_STORE:
+                    slot = base + code[pc]
+                    container = stack[slot]
+                    i = stack[slot + 1]
+                    if op == FOR_ITER_STORE:
+                        # FOR_ITER it off; STORE_LOCAL x
+                        if i < len(container):
+                            stack[base + code[pc + 1]] = container[i]
+                            stack[slot + 1] = i + 1
+                            pc += 4
+                        else:
+                            rel = code[pc + 2] | (code[pc + 3] << 8)
+                            pc += 4 + (rel - 0x10000 if rel >= 0x8000 else rel)
+                    elif i < len(container):
+                        stack.append(container[i])
+                        stack[slot + 1] = i + 1
+                        pc += 3
                     else:
-                        stack[-1] = self.compare(op, a, b)
+                        rel = code[pc + 1] | (code[pc + 2] << 8)
+                        pc += 3 + (rel - 0x10000 if rel >= 0x8000 else rel)
+                elif op == LOAD_UPVAL:
+                    stack.append(closure.up[code[pc]].v)
+                    pc += 1
+                elif op == GET_INDEX:
+                    idx = stack.pop()
+                    stack[-1] = self.index_get(stack[-1], idx)
                 elif op == JUMP_IF_FALSE or op == JUMP_IF_TRUE:
                     v = stack.pop()
                     t = v is True or (v is not False and v is not None and self.truthy(v))
@@ -9272,38 +9317,60 @@ class TILVM:
                         pc += 2 + rel
                     else:
                         pc += 2
-                elif op == INDEX_LL:
-                    # LOAD_LOCAL a; LOAD_LOCAL b; GET_INDEX
-                    stack.append(self.index_get(stack[base + code[pc]], stack[base + code[pc + 1]]))
-                    pc += 2
+                elif op == LT or op == LE or op == GT or op == GE:
+                    b = stack.pop()
+                    a = stack[-1]
+                    if type(a) is int and type(b) is int:
+                        stack[-1] = (a < b if op == LT else a <= b if op == LE else
+                                     a > b if op == GT else a >= b)
+                    else:
+                        stack[-1] = self.compare(op, a, b)
                 elif op == INDEX_L:
                     # LOAD_LOCAL b; GET_INDEX
                     stack[-1] = self.index_get(stack[-1], stack[base + code[pc]])
                     pc += 1
-                elif op == Op.LOAD_GLOBAL:
+                elif op == POP:
+                    stack.pop()
+                elif op == LOAD_GLOBAL:
                     stack.append(self.globals[code[pc] | (code[pc + 1] << 8)])
                     pc += 2
-                elif op == Op.STORE_GLOBAL:
+                elif op == STORE_GLOBAL:
                     self.globals[code[pc] | (code[pc + 1] << 8)] = stack.pop()
                     pc += 2
-                elif op == Op.EQ:
+                elif op == GET_FIELD:
+                    stack[-1] = self.get_field(stack[-1], code[pc] | (code[pc + 1] << 8))
+                    pc += 2
+                elif op == SET_FIELD:
+                    val = stack.pop()
+                    self.set_field(stack.pop(), code[pc] | (code[pc + 1] << 8), val)
+                    pc += 2
+                elif op == EQ:
                     b = stack.pop()
                     stack[-1] = self.equal(stack[-1], b)
-                elif op == Op.NE:
+                elif op == NE:
                     b = stack.pop()
                     stack[-1] = not self.equal(stack[-1], b)
-                elif op == Op.NATIVE or op == NATIVE_POP:
-                    nid, argc = code[pc], code[pc + 1]
-                    pc += 2
-                    args = stack[len(stack) - argc:] if argc else []
-                    if argc:
-                        del stack[len(stack) - argc:]
-                    frame[1] = pc
-                    v = self.call_native(nid, args)
-                    if op != NATIVE_POP:
-                        stack.append(v)
-                elif op == Op.POP:
-                    stack.pop()
+                elif op == DIV or op == MOD or op == POW:
+                    b = stack.pop()
+                    a = stack[-1]
+                    if op == MOD and type(a) is int and type(b) is int and a >= 0 and b > 0:
+                        stack[-1] = a % b               # C and Python agree here
+                    else:
+                        stack[-1] = self.arith(op, a, b)
+                elif op == CONCAT:
+                    n = code[pc]
+                    pc += 1
+                    parts = stack[len(stack) - n:]
+                    del stack[len(stack) - n:]
+                    stack.append(b"".join(p if type(p) is bytes else self.to_str(p) for p in parts))
+                elif op == NEW_STRUCT:
+                    t = code[pc] | (code[pc + 1] << 8)
+                    n = code[pc + 2]
+                    pc += 3
+                    fields = stack[len(stack) - n:] if n else []
+                    if n:
+                        del stack[len(stack) - n:]
+                    stack.append(VMStruct(t, fields))
                 elif op == Op.PUSH_NIL:
                     stack.append(None)
                 elif op == Op.PUSH_TRUE:
@@ -9320,9 +9387,6 @@ class TILVM:
                     stack.extend(stack[-2:])
                 elif op == Op.SWAP:
                     stack[-1], stack[-2] = stack[-2], stack[-1]
-                elif op == Op.DIV or op == Op.MOD or op == Op.POW:
-                    b = stack.pop()
-                    stack[-1] = self.arith(op, stack[-1], b)
                 elif op == Op.NEG:
                     v = stack[-1]
                     if type(v) is int:
@@ -9350,9 +9414,6 @@ class TILVM:
                 elif op == Op.MAKE_CELL:
                     slot = base + code[pc]
                     stack[slot] = VMCell(stack[slot])
-                    pc += 1
-                elif op == Op.LOAD_UPVAL:
-                    stack.append(closure.up[code[pc]].v)
                     pc += 1
                 elif op == Op.STORE_UPVAL:
                     closure.up[code[pc]].v = stack.pop()
@@ -9383,28 +9444,10 @@ class TILVM:
                     for i in range(0, len(items), 2):
                         d[self.map_key(items[i])] = items[i + 1]
                     stack.append(d)
-                elif op == Op.NEW_STRUCT:
-                    t = code[pc] | (code[pc + 1] << 8)
-                    n = code[pc + 2]
-                    pc += 3
-                    fields = stack[len(stack) - n:] if n else []
-                    if n:
-                        del stack[len(stack) - n:]
-                    stack.append(VMStruct(t, fields))
-                elif op == Op.GET_INDEX:
-                    idx = stack.pop()
-                    stack[-1] = self.index_get(stack[-1], idx)
                 elif op == Op.SET_INDEX:
                     val = stack.pop()
                     idx = stack.pop()
                     self.index_set(stack.pop(), idx, val)
-                elif op == Op.GET_FIELD:
-                    stack[-1] = self.get_field(stack[-1], code[pc] | (code[pc + 1] << 8))
-                    pc += 2
-                elif op == Op.SET_FIELD:
-                    val = stack.pop()
-                    self.set_field(stack.pop(), code[pc] | (code[pc + 1] << 8), val)
-                    pc += 2
                 elif op == Op.GET_SLOT:
                     v = stack[-1]
                     i = code[pc]
@@ -9425,32 +9468,6 @@ class TILVM:
                 elif op == Op.PUSH_FUNC:
                     stack.append(VMClosure(code[pc] | (code[pc + 1] << 8)))
                     pc += 2
-                elif op == Op.CONCAT:
-                    n = code[pc]
-                    pc += 1
-                    parts = stack[len(stack) - n:]
-                    del stack[len(stack) - n:]
-                    stack.append(b"".join(p if type(p) is bytes else self.to_str(p) for p in parts))
-                elif op == Op.FOR_ITER or op == FOR_ITER_STORE:
-                    slot = base + code[pc]
-                    container = stack[slot]
-                    i = stack[slot + 1]
-                    if op == FOR_ITER_STORE:
-                        # FOR_ITER it off; STORE_LOCAL x
-                        if i < len(container):
-                            stack[base + code[pc + 1]] = container[i]
-                            stack[slot + 1] = i + 1
-                            pc += 4
-                        else:
-                            rel = code[pc + 2] | (code[pc + 3] << 8)
-                            pc += 4 + (rel - 0x10000 if rel >= 0x8000 else rel)
-                    elif i < len(container):
-                        stack.append(container[i])
-                        stack[slot + 1] = i + 1
-                        pc += 3
-                    else:
-                        rel = code[pc + 1] | (code[pc + 2] << 8)
-                        pc += 3 + (rel - 0x10000 if rel >= 0x8000 else rel)
                 elif op == Op.MATCH_TYPE:
                     t = code[pc] | (code[pc + 1] << 8)
                     pc += 2
