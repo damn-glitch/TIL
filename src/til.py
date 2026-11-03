@@ -9578,31 +9578,6 @@ def feature_module(name: str):
     return importlib.import_module(name)
 
 
-def run_extra_command(command: str, argv: List[str]) -> int:
-    module_name = EXTRA_COMMANDS[command][0]
-    try:
-        module = feature_module(module_name)
-    except ImportError as e:
-        if getattr(e, 'name', None) != module_name:
-            raise
-        print(localize(f"til {command}: not available in this installation ({module_name}.py is missing)"),
-              file=sys.stderr)
-        return 1
-    return module.main(argv)
-
-
-def run_proofs(program: 'Program', source: str, filename: str, explicit: bool) -> List[str]:
-    """`til check`: prove the contracts of #[level: 4] functions (of every function
-    with --prove). Returns formatted errors (empty = everything proved)."""
-    try:
-        prover = feature_module('tilprove')
-    except ImportError as e:
-        if getattr(e, 'name', None) != 'tilprove':
-            raise
-        return ["til check --prove: the prover (tilprove.py) is not installed"] if explicit else []
-    return prover.check_program(program, source, filename, explicit)
-
-
 # ── localized messages (TIL 3.1) ─────────────────────────────────────────────
 # Diagnostics are written in English everywhere in this file. The command line
 # translates what it prints (compile errors, warnings, hints, VM error reports)
@@ -9757,6 +9732,31 @@ def run_localized(cmd: List[str]) -> int:
         proc.stderr.close()
         rc = proc.wait()
     return rc
+
+
+def run_extra_command(command: str, argv: List[str]) -> int:
+    module_name = EXTRA_COMMANDS[command][0]
+    try:
+        module = feature_module(module_name)
+    except ImportError as e:
+        if getattr(e, 'name', None) != module_name:
+            raise
+        print(localize(f"til {command}: not available in this installation ({module_name}.py is missing)"),
+              file=sys.stderr)
+        return 1
+    return module.main(argv)
+
+
+def run_proofs(program: 'Program', source: str, filename: str, explicit: bool) -> List[str]:
+    """`til check`: prove the contracts of #[level: 4] functions (of every function
+    with --prove). Returns formatted errors (empty = everything proved)."""
+    try:
+        prover = feature_module('tilprove')
+    except ImportError as e:
+        if getattr(e, 'name', None) != 'tilprove':
+            raise
+        return ["til check --prove: the prover (tilprove.py) is not installed"] if explicit else []
+    return prover.check_program(program, source, filename, explicit)
 
 
 # ── translate ────────────────────────────────────────────────────────────────
