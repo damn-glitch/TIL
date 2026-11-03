@@ -9914,6 +9914,9 @@ Options:
                           program, for calculators/MCUs) | c (generated C)
   --strip                 vm/c-vm: drop line tables (smallest bytecode)
   --max-steps <n>         VM sandbox: stop after n loop iterations/calls
+  --screen <file.ppm>     graphics: save the final screen as a PPM image
+  --screen-ansi           graphics: draw the screen in the terminal (24-bit colour)
+  --keys <list>           graphics: scripted keys, e.g. "UP,UP,ENTER,a,ESC"
   -O0, -O1, -O2, -O3      Optimization level for native builds (default -O2)
   --keep-c                Keep generated C file
   --no-check              Disable type warnings

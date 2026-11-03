@@ -43,13 +43,16 @@ output of every example is compared with the reference VM.
 
 | Target | CPU / board | Simulator | Profile | Code | RAM | Result |
 |---|---|---|---|---|---|---|
-| ARM Cortex-M (NumWorks/STM32 class) | Cortex-M3, 64 KB RAM | QEMU `lm3s6965evb` | int32, float32, 16 KB heap | 44.7 KB | 24 KB | 17/17 programs identical¹ |
-| 8-bit AVR (Arduino Mega class) | ATmega1284P, 16 KB RAM | simavr | int32, float32, 5 KB heap | 53.8 KB | 10.5 KB | 17/17 programs identical |
+| ARM Cortex-M (NumWorks/STM32 class) | Cortex-M3, 64 KB RAM | QEMU `lm3s6965evb` | int32, float32, 16 KB heap | 48.5 KB² | 24 KB | 17/17 programs identical¹ |
+| 8-bit AVR (Arduino Mega class) | ATmega1284P, 16 KB RAM | simavr | int32, float32, 5 KB heap | 60.8 KB² | 11.2 KB | 17/17 programs identical |
 | Z80 (TI-83/84 class) | Z80, 64 KB address space | ucsim `sz80` | int32, lean | 70.7 KB (SDCC) | ~7 KB | **does not fit** the 64 KB address space yet — see `ports/z80/RESULTS.md` |
 | Desktop | x86-64 | native | int64, double, 256 KB heap | 80 KB | ~400 KB | all 255 + 81 tests |
 
 ¹ Single-precision builds print the last digit of some floats differently
 (`78.5397` vs `78.5398`), as expected for `float`.
+
+² TIL 3.1 builds with the screen/keys natives (about 2.5 KB of ARM code, 7 KB
+of AVR code; `-DTILVM_NO_GFX` leaves them out). Measured with `examples/03_functions.til`.
 
 Reproduce:
 
@@ -83,7 +86,8 @@ Profiles in the `Makefile`: `make` (desktop), `make small` (32-bit, float,
 (AddressSanitizer + UBSan with a 4 KB heap — exercises the compacting GC).
 
 Code size of the whole VM (`arm-none-eabi-gcc -Os`, Cortex-M0, 32-bit ints, no
-floats): **24.5 KB**, or **19.4 KB** with `TILVM_LEAN`.
+floats, TIL 3.1 with the screen/keys natives): **28.2 KB**, or **22.0 KB** with
+`TILVM_LEAN` (25.7 KB / 19.5 KB with `TILVM_NO_GFX`).
 
 ## API
 

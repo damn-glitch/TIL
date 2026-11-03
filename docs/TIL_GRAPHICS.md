@@ -318,7 +318,7 @@ The graphics natives are part of every C VM build, including `TILVM_LEAN`
   on Harvard CPUs, e.g. `-DTILVM_ROM=__flash` with avr-gcc in GNU C mode (the
   AVR port does this; otherwise the table is copied to RAM at start-up).
 
-Code size of `vm/tilvm.c` (`TILVM_NO_STDIO`, object file text):
+Code size of `vm/tilvm.c` (`TILVM_NO_STDIO`, object file code, KB = 1024 bytes):
 
 | target | without graphics | with graphics | difference |
 |---|---|---|---|
@@ -326,9 +326,12 @@ Code size of `vm/tilvm.c` (`TILVM_NO_STDIO`, object file text):
 | same, `TILVM_LEAN` | 19.5 KB | 22.0 KB | +2.5 KB |
 | same, `TILVM_LEAN`, int16 | 19.5 KB | 22.1 KB | +2.6 KB |
 | AVR ATmega1284P, `-Os`, int32, float (AVR port flags) | 54.4 KB | 61.3 KB | +6.9 KB |
+| Z80, SDCC 4.2 `--opt-code-size`, int32, `TILVM_LEAN` (Z80 port flags) | 69.0 KB | 76.5 KB | +7.5 KB |
 
-(The +2.5 KB include the 480-byte font. 8-bit CPUs need more code for the
-32-bit arithmetic of the clipping.)
+The +2.5 KB on ARM include the 480-byte font; 8-bit CPUs need more code for
+the 32-bit arithmetic of the clipping. Where every byte counts (the classic
+Z80 calculators, whose whole address space is 64 KB), build with
+`-DTILVM_NO_GFX`.
 
 ## Writing a host (C API)
 
@@ -400,6 +403,22 @@ void install_screen(tilvm *vm) {
 
 `vm/main.c` (the desktop runner) is a full host: framebuffer, PPM output,
 terminal frames, scripted, terminal and stdin keys.
+
+The reference VM takes its host objects as keyword arguments (defaults: an
+offscreen screen and no keys, so `wait_key()` returns 27 at once):
+
+```python
+import til
+module = til.compile_to_bytecode(source, "game.til")
+screen = til.TILScreen(ansi=False)            # w, h, fb (bytearray, RGB), ppm(), ansi_frame()
+vm = til.TILVM(module, screen=screen, keys="RIGHT,RIGHT,ESC")   # or a list of codes,
+rc = vm.run()                                 # or an object with pressed() / wait()
+open("game.ppm", "wb").write(screen.ppm())
+```
+
+`til.TerminalKeys()` is the terminal/stdin key source of `til run`, and
+`til.gfx_line_points`, `gfx_circle_points`, `gfx_text_points` yield the
+pixels of a shape (before clipping).
 
 ## Device integration notes
 

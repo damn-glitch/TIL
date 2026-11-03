@@ -13,6 +13,7 @@ Run: python3 -m pytest tests/test_graphics.py -v
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -65,18 +66,21 @@ def py_run(src, keys="", ansi=False):
 def c_run(src, keys="", ansi=False, profile="host", exe=None):
     """C VM -> (exit code, stdout bytes, stderr text, PPM bytes or None)."""
     data = src if isinstance(src, (bytes, bytearray)) else tbc_bytes(src)
+    exe = exe or vm_exe(profile)
     work = tempfile.mkdtemp(prefix='tilgfx-')
-    prog, ppm = os.path.join(work, 'p.tbc'), os.path.join(work, 'screen.ppm')
-    with open(prog, 'wb') as f:
-        f.write(data)
-    args = [exe or vm_exe(profile), '--screen', ppm, '--keys', keys] + \
-        (['--screen-ansi'] if ansi else []) + [prog]
-    r = subprocess.run(args, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
-    image = None
-    if os.path.exists(ppm):
-        with open(ppm, 'rb') as f:
-            image = f.read()
-    return r.returncode, r.stdout, r.stderr.decode('utf-8', 'replace'), image
+    try:
+        prog, ppm = os.path.join(work, 'p.tbc'), os.path.join(work, 'screen.ppm')
+        with open(prog, 'wb') as f:
+            f.write(data)
+        args = [exe, '--screen', ppm, '--keys', keys] + (['--screen-ansi'] if ansi else []) + [prog]
+        r = subprocess.run(args, capture_output=True, timeout=60, stdin=subprocess.DEVNULL)
+        image = None
+        if os.path.exists(ppm):
+            with open(ppm, 'rb') as f:
+                image = f.read()
+        return r.returncode, r.stdout, r.stderr.decode('utf-8', 'replace'), image
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def both(src, keys="", ansi=False, profile="host", expect_rc=0):
