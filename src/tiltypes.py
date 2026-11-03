@@ -3532,6 +3532,19 @@ static TIL_Arr* til_args(void) {
     for (i = 1; i < til_argc; i++) til_arr_push(r, til_slot_s(til_argv[i]));
     return r;
 }
+/* closures used as values: the C function, a name for printing, captured values */
+typedef void (*til_fnptr)(void);
+typedef struct TIL_Clo { til_fnptr fn; const char* name; int64_t n; TIL_Slot env[]; } TIL_Clo;
+static TIL_Clo* til_clo_new(til_fnptr fn, const char* name, int64_t n) {
+    TIL_Clo* c = (TIL_Clo*)til_alloc_obj(sizeof(TIL_Clo) + sizeof(TIL_Slot) * (size_t)(n > 0 ? n : 1));
+    c->fn = fn; c->name = name; c->n = n;
+    return c;
+}
+static TIL_Clo* til_clo_chk(TIL_Clo* c) { if (!c) til_panic("nil is not callable"); return c; }
+static const char* til_clo_str(TIL_Clo* c) {
+    if (!c) return "None";
+    return til_str_concat(til_str_concat("<fn ", c->name), ">");
+}
 static int til_tostr_depth = 0;
 static bool til_truthy_s(const char* s) { return s && *s; }
 static bool til_truthy_arr(TIL_Arr* a) { return a && a->len; }
@@ -3620,7 +3633,7 @@ def c_string_opaque(text: str) -> str:
 
 def is_ptr(t) -> bool:
     """Values represented by a C pointer (NULL = None)."""
-    return t.name in PTR_KINDS or is_struct(t) or is_adt(t)
+    return t.name in PTR_KINDS or t.name == 'fn' or is_struct(t) or is_adt(t)
 
 
 def literal_default(node) -> bool:
@@ -3697,7 +3710,7 @@ class TypedCGen(til.CCodeGenerator):
         if t is DYN:
             self.unsupported(f"{what} has no single static type (it is dynamically typed)", node)
         if n == 'fn':
-            self.unsupported(f"{what} is a function value (closures as values run on the VM)", node)
+            return "TIL_Clo*"
         if is_adt(t):
             return self.adt_c(nominal_name(t)) + "*"
         self.unsupported(f"{what} has type {show(t)}", node)
@@ -3876,6 +3889,8 @@ class TypedCGen(til.CCodeGenerator):
             return f"til_bool_to_str({code})"
         if t is NIL:
             return f"((void)({code}), \"None\")"
+        if t.name == 'fn':
+            return f"til_clo_str({code})"
         return f"{self.tostr_helper(t, node)}({code})"
 
     def append_quoted(self, buf: str, code: str, t, node) -> str:
@@ -4003,6 +4018,8 @@ class TypedCGen(til.CCodeGenerator):
             return f"((void)({a}), (void)({b}), false)"
         if ta is STR and tb is STR:
             return f"til_str_eqn({a}, {b})"
+        if ta.name == 'fn' and tb.name == 'fn':
+            return f"((void*)({a}) == (void*)({b}))"      # closures: identity, like the VMs
         if ta.name != tb.name:
             return f"((void)({a}), (void)({b}), false)"
         return f"{self.eq_helper(ta, tb, node)}({a}, {b})"
@@ -4083,7 +4100,7 @@ class TypedCGen(til.CCodeGenerator):
             return f"({code}).has_value"
         if t is NIL:
             return f"((void)({code}), false)"
-        if is_struct(t) or is_adt(t):
+        if is_struct(t) or is_adt(t) or t.name == 'fn':
             return f"({code} != NULL)"
         if t.name == 'result':
             return f"((void)({code}), true)"
@@ -4102,8 +4119,9 @@ class TypedCGen(til.CCodeGenerator):
     def declare_var(self, name: str, t, node=None) -> str:
         base = c_local(name) if name != 'error' else 'error'
         cname = base
-        used = set().union(*self.cnames_used) if self.cnames_used else set()
-        if cname in self.cnames_used[-1] or cname in ('self', '_result') or (cname in used and False):
+        # the parameters and the outermost block of a function share one C scope
+        same_c_scope = self.cnames_used[-1] | (self.cnames_used[0] if len(self.cnames_used) == 2 else set())
+        if cname in same_c_scope or cname in ('self', '_result'):
             cname = f"{base}__{self.fresh_id()}"
         self.cnames_used[-1].add(cname)
         self.scopes[-1][name] = (cname, t)
@@ -4921,12 +4939,12 @@ class TypedCGen(til.CCodeGenerator):
         found = self.lookup_var(name)
         if found is not None:
             if isinstance(found[0], dict):
-                self.unsupported(f"the lambda '{name}' used as a value", n)
+                return self.closure_value(found[0]['lam'])
             return found[0]
         if name in self.ti.globals:
             return c_global(name)
         if name in self.ti.funcs:
-            self.unsupported(f"the function '{name}' used as a value", n)
+            return self.function_value(n)
         self.unsupported(f"unknown name '{name}'", n)
 
     def folded(self, n) -> Optional[str]:
@@ -5300,7 +5318,118 @@ class TypedCGen(til.CCodeGenerator):
         self.pop_scope()
 
     def e_Lambda(self, n):
-        self.unsupported("a lambda used as a value (closures as values run on the VM)", n)
+        return self.closure_value(n)
+
+    def changing_names(self) -> Set[str]:
+        """Names assigned (besides their declaration) or used as loop variables
+        anywhere in the current function: a closure cannot copy them."""
+        fdef = self.inst.info.fdef if self.inst.info is not None else None
+        cached = getattr(self, '_changing', None)
+        if cached is not None and cached[0] is fdef:
+            return cached[1]
+        names: Set[str] = set()
+        roots = [fdef.body] if fdef is not None else []
+        for root_node in roots:
+            for x in walk(root_node):
+                if isinstance(x, til.Assignment) and isinstance(x.target, til.Identifier):
+                    names.add(x.target.name)
+                elif isinstance(x, (til.For, til.ListComprehension)):
+                    names.add(x.var)
+        self._changing = (fdef, names)
+        return names
+
+    def closure_value(self, lam):
+        """A lambda used as a value (returned, stored, passed on): a TIL_Clo with
+        copies of the captured variables. The VMs capture variables by reference,
+        so only variables that never change afterwards can be copied."""
+        ft = self.T(lam)
+        if ft.name != 'fn':
+            self.unsupported("this lambda", lam)
+        ret, ptypes = ft.args[0], list(ft.args[1:])
+        pnames = [p for p, _t in lam.params]
+        caps = []
+        changing = self.changing_names()
+        for node in walk(lam.body):
+            if isinstance(node, til.Identifier) and node.name not in pnames and \
+                    node.name not in [c[0] for c in caps]:
+                found = self.lookup_var(node.name)
+                if found is None:
+                    continue
+                if isinstance(found[0], dict):
+                    self.unsupported(f"a closure that uses the lambda '{node.name}'", lam)
+                if node.name in changing:
+                    self.unsupported(f"a closure capturing '{node.name}', which changes later "
+                                     "(the VMs share captured variables)", lam)
+                self.check_slot_type(found[1], lam, f"captured variable '{node.name}'")
+                caps.append((node.name, found[0], found[1]))
+        k = self.fresh_id()
+        cname = f"_til_closure_{k}"
+        saved = (self.output, self.indent, self.scopes, self.cnames_used, self._recover_stack, self._loop_depth)
+        self.output, self.indent, self.scopes, self.cnames_used = [], 1, [], []
+        self._recover_stack, self._loop_depth = [], 0
+        try:
+            self.push_scope()
+            params = ["TIL_Clo* _clo"]
+            for pname, pt in zip(pnames, ptypes):
+                params.append(f"{self.ct(pt, lam, f'lambda parameter {pname}')} {self.declare_var(pname, pt, lam)}")
+            self.push_scope()
+            unpack = []
+            for i, (til_name, _c, ct_) in enumerate(caps):
+                cv = 'self' if til_name == 'self' else self.declare_var(til_name, ct_, lam)
+                if cv == 'self':
+                    self.scopes[-1]['self'] = ('self', ct_)
+                unpack.append(f"{self.ct(ct_, lam)} {cv} = {self.slot_get(ct_, f'_clo->env[{i}]')}; (void){cv};")
+            code = self.e_Block(lam.body) if isinstance(lam.body, til.Block) else self.x(lam.body)
+            bt = self.T(lam.body)
+            if ret is NIL or bt is NIL:
+                rc, body = "void", f"(void)({code});"
+            else:
+                rc, body = self.ct(ret, lam), f"return {self.coerce(code, bt, ret, lam)};"
+            self.pop_scope()
+            self.pop_scope()
+        finally:
+            self.output, self.indent, self.scopes, self.cnames_used, self._recover_stack, self._loop_depth = saved
+        self.lambda_defs.append(f"static {rc} {cname}({', '.join(params)}) {{ (void)_clo; {' '.join(unpack)} {body} }}")
+        name = til.c_string_literal(f"<lambda:{lam.line}>")
+        lines = [f"TIL_Clo* _cv{k} = til_clo_new((til_fnptr){cname}, {name}, {len(caps)});"]
+        for i, (_n, c_name, ct_) in enumerate(caps):
+            lines.append(f"_cv{k}->env[{i}] = {self.slot_make(ct_, c_name)};")
+        return self.sx(lines, f"_cv{k}")
+
+    def function_value(self, node):
+        """A named function used as a value: a closure without captures."""
+        target = self.inst.call(node)
+        if target is None:
+            self.unsupported(f"the function '{node.name}' used as a value", node)
+        key, params = target
+        ikey = (key, tuple(canon(p) for p in params))
+        cname = self.inst_names.get(ikey)
+        callee = self.insts.get(ikey)
+        if cname is None or callee is None:
+            self.unsupported(f"the function '{node.name}' used as a value", node)
+        tramp = f"_til_fnref_{cname}"
+        if tramp not in self.helpers:
+            ps = [f"{self.ct(t, node)} a{i}" for i, t in enumerate(callee.params)]
+            call = f"{cname}({', '.join(f'a{i}' for i in range(len(ps)))})"
+            rc = self.ret_ct(callee.ret)
+            body = f"{{ (void)_clo; {call}; }}" if rc == "void" else f"{{ (void)_clo; return {call}; }}"
+            self.add_helper(tramp, f"static {rc} {tramp}({', '.join(['TIL_Clo* _clo'] + ps)})", body)
+        return (f"til_clo_new((til_fnptr){tramp}, {til.c_string_literal(callee.info.fdef.name)}, 0)")
+
+    def call_closure(self, code: str, ft, args, n) -> str:
+        """Call a closure value with the static type fn(ret, params...)."""
+        if ft.name != 'fn' or len(ft.args) - 1 != len(args):
+            self.unsupported("calling a value that is not a known function", n)
+        ret, ptypes = ft.args[0], list(ft.args[1:])
+        k = self.fresh_id()
+        prelude, codes = self.seq(args, lambda i, nd: (self.coerce(self.x(nd), self.T(nd), ptypes[i], nd), ptypes[i]))
+        rc = "void" if ret is NIL else self.ct(ret, n)
+        sig = ", ".join(["TIL_Clo*"] + [self.ct(p, n) for p in ptypes])
+        call = f"(({rc} (*)({sig}))_k{k}->fn)({', '.join([f'_k{k}'] + codes)})"
+        lines = prelude + [f"TIL_Clo* _k{k} = til_clo_chk({code});"]
+        if ret is NIL:
+            return self.sx(lines + [f"{call};"], "NULL")
+        return self.sx(lines, call)
 
     def e_Block(self, n):
         t = self.T(n)
@@ -5660,7 +5789,7 @@ class TypedCGen(til.CCodeGenerator):
             if found is not None:
                 if isinstance(found[0], dict):
                     return self.call_lambda(found[0], n.args, n)
-                self.unsupported(f"calling the value '{name}' (closures as values run on the VM)", n)
+                return self.call_closure(found[0], found[1], n.args, n)
             if name in ('print', 'println'):
                 return self.sx(self.capture(lambda: self.print_call(n)), None if statement else "NULL")
             if name in ti.funcs and '.' not in name:
@@ -5690,7 +5819,7 @@ class TypedCGen(til.CCodeGenerator):
                     return f"til_{name}_{rname}({code})"
                 self.unsupported(f"{name}(...) without a known Option/Result type", n)
             if name in ti.globals:
-                self.unsupported(f"calling the global value '{name}'", n)
+                return self.call_closure(c_global(name), ti.globals[name].frozen, n.args, n)
             if name in til.NATIVE_ID:
                 return self.native(name, n, statement)
             self.unsupported(f"call of unknown function '{name}'", n)
@@ -5716,7 +5845,7 @@ class TypedCGen(til.CCodeGenerator):
                 if oname.startswith('__HashMap__') and f.attr == 'new':
                     return "til_map_new()"
             return self.method_call(n, statement)
-        self.unsupported("calling the result of an expression", n)
+        return self.call_closure(self.x(f), self.T(f), n.args, n)
 
     def call_user(self, n, args):
         target = self.inst.call(n)
@@ -5817,7 +5946,7 @@ class TypedCGen(til.CCodeGenerator):
             self.output, self.indent, self.scopes, self.cnames_used, self._recover_stack, self._loop_depth = saved
         self.lambda_defs.append(text)
         self.scopes[-1][name] = ({'cname': cname, 'caps': caps, 'ptypes': ptypes, 'ret': ret,
-                                  'name': name}, ft)
+                                  'name': name, 'lam': lam}, ft)
 
     def call_lambda(self, info, args, n):
         if len(args) != len(info['ptypes']):
@@ -5871,6 +6000,8 @@ class TypedCGen(til.CCodeGenerator):
             if found is not None and isinstance(found[0], dict):
                 info = found[0]
                 return (lambda codes: self.call_lambda_codes(info, codes, n)), ptypes, ret
+            if found is not None and found[1].name == 'fn':
+                return (lambda codes: self.call_closure_codes(found[0], ft, codes, n)), ptypes, ret
             if found is None and node.name in self.ti.funcs:
                 target = self.inst.call(node)
                 if target is None:
@@ -5890,6 +6021,17 @@ class TypedCGen(til.CCodeGenerator):
                     return f"({code}, NULL)" if callee.ret is NIL else code
                 return call_fn, ptypes, ret
         self.unsupported("a higher-order method with this function argument", n)
+
+    def call_closure_codes(self, code, ft, codes, n):
+        ret, ptypes = ft.args[0], list(ft.args[1:])
+        k = self.fresh_id()
+        rc = "void" if ret is NIL else self.ct(ret, n)
+        sig = ", ".join(["TIL_Clo*"] + [self.ct(p, n) for p in ptypes])
+        call = f"(({rc} (*)({sig}))_k{k}->fn)({', '.join([f'_k{k}'] + list(codes))})"
+        lines = [f"TIL_Clo* _k{k} = til_clo_chk({code});"]
+        if ret is NIL:
+            return self.sx(lines + [f"{call};"], "NULL")
+        return self.sx(lines, call)
 
     def call_lambda_codes(self, info, codes, n):
         for til_name, c_name, _t in info['caps']:
@@ -6083,6 +6225,8 @@ class TypedCGen(til.CCodeGenerator):
             return f"(({code}).is_ok ? \"Ok\" : \"Err\")"
         elif is_adt(t):
             return f"(({code}) ? {self.adt_c(nominal_name(t))}_names[({code})->tag] : \"nil\")"
+        elif t.name == 'fn':
+            return f"(({code}) ? \"fn\" : \"nil\")"
         elif t is STR or t.name in ('array', 'map') or is_struct(t):
             label = {'str': 'str', 'array': 'array', 'map': 'map'}.get(t.name) or nominal_name(t)
             return f"(({code}) ? {til.c_string_literal(label)} : \"nil\")"
@@ -6153,6 +6297,10 @@ class TypedCGen(til.CCodeGenerator):
             return self.to_s(self.x(obj), rt, n)
         if is_struct(rt):
             target = self.inst.call(n)
+            info = self.ti.structs.get(nominal_name(rt))
+            if target is None and info is not None and meth not in info.methods and \
+                    info.frozen.get(meth) is not None and info.frozen[meth].name == 'fn':
+                return self.call_closure(self.e_Attribute(f), info.frozen[meth], args, n)
             if target is None:
                 self.unsupported(f"method '{meth}' of struct '{nominal_name(rt)}'", n)
             key, params = target

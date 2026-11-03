@@ -323,6 +323,10 @@ FORMERLY_FALLBACK = {
     'intent_error': ('main()\n    let r = retry(1)\n        intent "parse config"\n            panic("bad token")\n'
                      '    else\n        error\n    print(r)\n'),
     'some_value': 'main()\n    let x = Some(42)\n    print(x, x.unwrap() + 1)\n',
+    'closures_as_values': ('make_counter()\n    var n = 0\n    return |step: int| n + step\n'
+                           'adder(k: int)\n    return |x: int| x + k\nmain()\n    let add5 = adder(5)\n'
+                           '    print(add5(10))\n    var base = 1\n    let f = |x: int| x + base\n    base = 100\n'
+                           '    print(f(1))\n    print(make_counter()(3), [1, 2].map(add5), add5)\n'),
     'ranges': 'print(range(4))\nfor i in range(2)\n    print(i)\nprint(sum([1, 2, 3]))\n',
     'args_files': ('let a = args()\nprint(len(a))\nfor x in a\n    print("[" + x + "]")\n'
                    'print(file_exists("/no/such/file"))\n'),
@@ -390,31 +394,36 @@ class TestNativeEqualsVM:
 # FALLBACK TO THE VM
 # ═══════════════════════════════════════════════════════════════
 
-CLOSURE_PROGRAM = 'adder(k: int)\n    return |x: int| x + k\nmain()\n    let add5 = adder(5)\n    print(add5(10))\n'
+DYNAMIC_PROGRAM = 'main()\n    let mixed = [1, "a", 2.5]\n    print(mixed)\n'
 
 
 class TestFallback:
     def test_unsupported_programs_raise_native_unsupported(self):
         with pytest.raises(til.NativeUnsupported) as info:
-            c_code(CLOSURE_PROGRAM)
-        assert "native backend:" in str(info.value) and "function value" in str(info.value)
+            c_code(DYNAMIC_PROGRAM)
+        assert "native backend:" in str(info.value) and "dynamically typed" in str(info.value)
         with pytest.raises(til.NativeUnsupported):
             c_code('main()\n    var x = 1\n    x = "a"\n    print(x)\n')
+        # a closure cannot copy a variable that changes after it is created
+        with pytest.raises(til.NativeUnsupported) as info:
+            c_code('make()\n    var total = 0\n    let f = |x: int| x + total\n    total = 10\n    return f\n'
+                   'main()\n    print(make()(1))\n')
+        assert "changes later" in str(info.value)
 
     @needs_cc
     def test_run_falls_back_and_explains(self, tmp_path):
-        prog = tmp_path / 'closure.til'
-        prog.write_text(CLOSURE_PROGRAM)
+        prog = tmp_path / 'mixed.til'
+        prog.write_text(DYNAMIC_PROGRAM)
         r = cli('run', str(prog))
-        assert r.returncode == 0 and r.stdout == "15\n"
+        assert r.returncode == 0 and r.stdout == '[1, "a", 2.5]\n'
         assert "running it on the TIL VM" in r.stderr
         r = cli('run', '-v', str(prog))
-        assert "function value" in r.stderr
-        r = cli('build', str(prog), '-o', str(tmp_path / 'closure'))
+        assert "dynamically typed" in r.stderr
+        r = cli('build', str(prog), '-o', str(tmp_path / 'mixed'))
         assert r.returncode == 1 and "native backend:" in r.stderr and "--target vm" in r.stderr
 
     def test_dead_code_does_not_force_a_fallback(self):
-        c = c_code('unused(k: int)\n    return |x: int| x + k\nmain()\n    print(1)\n')
+        c = c_code('unused(k: int)\n    let mixed = [k, "a"]\n    print(mixed)\nmain()\n    print(1)\n')
         assert 'til_main' in c and 'til_unused' not in c
 
     @needs_cc

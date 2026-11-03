@@ -135,7 +135,8 @@ E-TYPE is checked by `til check`, by every compilation to bytecode
 | enums with data | tagged struct with payload slots, one constructor per variant |
 | `Option<T>` / `Result<T, E>` | small structs passed by value |
 | generic functions | one C function per instance: `til_f__int`, `til_f__str`, `til_max_of__float`, methods `Box_add__int` |
-| lambdas | inline in `map`/`filter`/`reduce`/`each`/`any`/`all`; bound to a name: a static C function, captures passed at the call |
+| lambdas | inline in `map`/`filter`/`reduce`/`each`/`any`/`all`; bound to a name and called: a static C function that reads the captured variables at the call |
+| closures as values | `TIL_Clo*`: function pointer + copies of the captured variables (returned, stored, passed on; named functions too); printed `<fn …>`, compared by identity |
 
 ### Identical behaviour
 
@@ -167,12 +168,17 @@ says why) and `til build` reports the reason. Never a silent wrong result.
 
 * values that are *dynamic* (mixed types, see §1), e.g. heterogeneous arrays
   used for dynamic dispatch over trait objects;
-* closures used as values (returned, stored, passed to user functions);
+* a closure used as a value that captures a variable which changes after the
+  closure is created (the VMs share captured variables; a copy would differ),
+  or a loop variable;
 * `bytes_to_str()` and strings containing NUL bytes (native strings are C
   strings); graphics, keys and `energy_mode()` natives; `handle` (effects);
 * generic functions used with more than 32 type combinations.
 
 A function that is never called (dead code) does not force a fallback.
+
+Very deep recursion overflows the C stack (the process crashes) where the VMs
+stop with "stack overflow (recursion too deep)" after 2000 frames.
 
 Two cases are **explicit run-time errors** instead of a fallback, because they
 only happen when the program reaches a `None` that a native `int`/`float`/`bool`
@@ -208,10 +214,10 @@ python3 tools/native_coverage.py --compare tools/native_coverage_baseline.json
 
 | corpus: 233 programs (214 from the tests, 19 examples), 231 compared | before (TIL 3.0 backend) | after (typed backend) |
 |---|---|---|
-| compiled natively | 206 (88.8%) | **224 (97.0%)** |
-| … output identical to the VM | 203 | **224** |
+| compiled natively | 206 (88.8%) | **225 (97.4%)** |
+| … output identical to the VM | 203 | **225** |
 | … output **different** from the VM | 3 | **0** |
-| fall back to the VM | 26 | 7 |
+| fall back to the VM | 26 | 6 |
 
 The baseline per-program results are in `tools/native_coverage_baseline.json`
 (measured on the TIL 3.0 backend before this work); no program that compiled
@@ -219,12 +225,12 @@ before regresses. The 3 former mismatches were silent wrong results of the
 old backend (a `retry` value that is an int or a string, an `intent` error
 message, and a program that recursed into `main`). Newly native: dynamic
 arrays, maps, higher-order methods, string methods, Option/Result matching,
-enums with data, script-mode globals, ranges, `args()`/files, programs without
-`main()`.
+enums with data, closures as values, script-mode globals, ranges,
+`args()`/files, programs without `main()`.
 
-The 7 remaining fallbacks: closures returned from functions (2), heterogeneous
-arrays — dynamic dispatch over two struct types, `[1, [2, 3]]` (2) — and
-`bytes_to_str` (3).
+The 6 remaining fallbacks: heterogeneous arrays (3: dynamic dispatch over two
+struct types in `tests/test_v3.py` and `examples/09_v3_features.til`, and
+`[1, [2, 3]]`) and `bytes_to_str` (3).
 
 The old backend also compiled programs to wrong code that the corpus did not
 exercise, e.g. `print([1, 2, 3])` printed a pointer, `min(1.5, 2.5)` printed `1`,
@@ -234,9 +240,9 @@ pointers; all of these now match the VMs.
 As an extra check, the TIL programs in the test files of the other TIL 3.1
 feature branches (effects, fit, gfx, i18n, pkg, playground, prove, selfhost,
 vmcore) were measured the same way while they were being developed: of the
-189 programs this branch can compile, 184 were compared, **132 compiled
-natively, all with output identical to the VM**; most of the 52 fallbacks use
-the graphics/keys natives (VM-only), closures as values or `bytes_to_str`. Over all 543 TIL programs of all branches (tests, examples, the
+192 programs this branch can compile, 187 were compared, **138 compiled
+natively, all with output identical to the VM**; most of the 49 fallbacks use
+the graphics/keys natives (VM-only), dynamic values or `bytes_to_str`. Over all 543 TIL programs of all branches (tests, examples, the
 self-hosted compiler `tilc.til`) the inference reports no E-TYPE and never
 fails (the self-hosted compiler, 5600 lines, is inferred in about 0.6 s).
 
