@@ -148,9 +148,49 @@ def compiler_sizeof(cmd_prefix, flags, tmp_path, sdcc=False):
     if sdcc:
         sizes = dict(re.findall(r'_(tilfit_probe\w*)::\s*\n\s*\.ds (\d+)', asm))
     else:
-        sizes = dict(re.findall(r'\.size\s+(tilfit_probe\w*),\s*(\d+)', asm))
-        sizes.update(re.findall(r'\.comm\s+(tilfit_probe\w*),(\d+)', asm))
+        sizes = dict(re.findall(r'\.size\s+_?(tilfit_probe\w*),\s*(\d+)', asm))
+        sizes.update(re.findall(r'\.comm\s+_?(tilfit_probe\w*),\s*(\d+)', asm))
     return int(sizes['tilfit_probe']), int(sizes['tilfit_probe_val'])
+
+
+def host_sizes(configs, tmp_path):
+    """{key: (sizeof(tilvm), sizeof(tv_val))} on this host for several sets of -D flags:
+    one translation unit per set, linked into one probe program and run."""
+    files, calls = [], []
+    for i, (key, flags) in enumerate(sorted(configs.items())):
+        defines = "".join("#define " + f[2:].replace('=', ' ', 1) + "\n" for f in flags)
+        unit = tmp_path / f"size{i}.c"
+        unit.write_text(defines + '#include "tilvm.h"\n'
+                        f'unsigned long vm_size{i}(void) {{ return (unsigned long)sizeof(tilvm); }}\n'
+                        f'unsigned long val_size{i}(void) {{ return (unsigned long)sizeof(tv_val); }}\n')
+        files.append(str(unit))
+        calls.append((key, i))
+    main = tmp_path / "sizes.c"
+    main.write_text("#include <stdio.h>\n" +
+                    "".join(f"unsigned long vm_size{i}(void);\nunsigned long val_size{i}(void);\n" for _k, i in calls) +
+                    "int main(void) {\n" +
+                    "".join(f'    printf("%lu %lu\\n", vm_size{i}(), val_size{i}());\n' for _k, i in calls) +
+                    "    return 0;\n}\n")
+    exe = tmp_path / "sizes"
+    r = subprocess.run([CC, '-std=c99', '-I', VM_DIR, str(main)] + files + ['-o', str(exe)],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    lines = subprocess.run([str(exe)], capture_output=True, text=True).stdout.split("\n")
+    return {key: tuple(int(x) for x in lines[i].split()) for key, i in calls}
+
+
+_HOST_SIZES = {}
+
+
+def host_sizes_cached(tmp_path_factory):
+    """sizeof() for every device profile (and with TILVM_PACK) on this host, computed once."""
+    if not _HOST_SIZES:
+        configs = {}
+        for name, dev in fit.DEVICES.items():
+            configs[name] = dev.c_flags()
+            configs[name + "+pack"] = dev.c_flags() + ['-DTILVM_PACK']
+        _HOST_SIZES.update(host_sizes(configs, tmp_path_factory.mktemp("sizes")))
+    return _HOST_SIZES
 
 
 def host_abi() -> str:
@@ -159,15 +199,13 @@ def host_abi() -> str:
 
 @needs_cc
 @pytest.mark.parametrize("name", NAMES)
-def test_struct_model_matches_host_compiler(name, tmp_path):
+def test_struct_model_matches_host_compiler(name, tmp_path_factory):
     """The model of vm/tilvm.h (all of a profile's macros) == sizeof() on this host."""
-    if shutil.which('gcc') is None:
-        pytest.skip("gcc not installed")
     dev = fit.DEVICES[name]
     values = dict(dev.as_dict(), abi=host_abi())
     del values['name']
     want = fit.vm_struct_layout(fit.Device('host', **values))
-    got = compiler_sizeof(['gcc', '-std=c99'], dev.c_flags(), tmp_path)
+    got = host_sizes_cached(tmp_path_factory)[name]
     assert got == (want['tilvm'], want['tv_val']), \
         "vm/tilvm.h changed: update vm_struct_layout() in src/tilfit.py"
 
@@ -765,15 +803,11 @@ class TestCVM:
             r = subprocess.run([exe, str(path)], capture_output=True, text=True, timeout=60)
             assert (r.returncode, r.stdout) == (rc, ref), (name, r.stderr)
 
-    @needs_cc
-    def test_packed_layout_is_the_8_bit_layout(self, tmp_path):
-        """With TILVM_PACK a value takes as many bytes on the desktop as on AVR / Z80."""
-        if shutil.which('gcc') is None:
-            pytest.skip("gcc not installed")
+    def test_packed_layout_is_the_8_bit_layout(self, tmp_path_factory):
+        """With TILVM_PACK a value takes as many bytes on the desktop as on AVR / Z80 / eZ80."""
+        sizes = host_sizes_cached(tmp_path_factory)
         for name in ('atmega1284', 'arduino-mega', 'z80-16', 'ti84ce'):
-            dev = fit.DEVICES[name]
-            _vm, val = compiler_sizeof(['gcc', '-std=c99'], dev.c_flags() + ['-DTILVM_PACK'], tmp_path)
-            assert val == fit.vm_struct_layout(dev)['tv_val'], name
+            assert sizes[name + "+pack"][1] == fit.vm_struct_layout(fit.DEVICES[name])['tv_val'], name
 
 
 # ═══════════════════════════════════════════════════════════════

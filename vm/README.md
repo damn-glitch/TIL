@@ -72,6 +72,8 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_NO_TIME` | off | no `<time.h>`: `clock_ms()`/`timeout` count 1 ms per 1000 steps |
 | `TILVM_NO_MATH` | off | no `<math.h>`: built-in `sqrt`/`floor`/`pow` (integer powers) |
 | `TILVM_LEAN` | off | smallest code for 8-bit CPUs: the whole language core, without format specs, snapshots, `input/chr/ord/type_of/clock_ms/random/sleep_ms`, str `split/replace/trim/repeat/count`, array `insert/remove/sort/reverse/slice/copy/join/sum/min/max`, map `values/copy/clear` (calling them reports "not available"). ~20% smaller |
+| `TILVM_STATS` | off | record high-water marks (value stack, frames, recovery points, heap): `tilvm_get_stats()`, second `--stats` line; used by `til fit --run` (docs/TIL_FIT.md) |
+| `TILVM_PACK` | off | pack values like 8-bit CPUs do (GCC/Clang): desktop emulation of AVR / Z80 / eZ80 heap use |
 
 Profiles in the `Makefile`: `make` (desktop), `make small` (32-bit, float,
 16 KB heap), `make tiny` (16-bit, no floats, 2 KB heap, lean), `make check`
@@ -124,7 +126,7 @@ The desktop runner exposes the same features:
 vm/tilvm --snapshot-after 300 state.snap prog.tbc   # run 300 steps, save, exit 3
 vm/tilvm --resume state.snap prog.tbc               # continue
 vm/tilvm --max-steps 100000 prog.tbc                # sandbox
-vm/tilvm --stats prog.tbc                           # GC / heap statistics
+vm/tilvm --stats prog.tbc                           # GC / heap statistics (+ high-water marks with TILVM_STATS)
 ```
 
 ## Porting to a device

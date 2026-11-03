@@ -452,8 +452,8 @@ MATH_NATIVES = ('sin', 'cos', 'tan', 'log', 'exp')
 SCREEN_NATIVES = tuple(til.NATIVES[40:54])
 FILE_NATIVES = ('read_file', 'write_file', 'file_exists')
 CLOCK_NATIVES = ('clock_ms', 'sleep_ms')
-NONDETERMINISTIC_NATIVES = ('input', 'clock_ms', 'random', 'sleep_ms', 'key_pressed', 'wait_key',
-                            'read_file', 'file_exists')
+# --run does not compare the output with the desktop VM when these are used
+NONDETERMINISTIC_NATIVES = ('clock_ms', 'random', 'sleep_ms', 'key_pressed', 'wait_key')
 
 
 def lean_method_status(name: str) -> Tuple[str, List[str]]:
@@ -541,7 +541,8 @@ def _value(x, args) -> int:
     return x(args) if callable(x) else x
 
 
-def _flow_target(op: int, args, nxt: int) -> int:
+def _flow_target(args, nxt: int) -> int:
+    """Jump target: the last operand is relative to the end of the instruction."""
     return nxt + args[-1]
 
 
@@ -590,13 +591,13 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
         if flow == NEXT:
             succ = [(nxt, d2, t2)]
         elif flow == JUMP:
-            succ = [(_flow_target(op, args, nxt), d2, t2)]
+            succ = [(_flow_target(args, nxt), d2, t2)]
         elif flow in (BRANCH, DEFAULT):
-            succ = [(nxt, d2, t2), (_flow_target(op, args, nxt), d2, t2)]
+            succ = [(nxt, d2, t2), (_flow_target(args, nxt), d2, t2)]
         elif flow == ITER:
-            succ = [(nxt, d2, t2), (_flow_target(op, args, nxt), d, t2)]
+            succ = [(nxt, d2, t2), (_flow_target(args, nxt), d, t2)]
         elif flow == TRY:
-            succ = [(nxt, d2, t2 + 1), (_flow_target(op, args, nxt), d2 + 1, t2)]
+            succ = [(nxt, d2, t2 + 1), (_flow_target(args, nxt), d2 + 1, t2)]
         else:
             succ = []
         for s in succ:
@@ -626,7 +627,7 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
     for pc, (op, args, nxt) in decoded.items():
         eff = STACK_EFFECTS.get(op)
         if eff is not None and eff.flow in (JUMP, BRANCH, ITER, DEFAULT, TRY):
-            targets.add(_flow_target(op, args, nxt))
+            targets.add(_flow_target(args, nxt))
     has_maps = an.has_maps
     for pc in sorted(decoded):
         op, args, nxt = decoded[pc]
@@ -692,7 +693,7 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
         ff.max_need = max(ff.max_need, occ, d + need)
         ff.max_try = max(ff.max_try, t + (1 if eff.flow == TRY else 0))
         if eff.flow in (JUMP, BRANCH):
-            target = _flow_target(op, args, nxt)
+            target = _flow_target(args, nxt)
             if target <= pc:
                 ff.loops.append((target, pc))
     return ff
@@ -777,7 +778,6 @@ class Analysis:
         self.has_lines = bool(self.data[5] & 2)
         self.n_globals = len(m.globals)
         self.uses_float_consts = m.uses_float
-        self.has_maps = _O.NEW_MAP in m.code       # cheap pre-check, refined below
         order = sorted(range(len(m.funcs)), key=lambda i: (m.funcs[i].offset, i))
         self.ranges: Dict[int, Tuple[int, int]] = {}
         for k, i in enumerate(order):
@@ -1292,6 +1292,11 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
         r.error(f"format specs ({shown or 'format()'} at {_places(an, sites, 2)}) are ignored by the lean VM: "
                 f"values print unformatted", "format specs (ignored by the lean VM)")
 
+    unknown = sorted(n for n in natives if n.startswith('native#'))
+    if unknown:
+        r.warn(f"the bytecode calls unknown builtins ({', '.join(unknown)}): every VM reports "
+               f"\"?() is not available in this VM build\"")
+
     # ── device services ─────────────────────────────────────────────────────
     scr = [n for n in SCREEN_NATIVES if n in natives]
     if scr and not dev.screen:
@@ -1544,6 +1549,9 @@ def apply_run(r: Report, run: Dict[str, Any], compared: bool, why_not: str = "")
         heap['measured'] = human(st['peak_heap']) + (f" (live {human(live)})" if st.get('gc') else "")
     err = run.get('error')
     desk = run.get('desktop')
+    code = run.get('exit_code')
+    if code is not None and code < 0 and err is None:
+        err = f"the VM was killed by signal {-code}"
     stopped = err is not None and err.startswith('step limit exceeded')
     if stopped:
         r.notes.append("the run stopped at --max-steps; the measurements cover that part only")
@@ -1552,7 +1560,8 @@ def apply_run(r: Report, run: Dict[str, Any], compared: bool, why_not: str = "")
         desk_err = desk.get('error') if desk else None
         if desk is not None and desk_err == err:
             r.warn(f"the program stops with \"{err}\" on the desktop VM too (not a device limit)")
-        elif any(p in err for p in DEVICE_ERRORS) or (desk is not None and desk_err is None):
+        elif any(p in err for p in DEVICE_ERRORS + ("killed by signal",)) or \
+                (desk is not None and desk_err is None):
             r.error(f"the run on the device's VM stops with \"{err}\"", f"run: {err}")
         else:
             r.warn(f"the run stops with \"{err}\"")
@@ -1719,7 +1728,13 @@ def load_program(path: str, strip: bool = False) -> Tuple[bytes, int]:
     """Bytecode of a .til (compiled) or .tbc file, and how many bytes --strip saves."""
     if path.endswith('.tbc'):
         with open(path, 'rb') as f:
-            return f.read(), 0
+            data = f.read()
+        if strip and len(data) > 5 and data[5] & 2:
+            try:
+                data = til.TBCModule.from_bytes(data).serialize(strip=True)
+            except Exception as e:
+                raise ValueError(f"cannot read the bytecode: {e}")
+        return data, 0
     with open(path, encoding='utf-8') as f:
         source = f.read()
     module = til.compile_to_bytecode(source, path)
@@ -1861,9 +1876,9 @@ def main(argv: List[str]) -> int:
                 return 2
         used = {name for ff in an.reachable_facts() for _pc, name, _a in ff.natives}
         why_not = ""
-        odd = sorted(used & set(NONDETERMINISTIC_NATIVES) - {'input', 'read_file', 'file_exists'})
+        odd = sorted(used & set(NONDETERMINISTIC_NATIVES))
         if 'random' in odd and dev.int_bits == 64:
-            odd.remove('random')
+            odd.remove('random')        # the same generator as the desktop VM
         if odd:
             why_not = "the program uses " + ", ".join(n + "()" for n in odd)
         try:
