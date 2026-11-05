@@ -10,6 +10,7 @@ instructions and natives. Numbers are append-only and never change meaning.
 | natives 34–54 (`read_file` … `energy_mode`) | `docs/dev/TIL_3_1_DESIGN.md` §1 |
 | opcodes `0x76–0x79` (`HANDLE`, `END_HANDLE`, `PERFORM`, `RESUME`) | `docs/dev/TIL_3_1_DESIGN.md` §8 |
 | opcodes `0x80–0xBF`: **superinstructions** | this document |
+| optional **debug-info section** after the line table (variable names, written only with `--debug-info` / by `til debug`) | [TIL_DEBUGGER.md](TIL_DEBUGGER.md#the-debug-info-section) |
 
 Both VMs load versions 1 and 2. A version-1 file never contains the new
 opcodes. `--no-fuse` builds contain no superinstructions: such a file runs on a
@@ -130,7 +131,8 @@ and `compile_to_bytecode(..., fuse=False)` turn it off):
 
 The pass returns the map *old pc → new pc* of the function; a later pass that
 records pcs during code generation (e.g. local-variable debug info) must map
-them through it. Running the pass on already fused code changes nothing.
+them through it (the debug info does: `_remap_live_ranges`). Running the pass
+on already fused code changes nothing.
 
 Measured on the test programs and benchmarks, fused code has 25–40% fewer
 instructions and is 10–25% smaller.
