@@ -5,6 +5,9 @@
  *   tilvm --max-steps N program.tbc       sandbox: stop after N loop iterations/calls
  *   tilvm --snapshot-after N FILE p.tbc   run N steps, save the paused program to FILE
  *   tilvm --resume FILE program.tbc       continue a saved program
+ *   tilvm --save-portable-after N FILE p.tbc  run N steps, save a portable snapshot (.tilp)
+ *   tilvm --resume-portable FILE p.tbc    continue a portable snapshot (from any VM build
+ *                                         or `til run --vm`; docs/TIL_SNAPSHOTS.md)
  *   tilvm --stats program.tbc             print memory / GC statistics to stderr
  *                                         (+ high-water marks with -DTILVM_STATS)
  *   tilvm --screen out.ppm program.tbc    save the screen (screen_init, draw_*) as a PPM at exit
@@ -474,8 +477,35 @@ static unsigned char *read_file(const char *path, long *size) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: tilvm [--max-steps N] [--snapshot-after N FILE] [--resume FILE] [--stats] "
+    fprintf(stderr, "usage: tilvm [--max-steps N] [--snapshot-after N FILE] [--resume FILE] "
+                    "[--save-portable-after N FILE] [--resume-portable FILE] [--stats] "
                     "[--screen FILE.ppm] [--screen-ansi] [--keys LIST] program.tbc [args...]\n");
+}
+
+/* Portable snapshots (.tilp): the VM streams them through these callbacks. */
+static int put_file(void *ctx, const uint8_t *data, uint32_t len) {
+    return fwrite(data, 1, len, (FILE *)ctx) == len ? 0 : -1;
+}
+
+static int get_file(void *ctx, uint8_t *buf, uint32_t len) {
+    return fread(buf, 1, len, (FILE *)ctx) == len ? 0 : -1;
+}
+
+/* the reasons of tilvm_load_portable's error codes (src/til.py: TILP_ERRORS) */
+static const char *portable_error(int rc) {
+    static const char *const why[] = {
+        "not a portable TIL snapshot (.tilp)",
+        "unsupported snapshot version",
+        "the snapshot was saved by a different program",
+        "the snapshot is damaged or incomplete",
+        "the program's state does not fit this VM",
+        "the snapshot holds an integer that does not fit this VM",
+        "the snapshot holds floats, but this VM has no floats",
+        "the snapshot's screen is larger than this VM can show",
+        "portable snapshots are not available in this VM build",
+        "the snapshot uses effect handlers, which this VM build leaves out"
+    };
+    return rc <= -1 && rc >= -10 ? why[-rc - 1] : "error";
 }
 
 #ifdef TILVM_NO_STDIO
@@ -503,7 +533,8 @@ static int console_read_line(void *ctx, char *buf, size_t cap) {
 
 int main(int argc, char **argv) {
     const char *path = NULL, *snap_out = NULL, *resume = NULL, *screen_out = NULL;
-    unsigned long snap_after = 0, max_steps = 0;
+    const char *psave_out = NULL, *presume = NULL;
+    unsigned long snap_after = 0, max_steps = 0, psave_after = 0;
     int stats = 0, i, rc, prog_argc = 0;
     char **prog_argv = NULL;
     long size = 0;
@@ -515,6 +546,10 @@ int main(int argc, char **argv) {
             snap_after = strtoul(argv[++i], NULL, 10);
             snap_out = argv[++i];
         } else if (!strcmp(argv[i], "--resume") && i + 1 < argc) resume = argv[++i];
+        else if (!strcmp(argv[i], "--save-portable-after") && i + 2 < argc) {
+            psave_after = strtoul(argv[++i], NULL, 10);
+            psave_out = argv[++i];
+        } else if (!strcmp(argv[i], "--resume-portable") && i + 1 < argc) presume = argv[++i];
         else if (!strcmp(argv[i], "--stats")) stats = 1;
         else if (!strcmp(argv[i], "--screen") && i + 1 < argc) screen_out = argv[++i];
         else if (!strcmp(argv[i], "--screen-ansi")) ansi_screen = 1;
@@ -563,6 +598,18 @@ int main(int argc, char **argv) {
         }
         free(snap);
     }
+    if (presume) {                      /* after the hooks: a saved screen is re-created */
+        FILE *f = fopen(presume, "rb");
+        int prc;
+        if (!f) { fprintf(stderr, "tilvm: cannot read %s\n", presume); return 2; }
+        prc = tilvm_load_portable(&vm, get_file, f);
+        if (prc == 0 && fgetc(f) != EOF) prc = TILVM_P_CORRUPT;     /* bytes after the snapshot */
+        fclose(f);
+        if (prc != 0) {
+            fprintf(stderr, "tilvm: cannot resume %s: %s\n", presume, portable_error(prc));
+            return 2;
+        }
+    }
 
 #ifndef _WIN32
     {                                   /* Ctrl-C: see on_sigint (unless it is ignored) */
@@ -577,7 +624,28 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    if (snap_out) {
+    if (psave_out) {                    /* N more steps (0: none), then a portable snapshot */
+        rc = psave_after ? run_slices((uint32_t)psave_after) : TILVM_YIELD;
+        fflush(stdout);
+        if (rc == TILVM_YIELD && !interrupted) {
+            FILE *f = fopen(psave_out, "wb");
+            uint32_t n = f ? tilvm_save_portable(&vm, put_file, f) : 0;
+            if (f && fclose(f) != 0) n = 0;
+            if (!n) {
+#if defined(TILVM_LEAN) || defined(TILVM_NO_PORTABLE)
+                fprintf(stderr, "tilvm: %s\n", portable_error(TILVM_P_UNAVAILABLE));
+#else
+                fprintf(stderr, "tilvm: cannot write %s\n", psave_out);
+#endif
+                return 2;
+            }
+            fprintf(stderr, "tilvm: paused after %lu steps; saved %s (%lu bytes)\n",
+                    psave_after, psave_out, (unsigned long)n);
+            return save_screen(screen_out, 3);
+        }
+        if (!interrupted)
+            fprintf(stderr, "tilvm: the program ended before the pause point (nothing saved)\n");
+    } else if (snap_out) {
         rc = run_slices((uint32_t)snap_after);
         fflush(stdout);
         if (rc == TILVM_YIELD && !interrupted) {

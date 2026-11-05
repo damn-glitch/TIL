@@ -5185,3 +5185,799 @@ int tilvm_restore(tilvm *vm, const uint8_t *data, uint32_t size) {
     return 0;
 }
 #endif /* TILVM_LEAN */
+
+/* ─── portable snapshots (.tilp, docs/TIL_SNAPSHOTS.md) ───────────────────
+ * The byte layout, the object numbering (breadth-first from the roots, in
+ * file order) and the canonical encodings are specified in the document; the
+ * reference VM (TILVM.save_portable / load_portable in src/til.py) writes and
+ * checks exactly the same.
+ *
+ * Saving numbers the objects in their headers: mark 1 = numbered (fwd = id),
+ * 2 = a string with the same bytes as numbered string fwd, 3 = a string equal
+ * to string constant fwd; strings also keep a 16-bit hash of their bytes in
+ * aux. Afterwards mark and the strings' aux are 0 again (as outside the GC).
+ * The queue of numbered objects not yet written is a ring in the free end of
+ * the arena (or the GC's mark stack); objects that did not fit into it are
+ * found again by a heap scan, as the GC's mark phase does after an overflow.
+ *
+ * Loading allocates the objects in table order and stores references as
+ * TV_PEND values (u.r = object id) until every object exists; the id -> object
+ * table grows down from the end of the arena (dropped when the objects need
+ * that room: then a walk over the loaded objects finds them). */
+#if defined(TILVM_LEAN) || defined(TILVM_NO_PORTABLE)
+uint32_t tilvm_save_portable(tilvm *vm, tilvm_put_fn put, void *ctx) { (void)vm; (void)put; (void)ctx; return 0; }
+int tilvm_load_portable(tilvm *vm, tilvm_get_fn get, void *ctx) { (void)vm; (void)get; (void)ctx; return TILVM_P_UNAVAILABLE; }
+#else
+enum { TP_NIL, TP_FALSE, TP_TRUE, TP_INT, TP_FLOAT, TP_CONST, TP_REF, TP_FUNC, TP_UNDEF };
+#define TV_PEND 13                  /* loading: a reference to object u.r (an id) */
+#define FN_NUPVALS(p) ((p)[5])
+/* object kind (OBJ_STR ... OBJ_CELL) -> value tag, and the .tilp object kind */
+static const uint8_t TP_TAG[8] = { 0, TV_STR, TV_ARRAY, TV_MAP, 0, TV_STRUCT, TV_CLOSURE, TV_CELL };
+static const uint8_t TP_KIND[8] = { 0, 1, 2, 3, 0, 4, 5, 6 };
+
+static uint32_t crc32_add(uint32_t c, const uint8_t *p, uint32_t n) {   /* = zlib's crc32 */
+    unsigned k;
+    c = ~c;
+    while (n--) {
+        c ^= *p++;
+        for (k = 0; k < 8; k++) c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+#if TILVM_FLOAT && !(TILVM_FLOAT == 2 && DBL_MANT_DIG == 53)
+/* binary32 floats (TILVM_FLOAT=1; also AVR's 32-bit double) <-> the binary64
+ * bits of the file (hi, lo words), without a 64-bit double */
+typedef char tv_check_float32[sizeof(tv_float) == 4 ? 1 : -1];
+static void f32_bits(tv_float f, uint32_t *hi, uint32_t *lo) {
+    uint32_t b, e, m;
+    memcpy(&b, &f, 4);
+    e = (b >> 23) & 0xFFu;
+    m = b & 0x7FFFFFu;
+    if (e == 0xFFu) e = 0x7FFu;                       /* inf / nan */
+    else if (e) e += 1023u - 127u;
+    else if (m) {                                     /* subnormal: normalize */
+        e = 1023u - 126u;
+        while (!(m & 0x800000u)) { m <<= 1; e--; }
+        m &= 0x7FFFFFu;
+    }
+    *hi = (b & 0x80000000u) | (e << 20) | (m >> 3);
+    *lo = m << 29;
+}
+
+static tv_float f32_from_bits(uint32_t hi, uint32_t lo) {   /* round to nearest even */
+    uint32_t sign = hi & 0x80000000u, m, rest, b;
+    int32_t e = (int32_t)((hi >> 20) & 0x7FFu);
+    tv_float f;
+    if (e == 0x7FF) b = sign | 0x7F800000u | (((hi & 0xFFFFFu) | lo) ? 0x400000u : 0u);
+    else if (e == 0) b = sign;                        /* zero / double subnormal: far below */
+    else {
+        e += 127 - 1023;
+        m = 0x800000u | ((hi & 0xFFFFFu) << 3) | (lo >> 29);   /* 24 bits */
+        rest = lo & 0x1FFFFFFFu;                               /* 29 bits below them */
+        if (e <= 0) {                                 /* a float subnormal */
+            uint32_t s = (uint32_t)(1 - e), lost, half;
+            if (s > 25) b = sign;
+            else {
+                lost = m & ((1u << s) - 1u);
+                half = 1u << (s - 1u);
+                m >>= s;
+                if (lost > half || (lost == half && (rest || (m & 1u)))) m++;
+                b = sign | m;
+            }
+        } else {
+            if (rest > 0x10000000u || (rest == 0x10000000u && (m & 1u))) m++;
+            if (m == 0x1000000u) { m >>= 1; e++; }
+            b = e >= 0xFF ? sign | 0x7F800000u : sign | ((uint32_t)e << 23) | (m & 0x7FFFFFu);
+        }
+    }
+    memcpy(&f, &b, 4);
+    return f;
+}
+#endif
+
+/* ─── saving ─── */
+typedef struct tp_out {
+    tilvm *vm;
+    tilvm_put_fn put;
+    void *ctx;
+    uint32_t total, crc;
+    int err;
+    uint32_t n_ids, done, stored, qcap;    /* ids given; written; queued (done+1 .. stored) */
+    tv_ref *q;                              /* ring: q[id % qcap] */
+    tv_ref *ht;                             /* numbered strings by content (0 = empty slot) */
+    uint32_t hmask, hn;                     /* size - 1 (0: no table), entries */
+    int hfull;                              /* entries stopped: misses need a heap scan */
+    uint16_t len;
+    uint8_t buf[64];
+} tp_out;
+
+static void tp_put(tp_out *w, const uint8_t *p, uint32_t n) {
+    if (w->err || !n) return;
+    w->crc = crc32_add(w->crc, p, n);
+    if (w->put(w->ctx, p, n) != 0) w->err = 1;
+    w->total += n;
+}
+
+static void tp_flush(tp_out *w) {
+    tp_put(w, w->buf, w->len);
+    w->len = 0;
+}
+
+static void tp_bytes(tp_out *w, const uint8_t *p, uint32_t n) {
+    if (n > sizeof(w->buf) - w->len) {
+        tp_flush(w);
+        if (n > sizeof(w->buf)) { tp_put(w, p, n); return; }
+    }
+    memcpy(w->buf + w->len, p, n);
+    w->len = (uint16_t)(w->len + n);
+}
+
+static void tp_num(tp_out *w, uint32_t v, unsigned n) {      /* n <= 4 bytes, little endian */
+    uint8_t b[4];
+    unsigned i;
+    for (i = 0; i < n; i++) { b[i] = (uint8_t)v; v >>= 8; }
+    tp_bytes(w, b, n);
+}
+
+/* the records of the format: field sizes in bytes (0 ends) */
+static const uint8_t TP_STATE[] = { 4, 4, 4, 2, 1, 1, 2, 2, 0 };  /* steps, rng lo/hi, tick, energy, 0, G, F */
+static const uint8_t TP_FRAME[] = { 2, 4, 2, 1, 4, 0 };
+static const uint8_t TP_TRY[] = { 4, 4, 2, 2, 2, 0 };
+#ifndef TILVM_NO_EFFECTS
+static const uint8_t TP_HANDLER[] = { 1, 2, 2, 2, 4, 2, 0 };
+#endif
+
+static void tp_rec_out(tp_out *w, const uint8_t *f, const uint32_t *v) {
+    while (*f) tp_num(w, *v++, *f++);
+}
+
+/* first reference to heap object r: give it an id (a string equal to a constant
+ * or to a numbered string gets theirs) */
+/* is numbered string o (mark 1, aux = its hash) equal to s? */
+static int tp_same_str(tilvm *vm, tv_ref o, const tv_strobj *s, uint16_t hash) {
+    const tv_hdr *h = OBJ(vm, o);
+    return h->kind == OBJ_STR && h->mark == 1 && h->aux == hash && STROBJ(vm, o)->len == s->len &&
+           memcmp(STROBJ(vm, o)->data, s->data, s->len) == 0;
+}
+
+static void tp_number(tp_out *w, tv_ref r) {
+    tilvm *vm = w->vm;
+    tv_hdr *h = OBJ(vm, r);
+    if (h->kind == OBJ_STR) {
+        const tv_strobj *s = STROBJ(vm, r);
+        uint32_t hash = 2166136261u, i = 0;
+        tv_ref o = 0;
+        tv_size scan;
+        uint16_t k;
+        for (k = 0; k < vm->n_consts; k++) {         /* a string constant with these bytes */
+            const uint8_t *p = const_ptr(vm, k);
+            if (p[-1] == 3 && RD16(p) == s->len && memcmp(p + 2, s->data, s->len) == 0) {
+                h->mark = 3;
+                h->fwd = (tv_ref)k;
+                return;
+            }
+        }
+        for (; i < s->len; i++) hash = (hash ^ (uint8_t)s->data[i]) * 16777619u;
+        h->aux = (uint16_t)(hash ^ (hash >> 16));
+        if (w->hmask) {                              /* a numbered string with these bytes */
+            for (i = hash & w->hmask; (o = w->ht[i]) != 0; i = (i + 1) & w->hmask)
+                if (tp_same_str(vm, o, s, h->aux)) break;
+            if (!o && !w->hfull) {                   /* new: remember it */
+                if (++w->hn > w->hmask - w->hmask / 4) w->hfull = 1;
+                else w->ht[i] = r;
+            }
+        }
+        if (!o && (!w->hmask || w->hfull))           /* no table (or a full one): look at all */
+            for (scan = (tv_size)ALIGN_UP(1); scan < vm->st.heap_top; scan = (tv_size)(scan + OBJ(vm, scan)->size))
+                if (tp_same_str(vm, scan, s, h->aux)) { o = scan; break; }
+        if (o) {
+            h->mark = 2;
+            h->fwd = OBJ(vm, o)->fwd;
+            return;
+        }
+    }
+    h->mark = 1;
+    h->fwd = (tv_ref)++w->n_ids;
+    if (w->n_ids == w->stored + 1 && w->n_ids - w->done <= w->qcap) {
+        w->q[w->n_ids % w->qcap] = r;
+        w->stored = w->n_ids;
+    }
+}
+
+/* object id of r for a frame's closure field (0: none, or no upvalues) */
+static uint32_t tp_closure_id(tp_out *w, tv_ref r) {
+    if (!r || !OBJ(w->vm, r)->aux) return 0;
+    if (!OBJ(w->vm, r)->mark) tp_number(w, r);
+    return OBJ(w->vm, r)->fwd;
+}
+
+static void tp_value(tp_out *w, const tv_val *v) {
+    tilvm *vm = w->vm;
+    uint8_t b[3];
+    switch (v->t) {
+    case TV_NIL: b[0] = TP_NIL; break;
+    case TV_BOOL: b[0] = v->u.i ? TP_TRUE : TP_FALSE; break;
+    case TV_INT:
+        b[0] = TP_INT;
+        tp_bytes(w, b, 1);
+#if TILVM_INT_BITS == 64
+        tp_num(w, (uint32_t)v->u.i, 4);
+        tp_num(w, (uint32_t)((uint64_t)v->u.i >> 32), 4);
+#else
+        tp_num(w, (uint32_t)(int32_t)v->u.i, 4);
+        tp_num(w, v->u.i < 0 ? 0xFFFFFFFFu : 0u, 4);
+#endif
+        return;
+#if TILVM_FLOAT
+    case TV_FLOAT: {
+        uint32_t hi, lo;
+#if TILVM_FLOAT == 2 && DBL_MANT_DIG == 53
+        uint64_t bits;
+        memcpy(&bits, &v->u.f, 8);
+        lo = (uint32_t)bits;
+        hi = (uint32_t)(bits >> 32);
+#else
+        f32_bits(v->u.f, &hi, &lo);
+#endif
+        b[0] = TP_FLOAT;
+        tp_bytes(w, b, 1);
+        tp_num(w, lo, 4);
+        tp_num(w, hi, 4);
+        return;
+    }
+#endif
+    case TV_STRK: b[0] = TP_CONST; b[1] = (uint8_t)v->u.k; b[2] = (uint8_t)(v->u.k >> 8); tp_bytes(w, b, 3); return;
+    case TV_FUNC: b[0] = TP_FUNC; b[1] = (uint8_t)v->u.k; b[2] = (uint8_t)(v->u.k >> 8); tp_bytes(w, b, 3); return;
+    case TV_UNDEF: b[0] = TP_UNDEF; break;
+    case TV_STR: case TV_ARRAY: case TV_MAP: case TV_STRUCT: case TV_CLOSURE: case TV_CELL: {
+        tv_hdr *h = OBJ(vm, v->u.r);
+        if (h->kind > OBJ_CELL || TP_TAG[h->kind] != v->t) { w->err = 1; return; }
+        if (h->kind == OBJ_CLOSURE && !h->aux) {      /* no upvalues: a function value */
+            tv_val f;
+            f.t = TV_FUNC;
+            f.u.i = 0;
+            f.u.k = CLOSOBJ(vm, v->u.r)->func;
+            tp_value(w, &f);
+            return;
+        }
+        if (!h->mark) tp_number(w, v->u.r);
+        if (h->mark == 3) {
+            b[0] = TP_CONST; b[1] = (uint8_t)h->fwd; b[2] = (uint8_t)(h->fwd >> 8);
+            tp_bytes(w, b, 3);
+            return;
+        }
+        b[0] = TP_REF;
+        tp_bytes(w, b, 1);
+        tp_num(w, (uint32_t)h->fwd, 4);
+        return;
+    }
+    default: w->err = 1; return;        /* not a value a paused program holds */
+    }
+    tp_bytes(w, b, 1);
+}
+
+static void tp_values(tp_out *w, const tv_val *v, uint32_t n) {
+    while (n-- && !w->err) tp_value(w, v++);
+}
+
+uint32_t tilvm_save_portable(tilvm *vm, tilvm_put_fn put, void *ctx) {
+    tilvm_state *st = &vm->st;
+    tp_out w;
+    uint16_t i, g = vm->n_globals;
+    tv_size scan;
+    uint32_t v[8];
+    uint8_t crc[4];
+    if (st->halted || st->failed || !st->n_frames || st->sp < g) return 0;
+    memset(&w, 0, sizeof w);
+    w.vm = vm;
+    w.put = put;
+    w.ctx = ctx;
+    {   /* the queue (and a hash table of the strings, when there is room for both) in
+         * the free end of the arena; when it is tiny, the queue is the GC's mark stack */
+        uint32_t at = ((uint32_t)st->heap_top + sizeof(tv_ref) - 1u) / sizeof(tv_ref) * sizeof(tv_ref);
+        uint32_t room = at < (uint32_t)TILVM_HEAP_SIZE ? ((uint32_t)TILVM_HEAP_SIZE - at) / sizeof(tv_ref) : 0;
+        tv_ref *free_end = (tv_ref *)(void *)(vm->mem.heap + at);
+        if (room >= 4u * TILVM_MARK_STACK && room >= 64u) {
+            uint32_t n = 32;
+            while (n * 4u <= room) n *= 2;           /* the table: a quarter to a half of the room */
+#ifdef TILVM_P_SCRATCH
+            n = 4;                                   /* tests: a table that fills up (then scans) */
+#endif
+            w.ht = free_end;
+            w.hmask = n - 1u;
+            memset(w.ht, 0, n * sizeof(tv_ref));
+            free_end += n;
+            room -= n;
+        }
+        if (room > TILVM_MARK_STACK) { w.q = free_end; w.qcap = room; }
+        else { w.q = vm->mark_stack; w.qcap = TILVM_MARK_STACK; }
+#ifdef TILVM_P_SCRATCH         /* tests: a queue of this many entries (heap rescans) */
+        if (w.qcap > TILVM_P_SCRATCH) w.qcap = TILVM_P_SCRATCH;
+#endif
+    }
+    tp_bytes(&w, (const uint8_t *)"TILP\1\0", 6);
+    tp_num(&w, vm->bc_hash, 4);
+    v[0] = st->steps;
+#if TILVM_INT_BITS == 64
+    v[1] = (uint32_t)st->rng;
+    v[2] = (uint32_t)(st->rng >> 32);
+#else
+    v[1] = st->rng;
+    v[2] = 0;
+#endif
+    v[3] = st->tick;
+    v[4] = v[5] = 0;                        /* energy mode (reserved, design §11), reserved */
+    v[6] = g;
+    v[7] = st->n_frames;
+    tp_rec_out(&w, TP_STATE, v);
+    for (i = 0; i < st->n_frames; i++) {
+        const tv_frame *f = &st->frames[i];
+        v[0] = f->func;
+        v[1] = (uint32_t)(f->pc - vm->code_off);
+        v[2] = (uint32_t)(f->base - g);
+        v[3] = f->extra;
+        v[4] = tp_closure_id(&w, f->closure);
+        tp_rec_out(&w, TP_FRAME, v);
+    }
+    tp_num(&w, st->n_try, 2);
+    for (i = 0; i < st->n_try; i++) {
+        const tv_try *t = &st->tries[i];
+        v[0] = (uint32_t)(t->handler - vm->code_off);
+        v[1] = 0;
+        if (t->deadline) {                  /* time left; at least 1 (0 = no deadline) */
+            int32_t d = (int32_t)(t->deadline - now_ms(vm) - 1u);
+            v[1] = d < 1 ? 1u : (uint32_t)d;
+        }
+        v[2] = t->n_frames;
+        v[3] = (uint32_t)(t->sp - g);
+        v[4] = t->n_handlers;
+        tp_rec_out(&w, TP_TRY, v);
+    }
+    tp_num(&w, st->n_handlers, 2);
+#ifndef TILVM_NO_EFFECTS
+    for (i = 0; i < st->n_handlers; i++) {
+        const tv_handler *h = &st->handlers[i];
+        v[0] = h->kind;
+        v[1] = h->n_frames;
+        v[2] = h->kind ? 0u : (uint32_t)(h->sp - g);
+        v[3] = h->n_try;
+        v[4] = h->kind ? 0u : (uint32_t)(h->abort_pc - vm->code_off);
+        v[5] = h->n;
+        tp_rec_out(&w, TP_HANDLER, v);
+    }
+#endif
+    tp_values(&w, st->stack, g);
+    tp_num(&w, (uint32_t)(st->sp - g), 2);
+    tp_values(&w, st->stack + g, (uint32_t)(st->sp - g));
+    tp_num(&w, st->scr_w, 2);
+    tp_num(&w, st->scr_h, 2);
+    while (w.done < w.n_ids && !w.err) {    /* the object table, in id order */
+        uint32_t id = w.done + 1, n;
+        tv_ref r;
+        tv_hdr *h;
+        if (id > w.stored) {                /* not queued: find ids id .. id+qcap-1 again */
+            uint32_t hi = w.n_ids - w.done < w.qcap ? w.n_ids : w.done + w.qcap;
+            for (scan = (tv_size)ALIGN_UP(1); scan < st->heap_top; scan = (tv_size)(scan + OBJ(vm, scan)->size)) {
+                h = OBJ(vm, scan);
+                if (h->mark == 1 && h->fwd >= id && h->fwd <= hi) w.q[h->fwd % w.qcap] = scan;
+            }
+            w.stored = hi;
+        }
+        r = w.q[id % w.qcap];
+        w.done = id;
+        h = OBJ(vm, r);
+        tp_num(&w, TP_KIND[h->kind], 1);
+        switch (h->kind) {
+        case OBJ_STR:
+            tp_num(&w, STROBJ(vm, r)->len, 4);
+            tp_bytes(&w, (const uint8_t *)STROBJ(vm, r)->data, STROBJ(vm, r)->len);
+            break;
+        case OBJ_ARRAY: case OBJ_MAP:
+            n = ARROBJ(vm, r)->len;
+            tp_num(&w, n, 4);
+            tp_values(&w, VALS(vm, ARROBJ(vm, r)->buf), h->kind == OBJ_MAP ? 2 * n : n);
+            break;
+        case OBJ_STRUCT:
+            n = (uint32_t)((h->size - offsetof(tv_structobj, v)) / sizeof(tv_val));
+            tp_num(&w, h->aux, 2);
+            tp_num(&w, n, 2);
+            tp_values(&w, STRUCTOBJ(vm, r)->v, n);
+            break;
+        case OBJ_CLOSURE:
+            tp_num(&w, CLOSOBJ(vm, r)->func, 2);
+            tp_num(&w, h->aux, 2);
+            tp_values(&w, CLOSOBJ(vm, r)->v, h->aux);
+            break;
+        default:
+            tp_value(&w, &CELLOBJ(vm, r)->v);
+            break;
+        }
+    }
+    tp_num(&w, w.n_ids, 4);
+    tp_flush(&w);
+    for (i = 0; i < 4; i++) crc[i] = (uint8_t)(w.crc >> (8 * i));
+    tp_put(&w, crc, 4);
+    /* the headers as they were */
+    for (scan = (tv_size)ALIGN_UP(1); scan < st->heap_top; scan = (tv_size)(scan + OBJ(vm, scan)->size)) {
+        tv_hdr *h = OBJ(vm, scan);
+        h->mark = 0;
+        if (h->kind == OBJ_STR) h->aux = 0;
+    }
+    return w.err ? 0 : w.total;
+}
+
+/* ─── loading ─── */
+typedef struct tp_in {
+    tilvm *vm;
+    tilvm_get_fn get;
+    void *ctx;
+    uint32_t crc, n_ids;                    /* ids referenced so far */
+    int err;
+    int tab_on;                             /* the id -> object table at the arena's end */
+    uint32_t tab_n, cur_id;                 /* table entries; walk position (cur_id: cur_ref) */
+    tv_ref cur_ref;
+} tp_in;
+
+static void tp_fail(tp_in *r, int code) {
+    if (!r->err) r->err = code;
+}
+
+static uint32_t tp_rd(tp_in *r, unsigned n) {           /* n <= 4 bytes, little endian */
+    uint8_t b[4];
+    uint32_t v = 0;
+    if (r->err) return 0;
+    if (r->get(r->ctx, b, n) != 0) { tp_fail(r, TILVM_P_CORRUPT); return 0; }
+    r->crc = crc32_add(r->crc, b, n);
+    while (n--) v = (v << 8) | b[n];
+    return v;
+}
+
+static void tp_rec_in(tp_in *r, const uint8_t *f, uint32_t *v) {
+    while (*f) *v++ = tp_rd(r, *f++);
+}
+
+static void tp_get_value(tp_in *r, tv_val *dst) {
+    tilvm *vm = r->vm;
+    uint32_t tag = tp_rd(r, 1), lo, hi, k;
+    set_nil(dst);
+    switch (tag) {
+    case TP_NIL: return;
+    case TP_FALSE: case TP_TRUE: set_bool(dst, tag == TP_TRUE); return;
+    case TP_INT:
+        lo = tp_rd(r, 4);
+        hi = tp_rd(r, 4);
+#if TILVM_INT_BITS == 64
+        set_int(dst, (tv_int)(((uint64_t)hi << 32) | lo));
+#else
+        if (hi != ((lo & 0x80000000u) ? 0xFFFFFFFFu : 0u)) { tp_fail(r, TILVM_P_INT_RANGE); return; }
+#if TILVM_INT_BITS == 16
+        if (lo + 0x8000u > 0xFFFFu) { tp_fail(r, TILVM_P_INT_RANGE); return; }
+#endif
+        set_int(dst, (tv_int)(int32_t)lo);
+#endif
+        return;
+    case TP_FLOAT:
+        lo = tp_rd(r, 4);
+        hi = tp_rd(r, 4);
+#if !TILVM_FLOAT
+        (void)lo; (void)hi;
+        tp_fail(r, TILVM_P_NO_FLOAT);
+#elif TILVM_FLOAT == 2 && DBL_MANT_DIG == 53
+        {
+            uint64_t bits = ((uint64_t)hi << 32) | lo;
+            tv_float f;
+            memcpy(&f, &bits, 8);
+            set_float(dst, f);
+        }
+#else
+        set_float(dst, f32_from_bits(hi, lo));
+#endif
+        return;
+    case TP_CONST: case TP_FUNC:
+        k = tp_rd(r, 2);
+        if (tag == TP_CONST ? k >= vm->n_consts || vm->bc[vm->const_off[k] - 1] != 3 : k >= vm->n_funcs) break;
+        dst->t = tag == TP_CONST ? TV_STRK : TV_FUNC;
+        dst->u.k = (uint16_t)k;
+        return;
+    case TP_REF:
+        k = tp_rd(r, 4);
+        if (r->err) return;
+        if (!k || k > r->n_ids + 1) break;          /* ids come in order */
+        if (k > (uint32_t)TILVM_HEAP_SIZE / 8u) { tp_fail(r, TILVM_P_TOO_BIG); return; }   /* objects >= 8 bytes */
+        if (k > r->n_ids) r->n_ids = k;
+        dst->t = TV_PEND;
+        dst->u.r = (tv_ref)k;
+        return;
+    case TP_UNDEF: dst->t = TV_UNDEF; return;
+    default: break;
+    }
+    tp_fail(r, TILVM_P_CORRUPT);
+}
+
+/* a new object (no GC while loading: references are ids until the end) */
+static tv_ref tp_alloc(tp_in *r, uint8_t kind, uint32_t size) {
+    tilvm *vm = r->vm;
+    uint32_t top = vm->st.heap_top, limit;
+    tv_ref ref;
+    if (r->err) return 0;
+    size = (uint32_t)ALIGN_UP(size);
+    limit = r->tab_on ? (uint32_t)TILVM_HEAP_SIZE - r->tab_n * (uint32_t)sizeof(tv_ref) : (uint32_t)TILVM_HEAP_SIZE;
+    if (size > (uint32_t)TILVM_HEAP_SIZE - top) { tp_fail(r, TILVM_P_TOO_BIG); return 0; }
+    if (top + size > limit) r->tab_on = 0;            /* the objects need the table's room */
+    ref = (tv_ref)top;
+    vm->st.heap_top = (tv_size)(top + size);
+    memset(vm->mem.heap + ref, 0, size);
+    OBJ(vm, ref)->kind = kind;
+    OBJ(vm, ref)->size = (tv_size)size;
+    return ref;
+}
+
+static tv_ref tp_lookup(tp_in *r, uint32_t id) {        /* object `id` (1 ..) */
+    tilvm *vm = r->vm;
+    tv_ref ref;
+    if (r->tab_on) {
+        memcpy(&ref, vm->mem.heap + TILVM_HEAP_SIZE - id * sizeof(tv_ref), sizeof ref);
+        return ref;
+    }
+    if (!r->cur_id || id < r->cur_id) { r->cur_id = 1; r->cur_ref = (tv_ref)ALIGN_UP(1); }
+    while (r->cur_id < id) {                            /* objects lie in id order (+ buffers) */
+        do r->cur_ref = (tv_ref)(r->cur_ref + OBJ(vm, r->cur_ref)->size);
+        while (OBJ(vm, r->cur_ref)->kind == OBJ_VALS);
+        r->cur_id++;
+    }
+    return r->cur_ref;
+}
+
+static void tp_patch(tp_in *r, tv_val *v, uint32_t n) {
+    for (; n--; v++)
+        if (v->t == TV_PEND) {
+            tv_ref o = tp_lookup(r, v->u.r);
+            v->t = TP_TAG[OBJ(r->vm, o)->kind];
+            v->u.r = o;
+        }
+}
+
+int tilvm_load_portable(tilvm *vm, tilvm_get_fn get, void *ctx) {
+    tilvm_state *st = &vm->st;
+    tp_in r;
+    uint32_t state[8], v[6], n, i, k, depth, w, h, n_read = 0, crc;
+    uint16_t g = vm->n_globals, nf, nt, nh;
+    tv_size scan;
+    memset(&r, 0, sizeof r);
+    r.vm = vm;
+    r.get = get;
+    r.ctx = ctx;
+    r.tab_on = 1;
+    reset_state(vm);
+    st->sp = 0;
+    if (tp_rd(&r, 4) != 0x504C4954u) { tp_fail(&r, TILVM_P_NOT_TILP); goto fail; }     /* "TILP" */
+    if (tp_rd(&r, 2) != 1u) tp_fail(&r, TILVM_P_VERSION);                              /* version 1, flags 0 */
+    if (!r.err && tp_rd(&r, 4) != vm->bc_hash) tp_fail(&r, TILVM_P_PROGRAM);
+    tp_rec_in(&r, TP_STATE, state);         /* steps, rng, tick, energy mode, 0, G, F */
+    if (state[4] > 2 || state[3] > 255 || state[6] != g) tp_fail(&r, TILVM_P_CORRUPT);
+    /* frames (closure: the object id until the end), recovery points, handler records */
+    nf = (uint16_t)state[7];
+    if (!nf) tp_fail(&r, TILVM_P_CORRUPT);
+    if (nf > TILVM_MAX_FRAMES) tp_fail(&r, TILVM_P_TOO_BIG);
+    for (i = 0; i < nf && !r.err; i++) {
+        tv_frame *f = &st->frames[i];
+        tp_rec_in(&r, TP_FRAME, v);
+        f->func = (uint16_t)v[0];
+        f->pc = (tv_off)(vm->code_off + v[1]);
+        f->base = (uint16_t)v[2];
+        f->extra = (uint8_t)v[3];
+        f->ret_pc = 0;
+        if (v[0] >= vm->n_funcs || v[1] >= vm->code_size || v[3] > 1) tp_fail(&r, TILVM_P_CORRUPT);
+        k = v[4];
+        if (k > r.n_ids + 1) tp_fail(&r, TILVM_P_CORRUPT);                  /* ids come in order */
+        else if (k > (uint32_t)TILVM_HEAP_SIZE / 8u) tp_fail(&r, TILVM_P_TOO_BIG);
+        else if (k > r.n_ids) r.n_ids = k;
+        f->closure = (tv_ref)k;
+    }
+    nt = (uint16_t)tp_rd(&r, 2);
+    if (nt > TILVM_MAX_TRY) tp_fail(&r, TILVM_P_TOO_BIG);
+    for (i = 0; i < nt && !r.err; i++) {
+        tv_try *t = &st->tries[i];
+        tp_rec_in(&r, TP_TRY, v);
+        t->handler = (tv_off)(vm->code_off + v[0]);
+        t->deadline = v[1];                            /* time left (0 = none) until the end */
+        t->n_frames = (uint16_t)v[2];
+        t->sp = (uint16_t)v[3];
+        t->n_handlers = (uint16_t)v[4];
+        if (v[0] >= vm->code_size || !v[2] || v[2] > nf || (i && v[2] < t[-1].n_frames))
+            tp_fail(&r, TILVM_P_CORRUPT);
+    }
+    nh = (uint16_t)tp_rd(&r, 2);
+#ifdef TILVM_NO_EFFECTS
+    if (nh) tp_fail(&r, TILVM_P_NO_EFFECTS);
+#else
+    if (nh > TILVM_MAX_HANDLERS) tp_fail(&r, TILVM_P_TOO_BIG);
+    for (i = 0; i < nh && !r.err; i++) {
+        tv_handler *e = &st->handlers[i];
+        tp_rec_in(&r, TP_HANDLER, v);
+        e->kind = (uint8_t)v[0];
+        e->n_frames = (uint16_t)v[1];
+        e->sp = (uint16_t)v[2];
+        e->n_try = (uint16_t)v[3];
+        k = v[4];
+        e->n = (uint16_t)v[5];
+        e->abort_pc = (tv_off)(e->kind ? 0u : vm->code_off + k);
+        e->_pad[0] = e->_pad[1] = e->_pad[2] = 0;
+        if (v[0] > 1 || e->n_frames > nf || e->n_try > nt || (i && e->n_frames < e[-1].n_frames) ||
+            (e->kind == 0 && (!e->n_frames || k >= vm->code_size)) ||
+            (e->kind == 1 && (!e->n_frames || e->n_frames >= nf || e->n >= i || st->handlers[e->n].kind ||
+                              e->sp || k)))
+            tp_fail(&r, TILVM_P_CORRUPT);
+    }
+#endif
+    /* values: the globals, then the value stack */
+    for (i = 0; i < g && !r.err; i++) tp_get_value(&r, &st->stack[i]);
+    depth = tp_rd(&r, 2);
+    if ((uint32_t)g + depth > TILVM_STACK_SIZE) tp_fail(&r, TILVM_P_TOO_BIG);
+    for (i = 0; i < depth && !r.err; i++) tp_get_value(&r, &st->stack[g + i]);
+    if (r.err) goto fail;
+    st->sp = (uint16_t)(g + depth);
+    for (i = 0; i < nf; i++) {          /* locals below the next frame's arguments */
+        tv_frame *f = &st->frames[i];
+        uint32_t top = i + 1 < nf ? (uint32_t)f[1].base - f[1].extra : depth;
+        if (f->base < f->extra || (!i && f->base) || f->base + (uint32_t)F_NLOCALS(vm, f->func) > top ||
+            (i + 1 < nf && f[1].base < f[1].extra))
+            tp_fail(&r, TILVM_P_CORRUPT);
+    }
+    for (i = 0; i < nt; i++)
+        if (st->tries[i].sp > depth || st->tries[i].n_handlers > nh) tp_fail(&r, TILVM_P_CORRUPT);
+#ifndef TILVM_NO_EFFECTS
+    for (i = 0; i < nh; i++)
+        if (!st->handlers[i].kind && st->handlers[i].sp + 2u * st->handlers[i].n > depth) tp_fail(&r, TILVM_P_CORRUPT);
+#endif
+    w = tp_rd(&r, 2);
+    h = tp_rd(&r, 2);
+    if ((w == 0) != (h == 0) || w > 4096 || h > 4096) tp_fail(&r, TILVM_P_CORRUPT);
+#ifdef TILVM_NO_GFX
+    if (w) tp_fail(&r, TILVM_P_SCREEN);
+#else
+    if (w > TILVM_GFX_MAX_W || h > TILVM_GFX_MAX_H) tp_fail(&r, TILVM_P_SCREEN);
+#endif
+    /* the object table */
+    while (n_read < r.n_ids && !r.err) {
+        uint32_t kind = tp_rd(&r, 1);
+        tv_ref o = 0;
+        tv_val *vals = 0;
+        n = 0;
+        switch (kind) {
+        case 1:                                         /* string */
+            n = tp_rd(&r, 4);
+            if (n > TV_STR_MAX) { tp_fail(&r, TILVM_P_TOO_BIG); break; }
+            o = tp_alloc(&r, OBJ_STR, (uint32_t)offsetof(tv_strobj, data) + n + 1);
+            if (!o) break;
+            STROBJ(vm, o)->len = (tv_size)n;
+            if (n && get(ctx, (uint8_t *)STROBJ(vm, o)->data, n) != 0) tp_fail(&r, TILVM_P_CORRUPT);
+            else r.crc = crc32_add(r.crc, (const uint8_t *)STROBJ(vm, o)->data, n);
+            n = 0;
+            break;
+        case 2: case 3: {                               /* array, map */
+            uint32_t len = tp_rd(&r, 4), cap;
+            tv_ref buf;
+            n = kind == 3 ? 2 * len : len;
+            if (len > 0xFFFFu || n > 0xFFFFu) { tp_fail(&r, TILVM_P_TOO_BIG); break; }
+            o = tp_alloc(&r, kind == 3 ? OBJ_MAP : OBJ_ARRAY, sizeof(tv_arrobj));
+            cap = n < 4 ? 4 : n;
+            buf = tp_alloc(&r, OBJ_VALS, (uint32_t)offsetof(tv_valsobj, v) + cap * (uint32_t)sizeof(tv_val));
+            if (!buf) break;
+            OBJ(vm, buf)->aux = (uint16_t)cap;
+            for (k = 0; k < cap; k++) set_nil(&VALS(vm, buf)[k]);
+            ARROBJ(vm, o)->buf = buf;
+            ARROBJ(vm, o)->len = (tv_size)len;
+            vals = VALS(vm, buf);
+            break;
+        }
+        case 4: case 5: {                               /* struct, closure */
+            uint32_t a = tp_rd(&r, 2);
+            n = tp_rd(&r, 2);
+            if (r.err) break;
+            if (kind == 4 ? a >= vm->n_types || n != type_nfields(vm, (uint16_t)a)
+                          : a >= vm->n_funcs || n != FN_NUPVALS(func_rec(vm, (uint16_t)a))) {
+                tp_fail(&r, TILVM_P_CORRUPT);
+                break;
+            }
+            o = tp_alloc(&r, kind == 4 ? OBJ_STRUCT : OBJ_CLOSURE,
+                         (uint32_t)(kind == 4 ? offsetof(tv_structobj, v) : offsetof(tv_closobj, v)) +
+                         n * (uint32_t)sizeof(tv_val));
+            if (!o) break;
+            if (kind == 4) { OBJ(vm, o)->aux = (uint16_t)a; vals = STRUCTOBJ(vm, o)->v; }
+            else { OBJ(vm, o)->aux = (uint16_t)n; CLOSOBJ(vm, o)->func = (uint16_t)a; vals = CLOSOBJ(vm, o)->v; }
+            break;
+        }
+        case 6:                                         /* cell */
+            o = tp_alloc(&r, OBJ_CELL, sizeof(tv_cellobj));
+            if (o) vals = &CELLOBJ(vm, o)->v;
+            n = 1;
+            break;
+        default:
+            tp_fail(&r, TILVM_P_CORRUPT);
+        }
+        for (k = 0; k < n && !r.err; k++) tp_get_value(&r, &vals[k]);
+        if (r.err) break;
+        n_read++;
+        if (r.tab_on) {                                 /* id -> object, at the arena's end */
+#ifdef TILVM_P_SCRATCH         /* tests: an id table of this many entries (then walks) */
+            if (n_read > TILVM_P_SCRATCH) r.tab_on = 0;
+            else
+#endif
+            if (n_read * (uint32_t)sizeof(tv_ref) <= (uint32_t)TILVM_HEAP_SIZE - st->heap_top) {
+                memcpy(vm->mem.heap + TILVM_HEAP_SIZE - n_read * sizeof(tv_ref), &o, sizeof o);
+                r.tab_n = n_read;
+            } else r.tab_on = 0;
+        }
+    }
+    if (tp_rd(&r, 4) != r.n_ids) tp_fail(&r, TILVM_P_CORRUPT);
+    crc = r.crc;
+    if (tp_rd(&r, 4) != crc) tp_fail(&r, TILVM_P_CORRUPT);
+    if (r.err) goto fail;
+    /* references: ids -> objects; check what the program relies on */
+    tp_patch(&r, st->stack, st->sp);
+    for (i = 0; i < nf; i++) {
+        tv_frame *f = &st->frames[i];
+        f->base = (uint16_t)(f->base + g);
+        if (f->closure) {
+            f->closure = tp_lookup(&r, f->closure);
+            if (OBJ(vm, f->closure)->kind != OBJ_CLOSURE || CLOSOBJ(vm, f->closure)->func != f->func)
+                tp_fail(&r, TILVM_P_CORRUPT);
+        }
+    }
+    for (scan = (tv_size)ALIGN_UP(1); scan < st->heap_top; scan = (tv_size)(scan + OBJ(vm, scan)->size)) {
+        tv_hdr *o = OBJ(vm, scan);
+        tv_val *vals;
+        n = obj_nvals(vm, scan, &vals);
+        if (o->kind == OBJ_MAP) {                       /* its buffer: keys are scalars or strings */
+            tv_ref buf = ARROBJ(vm, scan)->buf;
+            tv_val *kv = VALS(vm, buf);
+            tp_patch(&r, kv, OBJ(vm, buf)->aux);
+            for (k = 0; k < ARROBJ(vm, scan)->len; k++) {
+                uint8_t t = kv[2 * k].t;
+                if (t != TV_NIL && t != TV_BOOL && t != TV_INT && t != TV_FLOAT && !is_str(&kv[2 * k]))
+                    tp_fail(&r, TILVM_P_CORRUPT);
+            }
+        }
+        tp_patch(&r, vals, n);
+        if (o->kind == OBJ_CLOSURE)
+            for (k = 0; k < n; k++)
+                if (vals[k].t != TV_CELL) tp_fail(&r, TILVM_P_CORRUPT);
+    }
+    if (r.err) goto fail;
+    /* the state */
+    st->n_frames = nf;
+    st->n_try = nt;
+    st->n_handlers = nh;
+    st->steps = state[0];
+#if TILVM_INT_BITS == 64
+    st->rng = ((uint64_t)state[2] << 32) | state[1];
+#else
+    st->rng = state[1];
+#endif
+    if (!st->rng) st->rng = 0x9E3779B9u;
+    st->tick = state[3];
+    st->n_deadlines = 0;
+    for (i = 0; i < nt; i++) {
+        tv_try *t = &st->tries[i];
+        t->sp = (uint16_t)(t->sp + g);
+        if (t->deadline) { t->deadline = now_ms(vm) + t->deadline + 1u; st->n_deadlines++; }
+    }
+#ifndef TILVM_NO_EFFECTS
+    for (i = 0; i < nh; i++)
+        if (!st->handlers[i].kind) st->handlers[i].sp = (uint16_t)(st->handlers[i].sp + g);
+#endif
+    st->scr_w = (uint16_t)w;
+    st->scr_h = (uint16_t)h;
+#ifndef TILVM_NO_GFX
+    if (w && vm->host.gfx_pixel) gfx_open(vm);         /* the size is kept, the pixels are not */
+#endif
+    TV_STAT_MAX(peak_heap, st->heap_top);
+    return 0;
+fail:
+    reset_state(vm);
+    st->failed = 1;
+    return r.err;
+}
+#endif /* TILVM_LEAN, TILVM_NO_PORTABLE */
