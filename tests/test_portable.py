@@ -1027,20 +1027,22 @@ int main(int argc, char **argv) {
 '''
 
 
+@pytest.fixture(scope='module')
+def host(tmp_path_factory):
+    d = tmp_path_factory.mktemp('host')
+    src = os.path.join(str(d), 'host.c')
+    with open(src, 'w') as f:
+        f.write(HOST_C)
+    exe = os.path.join(str(d), 'host')
+    r = subprocess.run([CC, '-std=c99', '-O1', '-Wall', '-Wextra', '-pedantic', '-Werror', '-DTILVM_HEAP_SIZE=8192',
+                        '-I', VM_DIR, '-o', exe, src, os.path.join(VM_DIR, 'tilvm.c'), '-lm'],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return exe
+
+
 @needs_cc
 class TestCAPI:
-    @pytest.fixture(scope='class')
-    def host(self, tmp_path_factory):        # (no @classmethod: pytest on Python 3.9 rejects it)
-        d = tmp_path_factory.mktemp('host')
-        src = os.path.join(str(d), 'host.c')
-        with open(src, 'w') as f:
-            f.write(HOST_C)
-        exe = os.path.join(str(d), 'host')
-        r = subprocess.run([CC, '-std=c99', '-O1', '-Wall', '-Wextra', '-pedantic', '-Werror', '-DTILVM_HEAP_SIZE=8192',
-                            '-I', VM_DIR, '-o', exe, src, os.path.join(VM_DIR, 'tilvm.c'), '-lm'],
-                           capture_output=True, text=True)
-        assert r.returncode == 0, r.stderr
-        return exe
 
     @pytest.mark.parametrize('name', ['closures', 'maps', 'effects'])
     def test_save_leaves_the_vm_unchanged(self, tmp_path, host, name):
