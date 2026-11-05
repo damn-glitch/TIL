@@ -10709,8 +10709,8 @@ class TILVM:
 
         try:
             out += TILP_MAGIC + bytes((TILP_VERSION, 0)) + pack('<I', self.program_hash())
-            # energy mode (design §11): reserved, 0
-            out += pack('<IQHBB', self.steps & 0xFFFFFFFF, self.rng & INT64_MASK, self.tick, 0, 0)
+            # state: steps, rng, tick, energy mode (design §11), reserved
+            out += pack('<IQHBB', self.steps & 0xFFFFFFFF, self.rng & INT64_MASK, self.tick, self.energy, 0)
             out += pack('<H', len(self.globals))
             out += pack('<H', len(self.frames))
             for func, pc, base, clos, extra in self.frames:
@@ -10971,6 +10971,7 @@ class TILVM:
         self.steps = steps
         self.rng = rng or 0x9E3779B97F4A7C15
         self.tick = tick
+        self.energy = energy                     # energy mode (design §11)
         self.globals = [res(v) for v in globals_]
         self.stack = [res(v) for v in stack]
         self.frames = frames

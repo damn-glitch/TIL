@@ -1192,3 +1192,57 @@ def test_continue_on_cortex_m(tmp_path):
     rest = b"".join(ln + b"\n" for ln in (r.stdout + r.stderr).splitlines() if b"Timer with period" not in ln)
     _rc, ref, _steps = reference(tbc)
     assert r1.stdout + rest == ref
+
+
+# ── energy mode travels with the snapshot (design §11 + §2) ──────────────────
+
+ENERGY_PROGRAM = '''#[energy: balanced]
+
+var total = 0
+for i in 0..3000
+    total += i
+print(energy_mode())
+print(energy_mode(2))
+var t2 = 0
+for i in 0..3000
+    t2 += i
+print(energy_mode())
+print(total + t2)
+'''
+
+
+@pytest.mark.parametrize("pause", [10, 2000, 3005, 4500])
+def test_energy_mode_is_saved_and_restored_both_ways(pause):
+    from tilhelpers import run_vm as _run_vm
+    data = til.compile_to_bytecode(ENERGY_PROGRAM, "<energy>").serialize()
+    _rc, full = _run_vm(data)
+    # Python VM -> Python VM and -> C VM
+    m = til.TBCModule.from_bytes(data)
+    out1 = []
+    vm = til.TILVM(m, write=out1.append)
+    assert vm.run_steps(pause) == 2
+    snap = vm.save_portable()
+    assert snap[24] == vm.energy
+    m2 = til.TBCModule.from_bytes(data)
+    out2 = []
+    vm2 = til.TILVM(m2, write=out2.append)
+    vm2.load_portable(snap)
+    assert vm2.energy == vm.energy
+    vm2.run()
+    assert (b"".join(out1) + b"".join(out2)).decode() == full
+
+
+@pytest.mark.skipif(shutil.which('gcc') is None and shutil.which('clang') is None, reason="no C compiler")
+@pytest.mark.parametrize("first, second", [("--vm", "--cvm"), ("--cvm", "--vm")])
+def test_energy_mode_crosses_vms(tmp_path, first, second):
+    prog = tmp_path / "e.til"
+    prog.write_text(ENERGY_PROGRAM, encoding="utf-8")
+    snap = str(tmp_path / "s.tilp")
+    whole = cli("run", "--vm", str(prog))
+    a = cli("run", first, str(prog), "--pause-after", "4500", "--save", snap)
+    assert a.returncode == 3, a.stderr
+    with open(snap, "rb") as f:
+        assert f.read()[24] == 2          # energy_mode(2) ran before the pause
+    b = cli("run", second, str(prog), "--resume", snap)
+    assert b.returncode == 0, b.stderr
+    assert a.stdout + b.stdout == whole.stdout

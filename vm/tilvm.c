@@ -5604,7 +5604,8 @@ uint32_t tilvm_save_portable(tilvm *vm, tilvm_put_fn put, void *ctx) {
     v[2] = 0;
 #endif
     v[3] = st->tick;
-    v[4] = v[5] = 0;                        /* energy mode (reserved, design §11), reserved */
+    v[4] = st->energy;                      /* energy mode (design §11) */
+    v[5] = 0;                               /* reserved */
     v[6] = g;
     v[7] = st->n_frames;
     tp_rec_out(&w, TP_STATE, v);
@@ -6055,6 +6056,7 @@ int tilvm_load_portable(tilvm *vm, tilvm_get_fn get, void *ctx) {
 #endif
     if (!st->rng) st->rng = 0x9E3779B9u;
     st->tick = state[3];
+    st->energy = (uint8_t)state[4];         /* energy mode (design §11) */
     st->n_deadlines = 0;
     for (i = 0; i < nt; i++) {
         tv_try *t = &st->tries[i];

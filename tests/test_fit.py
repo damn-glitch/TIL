@@ -1852,8 +1852,13 @@ class TestBuildSwitches:
 
     def test_z80_does_not_fit_what_the_port_leaves_out(self, tmp_path):
         dev = fit.DEVICES['z80-16']
-        assert dev.addr16 and dev.no_effects and dev.no_gfx and dev.lean and dev.funcs_table == 0
-        assert fit.vm_struct_layout(dev)['tilvm'] == 5836          # vm/ports/z80/RESULTS.md (SDCC)
+        assert dev.addr16 and dev.no_effects and dev.no_energy and dev.no_gfx and dev.lean and dev.funcs_table == 0
+        assert fit.vm_struct_layout(dev)['tilvm'] == 5840          # vm/ports/z80/RESULTS.md (SDCC)
+
+    def test_z80_has_no_energy_mode(self, tmp_path):
+        r = report("print(energy_mode())", 'z80-16')
+        assert not r.fits and "energy_mode() not available (TILVM_NO_ENERGY)" in r.verdict()
+        assert report("print(energy_mode())", 'cortex-m3-64k').fits
 
     def test_function_table(self, tmp_path):
         src = "".join(f"f{i}() -> int\n    return {i}\n" for i in range(12)) + \

@@ -150,7 +150,7 @@ builds) and 32 effect handler entries (`TILVM_MAX_HANDLERS`).
   16-bit integers, no floats, `TILVM_NO_EFFECTS`, `TILVM_NO_GFX`: with handlers and
   screen natives the code would not fit below 0xC000) with the memory map of its
   simulator harness (`main_z80.c`, `RESULTS.md`): the VM state at `0xC000-0xD7FF`
-  (6 KB; `sizeof(tilvm)` = 5836 bytes with SDCC), the program at `0xD800-0xEFEF`
+  (6 KB; `sizeof(tilvm)` = 5840 bytes with SDCC), the program at `0xD800-0xEFEF`
   (a u16 length + at most 6126 bytes of bytecode), the C stack in a region of its own
   at `0xF800` (2 KB; not counted). A real TI-83 Plus / TI-84 Plus needs a multi-page
   Flash application (not implemented, see `RESULTS.md`).
@@ -557,7 +557,7 @@ call frames, effect handlers, lookup caches); `--json` has them under
                             "tries_per_level": 0, "handlers_per_level": 0, "levels": 22,
                             "limited_by": "call frames"}],
              "uses_float_constants": true, "functions_detail": [{"name": "main", "...": "..."}]},
-  "vm": {"struct_bytes": 5836, "value_bytes": 3, "struct_parts": {"heap": 4096, "...": 0},
+  "vm": {"struct_bytes": 5840, "value_bytes": 3, "struct_parts": {"heap": 4096, "...": 0},
          "c_flags": ["-DTILVM_INT_BITS=16", "..."]},
   "run": null
 }

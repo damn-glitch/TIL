@@ -82,6 +82,7 @@ DEVICE_KEYS = {
     'lean': "TILVM_LEAN: builtins of the lean build only",
     'addr16': "TILVM_ADDR16: 16-bit bytecode offsets and object lengths (programs below 64 KB)",
     'no_effects': "TILVM_NO_EFFECTS: no effect handlers (handle ... with ... reports 'not available')",
+    'no_energy': "TILVM_NO_ENERGY: no battery saving (#[energy: ...] runs at full speed, energy_mode() reports 'not available')",
     'no_gfx': "TILVM_NO_GFX: no screen/keys natives",
     'gfx_max_w': "TILVM_GFX_MAX_W: widest screen screen_init() accepts (pixels)",
     'gfx_max_h': "TILVM_GFX_MAX_H: tallest screen screen_init() accepts (pixels)",
@@ -104,7 +105,7 @@ DEVICE_KEYS = {
     'title': "", 'cpu': "", 'source': "where the numbers come from",
 }
 
-BOOL_KEYS = ('lean', 'addr16', 'no_effects', 'no_gfx', 'no_stdio', 'no_time', 'no_math', 'bytecode_in_ram',
+BOOL_KEYS = ('lean', 'addr16', 'no_effects', 'no_energy', 'no_gfx', 'no_stdio', 'no_time', 'no_math', 'bytecode_in_ram',
              'clock', 'screen', 'files', 'console', 'args')
 STR_KEYS = ('rom', 'abi', 'title', 'cpu', 'source')
 NULLABLE_KEYS = ('storage', 'ram', 'max_funcs', 'field_cache')
@@ -112,7 +113,7 @@ GFX_LIMIT = 4096                  # the language's largest screen (TILVM_GFX_MAX
 
 _DESKTOP_BUILD = dict(int_bits=64, float=2, heap=256 * KB, stack=8192, frames=1000, consts=4096,
                       types=512, try_depth=32, max_handlers=32, mark_stack=64, max_funcs=None,
-                      field_cache=None, lean=False, addr16=False, no_effects=False, no_gfx=False,
+                      field_cache=None, lean=False, addr16=False, no_effects=False, no_energy=False, no_gfx=False,
                       gfx_max_w=GFX_LIMIT, gfx_max_h=GFX_LIMIT, no_stdio=False, no_time=False,
                       no_math=False, rom='')
 _BASE = dict(_DESKTOP_BUILD, storage=None, ram=None, c_stack=0, vm_static_ram=0,
@@ -121,7 +122,7 @@ _BASE = dict(_DESKTOP_BUILD, storage=None, ram=None, c_stack=0, vm_static_ram=0,
 # (key, macro) of the switches that are -DMACRO without a value
 _SWITCHES = (('lean', 'TILVM_LEAN'), ('addr16', 'TILVM_ADDR16'), ('no_stdio', 'TILVM_NO_STDIO'),
              ('no_time', 'TILVM_NO_TIME'), ('no_math', 'TILVM_NO_MATH'), ('no_effects', 'TILVM_NO_EFFECTS'),
-             ('no_gfx', 'TILVM_NO_GFX'))
+             ('no_gfx', 'TILVM_NO_GFX'), ('no_energy', 'TILVM_NO_ENERGY'))
 
 
 class Device:
@@ -306,13 +307,13 @@ _device('rp2040', title="Raspberry Pi Pico (RP2040), 264 KB SRAM / 2 MB flash",
 _device('z80-16', title="Z80 calculator class (TI-83 Plus / TI-84 Plus), 16-bit lean build",
         cpu="Z80 @ 6-15 MHz, 64 KB address space, verified in the ucsim simulator",
         int_bits=16, float=0, heap=4096, stack=192, frames=32, consts=192, types=24, try_depth=8,
-        mark_stack=16, lean=True, addr16=True, no_effects=True, no_gfx=True, no_stdio=True,
-        no_time=True, storage=0xEFF0 - 0xD802, ram=0xD800 - 0xC000, c_stack=0, abi='z80',
+        mark_stack=16, lean=True, addr16=True, no_effects=True, no_energy=True, no_gfx=True,
+        no_stdio=True, no_time=True, storage=0xEFF0 - 0xD802, ram=0xD800 - 0xC000, c_stack=0, abi='z80',
         clock=False,
         source="vm/ports/z80/Makefile and RESULTS.md: VM state at 0xC000-0xD7FF, the program "
                "at 0xD800-0xEFEF (u16 length + bytecode), the C stack in its own 2 KB at "
-               "0xF800 (not counted); no effect handlers and no screen natives (they would "
-               "not fit below 0xC000)")
+               "0xF800 (not counted); no effect handlers, no screen natives and no battery "
+               "saving (they would not fit below 0xC000)")
 
 
 def load_device(spec: str) -> Device:
@@ -2553,7 +2554,8 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
     label = (f"{len(natives)} native{'s' if len(natives) != 1 else ''}, "
              f"{len(methods)} method{'s' if len(methods) != 1 else ''}") + ("" if an.complete else " (incomplete)")
     off = [x for x, on in (("effect handlers", dev.no_effects and an.handle_sites()),
-                           ("screen/keys natives", dev.no_gfx and any(n in natives for n in SCREEN_NATIVES)))
+                           ("screen/keys natives", dev.no_gfx and any(n in natives for n in SCREEN_NATIVES)),
+                           ("energy_mode()", dev.no_energy and 'energy_mode' in natives))
            if on]
     note = "; ".join(x for x in (("missing: " + ", ".join(n for n, _s in missing)) if missing else "",
                                  ("not in this build: " + ", ".join(off)) if off else "") if x)
@@ -2596,6 +2598,10 @@ def check(an: Analysis, dev: Device, strip_saving: int = 0) -> Report:
                 f"built without them (TILVM_NO_EFFECTS): the program stops with \"effect handlers are not "
                 f"available in this VM build\" (a `perform` without a handler still calls the function of "
                 f"that name)", "effect handlers not available (TILVM_NO_EFFECTS)")
+    if 'energy_mode' in natives and dev.no_energy:
+        r.error(f"energy_mode() ({_places(an, natives['energy_mode'], 2)}): this device's VM is built without "
+                f"battery saving (TILVM_NO_ENERGY): the program stops with \"energy_mode() is not available "
+                f"in this VM build\"", "energy_mode() not available (TILVM_NO_ENERGY)")
     scr = [n for n in SCREEN_NATIVES if n in natives]
     if scr and dev.no_gfx:
         listed = ", ".join(n + "()" for n in scr[:4]) + (", ..." if len(scr) > 4 else "")
