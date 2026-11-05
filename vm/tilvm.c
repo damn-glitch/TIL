@@ -114,6 +114,10 @@ enum {
 #define FLAG_ENERGY_LOW 8
 #define FLAG_EFFECT_CLAUSE 16
 
+/* vm->flags: the .tbc header flags, and bit 7 = a function is #[energy: low] */
+#define TBC_ENERGY_SHIFT 2      /* header bits 2-3: initial energy mode */
+#define VMF_ENERGY_LOW 0x80
+
 /* Longest string: 64 KB - 1 with 16-bit heap references, else 16 MB */
 #if TILVM_HEAP_SIZE <= 65535L
 #define TV_STR_MAX 0xFFFFul
@@ -2239,7 +2243,7 @@ static int gfx_key(tilvm *vm, uint8_t id, tv_val *res) {
         return failn(vm, NATIVE_NAMES[id], "() is not available on this device", 0, 0, 0, 0);
     else {
         k = vm->host.key_pressed(vm->ctx);
-        while (id == N_WAIT_KEY && k == 0) {     /* no wait_key hook: poll */
+        while (id == N_WAIT_KEY && k == 0 && vm->st.halted != 2) {   /* no wait_key hook: poll */
             if (vm->host.idle) vm->host.idle(vm->ctx, 1);
             k = vm->host.key_pressed(vm->ctx);
         }
@@ -2315,6 +2319,30 @@ static int native_gfx(tilvm *vm, uint8_t id, uint16_t base, uint8_t argc, tv_val
     return 1;
 }
 #endif /* TILVM_NO_GFX */
+
+/* ─── energy saving (TIL 3.1, docs/TIL_ENERGY.md) ─────────────────────────
+ * Modes (st.energy): 0 performance (never idle), 1 balanced (idle 1 ms at
+ * every step that is a multiple of 4096), 2 low (every multiple of 512).
+ * While a frame of an #[energy: low] function is active the VM behaves as
+ * mode 2. The interpreter calls energy_point() only at steps that are
+ * multiples of 512 while ENERGY_ON (refuel() makes the fuel counter end
+ * there; energy_mode() refuels): nothing is added per instruction. */
+#ifndef TILVM_NO_ENERGY
+#define ENERGY_ON(vm) ((vm)->st.energy || ((vm)->flags & VMF_ENERGY_LOW))
+
+static void energy_point(tilvm *vm) {
+    tilvm_state *st = &vm->st;
+    unsigned m = st->energy;
+    uint16_t i;
+    if (m != 2 && (vm->flags & VMF_ENERGY_LOW))
+        for (i = st->n_frames; i > 0; i--)
+            if (F_FLAGS(vm, st->frames[i - 1].func) & FLAG_ENERGY_LOW) { m = 2; break; }
+    if (m == 2 || (m == 1 && !((uint16_t)st->steps & 4095u))) {
+        vm->idle_count++;
+        if (vm->host.idle) vm->host.idle(vm->ctx, 1);
+    }
+}
+#endif
 
 /* args are STK[base .. base+argc); the result replaces them */
 static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
@@ -2533,10 +2561,18 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         vm->st.rng = a->u.i ? (uint32_t)a->u.i : 0x9E3779B9u;
         break;
     case N_SLEEP_MS: {
-        uint32_t until;
+        uint32_t ms, until, now;
         if (a->t != TV_INT) return fail(vm, "sleep_ms() needs an integer");
-        until = now_ms(vm) + (uint32_t)(a->u.i > 0 ? a->u.i : 0);
-        if (vm->clock_ms) while ((int32_t)(now_ms(vm) - until) < 0) { }
+        ms = (uint32_t)(a->u.i > 0 ? a->u.i : 0);
+        if (vm->clock_ms) {
+            /* wait on the clock (re-read after every idle: hosts may watch the reads, see
+             * website/playground/wasm_host.c); idle instead of spinning when the host can */
+            until = now_ms(vm) + ms;
+            while ((int32_t)((now = now_ms(vm)) - until) < 0 && vm->st.halted != 2)
+                if (vm->host.idle) vm->host.idle(vm->ctx, (unsigned long)(until - now));
+        } else if (vm->host.idle && ms) {
+            vm->host.idle(vm->ctx, ms);         /* no clock: trust the idle hook */
+        }
         break;
     }
 #endif
@@ -2596,6 +2632,16 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         SP = (uint16_t)(base + 1);
         return 1;
     }
+#endif
+#ifndef TILVM_NO_ENERGY
+    case N_ENERGY_MODE:             /* energy_mode() -> mode; energy_mode(m) -> previous mode */
+        set_int(&res, (tv_int)vm->st.energy);
+        if (argc) {
+            if (a->t != TV_INT || a->u.i < 0 || a->u.i > 2)
+                return fail(vm, "energy_mode() needs a mode 0 (performance), 1 (balanced) or 2 (low)");
+            vm->st.energy = (uint8_t)a->u.i;
+        }
+        break;
 #endif
     case N_EXIT:
         vm->st.exit_code = (uint8_t)(argc && a->t == TV_INT ? a->u.i : 0);
@@ -3089,6 +3135,9 @@ static void reset_state(tilvm *vm) {
     uint16_t i;
     memset(st, 0, offsetof(tilvm_state, frames));     /* counters, flags, sp = 0 */
     st->magic = 0x54494C53u;   /* "TILS" */
+#ifndef TILVM_NO_ENERGY
+    st->energy = (uint8_t)((vm->flags >> TBC_ENERGY_SHIFT) & 3u);
+#endif
     st->heap_top = (tv_size)ALIGN_UP(1);
     st->n_handlers = 0;        /* after frames[]: not covered by the memset */
     st->_hpad = 0;
@@ -3120,7 +3169,12 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
 #endif
     vm->bc = bc;
     vm->bc_size = size;
+#ifndef TILVM_NO_ENERGY
+    vm->flags = (uint8_t)(bc[5] & 0x7Fu);
+    if (((vm->flags >> TBC_ENERGY_SHIFT) & 3u) == 3u) return -5;   /* energy mode 0..2 */
+#else
     vm->flags = bc[5];
+#endif
 #if !TILVM_FLOAT
     if (vm->flags & 1) return -3;          /* program uses floats */
 #endif
@@ -3185,6 +3239,10 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
         vm->funcs[i].flags = FN_FLAGS(f);
     }
 #endif
+#ifndef TILVM_NO_ENERGY
+    for (i = 0; i < vm->n_funcs; i++)         /* energy_point() looks at the frames then */
+        if (F_FLAGS(vm, (uint16_t)i) & FLAG_ENERGY_LOW) vm->flags |= VMF_ENERGY_LOW;
+#endif
 #if TILVM_FIELD_CACHE > 0
     for (i = 0; i < TILVM_FIELD_CACHE; i++) {
         vm->field_cache[i].type = CACHE_EMPTY;
@@ -3212,6 +3270,7 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
 #endif
     vm->ctx = 0;
     vm->max_steps = 0;
+    vm->idle_count = 0;
     memset(&vm->host, 0, sizeof(vm->host));
 #ifndef TILVM_NO_STDIO
     vm->host.read_file = default_read_file;
@@ -3614,8 +3673,10 @@ static int expired_try(tilvm *vm) {
  * while handler entries exist. */
 #if defined(__GNUC__)
 #define TV_NOINLINE __attribute__((noinline))
+#define TV_ALWAYS_INLINE __attribute__((always_inline)) inline
 #else
 #define TV_NOINLINE
+#define TV_ALWAYS_INLINE
 #endif
 
 /* effect name (string constant k) as a C string for error messages */
@@ -3825,14 +3886,23 @@ static void lean_save_pc(tv_frame *fr, const uint8_t *ip, const uint8_t *code) {
 #define REFUEL() (fuel_set = fuel = refuel(vm, budget))
 
 /* steps that may run before the slow path of `backedge` must check the sandbox
- * limit or the budget (budget 0 = none) */
-static uint32_t refuel(const tilvm *vm, uint32_t budget) {
+ * limit or the budget (budget 0 = none), or must look at energy saving (the
+ * next step that is a multiple of 512). Always inlined: as a call (GCC stops
+ * inlining it once it has the energy term) it costs the hot handlers registers,
+ * up to 3% more executed instructions on the benchmarks. */
+static TV_ALWAYS_INLINE uint32_t refuel(const tilvm *vm, uint32_t budget) {
     uint32_t fuel = budget ? budget : 0xFFFFFFFFu;
     if (vm->max_steps) {
         uint32_t left = vm->st.steps < vm->max_steps ? vm->max_steps - vm->st.steps : 0;
         if (left != 0xFFFFFFFFu) left++;
         if (left < fuel) fuel = left;
     }
+#ifndef TILVM_NO_ENERGY
+    if (ENERGY_ON(vm)) {
+        uint32_t left = 512u - (vm->st.steps & 511u);
+        if (left < fuel) fuel = left;
+    }
+#endif
     return fuel;
 }
 #endif
@@ -4570,6 +4640,9 @@ do_return:
         HELPER(call_native(vm, id, n));
         if (st->halted == 2) return TILVM_EXIT;
         if (op == OP_NATIVE_POP) sp--;
+#if !defined(TILVM_LEAN) && !defined(TILVM_NO_ENERGY)
+        if (id == N_ENERGY_MODE) goto energy_changed;
+#endif
         NEXT;
     }
 
@@ -5057,6 +5130,12 @@ backedge:
         st->failed = 1;
         goto fatal;
     }
+#ifndef TILVM_NO_ENERGY
+    if (!((uint16_t)st->steps & 511u) && ENERGY_ON(vm)) {
+        energy_point(vm);
+        if (st->halted == 2) goto host_exit;
+    }
+#endif
     if (st->n_deadlines && ++st->tick >= 256) {
         st->tick = 0;
         target = expired_try(vm);
@@ -5078,6 +5157,12 @@ backedge:
         st->failed = 1;
         goto fatal;
     }
+#ifndef TILVM_NO_ENERGY
+    if (!(st->steps & 511u) && ENERGY_ON(vm)) {
+        energy_point(vm);
+        if (st->halted == 2) goto host_exit;    /* the idle hook ended the program */
+    }
+#endif
     if (st->n_deadlines && ++st->tick >= 256) {
         st->tick = 0;
         target = expired_try(vm);
@@ -5092,6 +5177,18 @@ backedge:
     NEXT;
 #endif
 
+#if !defined(TILVM_LEAN) && !defined(TILVM_NO_ENERGY)
+energy_changed:     /* energy_mode() set the mode: refuel for the next energy point */
+    if (budget) budget -= fuel_set - fuel;   /* (the steps run since the last REFUEL) */
+    REFUEL();
+    NEXT;
+#endif
+#ifndef TILVM_NO_ENERGY
+host_exit:
+    SAVE_PC();
+    SYNC_SP();
+    return TILVM_EXIT;
+#endif
 #ifndef TILVM_LEAN
 stack_overflow:
     fail(vm, E_STACK);

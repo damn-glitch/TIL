@@ -2343,6 +2343,7 @@ struct FI
     pure: bool
     caps: any
     sc: any
+    elow: bool
 
 struct Prm
     name: str
@@ -2600,10 +2601,15 @@ parse_top_level(src)
         WORDS = {}
     skip_nl()
     var attrs = false
+    var etoks = []
     while TK.t == T_ATTRIBUTE
+        if TK.v.starts_with("energy:")
+            etoks.push(TK)
         PENDING_ATTRS.push(adv().v)
         skip_nl()
         attrs = true
+    if len(etoks) > 0
+        place_energy(src.text, etoks)
     let t = TK.t
     var node = None
     if t == T_IMPORT or t == T_FROM
@@ -2670,6 +2676,85 @@ parse_top_level(src)
         DEF_WORDS.push(WORDS)
         WORDS = None
     ITEMS.push(node)
+
+# `#[energy: ...]` before a top-level item (Parser.place_energy_attributes):
+# directly above a function (no empty line between) it marks the function,
+# else - or with `balanced` / `performance` - it is the file's energy-mode
+# pragma (FILE_ENERGY), which must come before every definition
+place_energy(text, etoks)
+    let fnext = at_func_def()
+    for tk in etoks
+        let lvl = strip_ws(tk.v.slice(7, len(tk.v)))
+        let attached = fnext and not blank_after(text, attr_end(text, tk.sp))
+        if attached and lvl != "balanced" and lvl != "performance"
+            continue
+        var i = 0
+        while PENDING_ATTRS[i] != tk.v
+            i += 1
+        PENDING_ATTRS.remove(i)
+        for it in ITEMS
+            if it.k != K_STMT
+                fail_at(tk.ln, "#[energy: ...] must be directly above a function, or come before every definition (the program's energy mode)")
+        var mode = -1
+        if lvl == "performance"
+            mode = 0
+        elif lvl == "balanced"
+            mode = 1
+        elif lvl == "low"
+            mode = 2
+        if mode < 0
+            fail_at(tk.ln, "unknown energy mode '" + lvl + "' (use low, balanced or performance)")
+        if FILE_ENERGY >= 0
+            fail_at(tk.ln, "the program's energy mode is set twice")
+        FILE_ENERGY = mode
+
+# the next top-level item is a function definition
+at_func_def()
+    if TK.t == T_FN
+        return true
+    if TK.t == T_PUB
+        return peek(1).t == T_FN or is_func_def_at(1)
+    return is_func_def_at(0)
+
+# offset just past the `]` of the attribute starting at sp (as lex_attr reads it)
+attr_end(text, sp)
+    let n = len(text)
+    var p = sp + 2
+    var depth = 1
+    while p < n and depth > 0
+        let c = text[p]
+        if c == 91
+            depth += 1
+        elif c == 93
+            depth -= 1
+        p += 1
+    return p
+
+# an empty line between offset p (the end of a token) and the next token
+# (comment lines do not count)
+blank_after(text, p0)
+    let n = len(text)
+    var p = p0
+    while p < n and text[p] != 10
+        let c = text[p]
+        if c == 35 and (p + 1 >= n or text[p + 1] != 91)
+            while p < n and text[p] != 10
+                p += 1
+            break
+        if c != 32 and c != 9 and c != 13
+            return false
+        p += 1
+    while p < n
+        p += 1
+        while p < n and (text[p] == 32 or text[p] == 9 or text[p] == 13)
+            p += 1
+        if p >= n or text[p] == 10
+            return true
+        if text[p] != 35 or (p + 1 < n and text[p + 1] == 91)
+            return false
+        while p < n and text[p] != 10
+            p += 1
+    return true
 
 # top-level let / var / const: a global. Only a literal value is kept as a
 # tree; other initializers are re-read from their position when compiled.
@@ -2756,9 +2841,12 @@ parse_pub_item(src)
 
 # name(...) followed by -> / { / => / NEWLINE INDENT is a definition
 is_func_def()
-    if TK.t != T_IDENT or peek(1).t != T_LPAREN
+    return is_func_def_at(0)
+
+is_func_def_at(o)
+    if peek(o).t != T_IDENT or peek(o + 1).t != T_LPAREN
         return false
-    var k = 2
+    var k = o + 2
     var depth = 1
     while depth > 0 and peek(k).t != T_EOF
         let t = peek(k).t
@@ -2808,6 +2896,7 @@ parse_func_body(name_tok, src, ind, allow_sig)
     var decl = None
     var pure = false
     var caps = []
+    var elow = false
     for a in attrs
         if a == "pure"
             pure = true
@@ -2835,6 +2924,12 @@ parse_func_body(name_tok, src, ind, allow_sig)
                     caps.push(strip_ws(c))
                     if WORDS != None
                         WORDS[strip_ws(c)] = 1
+        elif a.starts_with("energy:")
+            let lvl = strip_ws(a.slice(7, len(a)))
+            if lvl != "low" and lvl != "medium" and lvl != "high"
+                fail_at(name_tok.ln, "unknown energy level '" + lvl + "' for a function (use #[energy: low])")
+            if lvl == "low"
+                elow = true
     # (empty lists and maps are left out: they would cost memory per function)
     let fi = FI { name: name_tok.v, params: params, ret: ret, ln: name_tok.ln, src: src,
                   bpos: bpos, bline: bline, bind: ind, nstmts: nstmts, decl: decl, pure: pure,
@@ -2847,6 +2942,8 @@ parse_func_body(name_tok, src, ind, allow_sig)
         fi.ens = ens
     if len(caps) > 0
         fi.caps = caps
+    if elow
+        fi.elow = true
     CAPT = save_capt
     let node = mk(K_FUNC, name_tok.ln)
     node.a = fi
@@ -4606,12 +4703,15 @@ load_module(path)
     let save_sc = SC_SCRIPT
     let save_mod = MOD_PARSE
     let save_words = DEF_WORDS
+    let save_energy = FILE_ENERGY
     ITEMS = []
     PENDING_ATTRS = []
     SCRIPT_CAPT = {}
     MOD_PARSE = true
     DEF_WORDS = []
+    FILE_ENERGY = -1
     parse_program(setup_languages(text, path))
+    FILE_ENERGY = save_energy
     MOD_PARSE = save_mod
     hoist()
     # (hoist keeps the definitions in order and may add a main at the end:
@@ -4887,6 +4987,10 @@ var CONSTS = new_rope()
 var NCONSTS = 0
 var CONST_IX = [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]
 var USES_FLOAT = false
+# the program's energy mode (the main file's #[energy: ...] pragma; header bits 2-3)
+var ENERGY = 0
+# the energy-mode pragma of the file being parsed (-1 = none)
+var FILE_ENERGY = -1
 var FUNCS = []
 var FUNC_IX = {}
 var FDEFS = {}
@@ -6447,6 +6551,8 @@ compile_function(pe)
         rec.flags = rec.flags | 1
     if fi.ret == "Option" or fi.ret == "Result"
         rec.flags = rec.flags | 2
+    if fi.elow
+        rec.flags = rec.flags | 8
     for p in params
         declare_local(p.name, true, fi.ln)
     i = 0
@@ -8143,9 +8249,9 @@ serialize()
         off += chunks_len(f.code)
         nlines += chunks_len(f.lines) / 6
     let out = new_rope()
-    var flags = 2
+    var flags = 2 + ENERGY * 4
     if USES_FLOAT
-        flags = 3
+        flags += 1
     radd(out, "TILB" + bytes_to_str([2, flags]))
     radd(out, u16s(len(GLOBALS)) + u16s(ENTRY))
     radd(out, u16s(NCONSTS))
@@ -8218,6 +8324,8 @@ main()
     let src = read_source(a[0])
     MAIN_SF = setup_languages(src, a[0])
     parse_program(MAIN_SF)
+    if FILE_ENERGY > 0
+        ENERGY = FILE_ENERGY
     hoist()
     resolve_imports()
     if SC_ON

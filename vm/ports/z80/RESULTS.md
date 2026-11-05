@@ -2,8 +2,8 @@
 
 **Summary:** the 16-bit lean VM (`TILVM_LEAN`, `TILVM_ADDR16`, 16-bit ints, no
 floats; TIL 3.1 with the faster interpreter and superinstructions, without
-effect handlers and the screen natives) compiles with SDCC 4.2, its code and
-constants end at **0xBE26** (below 0xC000), and it runs TIL programs on the
+effect handlers, the screen natives and energy saving) compiles with SDCC 4.2,
+its code and constants end at **0xBE38** (below 0xC000), and it runs TIL programs on the
 ucsim Z80 simulator (`sz80`) with output identical to the reference VM for every
 example that fits 16-bit integers without floats. A real TI-83 Plus / TI-84 Plus additionally needs a multi-page
 Flash application (see *Real calculators* below); the TI-84 Plus CE has its own
@@ -103,6 +103,19 @@ Linked image (`run_sim.py --size`): code 0x0110-0xBE26 = 48,406 bytes (VM
 Largest functions: `lean_op` 5.6 KB, `call_native` 3.9 KB, `tilvm_run_steps`
 3.2 KB, `array_method` 1.9 KB, `tilvm_load` 1.8 KB.
 
+### TIL 3.1 energy saving (feature 11)
+
+Energy saving (`#[energy: ...]`, `energy_mode()`, docs/TIL_ENERGY.md) costs the
+lean Z80 image 802 bytes (VM `_CODE` 48,813 B: `energy_point` 287 B,
+`tilvm_load` +161 B, `tilvm_run_steps` +147 B, `call_native` +108 B, the error
+message 68 B, `reset_state` +31 B): the code would end at 0xC148, 328 bytes
+above the limit. The Makefile therefore adds `-DTILVM_NO_ENERGY` (programs run
+at full speed; `energy_mode()` reports "not available in this VM build"). What
+remains is the idle counter (4 bytes of RAM) and its reset at load: VM
+`_CODE` **48,029 B**, code 0x0110-0xBE38 = 48,424 bytes, **456 bytes free**;
+VM state 5,840 bytes. A Flash application (see below) would have room for
+energy saving, and the TI-84 Plus CE port includes it (`delay()` as idle).
+
 Desktop builds keep their behaviour and speed: the interpreter loop of the
 default build compiles from the same code as before the merge (the lean-only
 paths are `#ifdef TILVM_LEAN`); outside it only `arith`, `equal`, `report`,
@@ -116,7 +129,7 @@ and the effect opcodes on lean desktop builds against the default build
 
 | | bytes |
 |---|---|
-| VM state (`static tilvm vm`: 4 KB heap, 192 × 3-byte value stack, 32 frames, tables) | 5,836 |
+| VM state (`static tilvm vm`: 4 KB heap, 192 × 3-byte value stack, 32 frames, tables) | 5,840 |
 | C stack, typical program | ~250 |
 | C stack, deepest case measured (printing / comparing 15-31 levels of nested arrays) | 1,392 |
 | program bytecode (examples, with line numbers) | 156-1,596 |
@@ -165,8 +178,10 @@ sleep_ms`, str `split replace trim repeat count`, array `insert remove sort
 reverse slice copy join sum min max`, map `values copy clear`, snapshots,
 effect handlers (`handle ... with` reports "effect handlers are not available
 in this VM build"; `perform E()` still calls a top-level function `E`).
-`TILVM_NO_EFFECTS` and `TILVM_NO_GFX` are Z80 Makefile choices: with them in,
-the image would be about 1.5 KB and 7.5 KB larger.
+`TILVM_NO_EFFECTS`, `TILVM_NO_GFX` and `TILVM_NO_ENERGY` are Z80 Makefile
+choices: with them in, the image would be about 1.5 KB, 7.5 KB and 0.8 KB
+larger. (Without energy saving, `#[energy: ...]` programs run at full speed
+with the same output.)
 Integer arithmetic wraps at 16 bits (like every `TILVM_INT_BITS` build).
 Inherited from `TILVM_LEAN` and not changed here: f-string format specs are
 ignored and duplicate keys in map literals are not merged.
@@ -175,8 +190,8 @@ ignored and duplicate keys in map literals are not merged.
 
 ```
 0x0000-0x010F  reset vectors, startup
-0x0110-0xBFFF  VM code and constants (ends at 0xBE26)
-0xC000-0xD7FF  VM state (5,836 bytes used)
+0x0110-0xBFFF  VM code and constants (ends at 0xBE38)
+0xC000-0xD7FF  VM state (5,840 bytes used)
 0xD800-0xEFEF  program bytecode (u16 length + .tbc), written by run_sim.py
 0xEFF0-0xEFFF  results (output length, exit code, steps, heap, GC count, C stack mark)
 0xF000-0xF7FF  program output
@@ -215,7 +230,7 @@ Plus CE (`../ti84ce/`) has no such limit.
 
 ## Keeping it below 0xC000
 
-Only 474 bytes are free. New features in `tilvm.c` should be excluded from
+Only 456 bytes are free. New features in `tilvm.c` should be excluded from
 `TILVM_LEAN` builds (as the lean list above) or get a `TILVM_NO_...` switch for
 the Z80 Makefile, or the Z80 image overflows — `TIL_TEST_CROSS=1 python3 -m
 pytest tests/test_z80.py` reports the code end and the interpreter's frame size.

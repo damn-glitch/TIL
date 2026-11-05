@@ -494,6 +494,25 @@ COMPILER_MESSAGES: List[Tuple[str, str, str]] = [
     ("unknown language '{lang}' (use: {choices:text})",
      "неизвестный язык '{lang}' (доступны: {choices})",
      "белгісіз тіл: '{lang}' (мүмкін мәндер: {choices})"),
+    # energy saving: #[energy: ...] and its .tbc header bits (TIL 3.1, docs/TIL_ENERGY.md)
+    ("unknown energy mode '{mode}' (use low, balanced or performance)",
+     "неизвестный режим энергосбережения '{mode}' (используйте low, balanced или performance)",
+     "белгісіз энергия үнемдеу режимі: '{mode}' (low, balanced немесе performance қолданыңыз)"),
+    ("unknown energy level '{level}' for a function (use #[energy: low])",
+     "неизвестный уровень энергосбережения функции: '{level}' (используйте #[energy: low])",
+     "функцияның белгісіз энергия деңгейі: '{level}' (#[energy: low] қолданыңыз)"),
+    ("#[energy: ...] must be directly above a function, or come before every definition "
+     "(the program's energy mode)",
+     "#[energy: ...] должен стоять прямо над функцией или перед всеми определениями "
+     "(режим энергосбережения программы)",
+     "#[energy: ...] функцияның тура үстінде немесе барлық анықтамалардан бұрын тұруы керек "
+     "(бағдарламаның энергия үнемдеу режимі)"),
+    ("the program's energy mode is set twice",
+     "режим энергосбережения программы задан дважды",
+     "бағдарламаның энергия үнемдеу режимі екі рет берілген"),
+    ("bad bytecode header (energy mode {mode:int})",
+     "неверный заголовок байт-кода (режим энергосбережения {mode})",
+     "байт-код тақырыбы қате (энергия үнемдеу режимі: {mode})"),
 
     # ── type checker warnings of the native backend ────────────────────────
     ("Line {line:int}: {message:msg}",
@@ -787,6 +806,11 @@ RUNTIME_MESSAGES: List[Tuple[str, str, str]] = [
     ("effect handlers are not available in this VM build",
      "обработчики эффектов недоступны в этой сборке VM",
      "әсер өңдеушілері бұл VM құрастырмасында қолжетімсіз"),
+
+    # ── energy saving (TIL 3.1, docs/TIL_ENERGY.md) ────────────────────────
+    ("energy_mode() needs a mode 0 (performance), 1 (balanced) or 2 (low)",
+     "energy_mode() ожидает режим 0 (performance), 1 (balanced) или 2 (low)",
+     "energy_mode() 0 (performance), 1 (balanced) немесе 2 (low) режимін күтеді"),
 
     # ── graphics and keys (TIL 3.1; written against the til31/gfx branch) ───
     ("screen not initialized (call screen_init)",

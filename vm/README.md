@@ -45,7 +45,7 @@ output of every example is compared with the reference VM.
 |---|---|---|---|---|---|---|
 | ARM Cortex-M (NumWorks/STM32 class) | Cortex-M3, 64 KB RAM | QEMU `lm3s6965evb` | int32, float32, 16 KB heap | 48.4 KB² | 24 KB | 17/17 programs identical¹ |
 | 8-bit AVR (Arduino Mega class) | ATmega1284P, 16 KB RAM | simavr | int32, float32, 5 KB heap | 60.2 KB² | 11.2 KB | 17/17 programs identical |
-| Z80 (TI-83/84 class) | Z80, 64 KB address space | ucsim `sz80` | int16, lean, 16-bit offsets, 4 KB heap, no effects / screen³ | 46.9 KB (SDCC 4.2), ends at 0xBE26 (below 0xC000) | 5.7 KB + ≤1.4 KB C stack | 10/10 int16-compatible examples + test corpus identical³ — see `ports/z80/RESULTS.md` |
+| Z80 (TI-83/84 class) | Z80, 64 KB address space | ucsim `sz80` | int16, lean, 16-bit offsets, 4 KB heap, no effects / screen / energy saving³ | 46.9 KB (SDCC 4.2), ends at 0xBE38 (below 0xC000) | 5.7 KB + ≤1.4 KB C stack | 10/10 int16-compatible examples + test corpus identical³ — see `ports/z80/RESULTS.md` |
 | Desktop | x86-64 | native | int64, double, 256 KB heap | 80 KB | ~400 KB | all 255 + 81 tests |
 
 ¹ Single-precision builds print the last digit of some floats differently
@@ -54,9 +54,9 @@ output of every example is compared with the reference VM.
 of AVR code; `-DTILVM_NO_GFX` leaves them out). Measured with `examples/03_functions.til`.
 ³ 8 examples use floats and 2 compute values beyond 16 bits (`10!`); they are
 rejected at load or wrap, as documented for 16-bit builds. The Z80 build leaves
-out effect handlers and the screen/keys natives (`-DTILVM_NO_EFFECTS
--DTILVM_NO_GFX`, about 1.5 KB and 7.5 KB of Z80 code): with them the code would
-not fit below 0xC000.
+out effect handlers, the screen/keys natives and energy saving (`-DTILVM_NO_EFFECTS
+-DTILVM_NO_GFX -DTILVM_NO_ENERGY`, about 1.5 KB, 7.5 KB and 0.8 KB of Z80 code):
+with them the code would not fit below 0xC000.
 
 Reproduce:
 
@@ -89,6 +89,7 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_FIELD_CACHE` | 64 (lean: 0) | entries of the (struct type, name) → field / method lookup caches (power of two, 6 bytes each, two caches) |
 | `TILVM_COMPUTED_GOTO` | 1 with GCC/Clang, except lean and `-Os` | 1 = "labels as values" dispatch (one indirect jump per handler), 0 = portable `switch` |
 | `TILVM_FAST_PATHS` | 1, except lean and `-Os` | inline integer fast paths in the interpreter; 0 = smaller code, same results |
+| `TILVM_NO_ENERGY` | off | leave out energy saving ([docs/TIL_ENERGY.md](../docs/TIL_ENERGY.md)): `#[energy: ...]` programs run at full speed, `energy_mode()` reports "not available in this VM build"; saves ~0.8 KB on the Z80 (the Z80 build uses it) |
 | `TILVM_NO_GFX` | off | leave out the screen/keys natives (`screen_init` … `wait_key` report "not available in this VM build"); saves ~2.7 KB on ARM, ~7.5 KB on the Z80 (the Z80 build uses it) |
 | `TILVM_GFX_MAX_W` / `TILVM_GFX_MAX_H` | 4096 / 4096 | largest screen `screen_init` accepts: set the display's size on a device (`screen_init(400, 300)` on a 320×240 build is a runtime error, so the screen hooks never get coordinates outside the display) |
 | `TILVM_ROM` | empty | storage qualifier for the 480-byte font table, e.g. `__flash` for avr-gcc (keeps it out of RAM) |
@@ -162,7 +163,9 @@ vm/tilvm --keys "UP,UP,ENTER,a,ESC" prog.tbc        # scripted keys (default: th
 Without `--screen`/`--screen-ansi` the runner draws into an offscreen
 framebuffer (headless); without `--keys` keys come from the terminal in raw mode
 (restored at exit) or, when stdin is not a terminal, from stdin's bytes
-(on POSIX `key_pressed()` never waits for them). Ctrl-C ends the program,
+(on POSIX `key_pressed()` never waits for them). `clock_ms()`, timeouts and
+`sleep_ms()` use the wall clock, and the runner really sleeps when the VM idles
+(energy saving, `sleep_ms()`; [docs/TIL_ENERGY.md](../docs/TIL_ENERGY.md)). Ctrl-C ends the program,
 writes the `--screen` image, restores the terminal and ends the runner by
 SIGINT. See
 [docs/TIL_GRAPHICS.md](../docs/TIL_GRAPHICS.md).
@@ -180,7 +183,12 @@ SIGINT. See
    complete host and notes for TI-84 Plus CE (graphx), NumWorks (eadk), Casio
    (gint), SDL, Linux framebuffer and browser canvas. Without hooks the screen
    functions report "not available on this device".
-5. Embed the program (`til build --target c-vm`, or load a `.tbc` file from the
+5. For battery saving set `vm.host.idle` (sleep / halt the CPU for about `ms`
+   milliseconds: `halt`, `__WFI()`, an idle sleep mode) and a wall clock as
+   `clock_ms`: the VM idles in the energy modes of `#[energy: ...]` /
+   `energy_mode()` and while `sleep_ms()` waits —
+   [docs/TIL_ENERGY.md](../docs/TIL_ENERGY.md) has the rule and per-device notes.
+6. Embed the program (`til build --target c-vm`, or load a `.tbc` file from the
    device's file system).
 
 Integration notes for common platforms (the core is verified in simulators;

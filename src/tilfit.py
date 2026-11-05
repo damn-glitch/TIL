@@ -333,7 +333,7 @@ def vm_struct_layout(dev: Device) -> Dict[str, int]:
                  ptr, u32, u32, u32, u32, u32, u32, u32,                 # program
                  u16, u16, u16, u16, u16, u16, u16, u8, u8,
                  _array(u32, dev.consts), _array(u32, dev.types), u32,
-                 ptr, tv_val, _array(u8, 128), u16, u8, _array(tv_ref, dev.mark_stack),   # runtime
+                 ptr, tv_val, _array(u8, 128), u16, u8, _array(tv_ref, dev.mark_stack), u32,   # runtime
                  state, _union(*arena))
     return {'tilvm': vm[0], 'tilvm_state': state[0], 'tv_val': tv_val[0], 'tv_frame': tv_frame[0],
             'tv_try': tv_try[0], 'stack_bytes': tv_val[0] * dev.stack, 'heap': dev.heap}

@@ -56,6 +56,9 @@
  *                      `perform E()` still calls the top-level function E (TIL 3.0)
  *   TILVM_NO_GFX       leave out the screen/keys natives (screen_init ... wait_key
  *                      report "not available in this VM build")
+ *   TILVM_NO_ENERGY    leave out energy saving (docs/TIL_ENERGY.md): programs run
+ *                      at full speed whatever their #[energy: ...] mode, and
+ *                      energy_mode() reports "not available in this VM build"
  *   TILVM_GFX_MAX_W    largest screen the device can show (default 4096 x 4096, the
  *   TILVM_GFX_MAX_H    language limit): a host with a fixed display sets its size;
  *                      screen_init(w, h) beyond it is then a runtime error, and the
@@ -236,7 +239,9 @@ typedef struct tilvm_state {
     uint32_t magic;
     uint16_t sp, n_frames, n_try, n_deadlines;
     tv_size heap_top;
-    uint8_t halted, exit_code, failed, _pad;
+    uint8_t halted, exit_code, failed;
+    uint8_t energy;             /* energy mode of the program: 0 performance, 1 balanced, 2 low
+                                 * (.tbc header bits 2-3 at load, then energy_mode(m)) */
     uint16_t scr_w, scr_h;      /* screen size in pixels (0 = no screen_init yet) */
     uint32_t steps, gc_count, tick;
 #if TILVM_INT_BITS == 64
@@ -295,7 +300,11 @@ typedef struct tilvm_host {
      * is NULL the VM polls key_pressed and calls idle(1) between polls). */
     int (*key_pressed)(void *ctx);
     int (*wait_key)(void *ctx);
-    /* battery saving: sleep / halt the CPU for about `ms` milliseconds */
+    /* battery saving: sleep / halt the CPU for about `ms` milliseconds (docs/TIL_ENERGY.md).
+     * The VM calls idle(ctx, 1) every 512 or 4096 steps in the energy modes low and
+     * balanced, and from sleep_ms() (the time left, re-reading clock_ms) and a
+     * polling wait_key(). It may return early (an interrupt, a key); it may end the
+     * program as exit(n) does: st.exit_code = n, st.halted = 2. NULL = never idle. */
     void (*idle)(void *ctx, unsigned long ms);
     /* program arguments (args()) */
     int argc;
@@ -330,7 +339,9 @@ typedef struct tilvm {
     tv_off funcs_off, methods_off, prelude_off, lines_off;
     uint16_t n_consts, n_funcs, n_types, n_methods, n_globals, entry;
     uint16_t n_lines;
-    uint8_t n_prelude, flags;
+    uint8_t n_prelude;
+    uint8_t flags;              /* .tbc header flags (bit 0 floats, bit 1 lines, bits 2-3 the
+                                 * initial energy mode); bit 7: a function is #[energy: low] */
     tv_off const_off[TILVM_MAX_CONSTS];
     tv_off type_off[TILVM_MAX_TYPES];
     uint32_t bc_hash;                 /* FNV-1a of the bytecode, for snapshots (0 in TILVM_LEAN) */
@@ -349,6 +360,7 @@ typedef struct tilvm {
     uint16_t mark_sp;
     uint8_t mark_overflow;
     tv_ref mark_stack[TILVM_MARK_STACK];
+    uint32_t idle_count;        /* energy-saving idles so far (tilvm --stats; not in snapshots) */
     tilvm_state st;
     union {                     /* the arena (aligned for values) */
         uint8_t heap[TILVM_HEAP_SIZE];

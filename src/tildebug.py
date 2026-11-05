@@ -222,14 +222,17 @@ class DebugVM(til.TILVM):
     State that a snapshot copies (and restores): STATE_OBJECTS + STATE_NUMBERS
     of the VM - the value stack, frames, globals, effect handler records,
     recovery points (retry/timeout, with their deadlines), the screen's
-    framebuffer, the step counter, the random generator - and the debugger's
-    position: the line-event index, the frame line memory, the position in the
-    input recording and in the program's output. The key source and stdin are
-    outside streams: what the program read from them is in the recording, and
-    after the recorded part they continue where they are."""
+    framebuffer, the step counter, the random generator, the energy mode and
+    idle count - and the debugger's position: the line-event index, the frame
+    line memory, the position in the input recording and in the program's
+    output. The key source and stdin are outside streams: what the program read
+    from them is in the recording, and after the recorded part they continue
+    where they are. Energy saving counts its idles but does not sleep here (a
+    debugging session saves no battery, and history re-runs stay fast)."""
 
     STATE_OBJECTS = ('stack', 'frames', 'globals', 'handlers', 'recover', 'screen', 'shadow')
-    STATE_NUMBERS = ('deadlines', 'tick', 'steps', 'rng', 'ev', 'nd_pos', 'out_pos')
+    STATE_NUMBERS = ('deadlines', 'tick', 'steps', 'rng', 'energy', 'idle_count', 'ev', 'nd_pos',
+                     'out_pos')
 
     def __init__(self, module: 'til.TBCModule', out: Callable[[bytes], None],
                  read_line: Callable[[], bytes], argv=None, screen=None, keys=None,
@@ -342,10 +345,17 @@ class DebugVM(til.TILVM):
             self.path_arg(name, args[0])            # its errors come from the program
         return self.nd(name, lambda: til.TILVM.call_native(self, nid, args))
 
+    def idle(self, ms: int):
+        pass                            # energy saving: counted (energy_point), no sleep
+
     def check_budget(self, pc: int):
         self.steps += 1
-        if self.max_steps and self.steps > self.max_steps:
-            raise til.TILFatal(f"step limit exceeded ({self.max_steps})")
+        if self._slow:                  # a step limit or energy saving (TILVM.check_budget)
+            steps = self.steps
+            if self._max_steps and steps > self._max_steps:
+                raise til.TILFatal(f"step limit exceeded ({self._max_steps})")
+            if not steps & 511 and (self._energy or self.low_funcs):
+                self.energy_point()
         if self.deadlines:
             self.tick += 1
             if self.tick >= self.CHECK_INTERVAL:
