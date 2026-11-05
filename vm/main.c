@@ -6,6 +6,7 @@
  *   tilvm --snapshot-after N FILE p.tbc   run N steps, save the paused program to FILE
  *   tilvm --resume FILE program.tbc       continue a saved program
  *   tilvm --stats program.tbc             print memory / GC statistics to stderr
+ *                                         (+ high-water marks with -DTILVM_STATS)
  *   tilvm --screen out.ppm program.tbc    save the screen (screen_init, draw_*) as a PPM at exit
  *   tilvm --screen-ansi program.tbc       draw the screen in the terminal on every screen_show()
  *   tilvm --keys "UP,UP,ENTER,a" p.tbc    scripted keys (default: the keyboard, or stdin's bytes)
@@ -477,6 +478,29 @@ static void usage(void) {
                     "[--screen FILE.ppm] [--screen-ansi] [--keys LIST] program.tbc [args...]\n");
 }
 
+#ifdef TILVM_NO_STDIO
+/* The VM core was built without stdio (a device profile emulated on the desktop,
+ * see `til fit --run`): this runner provides the console. */
+static void console_write(void *ctx, const char *data, size_t len) {
+    (void)ctx;
+    fwrite(data, 1, len, stdout);
+}
+static void console_write_err(void *ctx, const char *data, size_t len) {
+    (void)ctx;
+    fflush(stdout);
+    fwrite(data, 1, len, stderr);
+}
+static int console_read_line(void *ctx, char *buf, size_t cap) {
+    size_t n;
+    (void)ctx;
+    fflush(stdout);
+    if (!fgets(buf, (int)cap, stdin)) return -1;
+    n = strlen(buf);
+    if (n && buf[n - 1] == '\n') buf[--n] = 0;
+    return (int)n;
+}
+#endif
+
 int main(int argc, char **argv) {
     const char *path = NULL, *snap_out = NULL, *resume = NULL, *screen_out = NULL;
     unsigned long snap_after = 0, max_steps = 0;
@@ -520,6 +544,11 @@ int main(int argc, char **argv) {
     vm.max_steps = (uint32_t)max_steps;
     vm.host.argc = prog_argc;
     vm.host.argv = (const char *const *)prog_argv;
+#ifdef TILVM_NO_STDIO
+    vm.write = console_write;
+    vm.write_err = console_write_err;
+    vm.read_line = console_read_line;
+#endif
     install_screen_and_keys(&vm);       /* before --resume: it re-creates a saved screen */
 
     if (resume) {
@@ -571,6 +600,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[tilvm] steps=%lu gc=%lu heap=%lu/%ld bytes\n",
                 (unsigned long)vm.st.steps, (unsigned long)vm.st.gc_count,
                 (unsigned long)tilvm_heap_used(&vm), (long)TILVM_HEAP_SIZE);
+#ifdef TILVM_STATS
+        {   /* high-water marks (til fit --run reads this line) */
+            tilvm_stats s;
+            tilvm_get_stats(&vm, &s);
+            fprintf(stderr, "[tilvm] peak stack=%lu/%lu frames=%lu/%lu try=%lu/%lu heap=%lu/%ld live=%lu\n",
+                    (unsigned long)s.peak_stack, (unsigned long)TILVM_STACK_SIZE,
+                    (unsigned long)s.peak_frames, (unsigned long)TILVM_MAX_FRAMES,
+                    (unsigned long)s.peak_try, (unsigned long)TILVM_MAX_TRY,
+                    (unsigned long)s.peak_heap, (long)TILVM_HEAP_SIZE, (unsigned long)s.peak_live);
+        }
+#endif
     }
     rc = save_screen(screen_out, rc);
     free(code);

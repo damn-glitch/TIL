@@ -41,10 +41,13 @@
  *   TILVM_NO_MATH      no <math.h>: sqrt/sin/... use built-in approximations
  *   TILVM_LEAN         smallest code for 8-bit CPUs: the whole language core, but
  *                      without format specs, snapshots, input/chr/ord/type_of/clock/
- *                      random/sleep, and str split/replace/trim/repeat/count,
+ *                      random/sleep, and str split/replace/trim/repeat/to_float,
  *                      array insert/remove/sort/reverse/slice/copy/join/sum/min/max,
- *                      map values/copy/clear (they report "not available");
- *                      effect handlers and the screen/keys natives ARE included
+ *                      map values/copy/clear (they report "not available" / "no
+ *                      method"), array + array ("unsupported operand types"), and
+ *                      the map-literal key check ({"a": 1, "a": 2} keeps both
+ *                      entries, 2.0 stays a float key); `til fit` reports all of them.
+ *                      Effect handlers and the screen/keys natives ARE included.
  *   TILVM_NO_EFFECTS   leave out effect handlers (handle/with/resume, ~1-3 KB of
  *                      code, TILVM_MAX_HANDLERS * 16 bytes of RAM): `handle` reports
  *                      "effect handlers are not available in this VM build";
@@ -57,6 +60,10 @@
  *                      screen hooks never see x >= TILVM_GFX_MAX_W, y >= TILVM_GFX_MAX_H
  *   TILVM_ROM          storage qualifier for the 5x7 font table, e.g. __flash with
  *                      avr-gcc (gnu99) to keep it out of RAM (default: empty)
+ *   TILVM_STATS        record high-water marks (tilvm_get_stats; til fit --run)
+ *   TILVM_PACK         pack values and heap objects like 8-bit CPUs do (desktop
+ *                      emulation of AVR / Z80 / eZ80 builds by til fit --run;
+ *                      GCC/Clang hosts only)
  */
 #ifndef TILVM_H
 #define TILVM_H
@@ -158,7 +165,13 @@ enum {
     TV_STRUCT, TV_CLOSURE, TV_FUNC, TV_CELL, TV_UNDEF
 };
 
-typedef struct tv_val {
+#if defined(TILVM_PACK) && defined(__GNUC__)
+#define TV_PACK __attribute__((packed))   /* 8-bit CPU layout: values without padding */
+#else
+#define TV_PACK
+#endif
+
+typedef struct TV_PACK tv_val {
     uint8_t t;
     union {
         tv_int i;
@@ -274,6 +287,17 @@ typedef struct tilvm_host {
     const char *const *argv;
 } tilvm_host;
 
+#ifdef TILVM_STATS
+/* High-water marks of one run (build with -DTILVM_STATS; used by `til fit --run`) */
+typedef struct tilvm_stats {
+    uint32_t peak_stack;    /* value-stack slots ever used (globals + locals + temporaries) */
+    uint32_t peak_frames;   /* deepest call */
+    uint32_t peak_try;      /* most nested retry/timeout/intent blocks */
+    uint32_t peak_heap;     /* arena high-water mark (heap_top), bytes */
+    uint32_t peak_live;     /* most heap in use right after a collection, bytes */
+} tilvm_stats;
+#endif
+
 typedef struct tilvm {
     /* ---- host bindings (set after tilvm_load; not part of snapshots) ---- */
     tilvm_write_fn write;       /* program output */
@@ -318,6 +342,9 @@ typedef struct tilvm {
         uint64_t align_u_;
 #endif
     } mem;
+#ifdef TILVM_STATS
+    tilvm_stats stats;          /* high-water marks (not part of snapshots) */
+#endif
 } tilvm;
 
 /* status codes of tilvm_run_steps */
@@ -345,6 +372,9 @@ int tilvm_restore(tilvm *vm, const uint8_t *data, uint32_t size);      /* after 
 
 /* Memory statistics */
 uint32_t tilvm_heap_used(const tilvm *vm);
+#ifdef TILVM_STATS
+void tilvm_get_stats(const tilvm *vm, tilvm_stats *out);   /* high-water marks so far */
+#endif
 
 /* Default host bindings (stdout / stdin / clock) unless TILVM_NO_STDIO */
 void tilvm_default_write(void *ctx, const char *data, size_t len);

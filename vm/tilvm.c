@@ -121,7 +121,9 @@ enum {
 /* ─── heap objects ──────────────────────────────────────────────────────── */
 enum { OBJ_STR = 1, OBJ_ARRAY, OBJ_MAP, OBJ_VALS, OBJ_STRUCT, OBJ_CLOSURE, OBJ_CELL };
 
-typedef struct tv_hdr {
+/* TV_PACK (TILVM_PACK, desktop emulation of 8-bit layouts): objects are 2-byte aligned
+ * there, so headers with 32-bit sizes (heap > 64 KB) must be packed too. */
+typedef struct TV_PACK tv_hdr {
     uint8_t kind;
     uint8_t mark;
     uint16_t aux;       /* struct: type index; closure: upvalue count */
@@ -129,12 +131,12 @@ typedef struct tv_hdr {
     tv_ref fwd;         /* forwarding address while compacting */
 } tv_hdr;
 
-typedef struct { tv_hdr h; tv_size len; char data[1]; } tv_strobj;
-typedef struct { tv_hdr h; tv_size len; tv_ref buf; } tv_arrobj;     /* arrays and maps */
-typedef struct { tv_hdr h; tv_val v[1]; } tv_valsobj;               /* capacity = aux */
-typedef struct { tv_hdr h; tv_val v[1]; } tv_structobj;             /* fields */
-typedef struct { tv_hdr h; uint16_t func; tv_val v[1]; } tv_closobj;  /* upvalues (cells) */
-typedef struct { tv_hdr h; tv_val v; } tv_cellobj;
+typedef struct TV_PACK { tv_hdr h; tv_size len; char data[1]; } tv_strobj;
+typedef struct TV_PACK { tv_hdr h; tv_size len; tv_ref buf; } tv_arrobj;     /* arrays and maps */
+typedef struct TV_PACK { tv_hdr h; tv_val v[1]; } tv_valsobj;               /* capacity = aux */
+typedef struct TV_PACK { tv_hdr h; tv_val v[1]; } tv_structobj;             /* fields */
+typedef struct TV_PACK { tv_hdr h; uint16_t func; tv_val v[1]; } tv_closobj;  /* upvalues (cells) */
+typedef struct TV_PACK { tv_hdr h; tv_val v; } tv_cellobj;
 
 struct tv_align_probe { char c; tv_val v; };
 #define TV_ALIGN (offsetof(struct tv_align_probe, v) < 2 ? 2 : offsetof(struct tv_align_probe, v))
@@ -310,6 +312,15 @@ static void out(tilvm *vm, const char *s, size_t n) {
     if (vm->write && n) vm->write(vm->ctx, s, n);
 }
 
+/* ─── high-water marks (TILVM_STATS, til fit --run) ─────────────────────── */
+#ifdef TILVM_STATS
+#define TV_PAINT 0xA5u          /* tag of value-stack slots never written */
+#define TV_STAT_MAX(field, v) \
+    do { if ((uint32_t)(v) > vm->stats.field) vm->stats.field = (uint32_t)(v); } while (0)
+#else
+#define TV_STAT_MAX(field, v) ((void)0)
+#endif
+
 /* ─── allocation & garbage collection ──────────────────────────────────── */
 static void gc(tilvm *vm);
 
@@ -327,6 +338,7 @@ static tv_ref alloc_obj(tilvm *vm, uint8_t kind, uint32_t size) {
     }
     r = vm->st.heap_top;
     vm->st.heap_top = (tv_size)(vm->st.heap_top + size);
+    TV_STAT_MAX(peak_heap, vm->st.heap_top);
     memset(vm->mem.heap + r, 0, size);
     h = OBJ(vm, r);
     h->kind = kind;
@@ -432,9 +444,24 @@ static void gc(tilvm *vm) {
         scan = (tv_size)(scan + size);
     }
     st->heap_top = free_at;
+    TV_STAT_MAX(peak_live, free_at);
 }
 
 uint32_t tilvm_heap_used(const tilvm *vm) { return vm->st.heap_top; }
+
+#ifdef TILVM_STATS
+void tilvm_get_stats(const tilvm *vm, tilvm_stats *out) {
+    uint32_t k = TILVM_STACK_SIZE;
+    *out = vm->stats;
+    /* tilvm_load painted the free stack slots: the highest slot ever written is
+     * the high-water mark (this also sees temporaries pushed inside builtins) */
+    while (k > vm->st.sp && vm->st.stack[k - 1].t == TV_PAINT) k--;
+    out->peak_stack = k;
+    if (vm->st.n_frames > out->peak_frames) out->peak_frames = vm->st.n_frames;
+    if (vm->st.n_try > out->peak_try) out->peak_try = vm->st.n_try;
+    if (vm->st.heap_top > out->peak_heap) out->peak_heap = vm->st.heap_top;
+}
+#endif
 
 /* ─── strings ───────────────────────────────────────────────────────────── */
 static const uint8_t *const_ptr(tilvm *vm, uint16_t k) { return vm->bc + vm->const_off[k]; }
@@ -1159,19 +1186,27 @@ static int array_push(tilvm *vm, uint16_t arr_slot, uint16_t val_slot) {
 }
 
 #ifndef TILVM_LEAN
-static int tv_array_concat(tilvm *vm) {    /* [.., a, b] -> [.., a+b] */
+/* [.., a, b] -> [.., a+b].  The elements are copied heap to heap: no value-stack
+ * slots beyond a and b, whatever the lengths (til fit relies on this). */
+static int tv_array_concat(tilvm *vm) {
     uint32_t la = ARROBJ(vm, STK[SP - 2].u.r)->len, lb = ARROBJ(vm, STK[SP - 1].u.r)->len, i;
-    if (SP + 1 > TILVM_STACK_SIZE) return fail(vm, "stack overflow");
-    for (i = 0; i < la + lb; i++) {           /* push copies of all elements */
-        tv_val v;
-        if (SP >= TILVM_STACK_SIZE - 2) return fail(vm, "stack overflow");
-        v = i < la ? VALS(vm, ARROBJ(vm, STK[SP - 2 - i].u.r)->buf)[i]
-                   : VALS(vm, ARROBJ(vm, STK[SP - 1 - i].u.r)->buf)[i - la];
-        STK[SP++] = v;
+    tv_ref buf, arr;
+    buf = new_vals(vm, la + lb < 4 ? 4 : la + lb);     /* a and b stay rooted on the stack */
+    if (!buf) return 0;
+    {
+        tv_val *dst = VALS(vm, buf);
+        const tv_val *src = VALS(vm, ARROBJ(vm, STK[SP - 2].u.r)->buf);
+        for (i = 0; i < la; i++) dst[i] = src[i];
+        src = VALS(vm, ARROBJ(vm, STK[SP - 1].u.r)->buf);
+        for (i = 0; i < lb; i++) dst[la + i] = src[i];
     }
-    if (!make_array(vm, OBJ_ARRAY, la + lb)) return 0;
-    STK[SP - 3] = STK[SP - 1];
-    SP -= 2;
+    set_ref(&STK[SP - 1], TV_CELL, buf);      /* b is copied: the buffer now roots the elements */
+    arr = alloc_obj(vm, OBJ_ARRAY, sizeof(tv_arrobj));
+    if (!arr) return 0;
+    ARROBJ(vm, arr)->buf = STK[SP - 1].u.r;  /* re-read after a possible collection */
+    ARROBJ(vm, arr)->len = (tv_size)(la + lb);
+    set_ref(&STK[SP - 2], TV_ARRAY, arr);
+    SP--;
     return 1;
 }
 
@@ -2906,6 +2941,15 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
     vm->host.write_file = default_write_file;
 #endif
     reset_state(vm);
+#ifdef TILVM_STATS
+    {   /* paint the free stack slots so tilvm_get_stats() can find the high-water mark */
+        uint32_t k;
+        for (k = vm->st.sp; k < (uint32_t)TILVM_STACK_SIZE; k++) vm->st.stack[k].t = (uint8_t)TV_PAINT;
+        memset(&vm->stats, 0, sizeof(vm->stats));
+        vm->stats.peak_frames = vm->st.n_frames;
+        vm->stats.peak_heap = vm->st.heap_top;
+    }
+#endif
     return 0;
 }
 
@@ -3244,6 +3288,7 @@ static int push_try(tilvm *vm, uint8_t op, uint32_t handler) {
     }
     if (st->n_try >= TILVM_MAX_TRY) return fail(vm, "too many nested retry/timeout blocks");
     t = &st->tries[st->n_try++];
+    TV_STAT_MAX(peak_try, st->n_try);
     t->handler = handler;
     t->deadline = deadline;
     t->n_frames = st->n_frames;
@@ -3794,6 +3839,7 @@ call_fn:   /* enter function fidx: argc arguments on the stack (+ `extra` callee
         for (i = argc; i < np; i++) { sp->t = TV_UNDEF; sp->u.i = 0; sp++; }
         for (i = np; i < nl; i++) { set_nil(sp); sp++; }
         fr = &st->frames[st->n_frames++];
+        TV_STAT_MAX(peak_frames, st->n_frames);
         fr->func = fidx;
         fr->base = (uint16_t)(nb - stk);
         fr->closure = clos;

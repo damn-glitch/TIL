@@ -79,7 +79,7 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_NO_STDIO` | off | no `<stdio.h>`: built-in number formatting, host sets `write` |
 | `TILVM_NO_TIME` | off | no `<time.h>`: `clock_ms()`/`timeout` count 1 ms per 1000 steps |
 | `TILVM_NO_MATH` | off | no `<math.h>`: built-in `sqrt`/`floor`/`pow` (integer powers) |
-| `TILVM_LEAN` | off | smallest code for 8-bit CPUs: the whole language core, without format specs, snapshots, `input/chr/ord/type_of/clock_ms/random/sleep_ms`, str `split/replace/trim/repeat/count`, array `insert/remove/sort/reverse/slice/copy/join/sum/min/max`, map `values/copy/clear` (calling them reports "not available"). ~20% smaller. The screen/keys natives stay in |
+| `TILVM_LEAN` | off | smallest code for 8-bit CPUs: the whole language core, without format specs, snapshots, `input/chr/ord/type_of/clock_ms/random/sleep_ms`, str `split/replace/trim/repeat/to_float`, array `insert/remove/sort/reverse/slice/copy/join/sum/min/max`, map `values/copy/clear` (calling them reports "not available" / "no method"), array `+` array ("unsupported operand types"), and the map-literal key check (`{"a": 1, "a": 2}` keeps both entries, `2.0` stays a float key). `til fit --device` reports all of them. ~20% smaller. Effect handlers and the screen/keys natives stay in |
 | `TILVM_MAX_FUNCS` | `TILVM_MAX_CONSTS` (lean: 0) | function records decoded once at load, 8 bytes each; more functions → load error -10. 0 = read records from the bytecode on every call (no limit, no RAM) |
 | `TILVM_FIELD_CACHE` | 64 (lean: 0) | entries of the (struct type, name) → field / method lookup caches (power of two, 6 bytes each, two caches) |
 | `TILVM_COMPUTED_GOTO` | 1 with GCC/Clang, except lean and `-Os` | 1 = "labels as values" dispatch (one indirect jump per handler), 0 = portable `switch` |
@@ -87,6 +87,8 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_NO_GFX` | off | leave out the screen/keys natives (`screen_init` … `wait_key` report "not available in this VM build"); saves ~2.7 KB on ARM |
 | `TILVM_GFX_MAX_W` / `TILVM_GFX_MAX_H` | 4096 / 4096 | largest screen `screen_init` accepts: set the display's size on a device (`screen_init(400, 300)` on a 320×240 build is a runtime error, so the screen hooks never get coordinates outside the display) |
 | `TILVM_ROM` | empty | storage qualifier for the 480-byte font table, e.g. `__flash` for avr-gcc (keeps it out of RAM) |
+| `TILVM_STATS` | off | record high-water marks (value stack, frames, recovery points, heap): `tilvm_get_stats()`, second `--stats` line; used by `til fit --run` (docs/TIL_FIT.md) |
+| `TILVM_PACK` | off | pack values and heap objects like 8-bit CPUs do (GCC/Clang): desktop emulation of AVR / Z80 / eZ80 heap use |
 
 Profiles in the `Makefile`: `make` (desktop), `make small` (32-bit, float,
 16 KB heap), `make tiny` (16-bit, no floats, 2 KB heap, lean), `make check`
@@ -146,7 +148,7 @@ The desktop runner exposes the same features:
 vm/tilvm --snapshot-after 300 state.snap prog.tbc   # run 300 steps, save, exit 3
 vm/tilvm --resume state.snap prog.tbc               # continue
 vm/tilvm --max-steps 100000 prog.tbc                # sandbox
-vm/tilvm --stats prog.tbc                           # GC / heap statistics
+vm/tilvm --stats prog.tbc                           # GC / heap statistics (+ high-water marks with TILVM_STATS)
 vm/tilvm --screen out.ppm prog.tbc                  # graphics: final frame as a PPM image
 vm/tilvm --screen-ansi prog.tbc                     # graphics: frames in a 24-bit colour terminal
 vm/tilvm --keys "UP,UP,ENTER,a,ESC" prog.tbc        # scripted keys (default: the keyboard)

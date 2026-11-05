@@ -11578,6 +11578,7 @@ Options:
                           program, for calculators/MCUs) | c (generated C)
   --strip                 vm/c-vm: drop line tables (smallest bytecode)
   --no-fuse               VM bytecode without superinstructions (0x80-0xBF)
+  --device <name>         vm/c-vm: fail the build unless it fits the device (til fit)
   --max-steps <n>         VM sandbox: stop after n loop iterations/calls
   --screen <file.ppm>     graphics: save the final screen as a PPM image
   --screen-ansi           graphics: draw the screen in the terminal (24-bit colour)
@@ -11606,17 +11607,46 @@ Examples:
 
 # ── VM helpers ───────────────────────────────────────────────────────────────
 
+def user_cache_dir() -> str:
+    """A directory for cached VM executables that only this user can write to:
+    ~/.til/cache, else <temp>/til-cache-<uid> (created 0700, owner and mode checked),
+    else a new private temporary directory.  Cached executables are run, so they must
+    never come from a shared, predictable place another user could have planted."""
+    def private(path: str, forbidden: int) -> bool:
+        import stat
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(st.st_mode):
+            return False
+        if not hasattr(os, 'getuid'):          # Windows: per-user profile and temp directories
+            return True
+        return st.st_uid == os.getuid() and not st.st_mode & forbidden
+    home = os.path.join(os.path.expanduser('~'), '.til', 'cache')
+    try:
+        os.makedirs(home, exist_ok=True)
+        if private(home, 0o002):
+            return home
+    except OSError:
+        pass
+    tmp = os.path.join(tempfile.gettempdir(), f"til-cache-{os.getuid() if hasattr(os, 'getuid') else 0}")
+    try:
+        os.mkdir(tmp, 0o700)
+    except OSError:
+        pass
+    if private(tmp, 0o077):
+        return tmp
+    return tempfile.mkdtemp(prefix='til-cache-')
+
+
 def _cvm_binary(verbose: bool = False) -> Optional[str]:
     """Build (once) and return the host C VM executable."""
     vm_dir = find_vm_sources()
     cc = TILCompiler().find_c_compiler()
     if vm_dir is None or cc is None:
         return None
-    cache = os.path.join(os.path.expanduser('~'), '.til', 'cache')
-    try:
-        os.makedirs(cache, exist_ok=True)
-    except OSError:
-        cache = tempfile.gettempdir()
+    cache = user_cache_dir()
     sources = [os.path.join(vm_dir, n) for n in ('tilvm.c', 'tilvm.h', 'main.c')]
     # one cached binary per VM source version (several checkouts can share ~/.til/cache)
     import hashlib
@@ -12096,6 +12126,19 @@ def run_proofs(program: 'Program', source: str, filename: str, explicit: bool) -
     return prover.check_program(program, source, filename, explicit)
 
 
+def run_fit_check(data: bytes, device: str, filename: str) -> bool:
+    """`til build --target vm|c-vm --device NAME`: does the built bytecode fit the
+    device? Prints the result; False = it does not (the build fails)."""
+    try:
+        fit = feature_module('tilfit')
+    except ImportError as e:
+        if getattr(e, 'name', None) != 'tilfit':
+            raise
+        print("Error: --device needs the fit checker (tilfit.py), which is not installed", file=sys.stderr)
+        return False
+    return fit.check_build(data, device, filename)
+
+
 # ── translate ────────────────────────────────────────────────────────────────
 
 def translate_source(source: str, target: str, filename: str = "<stdin>") -> str:
@@ -12390,6 +12433,11 @@ def main():
     if not os.path.exists(input_file):
         print(localize(f"Error: File not found: {input_file}"), file=sys.stderr)
         return 1
+    if opts.get('device') and (command != 'build' or target not in ('vm', 'tbc', 'c-vm', 'calc', 'embed')
+                               or input_file.endswith('.tbc')):
+        print("Error: --device works with `til build --target vm|c-vm` on a .til source; for a report on "
+              "any program (also .tbc) use `til fit FILE --device NAME`", file=sys.stderr)
+        return 1
 
     try:
         # bytecode files
@@ -12468,6 +12516,9 @@ def main():
             module = compile_to_bytecode(source, input_file, compiler.verify, fuse)
             data = module.serialize(strip=strip)
             out = output_file or base + '.tbc'
+            if opts.get('device') and not run_fit_check(data, opts['device'], input_file):
+                print(f"Build failed: {out} not written", file=sys.stderr)
+                return 1
             with open(out, 'wb') as f:
                 f.write(data)
             print(f"Built: {out} ({len(data)} bytes of TIL bytecode)")
@@ -12475,7 +12526,11 @@ def main():
 
         if target in ('c-vm', 'calc', 'embed'):
             module = compile_to_bytecode(source, input_file, compiler.verify, fuse)
-            text = amalgamate_c_vm(module.serialize(strip=strip), input_file)
+            data = module.serialize(strip=strip)
+            if opts.get('device') and not run_fit_check(data, opts['device'], input_file):
+                print("Build failed: nothing written", file=sys.stderr)
+                return 1
+            text = amalgamate_c_vm(data, input_file)
             out = output_file or base + '_vm.c'
             with open(out, 'w', encoding='utf-8', newline='\n') as f:
                 f.write(text)
