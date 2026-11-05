@@ -1226,7 +1226,7 @@ class TestRunVerdicts:
     def test_output_difference_names_the_likely_cause(self, tmp_path, capsys):
         prog = write(tmp_path, 'var a = 300\nprint(a * a)\n')
         rc, out, _ = fit_main(capsys, prog, '--device', 'arduino-mega', '--run')
-        assert "(integer width or float precision or the lean VM?)" in flat(out)
+        assert "(integer width, float precision or the lean VM?)" in flat(out)
 
     def test_live_data_warning(self, tmp_path, capsys):
         dev = custom_device(tmp_path, "mega-1400", base="arduino-mega", heap=1400)
@@ -1316,6 +1316,63 @@ class TestRecursionLevels:
         assert not an.recursions and an.complete
         _r, peak = measure(data, tmp_path)
         assert (an.slots_occ, an.frames) == (peak['stack'], peak['frames'])
+
+    @needs_cc
+    def test_prelude_function_called_directly(self, tmp_path):
+        """The callback edges hang on every call of a prelude function, not on its name."""
+        src = ('big(x: int) -> int\n    let a = [' + ", ".join(["x"] * 20) + ']\n    return len(a)\n'
+               'main()\n    print([1, 2].map(|v| v + 1))\n    print(__prelude_map([1, 2], big))\n')
+        data = compile_vm(src).serialize()
+        an = fit.Analysis(data, "<direct>")
+        r, peak = measure(data, tmp_path)
+        assert r.returncode == 0 and an.complete and not an.recursions
+        assert (an.slots_occ, an.frames) == (peak['stack'], peak['frames'])
+
+    @pytest.mark.parametrize("call", ["__prelude_map([n - 1], f)", "[n - 1].map(f)"])
+    def test_recursion_through_a_prelude_function(self, tmp_path, call):
+        """f -> __prelude_map -> f is a recursion also when the prelude function is called
+        directly (it used to be missed: no callback edge without INVOKE)."""
+        src = ('g() -> [int]\n    return [1].map(|x| x)\n'
+               f'f(n: int) -> int\n    if n == 0\n        return 0\n    return {call}[0] + 1\n'
+               'main()\n    print(g())\n    print(f(N))\n')
+        r = fit.check(analyze(src.replace('N', '3')), fit.DEVICES['cortex-m3-64k'])
+        rec = next(x for x in r.recursion if x['functions'] == ['f'])
+        assert (rec['frames_per_level'], rec['cycle'], rec['unit']) == (2, "f -> .map() -> f", 'levels')
+        if fit.til.TILCompiler().find_c_compiler() is None:
+            return
+        exe = device_vm('cortex-m3-64k')         # f(N) enters f N + 1 times: exact here
+        ok, _ = measure(compile_vm(src.replace('N', str(rec['levels'] - 1))).serialize(), tmp_path, exe)
+        bad, _ = measure(compile_vm(src.replace('N', str(rec['levels']))).serialize(), tmp_path, exe)
+        assert ok.returncode == 0, ok.stderr
+        assert bad.returncode == 1 and "recursion too deep" in bad.stderr
+
+    @needs_cc
+    @pytest.mark.parametrize("shape, src, device", [
+        ("expression before the call",            # the deepest level returns before pushing n, n, n, 1
+         'deep(n: int) -> int\n    if n == 0\n        return 0\n'
+         '    return n + (n * (n + (n - (1 + deep(n - 1)))))\nmain()\n    print(deep(N))\n', 'small-stack'),
+        ("retry",                                 # ... before entering the retry block
+         'r(n: int) -> int\n    if n == 0\n        return 0\n    let v = retry(1)\n        r(n - 1)\n'
+         '    return v + 1\nmain()\n    print(r(N))\n', 'small-stack'),
+        ("retry on avr", 'r(n: int) -> int\n    if n == 0\n        return 0\n    let v = retry(1)\n'
+         '        r(n - 1)\n    return v + 1\nmain()\n    print(r(N))\n', 'atmega1284'),
+        ("base case calls a chain",
+         'l2(x: int) -> int\n    return x + 1\nl1(x: int) -> int\n    return l2(x) + 1\n'
+         'count(n: int) -> int\n    if n == 0\n        return l1(0)\n    return 1 + count(n - 1)\n'
+         'main()\n    print(count(N))\n', 'arduino-mega'),
+    ])
+    def test_levels_are_a_guarantee(self, tmp_path, shape, src, device):
+        """The reported number of levels always runs on the device's VM, and at most one
+        more does (the review's shapes; N + 1 levels for f(N))."""
+        dev = self.small_stack() if device == 'small-stack' else fit.DEVICES[device]
+        rec = fit.check(analyze(src.replace('N', '1')), dev).recursion[0]
+        exe, err = fit.build_device_vm(dev)
+        assert exe, err
+        levels = rec['levels']
+        ok, _ = measure(compile_vm(src.replace('N', str(levels - 1))).serialize(), tmp_path, exe)
+        bad, _ = measure(compile_vm(src.replace('N', str(levels + 1))).serialize(), tmp_path, exe)
+        assert ok.returncode == 0, (shape, ok.stderr)
+        assert bad.returncode == 1, (shape, levels)
 
     def test_cycles_that_avoid_the_entry_count_calls(self):
         src = ('a(n: int) -> int\n    if n <= 0\n        return 0\n    return b(n - 1) + 1\n'

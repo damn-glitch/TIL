@@ -497,10 +497,10 @@ class CallSite:
     def __init__(self, pc, op, args, depth, tries):
         self.pc, self.op, self.args, self.depth, self.tries = pc, op, args, depth, tries
         self.targets: List[Tuple[int, int]] = []     # (callee, values consumed by its frame)
-        self.via: List[Tuple[int, int]] = []         # (callback, prelude function that calls it)
+        self.via: List[Tuple[int, int, int]] = []    # (callback, prelude function calling it, its args)
         self.edges: List['Edge'] = []                # every frame this call can push (Analysis._edges)
         self.callback = False      # the call of the function argument inside .map()/.filter()/...
-        self.fn_arg: Optional[int] = None   # INVOKE: the function passed as first argument, when known
+        self.fn_arg: Optional[int] = None   # the function passed as .map(f)'s f, when the code shows it
 
 
 class Edge:
@@ -674,7 +674,7 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
             targets.add(_flow_target(args, nxt))
     has_maps = an.has_maps
     ff.prev_of, ff.jump_targets = prev_of, targets
-    prelude = ff.name.startswith('__prelude_')
+    prelude = fidx in an.prelude_functions
     for pc in sorted(decoded):
         op, args, nxt = decoded[pc]
         eff = STACK_EFFECTS.get(op)
@@ -723,13 +723,13 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
                 if name in ALLOC_METHODS and (name != 'set' or has_maps):
                     ff.allocs.append((pc, ALLOC_METHODS[name]))
             site = CallSite(pc, op, args, d, t)
-            if args[2] >= 1 and pc in states:      # .map(f) / .reduce(f, init): f is the first argument
-                q = _producer(decoded, prev_of, targets, pc, args[2] - 1)
-                if q is not None and decoded[q][0] in (_O.PUSH_FUNC, _O.MAKE_CLOSURE):
-                    site.fn_arg = decoded[q][1][0]
+            if args[2] >= 1 and pc in states:      # xs.map(f) / xs.reduce(f, init): f is the first argument
+                site.fn_arg = _function_pushed(decoded, prev_of, targets, pc, args[2] - 1)
             ff.calls.append(site)
         elif eff.kind in (K_CALL, K_CALL_VALUE):
             site = CallSite(pc, op, args, d, t)
+            if op == _O.CALL and args[1] >= 2 and pc in states:      # __prelude_map(xs, f) called directly
+                site.fn_arg = _function_pushed(decoded, prev_of, targets, pc, args[1] - 2)
             if op == _O.CALL_VALUE and prelude and pc in states:
                 # __prelude_map(a, f) & co. call their parameter f: the callers' edges cover it
                 q = _producer(decoded, prev_of, targets, pc, args[0])
@@ -762,6 +762,14 @@ def analyze_function(an: 'Analysis', fidx: int) -> FuncFacts:
             if target <= pc:
                 ff.loops.append((target, pc))
     return ff
+
+
+def _function_pushed(decoded, prev_of, targets, pc: int, pos: int) -> Optional[int]:
+    """The function a PUSH_FUNC / MAKE_CLOSURE put `pos` slots below the top before `pc`."""
+    q = _producer(decoded, prev_of, targets, pc, pos)
+    if q is not None and decoded[q][0] in (_O.PUSH_FUNC, _O.MAKE_CLOSURE):
+        return decoded[q][1][0]
+    return None
 
 
 def _producer(decoded, prev_of, targets, pc: int, pos: int) -> Optional[int]:
@@ -1011,6 +1019,7 @@ class Analysis:
             if 0 <= fidx < len(m.funcs):
                 self.methods_by_name.setdefault(self.const_text(name_k), []).append(fidx)
         m.prelude = {mid: f for mid, f in m.prelude.items() if 0 <= f < len(m.funcs)}
+        self.prelude_functions = set(m.prelude.values())     # .map()/.filter()/... written in TIL
         self.field_names = {fld for _n, fields in m.types[til.TYPE_ERR + 1:] for fld in fields}
         self._facts: Dict[int, FuncFacts] = {}
         self.has_maps = self._program_has_maps()
@@ -1081,37 +1090,34 @@ class Analysis:
             out += [(g, argc) for g in sorted(address_taken) if self.arity_ok(g, argc)]
         return out
 
-    def callbacks(self, site: CallSite, address_taken: Set[int]) -> List[Tuple[int, int]]:
-        """(function, prelude function) pairs: .map(f)/.filter(f)/... called here runs the
-        prelude function, which calls f - the function passed at this site when the
-        bytecode shows it (a lambda or a named function), else any function value."""
+    def callbacks(self, site: CallSite, address_taken: Set[int]) -> List[Tuple[int, int, int]]:
+        """(function, prelude function, values its frame takes) triples: .map(f) /
+        .filter(f) / ... called here runs a prelude function, which calls f - the function
+        passed at this site when the bytecode shows it (a lambda or a named function),
+        else any function value."""
         m = self.module
-        if site.op != _O.INVOKE or site.args[2] < 1:
-            return []
-        p = m.prelude.get(site.args[1])
-        if p is None or not self.arity_ok(p, site.args[2] + 1):
-            return []
-        out: List[Tuple[int, int]] = []
-        for cb in self.facts(p).calls:
-            if not cb.callback:
+        out: List[Tuple[int, int, int]] = []
+        for p, c in self.call_targets(site, address_taken):
+            if p not in self.prelude_functions:
                 continue
-            if site.fn_arg is not None:
-                cands = [site.fn_arg] if 0 <= site.fn_arg < len(m.funcs) else []
-            else:
-                cands = sorted(address_taken)
-            out += [(g, p) for g in cands if self.arity_ok(g, cb.args[0]) and (g, p) not in out]
+            argc = site.args[2] if site.op == _O.INVOKE else site.args[-1] if site.op == _O.CALL else site.args[0]
+            known = site.fn_arg if (site.op == _O.INVOKE and c == argc + 1) or site.op == _O.CALL else None
+            for cb in self.facts(p).calls:
+                if not cb.callback:
+                    continue
+                cands = sorted(address_taken) if known is None else [known] if 0 <= known < len(m.funcs) else []
+                out += [(g, p, c) for g in cands if self.arity_ok(g, cb.args[0]) and (g, p, c) not in out]
         return out
 
     def _edges(self, ff: FuncFacts, site: CallSite) -> List[Edge]:
         out = [Edge(g, ff.n_locals + site.depth - c, 1, site.tries, None, site) for g, c in site.targets]
-        if site.via:
-            below = ff.n_locals + site.depth - (site.args[2] + 1)    # the prelude function's frame
-            for g, p in site.via:
-                pf = self.facts(p)
-                for cb in pf.calls:
-                    if cb.callback:
-                        out.append(Edge(g, below + pf.n_locals + cb.depth - cb.args[0], 2,
-                                        site.tries + cb.tries, p, site))
+        for g, p, c in site.via:
+            below = ff.n_locals + site.depth - c                     # the prelude function's frame
+            pf = self.facts(p)
+            for cb in pf.calls:
+                if cb.callback:
+                    out.append(Edge(g, below + pf.n_locals + cb.depth - cb.args[0], 2,
+                                    site.tries + cb.tries, p, site))
         return out
 
     # ── reachability, call graph, worst cases ────────────────────────────────
@@ -1126,7 +1132,7 @@ class Analysis:
                 f = work.pop()
                 for site in self.facts(f).calls:
                     callees = [g for g, _c in self.call_targets(site, address_taken)]
-                    callees += [g for g, _p in self.callbacks(site, address_taken)]
+                    callees += [g for g, _p, _c in self.callbacks(site, address_taken)]
                     for g in callees:
                         if g not in reach:
                             reach.add(g)
@@ -1444,7 +1450,7 @@ NATIVE_KINDS = {
     'abs': K_NUM, 'sqrt': K_FLOAT, 'pow': K_NUM, 'sin': K_FLOAT, 'cos': K_FLOAT, 'tan': K_FLOAT,
     'log': K_FLOAT, 'exp': K_FLOAT, 'floor': K_NUM, 'ceil': K_NUM, 'round': K_NUM, 'input': K_STR,
     'chr': K_STR, 'ord': K_INT, 'range': K_ARRAY, 'type_of': K_STR, 'format': K_STR, 'clock_ms': K_INT,
-    'random': K_NUM, 'seed': K_NIL, 'sleep_ms': K_NIL, 'bool': K_BOOL, 'iter': K_ARRAY | K_STR,
+    'random': K_NUM, 'seed': K_NIL, 'sleep_ms': K_NIL, 'bool': K_BOOL, 'iter': K_ARRAY | K_STR, 'sum': K_NUM,
     'read_file': K_STR, 'write_file': K_NIL, 'file_exists': K_BOOL, 'args': K_ARRAY, 'bytes_to_str': K_STR,
     'str_bytes': K_ARRAY,
 }
@@ -1545,7 +1551,7 @@ def infer_kinds(an: 'Analysis', max_rounds: int = 200) -> Optional[KindFacts]:
     callbacks: Dict[int, Set[int]] = {}        # prelude function -> functions passed to it
     for f in an.reachable:
         for s in an.facts(f).calls:
-            for g, p in s.via:
+            for g, p, _c in s.via:
                 callbacks.setdefault(p, set()).add(g)
     st = _KindState(an)
     out = KindFacts()
@@ -1868,7 +1874,8 @@ def lean_map_literals(an: Analysis) -> List[Tuple[bool, str, str]]:
                         "repeated keys in a map literal (the lean VM keeps them)"))
         if floats:
             out.append((True, f"the map literal at {where} has the key {', '.join(floats)}: the lean VM keeps it a "
-                              f"float key (the full VM turns it into an integer), so the output differs",
+                              f"float key (the full VM turns it into an integer), so arithmetic on the key "
+                              f"(3.0 / 2 is 1.5, 3 / 2 is 1) and the output may differ",
                         "float keys in a map literal (the lean VM keeps them)"))
         computed = [kinds[i] for i in range(n) if keys[i] is None]
         risks = []
@@ -2371,7 +2378,8 @@ def apply_run(r: Report, run: Dict[str, Any], compared: bool, why_not: str = "")
             wline = repr(b[i]) if i < len(b) else "(end)"
             causes = [c for c, on in (("integer width", dev.int_bits < 64), ("float precision", dev.float == 1),
                                       ("the lean VM", dev.lean)) if on]
-            why = (" or ".join(causes) + "?") if causes else "please report this"
+            why = (", ".join(causes[:-1]) + " or " * (len(causes) > 1) + causes[-1] + "?") if causes \
+                else "please report this"
             r.warn(f"the output differs from the desktop VM from line {i + 1} on: {dline} instead of "
                    f"{wline} ({why})")
     if not compared and why_not:

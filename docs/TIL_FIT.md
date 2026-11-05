@@ -41,8 +41,8 @@ VM build: int32, float32, 5 KB heap, 160 stack slots, 24 frames, full VM
 
 warnings:
   - recursion: factorial calls itself (line 26 in factorial); the depth depends on the
-    input. Each level needs 2 value-stack slots and 1 call frame: at most 22 levels fit on
-    this device (limited by call frames)
+    input. Each level needs 2 value-stack slots and 1 call frame: 22 levels fit on this
+    device (limited by call frames)
   - recursion: fib calls itself (line 32 in fib); ...
 
 notes:
@@ -71,7 +71,7 @@ on the input; notes are information.
 | `--timeout SEC` | `--run`: give up after SEC seconds |
 | `--stdin FILE` | `--run`: text for `input()` (default: none, `input()` returns `""`) |
 | `--show-output` | `--run`: print the program's output before the report |
-| `-- ARGS` | `--run`: program arguments (`args()`) |
+| `-- ARGS` | `--run`: program arguments (`args()`); the static numbers count them too |
 
 The input may be a `.til` source or a compiled `.tbc` file.
 
@@ -144,9 +144,10 @@ and `TILVM_NO_TIME` (the port provides output and, where noted, a clock).
   typical one about 0.8 KB, measured with `-fstack-usage`), 4 KB on Cortex-M3 and
   the CE, 8–64 KB on the larger devices.
 * **Device services**: `screen` (calculators, desktop), `files` (desktop, nspire),
-  `console` for `input()`, and `clock` (the port provides `clock_ms`; without it
-  `timeout(ms)` and `clock_ms()` count VM steps, 1 ms = 1000 steps — true for the
-  reference ports `cortex-m`, `avr` and `z80`).
+  `console` for `input()`, `args` (a command line for `args()`: desktop, nspire), and
+  `clock` (the port provides `clock_ms`; without it `timeout(ms)` and `clock_ms()`
+  count VM steps, 1 ms = 1000 steps — true for the reference ports `cortex-m`, `avr`
+  and `z80`).
 
 ### Custom devices
 
@@ -160,8 +161,11 @@ a built-in profile:
 Fields: `int_bits`, `float`, `heap`, `stack`, `frames`, `consts`, `types`,
 `try_depth`, `mark_stack`, `lean`, `no_stdio`, `no_time`, `no_math`, `storage`,
 `ram`, `c_stack`, `vm_static_ram`, `bytecode_in_ram`, `abi` (`lp64`, `ilp32`,
-`avr`, `z80`, `ez80`), `clock`, `screen`, `files`, `console`, `title`, `cpu`,
-`source`. Unknown fields and impossible values are errors.
+`avr`, `z80`, `ez80`), `clock`, `screen`, `files`, `console`, `args`, `title`, `cpu`,
+`source`. Unknown fields, impossible values and wrong JSON types are errors: numbers
+must be whole numbers (`16`, not `16.0` or `true`), switches `true`/`false`, `storage`
+and `ram` may be `null`. `float: 2` is refused with the `avr`, `z80` and `ez80` ABIs:
+their toolchains' `double` is 32-bit (use `float: 1`).
 
 ## What is checked
 
@@ -178,43 +182,73 @@ Fields: `int_bits`, `float`, `heap`, `stack`, `frames`, `consts`, `types`,
 | float conversions (`float()`, `: float` / `-> float`, `as float`) and `sqrt/sin/cos/tan/log/exp/floor/ceil/round/pow` on a VM without floats | runtime error ("built without floating point", "not available") |
 | `sin/cos/tan/log/exp` with `TILVM_NO_MATH` | runtime error |
 | builtins a lean build leaves out (`input chr ord type_of clock_ms random seed sleep_ms read_file write_file file_exists args bytes_to_str str_bytes`, and the methods below) | runtime error ("not available", "no method") |
+| `+` on two arrays on a lean build, when one operand is always an array | runtime error ("unsupported operand types for +: array and array") |
 | f-string format specs / `format()` on a lean build | the lean VM ignores specs: the output would differ |
+| map literals with a repeated constant key (`{"a": 1, "a": 2}`, also `1` and `1.0`) or an integral float key (`2.0`) on a lean build | the lean VM keeps every entry and float keys: `len()` and the output differ |
 | value stack, call frames, recovery points over the limit (worst case) | "stack overflow", "recursion too deep", "too many nested retry/timeout blocks" |
 | recursion where not even two levels fit | |
 | analysis incomplete (unknown opcode, malformed code) | the stack use cannot be verified |
-| `--run`: the run stops with a device error, or the VM refuses to load the program | |
+| `--run`: the run stops with a device limit (out of memory, stack overflow, recursion too deep, too many nested blocks, range/array/string too large — also when the desktop VM stops there too: then the program needs more than any VM build offers), a build limit the desktop VM does not have, or the VM refuses to load the program | |
 
 Lean builds lack these methods: str `trim repeat replace split to_float`; array
 `remove insert reverse sort sum min max copy slice join`; map `values copy
 clear`. A method that a lean build lacks only for *some* receivers (`slice` and
 `remove` for arrays, `clear` for maps) and methods that may dispatch to your own
 struct method of the same name are warnings, not errors (the receiver type is
-only known at run time). The tables are checked against a real lean build by
-`tests/test_fit.py` (the comment in `vm/tilvm.h` also lists str `count`, which the
-lean build does have).
+only known at run time). Lean builds also leave out **array concatenation**
+(`[1] + [2]`) and the **map-literal key check** (`map_literal_fixup`: removing
+repeated keys, turning `2.0` into `2`, rejecting arrays/maps/structs as keys).
+The tables and both differences are checked against a real lean build by
+`tests/test_fit.py`.
 
 ### Warnings (risks that depend on the input)
 
 * **Recursion** — the depth depends on the input. The report gives the cost of one
   level and how many levels fit: `count calls itself (line 4); each level needs 2
-  value-stack slots and 1 call frame: at most 14 levels fit on this device
-  (limited by call frames)`. The number is exact for the device's VM (a test
-  runs N and N+1 levels on the device build).
+  value-stack slots and 1 call frame: 14 levels fit on this device (limited by call
+  frames)`. A *level* is one way around the recursion: `count -> count`,
+  `even -> odd -> even` (2 frames), `depth -> .map() -> <lambda> -> depth` (3
+  frames: the prelude function and the lambda are frames too). The number is a
+  **guarantee**: it assumes every level takes its most expensive way around and the
+  topmost level runs everything it can before its recursive call. The tests run the
+  predicted number of levels and more on the device builds: it is exact for
+  `count`/`factorial`-style recursion, for mutual recursion (`even -> odd -> even`)
+  and for `f -> .map() -> f`, and one level low when the deepest level does less than
+  the analysis must assume — it returns before pushing the values the other levels
+  push for their recursive call (`return n * (n + f(n - 1))`), before entering their
+  `retry` block, or before calling the lambda of `.map()`. A recursion in which only
+  the outer levels make some expensive call can manage more levels than reported.
+  When some cycle of the recursion
+  avoids the function it is entered by (`a -> b -> a` and `b -> c -> b`), levels are
+  not comparable and the report counts *nested calls* instead, each at the cost of
+  the most expensive call.
 * **Stack use that grows with the data** — some builtins put a whole collection
   on the value stack before building the result: `.split()`, `.join()`,
   `.keys()`, `.values()`, array `.copy()`/`.slice()`, `range(n)` with a
-  non-constant `n`, and `for x in m` over a map. `range(n)` with constant bounds
-  is counted exactly (and `for i in a..b` needs no stack at all).
+  non-constant `n`, and `for x in m` when `m` may be a map (a loop over an array
+  needs no extra stack). `range(n)` with constant bounds is counted exactly (and
+  `for i in a..b` needs no stack at all). `+` on arrays copies heap to heap and
+  needs no stack. `args()` puts every program argument on the stack: a warning on
+  devices with a command line; the static numbers count the arguments given to
+  `--run`.
 * **Allocations inside loops** — a loop that keeps what it allocates
-  (`push`, `insert`, map item assignment) grows the heap with every iteration;
-  loops that only allocate temporaries are listed in a note.
+  (`push`, `insert`, map item assignment, and `x = x + y` / `x += y` building an
+  ever longer string or array, also `s = s * 2`) grows the heap with every iteration;
+  loops that only allocate temporaries (f-strings, `"a" + b` that is not kept) are
+  listed in a note. `+` and `*` count as allocations only when the value kinds (below)
+  show they always give a string or an array.
+* **Lean builds**: `+` whose operands may both be arrays when that is decided at run
+  time (e.g. `m[0] + m[1]`), and map literals with computed keys (repeated keys,
+  `2.0` keys and invalid keys are not checked by the lean VM).
 * Little room left (≥ 80 % of a limit), `random()` returning integers on a VM
   without floats, screen/file/input natives on devices without them, `timeout`
-  and `clock_ms` counting steps on devices without a clock, single-precision
-  floats, integer wrap-around on 16/32-bit devices (notes).
+  and `clock_ms` counting steps on devices without a clock, `x ** y` / `pow()` on a
+  `TILVM_NO_MATH` build (integer exponents only: a fractional one gives 0),
+  single-precision floats, integer wrap-around on 16/32-bit devices (notes).
 * `--run`: the output differs from the desktop VM (integer width, float
-  precision), live data close to the heap size, the program failing on the
-  desktop VM too (not a device limit).
+  precision, the lean VM), live data close to the heap size, the program failing
+  the same way on the desktop VM (its own error, e.g. an index out of bounds — not
+  a device limit).
 
 ## How the static analysis works
 
@@ -247,28 +281,52 @@ _O.NEW_ARRAY: E(_arg(0), 1, peak=1, need=2, alloc='array'),   # pops n, pushes 1
 methods with that name, the prelude function of a builtin method, and — when a
 struct field has that name — any function value), and `CALL_VALUE` (every
 function whose address is taken by `PUSH_FUNC` / `MAKE_CLOSURE` in reachable
-code, filtered by arity). Indirect calls are therefore conservative. The
-strongly connected components of this graph are the recursions. Without
-recursion the worst case of a function is the maximum of its own needs and, for
-every call site, *where the callee's frame starts* + *the callee's worst case*;
-the program's worst case is the globals plus the entry function's. Recursive
-components are counted once in the totals; the report adds their cost per level
-and the number of levels that fit:
+code, filtered by arity). `xs.map(f)` / `.filter` / `.reduce` / `.each` / `.any` /
+`.all` run a prelude function (written in TIL) that calls `f`: the call site gets an
+edge to the prelude function and one *through* it to `f` (2 frames deeper, at the
+offset where the prelude function calls it) — `f` is the function passed at this
+site when the bytecode shows it (a lambda or a named function), else any function
+value. So `m.map(|row| row.map(|x| x * 2))` is no recursion. Other indirect calls
+are conservative. The strongly connected components of this graph are the
+recursions. Without recursion the worst case of a function is the maximum of its
+own needs and, for every call edge, *where the callee's frame starts* + *the
+callee's worst case*; the program's worst case is the globals plus the entry
+function's. Recursive components are counted once in the totals; the report adds
+their cost per level and the number of levels that fit. A level costs the most
+expensive simple cycle through the function the recursion is entered by (slots,
+frames and recovery points each summed along the cycle and maximised on their
+own); `top` is the most expensive partial level: a simple path from that function
+plus what the last function can run before a recursive call (with its other
+callees):
 
 ```
-levels = min( (stack − base − top) / slots_per_level + 1,
-              frames − frames_below − top_frames + 2,
+levels = min( (stack − base − top_need) / slots_per_level + 1,
+              (frames − frames_below + 1 − top_frames) / frames_per_level + 1,
               (try − tries_below − top_tries) / tries_per_level + 1 )
 ```
+
+over every function the recursion is entered by.
+
+**Value kinds.** A second dataflow pass over the same bytecode tracks which kinds
+of value (nil, bool, int, float, str, array, map, other) every operand-stack slot
+and local may hold at every instruction; parameters get what their call sites
+pass, call results what the callees return, globals and struct fields (by name)
+what is ever stored in them. It decides the checks where operand types matter:
+`+` on arrays in lean builds (an error when one operand is always an array — then
+`+` only works as a concatenation —, a warning when both may be arrays), `+` and
+`*` that allocate strings or arrays, `for x in m` over a map, and the keys of map
+literals. Cells, upvalues, indexing results and loop elements are "any".
 
 **Exactness.** For programs without recursion and without data-dependent
 builtins, the static numbers equal the measured high-water marks of the C VM
 *exactly* when every path runs — `tests/test_fit.py` checks this for all
 examples and a corpus of programs (closures, structs, maps, retry/intent,
 match, Option/`?`, default arguments, comprehensions, globals, higher-order
-methods). Otherwise the static numbers are upper bounds (paths that are not
-taken, conservative indirect calls); for recursion the per-level formula is an
-upper bound that is at most one slot above the measurement in the tests.
+methods, nested `.map()`, array `+`). Otherwise the static numbers are upper
+bounds (paths that are not taken, conservative indirect calls; a `retry` handler
+is counted with the error message on the stack). For recursion the number of
+levels is a guarantee: exact for the common shapes, otherwise usually one level
+low (see *Recursion* above).
 
 **Not checked statically**: how much heap a program needs (it depends on the
 data — use `--run`), integer overflow at run time (only constants are checked;
@@ -296,24 +354,35 @@ _O.ADD_I8: E(1, 1),
 `--run` compiles `vm/tilvm.c` + `vm/main.c` with the device's `-D` flags plus
 `-DTILVM_STATS` (and `-DTILVM_PACK` for 8-bit targets), caches the binary in
 `~/.til/cache` (or `$TIL_FIT_CACHE`; keyed by the VM sources, the flags and the
-compiler), runs the program and reads the high-water marks. It also runs the
-program on the normal desktop VM and compares output and exit code (skipped
-when the program uses `clock_ms`, `sleep_ms`, keys, or `random` on a device whose
-random generator differs).
+compiler), runs the program and reads the high-water marks. Without a usable home
+directory the cache is `<temp>/til-cache-<uid>`, created with mode 0700 and used
+only when it belongs to the user and nobody else can write to it (else a new
+private temporary directory): cached executables are run, so they never come from
+a shared, predictable place. It also runs the program on the desktop VM (the
+`desktop` profile, built the same way) and compares output and exit code
+(skipped when the program uses `clock_ms`, `sleep_ms`, keys, or `random` on a
+device whose random generator differs, and after a device run that hit
+`--timeout`).
 
 * **Faithful device builds.** `TILVM_NO_STDIO` / `TILVM_NO_TIME` stay on, so number
   formatting and step-counted timeouts are those of the device; `vm/main.c`
   gives such a core a console (stdout/stderr/stdin). No file hooks are
   installed, as on the devices.
 * **8-bit layouts on the desktop.** On AVR, Z80 and eZ80 a value takes 3 or 5
-  bytes (no alignment); on the desktop 4 or 8. `-DTILVM_PACK` packs `tv_val` so
-  heap objects have the device's sizes and measured heap use matches the device
-  (checked against avr-gcc / SDCC by the tests).
-* **Errors** that come from the device's limits (`out of memory`, `stack
-  overflow`, `recursion too deep`, `too many nested retry/timeout blocks`,
-  `range too large`, `not available`, `no method` in a lean build, no floats...)
-  make the verdict `does not fit`. An error the desktop VM reports too is the
-  program's own and only a warning.
+  bytes (no alignment); on the desktop 4 or 8. `-DTILVM_PACK` packs `tv_val` and
+  the heap object headers so heap objects have the device's sizes and measured
+  heap use matches the device (checked against avr-gcc / SDCC by the tests; with
+  a heap above 64 KB the packed headers also keep 32-bit fields at 2-byte
+  alignment well-defined — a UBSan test covers it).
+* **Errors** that come from the VM's limits (`out of memory`, `stack overflow`,
+  `recursion too deep`, `too many nested retry/timeout blocks`, `range too large`,
+  `array too large`, `string too long`) make the verdict `does not fit` — also when
+  the desktop VM stops the same way (the program needs more than any VM build
+  offers). Errors from the device's build (`not available`, `no method` in a lean
+  build, no floats, no `<math.h>`) are `does not fit` unless the desktop VM fails
+  the same way. Any other error the desktop VM reports too (an index out of
+  bounds, a failed `assert`) is the program's own and only a warning. A VM killed
+  by a signal does not fit.
 
 ### C VM API (`TILVM_STATS`)
 
@@ -367,9 +436,9 @@ until then.
   "static": {"bytecode_bytes": 2952, "constants": 78, "types": 8, "globals": 1, "functions": 18,
              "reachable_functions": 18, "complete": true, "problems": [],
              "stack_slots": 52, "stack_slots_written": 50, "call_frames": 4, "recovery_points": 2,
-             "recursion": [{"functions": ["fib"], "at": "line 32 in fib", "slots_per_level": 2,
-                            "frames_per_level": 1, "tries_per_level": 0, "levels": 22,
-                            "limited_by": "call frames"}],
+             "recursion": [{"functions": ["fib"], "at": "line 32 in fib", "unit": "levels",
+                            "cycle": "fib -> fib", "slots_per_level": 2, "frames_per_level": 1,
+                            "tries_per_level": 0, "levels": 22, "limited_by": "call frames"}],
              "uses_float_constants": true, "functions_detail": [{"name": "main", "...": "..."}]},
   "vm": {"struct_bytes": 6400, "value_bytes": 3, "c_flags": ["-DTILVM_INT_BITS=16", "..."]},
   "run": null
@@ -378,9 +447,11 @@ until then.
 
 `stack_slots` is what the VM requires (including the free slots it checks for),
 `stack_slots_written` what it uses; both are `null` when the analysis is
-incomplete. With `--run`, `run` holds `exit_code`, `stdout`, `errors`, `error`,
-`stats` (`steps`, `gc`, `heap`, `peak_stack`, `peak_frames`, `peak_try`,
-`peak_heap`, `peak_live`) and `desktop` (`exit_code`, `error`, `same_output`).
+incomplete. In `recursion`, `unit` is `levels` or `calls` (see *Recursion*) and
+`cycle` the most expensive level. With `--run`, `run` holds `exit_code`, `stdout`,
+`errors`, `error`, `timeout`, `stats` (`steps`, `gc`, `heap`, `peak_stack`,
+`peak_frames`, `peak_try`, `peak_heap`, `peak_live`) and `desktop` (`exit_code`,
+`error`, `same_output`; absent when the desktop run was skipped).
 
 ## `til build --target vm --device NAME`
 
@@ -390,18 +461,21 @@ not fit it prints the full report to stderr, writes nothing and exits with 1 —
 like a linker whose memory region overflows. `--strip` is taken into account.
 `--target c-vm --device NAME` checks the same way (compile the generated C file
 with the device's flags; `til fit --json` lists them under `vm.c_flags`).
-`--device` with any other target or command is an error.
+`--device` with any other target or command, or with a `.tbc` input (use `til fit
+prog.tbc --device NAME`), is an error.
 
 ## Tests
 
 `tests/test_fit.py`: profiles and the struct model (host compiler; avr-gcc,
 arm-none-eabi-gcc and SDCC when installed), the analysis on hand-made and
 patched bytecode, static bounds against measured high-water marks (exact on
-the corpus), recursion levels against the device builds, verdicts, `--run`,
-the lean tables against a real lean build, the C VM macros (strict builds,
-packed layout, console runner) and `til build --device`. Opt-in:
-`TIL_TEST_SLOW=1` (every device VM built and run) and `TIL_TEST_CROSS=1`
-(linked ports).
+the corpus), recursion levels against the device builds, the value kinds,
+verdicts, `--run` (device limits, timeouts, signals, `--stdin`, program
+arguments), the lean tables and lean differences against a real lean build, the
+C VM macros (strict builds, packed layout incl. a UBSan run with a big packed
+heap, console runner), the private VM cache and `til build --device`. Opt-in:
+`TIL_TEST_SLOW=1` (every device VM built and run, `--timeout` timing) and
+`TIL_TEST_CROSS=1` (linked ports).
 
 ## Limitations
 
@@ -409,6 +483,10 @@ packed layout, console runner) and `til build --device`. Opt-in:
 * Integer overflow at run time is not detected statically (constants are).
 * Allocation warnings cover allocation sites directly inside a loop, not those
   in functions called from it.
+* The value kinds are coarse: struct fields are tracked by name across all struct
+  types, cells, upvalues, indexing results and loop elements are "any"; checks that
+  depend on them say "may" when the kinds are not certain.
+* Recursion levels are a guarantee, not always the exact maximum (see *Recursion*).
 * The profiles marked as assumptions above (TI-84 CE, NumWorks, Casio, ESP32,
   RP2040 RAM shares; Z80 storage) have not been measured on hardware.
 * `--run` runs on the desktop: speed, real clocks and device I/O are not
