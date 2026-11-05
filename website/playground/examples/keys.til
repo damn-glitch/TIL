@@ -1,0 +1,28 @@
+# Keys: click the screen, then move the square with the arrow keys.
+# wait_key() pauses the program until a key is pressed. Esc quits.
+
+screen_init(120, 90)
+var x = 55
+var y = 40
+var moves = 0
+loop
+    screen_clear(0x202830)
+    fill_rect(x, y, 10, 10, 0x40C0FF)
+    draw_text(2, 2, f"moves: {moves}", 0xFFFFFF)
+    screen_show()
+    let k = wait_key()
+    if k == 27
+        break
+    elif k == 1
+        y = max(y - 5, 0)
+    elif k == 2
+        y = min(y + 5, 80)
+    elif k == 3
+        x = max(x - 5, 0)
+    elif k == 4
+        x = min(x + 5, 110)
+    else
+        print(f"key code {k}")
+        continue
+    moves += 1
+print(f"bye after {moves} moves")

@@ -20,6 +20,9 @@
 #include <math.h>
 #define TV_HAVE_MATH 1
 #endif
+#if TILVM_FLOAT
+#include <float.h>
+#endif
 
 /* Integer fast paths of the interpreter and of map lookups / int formatting:
  * pure optimizations (the general paths give the same results). Off for
@@ -1491,40 +1494,238 @@ static int parse_int(const char *p, uint32_t n, tv_int *out_i) {
 }
 
 #if TILVM_FLOAT
-static int parse_float(const char *p, uint32_t n, tv_float *out_f) {
-    char buf[64];
-    if (n == 0 || n >= sizeof(buf)) return 0;
-    memcpy(buf, p, n);
-    buf[n] = 0;
-#ifndef TILVM_NO_STDIO
-    {
-        char *end;
-        double d = strtod(buf, &end);
-        while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
-        if (*end || end == buf) return 0;
-        *out_f = (tv_float)d;
-        return 1;
-    }
+/* float(str) - the syntax of the reference VM (Python's float() of the bytes):
+ * ASCII whitespace around [+-] (digits [. [digits]] | . digits) [(e|E) [+-]
+ * digits], or [+-] inf / infinity / nan in any case, '_' only between two
+ * digits. The value is the correctly rounded (ties to even) value of the
+ * decimal, computed with exact integer arithmetic, so every build gives the
+ * same float, without the C library. The first TV_FDIG significant digits are
+ * kept and any further nonzero digit counts as one more digit 1; this rounds
+ * like the whole string because no halfway point between two floats has more
+ * than 768 (double) or 113 (float) significant digits. A smaller
+ * TILVM_FLOAT_DIGITS saves stack (about 2 bytes per digit) on tiny devices
+ * at the price of exactness for longer inputs. */
+#if TILVM_FLOAT == 1
+#define TV_F_MANT FLT_MANT_DIG
+#define TV_F_EMIN (FLT_MIN_EXP - FLT_MANT_DIG)    /* exponent of the smallest subnormal */
+#define TV_F_EMAX FLT_MAX_EXP                     /* floats are < 2^TV_F_EMAX */
+#define TV_F_HUGE FLT_MAX
+typedef uint32_t tv_fmant;
 #else
-    {
-        uint32_t i = 0;
-        tv_float v = 0, scale = 1;
-        int neg = 0, any = 0, frac = 0;
-        while (buf[i] == ' ') i++;
-        if (buf[i] == '-' || buf[i] == '+') { neg = buf[i] == '-'; i++; }
-        for (; buf[i]; i++) {
-            if (buf[i] == '.') { if (frac) return 0; frac = 1; continue; }
-            if (buf[i] < '0' || buf[i] > '9') break;
-            any = 1;
-            if (frac) { scale /= 10; v += (tv_float)(buf[i] - '0') * scale; }
-            else v = v * 10 + (tv_float)(buf[i] - '0');
-        }
-        while (buf[i] == ' ') i++;
-        if (!any || buf[i]) return 0;
-        *out_f = neg ? -v : v;
-        return 1;
-    }
+#define TV_F_MANT DBL_MANT_DIG
+#define TV_F_EMIN (DBL_MIN_EXP - DBL_MANT_DIG)
+#define TV_F_EMAX DBL_MAX_EXP
+#define TV_F_HUGE DBL_MAX
+typedef uint64_t tv_fmant;
 #endif
+#ifdef TILVM_FLOAT_DIGITS
+#define TV_FDIG TILVM_FLOAT_DIGITS
+#elif TILVM_FLOAT == 1
+#define TV_FDIG 120
+#else
+#define TV_FDIG 770
+#endif
+/* 16-bit limbs for 10^(TV_FDIG + 1 - smallest decimal exponent) * 2^(mantissa + 2) */
+#define TV_BIG_LIMBS \
+    (((TV_FDIG + 3 + (1L - TV_F_EMIN) * 30103L / 100000L) * 3322L / 1000L + TV_F_MANT + 40) / 16)
+
+typedef struct tv_dec {
+    uint16_t nd;                /* significant digits, the first is not 0 */
+    uint8_t d[TV_FDIG + 1];     /* their values */
+    long e;                     /* value = (d as an integer) * 10^e */
+} tv_dec;
+
+typedef struct tv_big { uint16_t n, w[TV_BIG_LIMBS]; } tv_big;   /* little-endian */
+
+static int f_space(char c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
+
+static int f_word(const char *p, uint32_t n, const char *w) {   /* w: lower case */
+    uint32_t i;
+    for (i = 0; i < n; i++)
+        if (!w[i] || (p[i] | 0x20) != w[i]) return 0;
+    return !w[n];
+}
+
+/* digits with '_' only between two digits: part 0 integer, 1 fraction (into dec), 2 exponent (ex) */
+static uint32_t f_digits(const char *p, uint32_t i, uint32_t n, tv_dec *dec, int part, int *any, int *sticky,
+                         long *ex) {
+    int prev = 0;
+    for (; i < n; i++) {
+        char c = p[i];
+        if (c == '_' && prev && i + 1 < n && p[i + 1] >= '0' && p[i + 1] <= '9') { prev = 0; continue; }
+        if (c < '0' || c > '9') break;
+        prev = *any = 1;
+        if (part == 2) {                                  /* exponent */
+            if (*ex < 100000L) *ex = *ex * 10 + (c - '0');
+        } else if (dec->nd < TV_FDIG && (dec->nd || c != '0')) {
+            dec->d[dec->nd++] = (uint8_t)(c - '0');
+            if (part) dec->e--;
+        } else if (!dec->nd) {                            /* a leading zero */
+            if (part) dec->e--;
+        } else {                                          /* beyond TV_FDIG digits */
+            if (c != '0') *sticky = 1;
+            if (!part) dec->e++;
+        }
+    }
+    return i;
+}
+
+/* 0 = not a number, 1 = finite (dec), 2 = inf, 3 = nan */
+static int scan_float(const char *p, uint32_t n, int *neg, tv_dec *dec) {
+    uint32_t i = 0;
+    int any = 0, sticky = 0;
+    long ex = 0;
+    while (i < n && f_space(p[i])) i++;
+    while (n > i && f_space(p[n - 1])) n--;
+    *neg = 0;
+    if (i < n && (p[i] == '+' || p[i] == '-')) *neg = p[i++] == '-';
+    if (f_word(p + i, n - i, "inf") || f_word(p + i, n - i, "infinity")) return 2;
+    if (f_word(p + i, n - i, "nan")) return 3;
+    dec->nd = 0;
+    dec->e = 0;
+    i = f_digits(p, i, n, dec, 0, &any, &sticky, &ex);
+    if (i < n && p[i] == '.') i = f_digits(p, i + 1, n, dec, 1, &any, &sticky, &ex);
+    if (!any) return 0;
+    if (i < n && (p[i] == 'e' || p[i] == 'E')) {
+        int eneg = 0, edig = 0;
+        if (++i < n && (p[i] == '+' || p[i] == '-')) eneg = p[i++] == '-';
+        i = f_digits(p, i, n, dec, 2, &edig, &sticky, &ex);
+        if (!edig) return 0;
+        if (eneg) ex = -ex;
+    }
+    if (i != n) return 0;
+    if (sticky) { dec->d[dec->nd++] = 1; dec->e--; }
+    dec->e += ex;
+    return 1;
+}
+
+static int big_bits(const tv_big *b) {
+    int bits = b->n ? (b->n - 1) * 16 : 0;
+    uint16_t top = b->n ? b->w[b->n - 1] : 0;
+    while (top) { bits++; top = (uint16_t)(top >> 1); }
+    return bits;
+}
+
+static void big_muladd(tv_big *b, uint32_t m, uint32_t c) {   /* b = b * m + c (m, c < 65536) */
+    int i;
+    for (i = 0; i < b->n; i++) {
+        uint32_t t = (uint32_t)b->w[i] * m + c;
+        b->w[i] = (uint16_t)t;
+        c = t >> 16;
+    }
+    if (c) b->w[b->n++] = (uint16_t)c;
+}
+
+static void big_pow10(tv_big *b, long k) {                   /* b *= 10^k */
+    for (; k >= 4; k -= 4) big_muladd(b, 10000, 0);
+    for (; k > 0; k--) big_muladd(b, 10, 0);
+}
+
+static void big_shl(tv_big *b, long s) {                     /* b <<= s */
+    int limbs = (int)(s / 16), bits = (int)(s % 16), i;
+    if (!b->n) return;
+    if (bits) {
+        uint32_t c = 0;
+        for (i = 0; i < b->n; i++) {
+            uint32_t t = ((uint32_t)b->w[i] << bits) | c;
+            b->w[i] = (uint16_t)t;
+            c = t >> 16;
+        }
+        if (c) b->w[b->n++] = (uint16_t)c;
+    }
+    if (limbs) {
+        for (i = b->n - 1; i >= 0; i--) b->w[i + limbs] = b->w[i];
+        for (i = 0; i < limbs; i++) b->w[i] = 0;
+        b->n = (uint16_t)(b->n + limbs);
+    }
+}
+
+static void big_shr1(tv_big *b) {
+    int i;
+    for (i = 0; i < b->n; i++)
+        b->w[i] = (uint16_t)((b->w[i] >> 1) | (i + 1 < b->n ? (b->w[i + 1] & 1) << 15 : 0));
+    while (b->n && !b->w[b->n - 1]) b->n--;
+}
+
+static int big_cmp(const tv_big *a, const tv_big *b) {
+    int i;
+    if (a->n != b->n) return a->n < b->n ? -1 : 1;
+    for (i = a->n - 1; i >= 0; i--)
+        if (a->w[i] != b->w[i]) return a->w[i] < b->w[i] ? -1 : 1;
+    return 0;
+}
+
+static void big_sub(tv_big *a, const tv_big *b) {           /* a -= b (a >= b) */
+    int i;
+    uint32_t borrow = 0;
+    for (i = 0; i < a->n; i++) {
+        uint32_t t = (uint32_t)(i < b->n ? b->w[i] : 0) + borrow;
+        borrow = a->w[i] < t;
+        a->w[i] = (uint16_t)(a->w[i] - t);
+    }
+    while (a->n && !a->w[a->n - 1]) a->n--;
+}
+
+/* the float nearest to the decimal (ties to even) */
+static tv_float dec_to_float(const tv_dec *dec) {
+    const long lo = -(((1L - TV_F_EMIN) * 30103L + 99999L) / 100000L);  /* 10^lo < half the smallest float */
+    const long hi = (long)TV_F_EMAX * 30103L / 100000L + 1;             /* 10^(hi) > the largest float */
+    long mag = (long)dec->nd + dec->e, s, e2;
+    tv_big num, den;
+    tv_fmant q = 0, m, half, low;
+    int i, qbits = 0, extra, sticky;
+    tv_float x;
+    if (!dec->nd || mag <= lo) return 0;
+    if (mag > hi) { x = TV_F_HUGE; return x + x; }           /* inf */
+    num.n = 0;
+    for (i = 0; i < dec->nd; i++) big_muladd(&num, 10, dec->d[i]);
+    den.n = 1;
+    den.w[0] = 1;
+    if (dec->e > 0) big_pow10(&num, dec->e);
+    else big_pow10(&den, -dec->e);
+    /* q = floor(num / (den * 2^s)) has TV_F_MANT + 1 or + 2 bits */
+    s = (long)big_bits(&num) - big_bits(&den) - (TV_F_MANT + 1);
+    if (s > 0) big_shl(&den, s);
+    else big_shl(&num, -s);
+    big_shl(&den, TV_F_MANT + 1);
+    for (i = 0; i <= TV_F_MANT + 1; i++) {
+        q <<= 1;
+        if (big_cmp(&num, &den) >= 0) { big_sub(&num, &den); q |= 1; }
+        big_shr1(&den);
+    }
+    sticky = num.n != 0;
+    for (m = q; m; m >>= 1) qbits++;
+    extra = qbits - TV_F_MANT;                               /* bits to round off */
+    if (s + extra < TV_F_EMIN) extra = (int)(TV_F_EMIN - s);    /* subnormal */
+    if (extra > qbits) return 0;
+    half = (tv_fmant)1 << (extra - 1);
+    low = q & ((half << 1) - 1);
+    m = q >> extra;
+    if (low > half || (low == half && (sticky || (m & 1)))) m++;
+    e2 = s + extra;
+    for (qbits = 0, q = m; q; q >>= 1) qbits++;
+    if (qbits + e2 > TV_F_EMAX) { x = TV_F_HUGE; return x + x; }
+    x = (tv_float)m;                                         /* exact; scaling by 2^e2 is exact too */
+    for (; e2 >= 16; e2 -= 16) x *= (tv_float)65536.0;
+    for (; e2 > 0; e2--) x *= 2;
+    for (; e2 <= -16; e2 += 16) x *= (tv_float)1.52587890625e-05;
+    for (; e2 < 0; e2++) x *= (tv_float)0.5;
+    return x;
+}
+
+static int parse_float(const char *p, uint32_t n, tv_float *out_f) {
+    tv_dec dec;
+    int neg, kind = scan_float(p, n, &neg, &dec);
+    tv_float x;
+    if (!kind) return 0;
+    if (kind == 1) x = dec_to_float(&dec);
+    else {
+        x = TV_F_HUGE;
+        x = x + x;                                           /* inf */
+        if (kind == 3) x = x - x;                            /* nan */
+    }
+    *out_f = neg ? -x : x;
+    return 1;
 }
 #endif
 

@@ -1,0 +1,35 @@
+# input() waits for a line: type it below the output and press Enter.
+# An empty line ends the game.
+
+is_number(s: str) -> bool
+    if len(s) == 0
+        return false
+    for b in str_bytes(s)
+        if b < 48 or b > 57
+            return false
+    return true
+
+let name = input("What is your name? ")
+print(f"Nice to meet you, {name}!")
+
+seed(clock_ms())
+let secret = random(1, 100)
+var tries = 0
+print("I am thinking of a number from 1 to 100.")
+loop
+    let text = input("Your guess: ").trim()
+    if text == ""
+        print(f"The number was {secret}. Bye, {name}!")
+        break
+    if not is_number(text)
+        print("Please type a number.")
+        continue
+    let guess = text.to_int()
+    tries += 1
+    if guess < secret
+        print("Higher!")
+    elif guess > secret
+        print("Lower!")
+    else
+        print(f"Yes, {secret}! You needed {tries} tries, {name}.")
+        break

@@ -1,0 +1,9 @@
+# A runtime error stops the program and reports where it happened:
+# the line is highlighted in the editor.
+
+average(xs) -> int
+    return sum(xs) / len(xs)
+
+print(average([10, 20, 30]))
+print(average([]))
+print("this line is never reached")

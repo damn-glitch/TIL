@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TIL Playground - compile and run TIL in your browser</title>
+    <meta name="description" content="Write TIL code and run it in your browser: the self-hosted TIL compiler and the TIL VM run as WebAssembly, no server and no installation.">
+    <meta name="color-scheme" content="light dark">
+    <link rel="icon" type="image/svg+xml" href="../logo.svg">
+    <link rel="stylesheet" href="playground.css">
+    <script>
+        /* theme before first paint: saved choice, else the system preference */
+        (function () {
+            try {
+                var t = localStorage.getItem('til-playground-theme');
+                if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+            } catch (e) { /* storage disabled */ }
+        }());
+    </script>
+</head>
+<body data-state="loading" data-compiler="loading">
+    <header class="topbar">
+        <a class="brand" href="../" title="TIL home page">
+            <img src="../logo.svg" alt="" width="28" height="28">
+            <span>TIL <b>Playground</b></span>
+        </a>
+        <div class="toolbar">
+            <label class="picker">
+                <span class="visually-hidden">Example</span>
+                <select id="examples" aria-label="Load an example">
+                    <option value="">Examples…</option>
+                </select>
+            </label>
+            <button id="run" class="btn primary" type="button" title="Compile and run (Ctrl+Enter)" disabled>
+                <span aria-hidden="true">▶</span> Run
+            </button>
+            <button id="stop" class="btn danger" type="button" title="Stop the program (Esc in the editor)" disabled>
+                <span aria-hidden="true">■</span> Stop
+            </button>
+            <button id="share" class="btn" type="button" title="Copy a link that contains this code">
+                <span aria-hidden="true">🔗</span> Share
+            </button>
+            <button id="theme" class="btn icon" type="button" title="Switch light / dark theme" aria-label="Switch theme">
+                <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 1.5v11a5.5 5.5 0 0 1 0-11z"/></svg>
+            </button>
+        </div>
+    </header>
+
+    <main class="layout">
+        <section class="pane editor-pane" aria-label="Code editor">
+            <div class="pane-head">
+                <span class="file-name">main.til</span>
+                <span class="hint">Ctrl+Enter runs · Tab indents · Shift+Tab outdents</span>
+            </div>
+            <div class="editor" id="editor">
+                <div class="gutter" id="gutter" aria-hidden="true"></div>
+                <div class="code-wrap">
+                    <div class="error-line" id="error-line" hidden></div>
+                    <textarea id="code" spellcheck="false" autocapitalize="off" autocomplete="off"
+                              autocorrect="off" wrap="off" aria-label="TIL source code"></textarea>
+                </div>
+            </div>
+        </section>
+
+        <section class="pane run-pane" aria-label="Program">
+            <div class="screen-wrap" id="screen-wrap" hidden>
+                <canvas id="screen" width="160" height="120" tabindex="0"
+                        aria-label="Program screen: click it to send keys to the program"></canvas>
+                <div class="screen-note" id="screen-note">
+                    <span class="for-mouse">Click the screen to send keys: arrows, Enter, Esc, letters (Tab leaves the screen)</span>
+                    <span class="for-touch">Use these keys for the program:</span>
+                </div>
+                <div class="keybar" id="keybar" aria-label="Keys for the program">
+                    <button type="button" data-key="3" aria-label="Left">←</button>
+                    <button type="button" data-key="1" aria-label="Up">↑</button>
+                    <button type="button" data-key="2" aria-label="Down">↓</button>
+                    <button type="button" data-key="4" aria-label="Right">→</button>
+                    <button type="button" data-key="32">Space</button>
+                    <button type="button" data-key="13">Enter</button>
+                    <button type="button" data-key="27">Esc</button>
+                </div>
+            </div>
+            <div class="pane-head">
+                <span>Output</span>
+                <button id="clear" class="btn small" type="button" title="Clear the output">Clear</button>
+            </div>
+            <div class="output" id="output" tabindex="0" role="log" aria-label="Program output"></div>
+            <form class="stdin" id="stdin" hidden autocomplete="off">
+                <label for="stdin-text" class="stdin-label">input()</label>
+                <input id="stdin-text" type="text" spellcheck="false" placeholder="type a line and press Enter (Ctrl+D: end of input)">
+            </form>
+            <div class="statusbar">
+                <span class="state" id="state" role="status" aria-live="polite">Loading…</span>
+                <span class="stats" id="stats"></span>
+            </div>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <span id="compiler-info">Loading the compiler…</span>
+        <span id="vm-info"></span>
+        <a href="https://github.com/damn-glitch/TIL" target="_blank" rel="noopener">GitHub</a>
+    </footer>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+    <noscript><p class="noscript">The playground needs JavaScript and WebAssembly.</p></noscript>
+
+    <script src="tilvm.js"></script>
+    <script src="playground.js"></script>
+</body>
+</html>

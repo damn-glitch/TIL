@@ -1,0 +1,153 @@
+[
+  {
+    "name": "hello",
+    "source": "print(\"Hello from the compiler pipeline!\")\nprint(\"Сәлем, әлем! Привет, мир!\")\nlet n = 6 * 7\nprint(f\"answer = {n}\")\n",
+    "expect": {
+      "state": "done",
+      "output": "Hello from the compiler pipeline!\nСәлем, әлем! Привет, мир!\nanswer = 42\n"
+    }
+  },
+  {
+    "name": "runtime_error",
+    "source": "let xs = [1, 2, 3]\nprint(xs[0])\nprint(xs[10])\nprint(\"unreachable\")\n",
+    "expect": {
+      "state": "error",
+      "output_contains": [
+        "1\n",
+        "runtime error"
+      ],
+      "error_line": 3
+    }
+  },
+  {
+    "name": "compile_error",
+    "source": "print(\"before\")\nlet x = \nprint(x)\n",
+    "expect": {
+      "state": "compile-error",
+      "error_line": 2
+    }
+  },
+  {
+    "name": "infinite",
+    "source": "var i = 0\nprint(\"spinning\")\nloop\n    i += 1\n",
+    "expect": {
+      "state": "running",
+      "output_contains": [
+        "spinning"
+      ]
+    }
+  },
+  {
+    "name": "flood",
+    "source": "var i = 0\nloop\n    i += 1\n    print(f\"line {i}: \" + \"x\".repeat(60))\n",
+    "expect": {
+      "state": "running"
+    }
+  },
+  {
+    "name": "input",
+    "source": "let name = input(\"Name? \")\nprint(f\"Hi, {name}!\")\nlet more = input()\nprint(f\"[{more}]\")\n",
+    "expect": {
+      "state": "done"
+    }
+  },
+  {
+    "name": "files_and_args",
+    "source": "print(args())\nprint(file_exists(\"/main.til\"))\nwrite_file(\"/note.txt\", \"saved\")\nprint(read_file(\"/note.txt\"))\nprint(file_exists(\"/nope.txt\"))\n",
+    "expect": {
+      "state": "done",
+      "output": "[]\ntrue\nsaved\nfalse\n"
+    }
+  },
+  {
+    "name": "sleep",
+    "source": "let t0 = clock_ms()\nprint(\"tick\")\nsleep_ms(300)\nprint(\"tock\")\nprint(clock_ms() - t0 >= 300)\n",
+    "expect": {
+      "state": "done",
+      "output": "tick\ntock\ntrue\n"
+    }
+  },
+  {
+    "name": "exit_code",
+    "source": "print(\"leaving\")\nexit(3)\nprint(\"not printed\")\n",
+    "expect": {
+      "state": "done",
+      "output": "leaving\n",
+      "status_contains": "code 3"
+    }
+  },
+  {
+    "name": "graphics",
+    "source": "screen_init(64, 48)\nscreen_clear(0x000000)\nfill_rect(8, 8, 20, 12, 0xFF8000)\ndraw_line(0, 47, 63, 0, 0x00FF00)\nscreen_show()\nprint(get_pixel(10, 10))\nprint(f\"{screen_width()}x{screen_height()}\")\n",
+    "expect": {
+      "state": "done",
+      "output": "16744448\n64x48\n",
+      "graphics": true
+    }
+  },
+  {
+    "name": "keys",
+    "source": "screen_init(32, 24)\nscreen_clear(0x204060)\nscreen_show()\nloop\n    let k = wait_key()\n    if k == 27\n        break\n    print(f\"key {k}\")\nprint(\"bye\")\n",
+    "expect": {
+      "state": "done",
+      "graphics": true
+    }
+  },
+  {
+    "name": "costly_steps",
+    "source": "var a = []\nfor i in 0..500\n    a.push((i * 7919) % 500)\nprint(\"sorting\")\nvar n = 0\nloop\n    var b = a.copy()\n    b.sort()\n    n += 1\n",
+    "expect": {
+      "state": "running",
+      "output_contains": [
+        "sorting"
+      ]
+    }
+  },
+  {
+    "name": "sleep_many",
+    "source": "let t0 = clock_ms()\nfor i in 0..100\n    sleep_ms(2)\nlet t = clock_ms() - t0\nprint(t >= 200, t < 1000)\n",
+    "expect": {
+      "state": "done",
+      "output": "true\ntrue\n"
+    }
+  },
+  {
+    "name": "no_show",
+    "source": "screen_init(40, 30)\nfill_rect(0, 0, 40, 30, 0xFF0000)\nprint(get_pixel(5, 5))\n",
+    "expect": {
+      "state": "done",
+      "output": "16711680\n",
+      "graphics": true
+    }
+  },
+  {
+    "name": "input_eof",
+    "source": "let a = input(\"first? \")\nlet b = input(\"second? \")\nlet c = input(\"third? \")\nprint(f\"[{a}] [{b}] [{c}]\")\n",
+    "expect": {
+      "state": "done"
+    }
+  },
+  {
+    "name": "tilc_unsupported",
+    "source": "import math_utils\nprint(math_utils.square(3))\n",
+    "tilc_says": "tilc: /main.til:1: unsupported: import of 'math_utils' (module not found)\n",
+    "expect": {
+      "state": "compile-error",
+      "error_line": 1,
+      "status_contains": "Compile error (line 1)"
+    }
+  },
+  {
+    "name": "tilc_crash",
+    "source": "print(1)\nlet y = ((((((1))))))\n",
+    "tilc_crashes": true,
+    "expect": {
+      "state": "compile-error",
+      "no_error_line": true,
+      "status_contains": "Compiler failed",
+      "output_contains": [
+        "stack overflow"
+      ]
+    }
+  }
+]

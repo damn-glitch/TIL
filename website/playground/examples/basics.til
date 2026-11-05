@@ -1,0 +1,42 @@
+# Functions, loops, arrays, maps and f-strings.
+
+square(n: int) -> int
+    return n * n
+
+is_prime(n: int) -> bool
+    if n < 2
+        return false
+    var d = 2
+    while d * d <= n
+        if n % d == 0
+            return false
+        d += 1
+    return true
+
+let nums = [3, 1, 4, 1, 5, 9, 2, 6]
+var total = 0
+for n in nums
+    total += square(n)
+print(f"sum of squares of {nums} = {total}")
+
+var primes = []
+for n in 1..=50
+    if is_prime(n)
+        primes.push(n)
+print(f"primes up to 50: {primes}")
+print(f"there are {len(primes)} of them")
+
+var counts = {}
+for word in "the cat and the hat and the bat".split(" ")
+    counts[word] = counts.get_or(word, 0) + 1
+for word in counts.keys()
+    print(f"{word} x{counts[word]}")
+
+var i = 0
+loop
+    i += 1
+    if i % 2 == 0
+        continue
+    if i > 9
+        break
+    print(f"odd: {i}")

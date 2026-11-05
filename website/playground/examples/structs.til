@@ -1,0 +1,36 @@
+# Structs with methods (impl blocks).
+
+struct Vec2
+    x: float
+    y: float
+
+impl Vec2
+    length(self) -> float
+        return sqrt(self.x * self.x + self.y * self.y)
+
+    plus(self, other: Vec2) -> Vec2
+        return Vec2 { x: self.x + other.x, y: self.y + other.y }
+
+    scaled(self, k: float) -> Vec2
+        return Vec2 { x: self.x * k, y: self.y * k }
+
+struct Account
+    owner: str
+    balance: int
+
+impl Account
+    deposit(self, amount: int)
+        self.balance += amount
+
+    describe(self) -> str
+        return f"{self.owner} has {self.balance} tenge"
+
+let a = Vec2 { x: 3.0, y: 4.0 }
+let b = Vec2 { x: 1.0, y: -2.0 }
+print(f"|a| = {a.length()}")
+let c = a.plus(b).scaled(2.0)
+print(f"2 * (a + b) = ({c.x}, {c.y})")
+
+var acc = Account { owner: "Aigerim", balance: 1000 }
+acc.deposit(500)
+print(acc.describe())

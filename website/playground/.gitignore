@@ -1,0 +1,4 @@
+# The website is static: the built tilc.tbc and the precompiled fallback
+# examples are committed (build.sh), although *.tbc is ignored elsewhere.
+!tilc.tbc
+!examples/*.tbc
