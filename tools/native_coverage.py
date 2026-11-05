@@ -38,7 +38,11 @@ Both runs use the same scratch working directory (deleted afterwards), so a
 program that writes files (`write_file("NOTE", ...)`) never touches the
 checkout.
 
-Status: `native-ok` (same exit code and stdout as the VM), `native-mismatch`,
+Status: `native-ok` (same exit code and stdout as the VM), `native-refused`
+(the native program stopped with one of the explicit run-time errors of
+docs/TIL_TYPES.md -- `chr(0)`, `sort()` of nan, ...: exit code 1, a message
+naming the native backend on stderr, and up to there the same stdout as the
+VM; never a wrong value), `native-mismatch`,
 `fallback` (the native backend cannot compile it: `til run` uses the VM), or
 `vm-limit` (the VM did not finish within the step budget or stopped with a
 fatal error such as its recursion limit: native limits differ, not compared).
@@ -226,7 +230,7 @@ def first_error_line(text):
 
 
 def run_native(prog, workdir, opt=0):
-    """('ok', rc, stdout) | ('fallback', reason) | ('timeout', reason)."""
+    """('ok', rc, stdout, stderr) | ('fallback', reason) | ('timeout', reason)."""
     compiler = til.TILCompiler()
     compiler.optimize = opt
     exe = os.path.join(workdir, 'prog_' + prog.id)
@@ -236,19 +240,21 @@ def run_native(prog, workdir, opt=0):
         return ('fallback', f"codegen: {type(e).__name__}: {str(e).strip().splitlines()[0][:160] if str(e).strip() else ''}")
     if not ok:
         return ('fallback', "cc: " + first_error_line(getattr(compiler, 'last_c_error', '') or ''))
-    out_path = exe + '.out'
+    out_path, err_path = exe + '.out', exe + '.err'
     try:
-        with open(out_path, 'wb') as out:
+        with open(out_path, 'wb') as out, open(err_path, 'wb') as err:
             # same working directory as the in-process VM run (measure(): a scratch one)
-            r = subprocess.run([exe], stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
+            r = subprocess.run([exe], stdin=subprocess.DEVNULL, stdout=out, stderr=err,
                                timeout=NATIVE_TIMEOUT)
         with open(out_path, 'rb') as f:
             data = f.read(OUTPUT_CAP + 1)
-        return ('ok', r.returncode, data)
+        with open(err_path, 'rb') as f:
+            errors = f.read(4096)
+        return ('ok', r.returncode, data, errors)
     except subprocess.TimeoutExpired:
         return ('timeout', f"native run exceeded {NATIVE_TIMEOUT}s")
     finally:
-        for p in (exe, out_path):
+        for p in (exe, out_path, err_path):
             try:
                 os.unlink(p)
             except OSError:
@@ -272,9 +278,14 @@ def measure_one(prog, workdir, opt=0):
     elif native[0] == 'timeout':
         result.update(status='native-mismatch', reason=native[1])
     else:
-        _, rc, out = native
+        _, rc, out, errors = native
         if (rc, out) == ref:
             result.update(status='native-ok')
+        elif rc == 1 and b"native backend" in errors and ref[1].startswith(out):
+            # an explicit run-time error of the native code (chr(0), sort() of nan, ...;
+            # docs/TIL_TYPES.md): it stopped, saying so, after printing what the VM printed
+            line = errors.decode('utf-8', 'replace').strip().splitlines()
+            result.update(status='native-refused', reason=(line[0] if line else '')[:160])
         else:
             why = []
             if rc != ref[0]:
@@ -306,13 +317,14 @@ def summarize(results):
     counts = {}
     for r in results:
         counts[r['status']] = counts.get(r['status'], 0) + 1
-    compared = sum(counts.get(s, 0) for s in ('native-ok', 'native-mismatch', 'fallback'))
-    native = counts.get('native-ok', 0) + counts.get('native-mismatch', 0)
+    compared = sum(counts.get(s, 0) for s in ('native-ok', 'native-refused', 'native-mismatch', 'fallback'))
+    native = counts.get('native-ok', 0) + counts.get('native-refused', 0) + counts.get('native-mismatch', 0)
     return {
         'programs': len(results),
         'compared': compared,
         'native': native,
         'native_ok': counts.get('native-ok', 0),
+        'native_refused': counts.get('native-refused', 0),
         'native_mismatch': counts.get('native-mismatch', 0),
         'fallback': counts.get('fallback', 0),
         'vm_limit': counts.get('vm-limit', 0),
@@ -330,6 +342,7 @@ def format_summary(summary, title="native backend coverage"):
         f"  compared with the VM       {s['compared']}",
         f"  compiled natively          {s['native']} ({pct:.1f}%)",
         f"    output == VM             {s['native_ok']} ({ok_pct:.1f}%)",
+        f"    explicit native error    {s.get('native_refused', 0)}",
         f"    output differs           {s['native_mismatch']}",
         f"  fall back to the VM        {s['fallback']}",
         f"  not compared (VM limit)    {s['vm_limit']}",
@@ -339,7 +352,7 @@ def format_summary(summary, title="native backend coverage"):
 def reason_histogram(results, top=25):
     hist = {}
     for r in results:
-        if r['status'] in ('fallback', 'native-mismatch'):
+        if r['status'] in ('fallback', 'native-refused', 'native-mismatch'):
             key = r['status'] + ": " + (r.get('reason') or '?')
             hist[key] = hist.get(key, 0) + 1
     return sorted(hist.items(), key=lambda kv: -kv[1])[:top]
@@ -347,7 +360,7 @@ def reason_histogram(results, top=25):
 
 def compare(results, baseline):
     """Programs whose status got worse than in the baseline file."""
-    rank = {'native-ok': 2, 'native-mismatch': 0, 'fallback': 1}
+    rank = {'native-ok': 2, 'native-refused': 1, 'native-mismatch': 0, 'fallback': 1}
     before = {p['id']: p['status'] for p in baseline.get('programs', [])}
     worse = []
     for r in results:

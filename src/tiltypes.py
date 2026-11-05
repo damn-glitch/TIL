@@ -2001,10 +2001,30 @@ class FuncCtx:
         return self.block_value(n)
 
     def ex_EffectHandler(self, n):
-        return self.block_value(n.expr)
+        """handle <body> with <clauses>: the value is the body's, or that of a
+        clause that ends without resume(): dynamic. The clauses are closures over
+        this scope (they may assign its variables); nothing in them is reported."""
+        body = self.block_value(n.expr)
+        if not n.handlers:
+            return body
+        self.guard += 1
+        try:
+            for clause in n.handlers:
+                self.push()
+                for p in clause.params:
+                    self.declare(p, DYN)
+                self.block_value(clause.body)
+                self.pop()
+        finally:
+            self.guard -= 1
+        return DYN
 
     def ex_PerformEffect(self, n):
         args = [self.expr(a) for a in n.args]
+        if n.name in self.infer.handled_effects:
+            # some clause may handle it (dynamically: across calls, closures,
+            # ...): the arguments go to that clause, its resume() value comes back
+            return DYN
         if n.name in self.infer.funcs:
             params, ret, modes = self.instantiate(n.name)
             self.bind_args(n.name, params, modes, args, n, arg_nodes=n.args)
@@ -2203,6 +2223,11 @@ class TypeInfer:
         self.solver = Solver('A')
         self.instances: Dict[Tuple[str, Tuple[str, ...]], Instance] = {}
         self._alias_depth = 0
+        # effects some `handle ... with` clause may handle: `perform E(...)` of
+        # any other effect always calls the function E (typed like a call)
+        clause = getattr(til, 'EffectClause', None)
+        self.handled_effects: Set[str] = {x.name for st in program.statements for x in walk(st)
+                                          if clause is not None and isinstance(x, clause)}
         self.collect()
 
     # ── declarations ────────────────────────────────────────────────────────
@@ -3741,6 +3766,24 @@ def is_ptr(t) -> bool:
     return t.name in PTR_KINDS or t.name == 'fn' or is_struct(t) or is_adt(t)
 
 
+class _NativeFoldEnv:
+    """The bytecode compiler's `_FoldEnv` for the native backend: an inline
+    constant is the constant only where no local, parameter, loop variable,
+    lambda parameter, pattern binding or captured variable of the same name is
+    visible (`BytecodeCompiler.names_a_constant`); const_eval only tests
+    `name in env` and reads env[name]."""
+    __slots__ = ('gen',)
+
+    def __init__(self, gen):
+        self.gen = gen
+
+    def __contains__(self, name) -> bool:
+        return name in self.gen._inline_consts and self.gen.lookup_var(name) is None
+
+    def __getitem__(self, name):
+        return self.gen._inline_consts[name]
+
+
 def preset_global(decl) -> bool:
     """A global the VMs set before any code runs: an immutable one with a literal
     value (inlined as a constant). Every other global is set in order at start-up
@@ -5201,20 +5244,13 @@ class TypedCGen(til.CCodeGenerator):
         self.unsupported(f"unknown name '{name}'", n)
 
     def folded(self, n) -> Optional[str]:
-        """The bytecode compiler folds constant operator trees with const_eval
-        (Python semantics: `true == 1` is true there); use the same value."""
-        if not hasattr(self, '_inline_consts'):
-            env = {}
-            for name, g in self.ti.globals.items():
-                d = g.decl
-                if not d.mutable and isinstance(d.value, (til.IntLit, til.FloatLit, til.StringLit,
-                                                          til.BoolLit, til.CharLit)):
-                    env[name] = ord(d.value.value) if isinstance(d.value, til.CharLit) else d.value.value
-            self._inline_consts = env
+        """The bytecode compiler folds constant operator trees with const_eval;
+        where that differs from the run-time rules (integer literals beyond 64
+        bits), use the folded value."""
         if not self.fold_differs(n):
             return None             # run-time semantics give the same value: generate normally
         try:
-            v = til.const_eval(n, self._inline_consts)
+            v = til.const_eval(n, self.fold_env())
         except (til.NotConstant, OverflowError, ValueError, ZeroDivisionError, TypeError):
             return None
         want = BOOL if isinstance(v, bool) else INT if isinstance(v, int) else \
@@ -5222,7 +5258,6 @@ class TypedCGen(til.CCodeGenerator):
         if want is None:
             return None
         if self.T(n) is not want:
-            # e.g. a local that shadows a global constant (the VM still folds with the constant)
             self.unsupported("an expression the bytecode compiler folds with a different type", n)
         if isinstance(v, bool):
             return "true" if v else "false"
@@ -5234,28 +5269,34 @@ class TypedCGen(til.CCodeGenerator):
             self.unsupported("a string containing a NUL byte", n)
         return til.c_string_literal(v)
 
+    def fold_env(self) -> '_NativeFoldEnv':
+        """The inline constants (immutable globals with a literal value, like the
+        bytecode compiler's inline_consts) that are not shadowed here."""
+        if not hasattr(self, '_inline_consts'):
+            env = {}
+            for name, g in self.ti.globals.items():
+                d = g.decl
+                if not d.mutable and isinstance(d.value, (til.IntLit, til.FloatLit, til.StringLit,
+                                                          til.BoolLit, til.CharLit)):
+                    env[name] = ord(d.value.value) if isinstance(d.value, til.CharLit) else d.value.value
+            self._inline_consts = env
+        return _NativeFoldEnv(self)
+
     def fold_differs(self, n) -> bool:
-        """Does const_eval disagree with the run-time rules somewhere in n?
-        (bool == number is true when folded, false at run time; a local that
-        shadows an inlined constant is still folded with the constant)."""
-        env = self._inline_consts
+        """Does const_eval disagree with the run-time rules somewhere in n? Only
+        for integer literals beyond 64 bits: const_eval computes with the exact
+        value (`18446744073709551616 > 0` is true), run time with the wrapped one.
+        (Equality, `~` and shadowed names follow the run-time rules in const_eval.)"""
+        env = self.fold_env()
         for x in walk(n):
-            if isinstance(x, til.Identifier) and x.name in env and self.lookup_var(x.name) is not None:
-                return True
-            # an integer literal beyond 64 bits: const_eval computes with the exact
-            # value (`18446744073709551616 > 0` is true), run time with the wrapped one
-            big = x.value if isinstance(x, til.IntLit) else \
-                env.get(x.name) if isinstance(x, til.Identifier) and self.lookup_var(x.name) is None else None
+            if isinstance(x, til.IntLit):
+                big = x.value
+            elif isinstance(x, til.Identifier) and x.name in env:
+                big = env[x.name]
+            else:
+                continue
             if isinstance(big, int) and not isinstance(big, bool) and not -(1 << 63) <= big < (1 << 63):
                 return True
-            if isinstance(x, til.BinaryOp) and x.op in ('==', '!='):
-                try:
-                    a, b = til.const_eval(x.left, env), til.const_eval(x.right, env)
-                except (til.NotConstant, OverflowError, ValueError, ZeroDivisionError, TypeError):
-                    continue
-                if isinstance(a, (int, float)) and isinstance(b, (int, float)) and \
-                        isinstance(a, bool) != isinstance(b, bool):
-                    return True
         return False
 
     def e_BinaryOp(self, n):

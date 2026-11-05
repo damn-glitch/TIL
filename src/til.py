@@ -13315,6 +13315,19 @@ def run_repl():
 
 @scoped_message_language
 def main():
+    """The `til` command line. `--no-types` switches type inference off for this
+    call only (the environment is restored afterwards, also for in-process callers)."""
+    saved = os.environ.get('TIL_NO_TYPES')
+    try:
+        return _main()
+    finally:
+        if saved is None:
+            os.environ.pop('TIL_NO_TYPES', None)
+        else:
+            os.environ['TIL_NO_TYPES'] = saved
+
+
+def _main():
     args = sys.argv[1:]
 
     lang_error = set_message_language(args)       # messages: --lang / TIL_LANG (pragma: below)
@@ -13461,7 +13474,7 @@ def main():
             errors = type_errors(ast, source, input_file) if compiler.typed else []
             if errors:
                 for err in errors:
-                    print(err, file=sys.stderr)
+                    print(localize(err), file=sys.stderr)
                 return 1
             proof_errors = run_proofs(ast, source, input_file, bool(opts.get('prove')))
             if proof_errors:
