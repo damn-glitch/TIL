@@ -38,7 +38,7 @@
       "patterns": [
         {
           "name": "keyword.control.til",
-          "match": "\\b(if|else|elif|for|while|loop|match|in|return|break|continue|retry|timeout|intent|assert|invariant|perform|handle)\\b"
+          "match": "\\b(if|else|elif|for|while|loop|match|in|return|break|continue|retry|timeout|intent|assert|invariant|perform|handle|with|resume)\\b"
         },
         {
           "name": "keyword.declaration.til",

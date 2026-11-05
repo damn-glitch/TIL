@@ -24,6 +24,7 @@
  *   TILVM_STACK_SIZE   value-stack slots       (default 8192)
  *   TILVM_MAX_FRAMES   call depth              (default 1000)
  *   TILVM_MAX_TRY      nested retry/timeout    (default 32)
+ *   TILVM_MAX_HANDLERS active effect handlers + running clauses (default 32)
  *   TILVM_MAX_CONSTS   constants per program   (default 4096)
  *   TILVM_MAX_TYPES    struct types            (default 512)
  *   TILVM_MAX_FUNCS    functions decoded into a table at load (default TILVM_MAX_CONSTS;
@@ -43,6 +44,11 @@
  *                      random/sleep, and str split/replace/trim/repeat/count,
  *                      array insert/remove/sort/reverse/slice/copy/join/sum/min/max,
  *                      map values/copy/clear (they report "not available")
+ *                      (effect handlers are included in LEAN builds)
+ *   TILVM_NO_EFFECTS   leave out effect handlers (handle/with/resume, ~1-3 KB of
+ *                      code, TILVM_MAX_HANDLERS * 16 bytes of RAM): `handle` reports
+ *                      "effect handlers are not available in this VM build";
+ *                      `perform E()` still calls the top-level function E (TIL 3.0)
  */
 #ifndef TILVM_H
 #define TILVM_H
@@ -71,6 +77,9 @@
 #endif
 #ifndef TILVM_MAX_TRY
 #define TILVM_MAX_TRY 32
+#endif
+#ifndef TILVM_MAX_HANDLERS
+#define TILVM_MAX_HANDLERS 32
 #endif
 #ifndef TILVM_MAX_CONSTS
 #define TILVM_MAX_CONSTS 4096
@@ -161,7 +170,24 @@ typedef struct tv_try {
     uint32_t deadline;  /* ms (0 = no deadline) */
     uint16_t n_frames;
     uint16_t sp;
+    uint16_t n_handlers; /* effect handler entries when the block started */
 } tv_try;
+
+/* Effect handler stack entry (TIL 3.1, docs/TIL_EFFECTS.md).
+ * kind 0 - an active `handle`: its n (clause, effect-name) value pairs lie on the
+ *          value stack at stack[sp .. sp + 2n - 1]; a clause that finishes
+ *          without resume() continues at abort_pc in frame n_frames - 1.
+ * kind 1 - a running clause of handler #n (the owner): it masks the owner and
+ *          every entry above it; n_frames / n_try are the values at the perform. */
+typedef struct tv_handler {
+    uint32_t abort_pc;  /* kind 0: absolute pc after END_HANDLE; kind 1: 0 */
+    uint16_t n_frames;  /* frames when installed (kind 1: at the perform) */
+    uint16_t sp;        /* kind 0: stack index of the first pair; kind 1: 0 */
+    uint16_t n_try;     /* recovery points when installed */
+    uint16_t n;         /* kind 0: clause count; kind 1: owner index */
+    uint8_t kind;
+    uint8_t _pad[3];
+} tv_handler;
 
 /* Everything that changes while a program runs. Saved by snapshots. */
 typedef struct tilvm_state {
@@ -177,6 +203,10 @@ typedef struct tilvm_state {
 #endif
     tv_frame frames[TILVM_MAX_FRAMES];
     tv_try tries[TILVM_MAX_TRY];
+    uint16_t n_handlers, _hpad;                 /* effect handlers (TIL 3.1) */
+#ifndef TILVM_NO_EFFECTS
+    tv_handler handlers[TILVM_MAX_HANDLERS];
+#endif
     tv_val stack[TILVM_STACK_SIZE];
 } tilvm_state;
 

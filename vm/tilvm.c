@@ -2490,6 +2490,8 @@ static void reset_state(tilvm *vm) {
     st->n_frames = 0;
     st->n_try = 0;
     st->n_deadlines = 0;
+    st->n_handlers = 0;
+    st->_hpad = 0;
     st->heap_top = (tv_size)ALIGN_UP(1);
     st->halted = 0;
     st->exit_code = 0;
@@ -2687,6 +2689,7 @@ static int recover(tilvm *vm, int target) {
     if (t->deadline) st->n_deadlines--;
     st->n_frames = t->n_frames;
     st->sp = t->sp;
+    st->n_handlers = t->n_handlers;     /* handles / running clauses inside the block */
     st->frames[st->n_frames - 1].pc = t->handler;
     /* push the message as a string */
     if (vm->err_val.t != TV_NIL && is_str(&vm->err_val) && (!vm->err_msg || !*vm->err_msg)) {
@@ -2957,6 +2960,7 @@ static int push_try(tilvm *vm, uint8_t op, uint32_t handler) {
     t->deadline = deadline;
     t->n_frames = st->n_frames;
     t->sp = SP;
+    t->n_handlers = st->n_handlers;
     if (deadline) st->n_deadlines++;
     return 1;
 }
@@ -2970,6 +2974,147 @@ static int expired_try(tilvm *vm) {
         if (st->tries[i].deadline && (int32_t)(now - st->tries[i].deadline) >= 0) return i;
     return -1;
 }
+
+/* ─── effect handlers with resumption (TIL 3.1, docs/TIL_EFFECTS.md) ────── */
+#define EFFECT_NAME_MAX 64     /* effect names in error messages (same cut in src/til.py) */
+
+/* The effect helpers below are called from one place each in the interpreter.
+ * Inlined there (GCC does that for static functions called once) they cost the
+ * hot opcode handlers registers: up to 4% more executed instructions on the
+ * benchmarks. Kept out of line they cost one call per perform and per return
+ * while handler entries exist. */
+#if defined(__GNUC__)
+#define TV_NOINLINE __attribute__((noinline))
+#else
+#define TV_NOINLINE
+#endif
+
+/* effect name (string constant k) as a C string for error messages */
+static const char *effect_name(tilvm *vm, uint16_t k, char *buf) {
+    tv_val nv;
+    uint32_t n;
+    const char *p;
+    nv.t = TV_STRK;
+    nv.u.i = 0;
+    nv.u.k = k;
+    p = str_data(vm, &nv, &n);
+    if (n > EFFECT_NAME_MAX) n = EFFECT_NAME_MAX;
+    memcpy(buf, p, n);
+    buf[n] = 0;
+    return buf;
+}
+
+#ifdef TILVM_NO_EFFECTS
+/* PERFORM without handler support: the top-level function E (TIL 3.0). */
+TV_NOINLINE static int effect_target(tilvm *vm, uint16_t name_c, uint16_t dflt, uint8_t argc,
+                                     uint16_t *fidx, tv_ref *clos) {
+    char name[EFFECT_NAME_MAX + 1];
+    (void)argc;
+    *clos = 0;
+    if (dflt == 0xFFFF) return failn(vm, "unhandled effect '", effect_name(vm, name_c, name), "'", 0, 0, 0);
+    *fidx = dflt;
+    return 1;
+}
+#else
+TV_NOINLINE static void pop_tries_to(tilvm *vm, uint16_t n) {
+    tilvm_state *st = &vm->st;
+    while (st->n_try > n) {
+        if (st->tries[st->n_try - 1].deadline) st->n_deadlines--;
+        st->n_try--;
+    }
+}
+
+/* Innermost visible clause for effect `name_c`: returns the handler index and
+ * stores the clause value, or -1. A running clause (kind 1) masks its owner and
+ * everything above it, so the search continues below the owner. */
+static int find_clause(tilvm *vm, uint16_t name_c, tv_val *clause) {
+    tilvm_state *st = &vm->st;
+    tv_val key;
+    int i = (int)st->n_handlers - 1;
+    key.t = TV_STRK;
+    key.u.i = 0;
+    key.u.k = name_c;
+    while (i >= 0) {
+        const tv_handler *h = &st->handlers[i];
+        uint16_t j;
+        if (h->kind == 1) { i = (int)h->n - 1; continue; }
+        for (j = 0; j < h->n; j++) {
+            const tv_val *nm = &STK[h->sp + 2u * j + 1u];
+            if ((nm->t == TV_STRK && nm->u.k == name_c) || (is_str(nm) && str_eq(vm, nm, &key))) {
+                *clause = STK[h->sp + 2u * j];
+                return i;
+            }
+        }
+        i--;
+    }
+    return -1;
+}
+
+/* RETURN with handler entries present: drop the handles the returning frame
+ * installed. Returning from an effect clause (= it finished without resume)
+ * aborts the handle that owns it: the clause value becomes the value of the
+ * handle expression. Returns 1 after such an abort (frames, recovery points
+ * and SP are cut back to the handle; the caller pushes the value and continues
+ * at the frame's pc), 0 for a normal return, -1 on a fatal error. The value is
+ * not passed here: taking the address of the interpreter's `result` would keep
+ * it in memory on every RETURN. */
+TV_NOINLINE static int effect_leave(tilvm *vm) {
+    tilvm_state *st = &vm->st;
+    const tv_handler *m, *h;
+    uint16_t owner;
+    while (st->n_handlers && st->handlers[st->n_handlers - 1].n_frames >= st->n_frames) st->n_handlers--;
+    if (!(F_FLAGS(vm, st->frames[st->n_frames - 1].func) & FLAG_EFFECT_CLAUSE)) return 0;
+    m = st->n_handlers ? &st->handlers[st->n_handlers - 1] : 0;
+    if (!m || m->kind != 1 || m->n_frames + 1 != st->n_frames) {
+        fail(vm, "effect clause returned outside its handler");
+        return -1;
+    }
+    owner = m->n;
+    h = &st->handlers[owner];
+    pop_tries_to(vm, h->n_try);
+    st->n_frames = h->n_frames;
+    SP = h->sp;
+    st->frames[st->n_frames - 1].pc = h->abort_pc;
+    st->n_handlers = owner;
+    return 1;
+}
+
+/* PERFORM: choose the function to enter (a clause, or the default handler).
+ * Returns 1 (fidx / clos set; for a clause the running-clause entry is pushed),
+ * 0 on a runtime error. */
+TV_NOINLINE static int effect_target(tilvm *vm, uint16_t name_c, uint16_t dflt, uint8_t argc,
+                                     uint16_t *fidx, tv_ref *clos) {
+    tilvm_state *st = &vm->st;
+    char name[EFFECT_NAME_MAX + 1], n1[32], n2[32];
+    tv_val clause;
+    tv_handler *m;
+    uint8_t np;
+    int idx = st->n_handlers ? find_clause(vm, name_c, &clause) : -1;
+    *clos = 0;
+    if (idx < 0) {
+        if (dflt == 0xFFFF) return failn(vm, "unhandled effect '", effect_name(vm, name_c, name), "'", 0, 0, 0);
+        *fidx = dflt;                       /* the top-level function E (TIL 3.0) */
+        return 1;
+    }
+    if (clause.t == TV_CLOSURE) { *clos = clause.u.r; *fidx = CLOSOBJ(vm, *clos)->func; }
+    else if (clause.t == TV_FUNC) *fidx = clause.u.k;
+    else return failn(vm, "effect '", effect_name(vm, name_c, name), "' has no callable clause", 0, 0, 0);
+    np = F_NPARAMS(vm, *fidx);
+    if (argc > np || argc < F_NREQ(vm, *fidx))
+        return failn(vm, "effect '", effect_name(vm, name_c, name), "' expects ",
+                     fmt_int(n1, (tv_int)np), " argument(s), got ", fmt_int(n2, (tv_int)argc));
+    if (st->n_handlers >= TILVM_MAX_HANDLERS) return fail(vm, "too many nested handlers");
+    m = &st->handlers[st->n_handlers++];
+    m->kind = 1;
+    m->n_frames = st->n_frames;
+    m->sp = 0;
+    m->n_try = st->n_try;
+    m->n = (uint16_t)idx;
+    m->abort_pc = 0;
+    m->_pad[0] = m->_pad[1] = m->_pad[2] = 0;
+    return 1;
+}
+#endif /* TILVM_NO_EFFECTS */
 
 /* ─── the interpreter ───────────────────────────────────────────────────── */
 /*
@@ -3100,8 +3245,8 @@ int tilvm_run_steps(tilvm *vm, uint32_t budget) {
         /* 0x58 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
         /* 0x60 */ &&L_OP_NEW_ARRAY, &&L_OP_NEW_MAP, &&L_OP_NEW_STRUCT, &&L_OP_GET_INDEX, &&L_OP_SET_INDEX, &&L_OP_GET_FIELD, &&L_OP_SET_FIELD, &&L_OP_GET_SLOT,
         /* 0x68 */ &&L_OP_MAKE_CLOSURE, &&L_OP_PUSH_FUNC, &&L_OP_CONCAT, &&L_OP_FOR_ITER, &&L_OP_MATCH_TYPE, &&L_OP_CAST, &&L_OP_IS_ARRAY_LEN, &&L_BAD,
-        /* 0x70 */ &&L_OP_TRY, &&L_OP_TRY_TIMEOUT, &&L_OP_END_TRY, &&L_OP_PANIC, &&L_OP_UNWRAP_OR_RETURN, &&L_OP_UNWRAP_OR_PANIC, &&L_BAD, &&L_BAD,
-        /* 0x78 */ &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_OP_HALT,
+        /* 0x70 */ &&L_OP_TRY, &&L_OP_TRY_TIMEOUT, &&L_OP_END_TRY, &&L_OP_PANIC, &&L_OP_UNWRAP_OR_RETURN, &&L_OP_UNWRAP_OR_PANIC, &&L_OP_HANDLE, &&L_OP_END_HANDLE,
+        /* 0x78 */ &&L_OP_PERFORM, &&L_OP_RESUME, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_OP_HALT,
         /* 0x80 */ &&L_OP_LOAD_LOCAL2, &&L_OP_LOAD_LOCAL_FIELD, &&L_OP_INC_LOCAL, &&L_OP_CAST_LOCAL, &&L_OP_CAST_RETURN, &&L_OP_ADD_STORE_LOCAL, &&L_OP_NATIVE_POP, &&L_OP_INDEX_L,
         /* 0x88 */ &&L_OP_INDEX_LL, &&L_OP_RETURN_LOCAL, &&L_OP_FOR_ITER_STORE, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD, &&L_BAD,
         /* 0x90 */ &&L_OP_JUMP_IF_NOT, &&L_OP_JUMP_IF_NOT_L, &&L_OP_JUMP_IF_NOT_I, &&L_OP_JUMP_IF_NOT_LL, &&L_OP_JUMP_IF_NOT_LI, &&L_BAD, &&L_BAD, &&L_BAD,
@@ -3378,6 +3523,22 @@ do_return:
         if (st->tries[st->n_try - 1].deadline) st->n_deadlines--;
         st->n_try--;
     }
+#ifndef TILVM_NO_EFFECTS
+    if (st->n_handlers) {
+        /* drop the handles this frame installed; an effect clause that returns
+         * (finished without resume) aborts its handle: continue after it */
+        r = effect_leave(vm);
+        if (r) {
+            if (r < 0) { st->failed = 1; goto fatal; }
+            fr = &st->frames[st->n_frames - 1];
+            ip = code + fr->pc;
+            bp = stk + fr->base;
+            RELOAD_SP();
+            *sp++ = result;                  /* the value of the handle expression */
+            NEXT;
+        }
+    }
+#endif
     sp = stk + fr->base - fr->extra;
     *sp++ = result;
     if (!--st->n_frames) { st->halted = 1; SYNC_SP(); return TILVM_DONE; }
@@ -3569,6 +3730,71 @@ do_return:
         vm->err_val = *--sp;
         vm->err_msg = "";
         goto panic;
+    /* ── effects with resumption (docs/TIL_EFFECTS.md) ── */
+    CASE(OP_PERFORM) {                       /* PERFORM name, default, argc: a call */
+        uint16_t dflt = RD16(ip + 2);
+        name_c = RD16(ip);
+        argc = ip[4];
+        ip += 5;
+        extra = 0;
+        /* a clause (the running-clause entry is pushed) or the default function */
+        if (!effect_target(vm, name_c, dflt, argc, &fidx, &clos)) goto panic;
+        goto call_fn;
+    }
+#ifdef TILVM_NO_EFFECTS
+    CASE(OP_HANDLE)
+        fail(vm, "effect handlers are not available in this VM build");
+        goto panic;
+#else
+    CASE(OP_HANDLE) {                        /* HANDLE n, rel_end: the n pairs stay on the stack */
+        uint8_t n = ip[0];
+        int16_t rel = RDS16(ip + 1);
+        tv_handler *h;
+        ip += 3;
+        if (st->n_handlers >= TILVM_MAX_HANDLERS) { fail(vm, "too many nested handlers"); goto panic; }
+        h = &st->handlers[st->n_handlers++];
+        h->kind = 0;
+        h->n_frames = st->n_frames;
+        h->sp = (uint16_t)(TOPSLOT(0) - 2u * n);
+        h->n_try = st->n_try;
+        h->n = n;
+        h->abort_pc = (uint32_t)(ip - code) + (uint32_t)(int32_t)rel;
+        h->_pad[0] = h->_pad[1] = h->_pad[2] = 0;
+        NEXT;
+    }
+    CASE(OP_END_HANDLE) {                    /* drop the record and its pairs, keep the value */
+        const tv_handler *h = st->n_handlers ? &st->handlers[st->n_handlers - 1] : 0;
+        if (!h || h->kind != 0 || h->n_frames != st->n_frames) {
+            fail(vm, "END_HANDLE without an active handle");
+            st->failed = 1;
+            goto fatal;
+        }
+        st->n_handlers--;
+        stk[h->sp] = sp[-1];
+        sp = stk + h->sp + 1;
+        NEXT;
+    }
+    CASE(OP_RESUME) {                        /* in a clause: TOS -> value of the perform */
+        int k = (int)st->n_handlers - 1;
+        result = *--sp;
+        while (k >= 0 && st->handlers[k].kind != 1) k--;
+        if (k < 0 || st->handlers[k].n_frames + 1 != st->n_frames ||
+            !(F_FLAGS(vm, fr->func) & FLAG_EFFECT_CLAUSE)) {
+            fail(vm, "resume outside an effect clause");
+            st->failed = 1;
+            goto fatal;
+        }
+        pop_tries_to(vm, st->handlers[k].n_try);
+        st->n_handlers = (uint16_t)k;        /* exactly as at the perform */
+        sp = stk + fr->base - fr->extra;
+        *sp++ = result;
+        st->n_frames--;
+        fr = &st->frames[st->n_frames - 1];
+        ip = code + fr->pc;
+        bp = stk + fr->base;
+        NEXT;
+    }
+#endif /* TILVM_NO_EFFECTS */
     CASE(OP_HALT)
         st->halted = 1;
         SAVE_PC();
@@ -3789,6 +4015,9 @@ cmp_branch:   /* ip at the i16 offset */
         op = FUSED_BINOP[op & 15];
         DISPATCH_OP();
 
+#ifdef TILVM_NO_EFFECTS
+    CASE(OP_END_HANDLE) CASE(OP_RESUME)      /* never reached: HANDLE reports the build */
+#endif
 #if TILVM_COMPUTED_GOTO
     L_BAD:
 #else

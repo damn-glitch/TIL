@@ -67,6 +67,8 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_STACK_SIZE` | 8192 | value-stack slots (globals + locals + temporaries) |
 | `TILVM_MAX_FRAMES` | 1000 | call depth |
 | `TILVM_MAX_TRY` | 32 | nested `retry`/`timeout`/`intent` blocks |
+| `TILVM_MAX_HANDLERS` | 32 | active effect handlers + running clauses (`handle ... with`, 16 bytes each; [docs/TIL_EFFECTS.md](../docs/TIL_EFFECTS.md)) |
+| `TILVM_NO_EFFECTS` | off | leave effect handlers out (~1–3 KB of code): `handle` reports "not available", `perform` still calls the default function |
 | `TILVM_MAX_CONSTS` / `TILVM_MAX_TYPES` | 4096 / 512 | per-program table sizes |
 | `TILVM_NO_STDIO` | off | no `<stdio.h>`: built-in number formatting, host sets `write` |
 | `TILVM_NO_TIME` | off | no `<time.h>`: `clock_ms()`/`timeout` count 1 ms per 1000 steps |

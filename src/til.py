@@ -254,6 +254,8 @@ class TokenType(Enum):
     CAP = auto()
     PERFORM = auto()
     HANDLE = auto()
+    WITH = auto()      # handle ... with <clauses>   (TIL 3.1 effects)
+    RESUME = auto()    # resume(v) inside an effect clause
 
     # Attributes
     ATTRIBUTE = auto()
@@ -292,6 +294,7 @@ KEYWORDS = {
     'intent': TokenType.INTENT, 'retry': TokenType.RETRY,
     'fallback': TokenType.FALLBACK, 'timeout': TokenType.TIMEOUT,
     'cap': TokenType.CAP, 'perform': TokenType.PERFORM, 'handle': TokenType.HANDLE,
+    # TIL 3.1 `with` / `resume` are contextual: see CONTEXTUAL_KEYWORDS
 }
 
 # Казахские ключевые слова (Kazakh language keywords)
@@ -331,6 +334,7 @@ KAZAKH_KEYWORDS = {
     'тексеру': TokenType.ASSERT,  # assert
     'қайталау': TokenType.RETRY,  # retry
     'ниет': TokenType.INTENT,     # intent
+    # effects (TIL 3.1): contextual, see CONTEXTUAL_KEYWORDS
 }
 # NOTE: 'немесе' used to be registered twice (ELIF and OR) in one dict literal,
 # so it silently became OR and Kazakh `elif` never worked. TIL v3 writes elif
@@ -352,6 +356,7 @@ KAZAKH_LATIN_KEYWORDS = {
     'nemese': TokenType.OR, 'emes': TokenType.NOT, 'aqiqat': TokenType.BOOL,
     'zhalgan': TokenType.BOOL, 'tekseru': TokenType.ASSERT,
     'qaitalau': TokenType.RETRY, 'niet': TokenType.INTENT,
+    # effects (TIL 3.1): contextual, see CONTEXTUAL_KEYWORDS
 }
 
 # Russian keywords. Enabled per file with the pragma `#[lang: ru]`
@@ -372,7 +377,34 @@ RUSSIAN_KEYWORDS = {
     'проверить': TokenType.ASSERT, 'инвариант': TokenType.INVARIANT,
     'повторить': TokenType.RETRY, 'таймаут': TokenType.TIMEOUT,
     'намерение': TokenType.INTENT,
+    # effects (TIL 3.1): contextual, see CONTEXTUAL_KEYWORDS
 }
+
+# TIL 3.1 effect words are *contextual keywords* (docs/TIL_EFFECTS.md): the lexer
+# reads them as identifiers and the parser gives them their keyword meaning only
+# where an identifier could not stand in a TIL 3.0 program, so no 3.0 program
+# changes meaning (variables, functions, methods and fields may still be called
+# `with`, `resume`, `с`, `орындау`, ...):
+#   WITH     right after the body of a `handle`
+#   RESUME   inside an effect clause (there it always means resume)
+#   PERFORM  followed by an identifier on the same line (the effect name)
+#   HANDLE   followed by a newline and an indented body, or on the same line by
+#            an identifier, a literal or perform/handle/match/retry/timeout
+# English `perform` and `handle` have been hard keywords since TIL 3.0.
+CONTEXTUAL_KEYWORDS = {
+    'en': {'with': TokenType.WITH, 'resume': TokenType.RESUME},
+    'kk': {'орындау': TokenType.PERFORM, 'өңдеу': TokenType.HANDLE,
+           'арқылы': TokenType.WITH, 'жалғау': TokenType.RESUME},
+    'kk-latn': {'oryndau': TokenType.PERFORM, 'ondeu': TokenType.HANDLE,
+                'arqyly': TokenType.WITH, 'zhalgau': TokenType.RESUME},
+    'ru': {'выполнить': TokenType.PERFORM, 'обработать': TokenType.HANDLE,
+           'с': TokenType.WITH, 'возобновить': TokenType.RESUME},
+}
+# every spelling of `handle` (the REPL reads a multi-line block after one) and resume
+HANDLE_WORDS = ('handle',) + tuple(w for tbl in CONTEXTUAL_KEYWORDS.values()
+                                   for w, t in tbl.items() if t == TokenType.HANDLE)
+RESUME_WORDS = frozenset(w for tbl in CONTEXTUAL_KEYWORDS.values()
+                         for w, t in tbl.items() if t == TokenType.RESUME)
 
 # Values of localized boolean literals.
 TRUE_WORDS = {'true', 'True', 'ақиқат', 'aqiqat', 'истина'}
@@ -1280,16 +1312,33 @@ class GenericFunc(ASTNode):
     func: FuncDef = None
 
 @dataclass
+class EffectClause(ASTNode):
+    """One clause of `handle ... with`:  Name(params) => body   (TIL 3.1)"""
+    name: str = ""
+    params: List[str] = field(default_factory=list)
+    param_types: List[Any] = field(default_factory=list)
+    body: ASTNode = None          # Block (indented clause) or a single expression
+
+@dataclass
 class EffectHandler(ASTNode):
-    """effect handler block: handle expr with { effect_name(args) => body }"""
+    """handle <body> with <clauses>: the body runs with the clauses installed
+    (docs/TIL_EFFECTS.md). Its value is the body's value, or the value of a
+    clause that finishes without resume()."""
     expr: ASTNode = None
-    handlers: List[tuple] = field(default_factory=list)  # [(name, params, body), ...]
+    handlers: List[EffectClause] = field(default_factory=list)
 
 @dataclass
 class PerformEffect(ASTNode):
-    """perform EffectName(args) - trigger an effect"""
+    """perform EffectName(args) - trigger an effect (an expression: its value is
+    what the handling clause passes to resume)"""
     name: str = ""
     args: List[ASTNode] = field(default_factory=list)
+
+@dataclass
+class ResumeExpr(ASTNode):
+    """resume(v) / resume() inside an effect clause: v becomes the value of the
+    `perform` and the handled body continues (tail resumption: the clause ends)"""
+    value: Optional[ASTNode] = None
 
 @dataclass
 class CapabilityType(ASTNode):
@@ -1387,6 +1436,67 @@ class Parser:
         self.pending_attributes: List[str] = []
         self.error_reporter = ErrorReporter(source, filename)
         self.languages = languages
+        self.in_clause = False   # parsing the code of an effect clause (resume allowed)
+        # contextual keywords of the file's languages (identifier -> keyword type)
+        self.ctx_words: Dict[str, TokenType] = {}
+        for code in (languages or DEFAULT_LANGUAGES):
+            self.ctx_words.update(CONTEXTUAL_KEYWORDS.get(code, {}))
+
+    # ── contextual keywords (TIL 3.1 effects, see CONTEXTUAL_KEYWORDS) ────────
+    # token types that can follow a localized `handle` word on the same line
+    _HANDLE_BODY_START = frozenset((
+        TokenType.IDENT, TokenType.INT, TokenType.FLOAT, TokenType.STRING, TokenType.FSTRING,
+        TokenType.CHAR, TokenType.BOOL, TokenType.SELF, TokenType.PERFORM, TokenType.HANDLE,
+        TokenType.MATCH, TokenType.RETRY, TokenType.TIMEOUT))
+
+    def word_is(self, tok: Token, kind: TokenType) -> bool:
+        """`tok` is the keyword `kind`: a hard keyword or a contextual word."""
+        return tok.type == kind or (tok.type == TokenType.IDENT and self.ctx_words.get(tok.value) == kind)
+
+    def take_word(self, kind: TokenType) -> Token:
+        """Consume a (contextual) keyword. The token is retyped, so that `til
+        translate` and later error messages see the keyword."""
+        tok = self.current()
+        if not self.word_is(tok, kind):
+            self.error(f"Expected {kind.name}, got {tok.type.name}")
+        tok.type = kind
+        self.pos += 1
+        return tok
+
+    def contextual_start(self) -> Optional[TokenType]:
+        """At the start of a primary expression: the effect keyword a contextual
+        word stands for here (see CONTEXTUAL_KEYWORDS), or None."""
+        tok = self.current()
+        kind = self.ctx_words.get(tok.value) if tok.type == TokenType.IDENT else None
+        if kind is None:
+            return None
+        nxt = self.peek()
+        if kind == TokenType.RESUME:
+            return kind if self.in_clause else None
+        if kind == TokenType.PERFORM:
+            return kind if nxt.type == TokenType.IDENT and nxt.line == tok.line else None
+        if kind == TokenType.HANDLE:
+            if nxt.type == TokenType.NEWLINE:
+                k = self.pos + 1
+                while k < len(self.tokens) and self.tokens[k].type == TokenType.NEWLINE:
+                    k += 1
+                return kind if k < len(self.tokens) and self.tokens[k].type == TokenType.INDENT else None
+            if nxt.line == tok.line and nxt.type in self._HANDLE_BODY_START:
+                return kind
+        return None
+
+    def reserved_note(self) -> str:
+        """' (`x` is a reserved word ...)' when the current token is a keyword."""
+        tok = self.current()
+        if tok.type != TokenType.IDENT and isinstance(tok.value, str) and tok.value.isidentifier():
+            return f" ('{tok.value}' is a reserved word and cannot be used as a name)"
+        return ""
+
+    def check_binding_name(self, tok: Token):
+        """Inside an effect clause the resume words mean resume: no variables."""
+        if self.in_clause and self.ctx_words.get(tok.value) == TokenType.RESUME:
+            self._syntax_error_at(tok, f"'{tok.value}' is reserved inside an effect clause",
+                                  "there it always means resume(...); choose another name")
 
     @staticmethod
     def _mark(node, tok: Token):
@@ -1421,9 +1531,10 @@ class Parser:
             tok = self.current()
             self.pos += 1
             return tok
+        note = self.reserved_note() if type == TokenType.IDENT else ""
         if msg:
-            self.error(msg)
-        self.error(f"Expected {type.name}, got {self.current().type.name}")
+            self.error(msg + note)
+        self.error(f"Expected {type.name}, got {self.current().type.name}{note}")
     
     def advance(self) -> Token:
         tok = self.current()
@@ -1890,9 +2001,6 @@ class Parser:
         if self.match(TokenType.INVARIANT):
             return self.parse_invariant()
 
-        if self.match(TokenType.PERFORM):
-            return ExprStmt(expr=self.parse_perform())
-
         if self.match(TokenType.INTENT):
             return self.parse_intent_block()
 
@@ -1913,7 +2021,9 @@ class Parser:
         mutable = self.match(TokenType.VAR)
         self.advance()  # let/var/const
         
-        name = self.consume(TokenType.IDENT).value
+        name_tok = self.consume(TokenType.IDENT)
+        self.check_binding_name(name_tok)
+        name = name_tok.value
         
         type_ann = None
         if self.match(TokenType.COLON):
@@ -1975,7 +2085,9 @@ class Parser:
     
     def parse_for(self) -> For:
         self.consume(TokenType.FOR)
-        var = self.consume(TokenType.IDENT).value
+        var_tok = self.consume(TokenType.IDENT)
+        self.check_binding_name(var_tok)
+        var = var_tok.value
         self.consume(TokenType.IN)
         iter_expr = self.parse_expression()
         
@@ -2051,7 +2163,19 @@ class Parser:
         if self.match(TokenType.DEDENT):
             self.advance()
 
+        self.end_block_expr()
         return MatchExpr(value=value, arms=arms)
+
+    def end_block_expr(self):
+        """An expression that ends with an indented block (match, retry, timeout,
+        handle) also ends its statement: an `if`, `[`, `(` or `-` on the next line
+        starts a new statement instead of continuing the expression (`x if c else
+        y`, indexing, ...). The lexer emits no NEWLINE after a DEDENT (and the
+        parsers above skip the NEWLINE before a possible `else`), so add one."""
+        if self.pos > 0 and self.tokens[self.pos - 1].type in (TokenType.DEDENT, TokenType.NEWLINE) and \
+                not self.match(TokenType.NEWLINE, TokenType.DEDENT, TokenType.EOF):
+            tok = self.current()
+            self.tokens.insert(self.pos, Token(TokenType.NEWLINE, '\n', tok.line, tok.col))
 
     # ═══════════════════════════════════════════════════════════
     # V2.0 ADVANCED PARSERS
@@ -2108,6 +2232,7 @@ class Parser:
             self.advance()
             self.skip_newlines()
             fallback = self.parse_block() if self.match(TokenType.INDENT) else self.parse_expression()
+        self.end_block_expr()
         return RetryExpr(count=count, body=body, fallback=fallback)
 
     def parse_timeout_expr(self) -> TimeoutExpr:
@@ -2124,6 +2249,7 @@ class Parser:
             self.advance()
             self.skip_newlines()
             fallback = self.parse_block() if self.match(TokenType.INDENT) else self.parse_expression()
+        self.end_block_expr()
         return TimeoutExpr(duration=duration, body=body, fallback=fallback)
 
     def parse_intent_block(self) -> IntentBlock:
@@ -2136,8 +2262,8 @@ class Parser:
 
     def parse_perform(self) -> PerformEffect:
         """Parse: perform EffectName(args)"""
-        self.consume(TokenType.PERFORM)
-        name = self.consume(TokenType.IDENT).value
+        self.take_word(TokenType.PERFORM)
+        name = self.consume(TokenType.IDENT, "Expected the effect name after 'perform'").value
         args = []
         if self.match(TokenType.LPAREN):
             self.advance()
@@ -2151,21 +2277,193 @@ class Parser:
         return PerformEffect(name=name, args=args)
 
     def parse_handle_expr(self) -> EffectHandler:
-        """Parse: handle { body } with { EffectName(params) => handler_body }"""
-        self.consume(TokenType.HANDLE)
+        """Parse an effect handler (TIL 3.1, docs/TIL_EFFECTS.md):
+
+            handle                          handle <expression>
+                <body>                      with
+            with                                Name(params) => <expression>
+                Name(params) => <expression>
+                Name(params) =>
+                    <block>
+                Tick => <expression>        (no parameters: `Tick` or `Tick()`)
+        """
+        self.take_word(TokenType.HANDLE)
         self.skip_newlines()
-        expr = self.parse_block() if self.match(TokenType.INDENT) else self.parse_expression()
-        # Expect 'with' as an identifier (not a keyword)
-        # We'll check for it manually
+        body = self.parse_block() if self.match(TokenType.INDENT) else self.parse_expression()
         self.skip_newlines()
-        handlers = []
-        # If there's a 'with' identifier followed by handlers, parse them
-        # For simplicity, return the handler with empty handlers list
-        return EffectHandler(expr=expr, handlers=handlers)
+        if not self.word_is(self.current(), TokenType.WITH):
+            self.error("Expected 'with' and effect clauses after the body of 'handle'")
+        self.take_word(TokenType.WITH)
+        self.skip_newlines()
+        clauses: List[EffectClause] = []
+        if self.match(TokenType.INDENT):
+            self.advance()
+            while not self.match(TokenType.DEDENT, TokenType.EOF):
+                self.skip_newlines()
+                if self.match(TokenType.DEDENT, TokenType.EOF):
+                    break
+                clauses.append(self.parse_effect_clause(clauses))
+                self.skip_newlines()
+            if self.match(TokenType.DEDENT):
+                self.advance()
+        else:
+            clauses.append(self.parse_effect_clause(clauses))
+        if not clauses:
+            self.error("'handle ... with' needs at least one effect clause: Name(params) => ...")
+        self.end_block_expr()
+        return EffectHandler(expr=body, handlers=clauses)
+
+    def _syntax_error_at(self, node_or_tok, msg: str, hint: str = ""):
+        line = getattr(node_or_tok, 'line', 0) or 0
+        col = getattr(node_or_tok, 'col', 0) or 1
+        raise SyntaxError(self.error_reporter.format_error(line, col, msg, hint=hint))
+
+    def parse_effect_clause(self, seen: List[EffectClause]) -> EffectClause:
+        """Name(params) => expression   |   Name(params) => NEWLINE <block>"""
+        name_tok = self.consume(TokenType.IDENT, "Expected an effect clause: Name(params) => ...")
+        params: List[str] = []
+        ptypes: List[Any] = []
+        if self.match(TokenType.LPAREN):
+            self.advance()
+            if not self.match(TokenType.RPAREN):
+                while True:
+                    ptok = self.consume(TokenType.IDENT, "Expected a parameter name in the effect clause")
+                    if self.ctx_words.get(ptok.value) == TokenType.RESUME:
+                        self._syntax_error_at(ptok, f"'{ptok.value}' is reserved inside an effect clause",
+                                              "there it always means resume(...); choose another name")
+                    ptype = None
+                    if self.match(TokenType.COLON):
+                        self.advance()
+                        ptype = self.parse_type()
+                    if ptok.value in params:
+                        self._syntax_error_at(ptok, f"duplicate parameter '{ptok.value}' in the clause "
+                                                    f"for effect '{name_tok.value}'")
+                    params.append(ptok.value)
+                    ptypes.append(ptype)
+                    if not self.match(TokenType.COMMA):
+                        break
+                    self.advance()
+            self.consume(TokenType.RPAREN, "Expected ')' after the clause parameters")
+        if any(c.name == name_tok.value for c in seen):
+            self._syntax_error_at(name_tok, f"duplicate clause for effect '{name_tok.value}' in one handle",
+                                  "each effect may have only one clause per 'handle ... with'")
+        self.consume(TokenType.FAT_ARROW, "Expected '=>' after the effect clause head")
+        saved = self.in_clause
+        self.in_clause = True
+        try:
+            if self.match(TokenType.NEWLINE):
+                self.skip_newlines()
+                if not self.match(TokenType.INDENT):
+                    self.error("Expected an expression or an indented block after '=>'")
+                body = self.parse_block()
+            else:
+                body = self.parse_expression()
+        finally:
+            self.in_clause = saved
+        self._check_code_after_resume(body)
+        return EffectClause(name=name_tok.value, params=params, param_types=ptypes, body=body,
+                            line=name_tok.line, col=name_tok.col)
+
+    # nodes that evaluate all their children, in order, and then do their own
+    # work: when a child always reaches resume(...), that work never happens
+    _EAGER_NODES = (Call, UnaryOp, Index, Attribute, ArrayLit, TupleLit, DictLit, StructInit,
+                    Range, Cast, NullCheck, FStringLit, PerformEffect, VarDecl, Assignment,
+                    AssertStmt, InvariantStmt)
+
+    def _check_code_after_resume(self, body):
+        """resume() is a tail call: the clause ends there. Code that could only run
+        after it - a following statement, or the expression that would use the
+        value of resume(...) - is a compile error, never silently dropped."""
+        def unreachable(node, what="unreachable code after resume(...)"):
+            at = next((n for n in walk(node) if getattr(n, 'line', 0)), node)
+            self._syntax_error_at(
+                at, what, "resume ends the clause and continues the handled body at once "
+                          "(tail resumption); it does not return here, so move this code before "
+                          "resume (write resume(v) as the clause's last statement)")
+        value_lost = "the value of resume(...) is never available: resume ends the clause"
+
+        def ends(node) -> bool:
+            """Check `node`; True when evaluating it always reaches resume(...)."""
+            if node is None or isinstance(node, (Lambda, EffectClause)):
+                return False      # separate code (a nested clause is checked on its own)
+            if isinstance(node, ResumeExpr):
+                if ends(node.value):
+                    unreachable(node)
+                return True
+            if isinstance(node, Block):
+                stmts = node.statements
+                for k, st in enumerate(stmts):
+                    if ends(st):
+                        if k + 1 < len(stmts):
+                            unreachable(stmts[k + 1])
+                        return True
+                return False
+            if isinstance(node, ExprStmt):
+                return ends(node.expr)
+            if isinstance(node, Assignment) and isinstance(node.target, ResumeExpr):
+                self._syntax_error_at(node, "'resume' is reserved inside an effect clause",
+                                      "there it always means resume(...); use another variable name")
+            if isinstance(node, BinaryOp) and node.op in ('and', 'or'):
+                if ends(node.left):
+                    unreachable(node.left, value_lost)
+                ends(node.right)          # only sometimes evaluated
+                return False
+            if isinstance(node, self._EAGER_NODES) or isinstance(node, BinaryOp):
+                for child in iter_children(node):
+                    if ends(child):
+                        unreachable(child, value_lost)
+                return False
+            if isinstance(node, (If, IfExpr)):
+                if isinstance(node, If):
+                    tests = [(node.condition, node.then_body)] + list(node.elifs)
+                    other = node.else_body
+                else:
+                    tests, other = [(node.condition, node.then_expr)], node.else_expr
+                every = True
+                for cond, branch in tests:
+                    if ends(cond):
+                        unreachable(branch)
+                    every = ends(branch) and every
+                return ends(other) and every
+            if isinstance(node, (While, For)):
+                if ends(node.condition if isinstance(node, While) else node.iter):
+                    unreachable(node.body)
+                ends(node.body)
+                return False
+            if isinstance(node, MatchExpr):
+                if ends(node.value):
+                    unreachable(node, "the match arms are never reached: resume(...) ends the clause")
+            # anything else (match arms, loop bodies, retry/timeout/intent and nested
+            # handle bodies - a clause may abort them, an error may skip to the
+            # fallback): checked inside, but it is not known to always resume
+            for child in iter_children(node):
+                ends(child)
+            return False
+
+        ends(body)
+
+    def parse_resume(self) -> ResumeExpr:
+        """resume(v) / resume() / resume: only inside an effect clause."""
+        tok = self.take_word(TokenType.RESUME)
+        if not self.in_clause:
+            self._syntax_error_at(tok, "resume(...) outside an effect clause",
+                                  "resume continues the body of a 'handle' and may only be used in "
+                                  "one of its 'with' clauses (not in a nested lambda)")
+        value = None
+        if self.match(TokenType.LPAREN):
+            self.advance()
+            if not self.match(TokenType.RPAREN):
+                value = self.parse_expression()
+            self.consume(TokenType.RPAREN, "resume takes at most one value: resume(v)")
+        return ResumeExpr(value=value)
 
     def parse_return(self) -> Return:
-        self.consume(TokenType.RETURN)
-        
+        ret_tok = self.consume(TokenType.RETURN)
+        if self.in_clause:
+            self._syntax_error_at(ret_tok, "'return' is not allowed in an effect clause",
+                                  "use resume(v) to continue the handled body, or end the clause "
+                                  "with a value: that value becomes the value of the whole handle")
+
         value = None
         if not self.match(TokenType.NEWLINE, TokenType.DEDENT, TokenType.EOF, TokenType.RBRACE):
             value = self.parse_expression()
@@ -2281,7 +2579,7 @@ class Parser:
             elif self.match(TokenType.IDENT) and self.is_func_def():
                 method = self.parse_func_def_simple()
             else:
-                self.error("Expected method definition in impl block")
+                self.error("Expected method definition in impl block" + self.reserved_note())
             
             method.is_method = True
             method.self_type = type_name
@@ -2312,7 +2610,7 @@ class Parser:
                 method_name = self.advance().value
                 method = self.parse_func_body(method_name, allow_signature=True)
             else:
-                self.error("Expected method definition in trait")
+                self.error("Expected method definition in trait" + self.reserved_note())
             
             methods.append(method)
             self.skip_newlines()
@@ -2575,6 +2873,7 @@ class Parser:
         sub_tokens = Lexer(text, "<fstring>", languages=self.languages,
                            line_offset=max(line - 1, 0)).tokenize()
         sub_parser = Parser(sub_tokens, "<fstring>", languages=self.languages)
+        sub_parser.in_clause = self.in_clause       # `resume` means the same inside {...}
         return sub_parser.parse_expression()
 
     def _parse_primary(self) -> ASTNode:
@@ -2707,6 +3006,7 @@ class Parser:
                 self.advance()
                 ret_type = self.parse_type()
             # Body: either { expr } or just expr
+            saved_clause, self.in_clause = self.in_clause, False   # a lambda is not the clause
             if self.match(TokenType.LBRACE):
                 self.advance()
                 self.skip_newlines()
@@ -2715,12 +3015,22 @@ class Parser:
                 self.consume(TokenType.RBRACE)
             else:
                 body = self.parse_expression()
+            self.in_clause = saved_clause
             return Lambda(params=params, body=body, ret_type=ret_type)
         
         # Self keyword (used in method bodies)
         if self.match(TokenType.SELF):
             self.advance()
             return Identifier(name="self")
+
+        # contextual effect keywords (TIL 3.1): localized perform/handle, resume
+        kind = self.contextual_start() if self.match(TokenType.IDENT) else None
+        if kind == TokenType.HANDLE:
+            return self.parse_handle_expr()
+        if kind == TokenType.PERFORM:
+            return self.parse_perform()
+        if kind == TokenType.RESUME:
+            return self.parse_resume()
 
         # None literal
         if self.match(TokenType.IDENT) and self.current().value == "None":
@@ -2777,6 +3087,10 @@ class Parser:
 
         if self.match(TokenType.HANDLE):
             return self.parse_handle_expr()
+
+        # effects (TIL 3.1): `perform E(args)` is an expression, resume only in clauses
+        if self.match(TokenType.PERFORM):
+            return self.parse_perform()
 
         self.error(f"Unexpected token: {self.current().type.name}")
 
@@ -3106,6 +3420,10 @@ def iter_children(node):
     for value in vars(node).values():
         if isinstance(value, ASTNode):
             yield value
+        elif isinstance(value, dict):            # StructInit.fields: {name: value}
+            for item in value.values():
+                if isinstance(item, ASTNode):
+                    yield item
         elif isinstance(value, (list, tuple)):
             for item in value:
                 if isinstance(item, ASTNode):
@@ -3218,6 +3536,8 @@ class SemanticChecker:
                    'screen_init', 'screen_clear', 'draw_pixel', 'draw_line', 'draw_rect',
                    'fill_rect', 'draw_circle', 'draw_text', 'get_pixel', 'screen_show',
                    'key_pressed', 'wait_key', 'energy_mode'}
+    # effects of builtins: no `handle` clause intercepts them (print never performs)
+    BUILTIN_EFFECTS = frozenset({'io'})
 
     def __init__(self, source: str = "", filename: str = "<stdin>"):
         self.reporter = ErrorReporter(source, filename)
@@ -3261,6 +3581,10 @@ class SemanticChecker:
         self.base_effects: Dict[str, Set[str]] = {}
         self.edges: Dict[str, List[Tuple[str, ASTNode, bool]]] = {}  # (callee, node, precise)
         self.effect_origin: Dict[Tuple[str, str], ASTNode] = {}
+        # id(call node) -> effects handled by the `handle` expressions around it
+        self.edge_handled: Dict[int, frozenset] = {}
+        # function -> [(E, perform node)]: performs that may call the function E
+        self.perform_uses: Dict[str, List[Tuple[str, ASTNode]]] = {}
         for key, fn in self.funcs.items():
             self.scan_function(key, fn)
 
@@ -3291,10 +3615,38 @@ class SemanticChecker:
             return [(c, len(candidates) == 1) for c in candidates]
         return []
 
+    @classmethod
+    def handled_effects(cls, body, through_lambdas: bool = True) -> Dict[int, frozenset]:
+        """id(node) -> effects handled by the `handle ... with` expressions that
+        lexically enclose the node. A clause body only sees the handles outside its
+        own handle (the owner is masked while its clause runs). Lambdas inside a
+        handle body count as handled (they are assumed to run inside it) unless
+        `through_lambdas` is false: a lambda may escape the handle and run later.
+        Builtin effects (io) are never handled: no clause intercepts print."""
+        out: Dict[int, frozenset] = {}
+        todo: List[Tuple[Any, frozenset]] = [(body, frozenset())]
+        while todo:
+            node, handled = todo.pop()
+            if node is None:
+                continue
+            if not through_lambdas and isinstance(node, Lambda):
+                handled = frozenset()
+            if handled:
+                out[id(node)] = handled
+            if isinstance(node, EffectHandler):
+                names = frozenset(c.name for c in node.handlers) - cls.BUILTIN_EFFECTS
+                todo.append((node.expr, handled | names))
+                todo.extend((c, handled) for c in node.handlers)
+                continue
+            todo.extend((child, handled) for child in iter_children(node))
+        return out
+
     def scan_function(self, key: str, fn: FuncDef):
         effects: Set[str] = set()
         edges: List[Tuple[str, ASTNode, bool]] = []
         callee_nodes = set()
+        performs: List[PerformEffect] = []      # performs whose default is a function
+        handled = self.handled_effects(fn.body)
         for node in walk(fn.body):
             if isinstance(node, Call):
                 if isinstance(node.func, Identifier) and node.func.name in self.IO_BUILTINS:
@@ -3304,8 +3656,14 @@ class SemanticChecker:
                     edges.append((callee, node, precise))
                     if precise:
                         self.check_call_site(callee, node)
+                if id(node) in handled:
+                    self.edge_handled[id(node)] = handled[id(node)]
                 callee_nodes.add(id(node.func))
             elif isinstance(node, PerformEffect):
+                if node.name in self.funcs and '.' not in node.name:
+                    performs.append(node)
+                if node.name in handled.get(id(node), ()):
+                    continue          # handled by an enclosing `handle` in this function
                 effects.add(node.name)
                 self.effect_origin.setdefault((key, node.name), node)
         # Taking a function as a value (e.g. `let f = read_file`) counts as a
@@ -3314,6 +3672,16 @@ class SemanticChecker:
             if isinstance(node, Identifier) and id(node) not in callee_nodes \
                     and node.name in self.funcs and self.funcs[node.name].caps:
                 edges.append((node.name, node, True))
+                if id(node) in handled:
+                    self.edge_handled[id(node)] = handled[id(node)]
+        # `perform E(...)` calls the top-level function E when no handler is active:
+        # for capabilities that is a use of E, unless a handle with a clause for E
+        # surrounds the perform in this function (not through a lambda, which may
+        # escape the handle). Effects are unchanged: perform E is the effect E.
+        if performs:
+            strict = self.handled_effects(fn.body, through_lambdas=False)
+            self.perform_uses[key] = [(n.name, n) for n in performs
+                                      if n.name not in strict.get(id(n), ())]
         self.base_effects[key] = effects
         self.edges[key] = edges
 
@@ -3335,7 +3703,7 @@ class SemanticChecker:
                     callee_eff = self.declared(callee)
                     if callee_eff is None:
                         callee_eff = inferred.get(callee, set())
-                    new = callee_eff - inferred[key]
+                    new = callee_eff - self.edge_handled.get(id(_node), frozenset()) - inferred[key]
                     if new:
                         inferred[key] |= new
                         changed = True
@@ -3348,7 +3716,7 @@ class SemanticChecker:
                 callee_eff = self.declared(callee)
                 if callee_eff is None:
                     callee_eff = inferred.get(callee, set())
-                for eff in callee_eff - allowed:
+                for eff in callee_eff - allowed - self.edge_handled.get(id(node), frozenset()):
                     if eff not in actual:
                         actual.add(eff)
                         self.effect_origin.setdefault((key, eff), node)
@@ -3372,15 +3740,18 @@ class SemanticChecker:
             if key == "main":
                 continue  # the program entry point holds all authority
             held = set(self.funcs[key].caps)
-            for callee, node, precise in edges:
-                if not precise:
-                    continue
+            uses = [(callee, node) for callee, node, precise in edges if precise]
+            uses += self.perform_uses.get(key, [])
+            for callee, node in uses:
                 missing = [c for c in self.funcs[callee].caps if c not in held]
                 for cap in missing:
+                    hint = f"add #[cap: {cap}] to '{key}' (only main holds every capability)"
+                    if isinstance(node, PerformEffect):
+                        hint = (f"`perform {callee}(...)` calls the function '{callee}' when no "
+                                "handler is active; " + hint)
                     self.error(node,
                                f"'{key}' uses '{callee}', which requires capability '{cap}', "
-                               f"but '{key}' does not hold it",
-                               "E-CAP", f"add #[cap: {cap}] to '{key}' (only main holds every capability)")
+                               f"but '{key}' does not hold it", "E-CAP", hint)
 
     # ── call sites: arity + constant contracts ─────────────────────────────
     def check_call_site(self, callee: str, call: Call):
@@ -3420,6 +3791,12 @@ class SemanticChecker:
 
 class CompileError(Exception):
     """A fatal, already formatted, compile-time error."""
+    pass
+
+
+class NativeUnsupported(CompileError):
+    """The native (C) backend cannot compile this program, but the TIL VM can:
+    `til run` falls back to the VM, `til build` reports it."""
     pass
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3544,7 +3921,15 @@ class CCodeGenerator:
         self.output = []
         self.module_names = set(getattr(program, 'module_names', set()) or ())
         self._uses_timeout = any(isinstance(n, TimeoutExpr) for st in program.statements for n in walk(st))
-        
+        # Effect handlers with resumption (TIL 3.1) only run on the TIL VM.
+        for st in program.statements:
+            for n in walk(st):
+                if isinstance(n, (EffectHandler, ResumeExpr)):
+                    raise NativeUnsupported(
+                        f"line {n.line}: the native backend does not support effect handlers "
+                        "(handle ... with / resume); run it on the TIL VM (til run, til run --vm) "
+                        "or build bytecode (til build --target vm)")
+
         # First pass: collect definitions
         self._globals: List[VarDecl] = []
         self._type_aliases: Dict[str, TypeAlias] = {}
@@ -6128,25 +6513,18 @@ static bool til_hashmap_str_str_has(TIL_HashMap_str_str* m, const char* key) {
         return ""
 
     def gen_PerformEffect(self, node: PerformEffect) -> str:
-        """Generate effect invocation as function call."""
+        """A program without `handle`: `perform E(args)` calls the top-level
+        function E, its default handler (TIL 3.0 behaviour)."""
+        if node.name not in self.functions:
+            raise NativeUnsupported(f"line {node.line}: effect '{node.name}' has no default handler "
+                                    "function; the TIL VM reports unhandled effects at run time")
         name = self.mangle_name(node.name)
         args = ", ".join(self.generate_node(a) for a in node.args)
         return f"til_{name}({args})"
 
     def gen_EffectHandler(self, node: EffectHandler) -> str:
-        """Generate effect handler as try-execute block."""
-        self.emit("// Effect handler")
-        self.emit("{")
-        self.indent += 1
-        if isinstance(node.expr, Block):
-            self.generate_node(node.expr)
-        else:
-            val = self.generate_node(node.expr)
-            if val:
-                self.emit(f"{val};")
-        self.indent -= 1
-        self.emit("}")
-        return ""
+        raise NativeUnsupported(f"line {node.line}: the native backend does not support effect "
+                                "handlers (handle ... with); use the TIL VM")
 
     def gen_DurationLit(self, node: DurationLit) -> str:
         """Convert duration to milliseconds as int64."""
@@ -6534,8 +6912,11 @@ class TBCModule:
 # dispatch. Rules that keep every observable behaviour unchanged:
 #   * a sequence never spans a jump target or a line-table entry: only its first
 #     instruction may be one, so jumps, error lines and tracebacks stay the same;
-#   * sequences contain no calls, no TRY/END_TRY (recovery points), no HANDLE;
-#     their jumps count a step when they go backwards, like JUMP_IF_FALSE;
+#   * sequences contain no calls, no TRY/END_TRY (recovery points) and no effect
+#     instruction (HANDLE/END_HANDLE/PERFORM/RESUME, also checked explicitly:
+#     _NEVER_FUSED); their jumps count a step when they go backwards, like
+#     JUMP_IF_FALSE. A perform returns (resume) to the instruction after it and an
+#     aborted handle continues at its HANDLE target, both instruction starts;
 #   * jump offsets and the line table are rebuilt for the shorter code.
 # `JUMP 0` (a jump to the next instruction) is dropped. The choice of sequences
 # minimises the number of instructions per function (dynamic programming).
@@ -6545,6 +6926,8 @@ _JUMP_OPS = frozenset([Op.JUMP, Op.JUMP_IF_FALSE, Op.JUMP_IF_TRUE, Op.TRY, Op.TR
                        Op.FOR_ITER, Op.ARG_DEFAULT, Op.HANDLE, Op.JUMP_IF_NOT, Op.JUMP_IF_NOT_L,
                        Op.JUMP_IF_NOT_I, Op.JUMP_IF_NOT_LL, Op.JUMP_IF_NOT_LI, Op.FOR_ITER_STORE])
 _PUSH_INT = (Op.PUSH_I8, Op.PUSH_I16)       # small integer constants (immediates of fused ops)
+# never part of a fused sequence (effects: docs/TIL_EFFECTS.md)
+_NEVER_FUSED = frozenset([Op.HANDLE, Op.END_HANDLE, Op.PERFORM, Op.RESUME])
 _FUSED_INDEX = {op: i for i, op in enumerate(FUSED_BINOPS)}
 
 
@@ -6580,7 +6963,10 @@ def _fusions_at(insns: List[list], i: int, boundary: Set[int]):
     def ops(n):
         if i + n > len(insns) or any(insns[j][0] in boundary for j in range(i + 1, i + n)):
             return None
-        return [insns[j] for j in range(i, i + n)]
+        group = [insns[j] for j in range(i, i + n)]
+        if any(ins[1] in _NEVER_FUSED for ins in group):
+            return None
+        return group
 
     found = []
     g = ops(4)
@@ -6729,6 +7115,60 @@ class _Local:
         self.name, self.slot, self.mutable, self.celled = name, slot, mutable, celled
 
 
+# ── operand stack depth while compiling ─────────────────────────────────────
+# The compiler follows how many values the code it emits leaves on the operand
+# stack (above the locals). `break`/`continue` written inside an expression
+# (`total += handle ... continue ...`, `x = 1 + 2 * retry(2) ... break ...`) pop
+# the values that expression had pushed, so a loop never leaks stack slots.
+# Net stack effect per instruction; the ones that depend on an operand are in
+# _OPERAND_EFFECT. END_HANDLE is set by the compiler (it drops its handle's pairs).
+_STACK_EFFECT = {
+    Op.NOP: 0, Op.PUSH_NIL: 1, Op.PUSH_TRUE: 1, Op.PUSH_FALSE: 1, Op.PUSH_I8: 1,
+    Op.PUSH_I16: 1, Op.PUSH_CONST: 1, Op.POP: -1, Op.DUP: 1, Op.DUP2: 2, Op.SWAP: 0,
+    Op.LOAD_LOCAL: 1, Op.STORE_LOCAL: -1, Op.LOAD_GLOBAL: 1, Op.STORE_GLOBAL: -1,
+    Op.LOAD_UPVAL: 1, Op.STORE_UPVAL: -1, Op.LOAD_CELL: 1, Op.STORE_CELL: -1,
+    Op.MAKE_CELL: 0, Op.LOAD_UPVAL_RAW: 1, Op.ARG_DEFAULT: 0,
+    Op.ADD: -1, Op.SUB: -1, Op.MUL: -1, Op.DIV: -1, Op.MOD: -1, Op.POW: -1,
+    Op.NEG: 0, Op.NOT: 0, Op.BAND: -1, Op.BOR: -1, Op.BXOR: -1, Op.BNOT: 0,
+    Op.SHL: -1, Op.SHR: -1,
+    Op.EQ: -1, Op.NE: -1, Op.LT: -1, Op.LE: -1, Op.GT: -1, Op.GE: -1,
+    Op.JUMP: 0, Op.JUMP_IF_FALSE: -1, Op.JUMP_IF_TRUE: -1,
+    Op.RETURN: -1, Op.RETURN_NIL: 0,
+    Op.GET_INDEX: -1, Op.SET_INDEX: -3, Op.GET_FIELD: 0, Op.SET_FIELD: -2, Op.GET_SLOT: 0,
+    Op.PUSH_FUNC: 1, Op.FOR_ITER: 1, Op.MATCH_TYPE: 0, Op.CAST: 0, Op.IS_ARRAY_LEN: 0,
+    Op.TRY: 0, Op.TRY_TIMEOUT: -1, Op.END_TRY: 0, Op.PANIC: -1,
+    Op.UNWRAP_OR_RETURN: 0, Op.UNWRAP_OR_PANIC: 0,
+    Op.HANDLE: 0, Op.END_HANDLE: 0, Op.RESUME: 0, Op.HALT: 0,
+    # superinstructions (emitted only by fuse_superinstructions, after compiling):
+    # the net effect of the sequence each one replaces
+    Op.LOAD_LOCAL2: 2, Op.LOAD_LOCAL_FIELD: 1, Op.INC_LOCAL: 0, Op.CAST_LOCAL: 0,
+    Op.CAST_RETURN: -1, Op.ADD_STORE_LOCAL: -2, Op.INDEX_L: 0, Op.INDEX_LL: 1,
+    Op.RETURN_LOCAL: 0, Op.FOR_ITER_STORE: 0, Op.JUMP_IF_NOT: -2, Op.JUMP_IF_NOT_L: -1,
+    Op.JUMP_IF_NOT_I: -1, Op.JUMP_IF_NOT_LL: 0, Op.JUMP_IF_NOT_LI: 0,
+}
+_STACK_EFFECT.update({0xA0 + _i: 0 for _i in range(16)})     # <op>_I k
+_STACK_EFFECT.update({0xB0 + _i: 0 for _i in range(16)})     # <op>_L b
+# (operand index, factor, constant): effect = constant - factor * operands[index]
+_OPERAND_EFFECT = {
+    Op.CALL: (1, 1, 1), Op.CALL_VALUE: (0, 1, 0), Op.INVOKE: (2, 1, 0), Op.NATIVE: (1, 1, 1),
+    Op.NEW_ARRAY: (0, 1, 1), Op.NEW_MAP: (0, 2, 1), Op.NEW_STRUCT: (1, 1, 1),
+    Op.MAKE_CLOSURE: (1, 1, 1), Op.CONCAT: (0, 1, 1), Op.PERFORM: (2, 1, 1),
+    Op.NATIVE_POP: (1, 1, 0),
+}
+# depth where a jump lands, relative to the depth before the instruction
+# (TRY: the error message is pushed; HANDLE: an abort cuts the stack back to the
+# clause pairs and pushes the clause value - minus 2n, done in track_depth)
+_JUMP_LANDING = {
+    Op.JUMP: 0, Op.JUMP_IF_FALSE: -1, Op.JUMP_IF_TRUE: -1, Op.TRY: 1, Op.TRY_TIMEOUT: 0,
+    Op.FOR_ITER: 0, Op.ARG_DEFAULT: 0, Op.HANDLE: 1,
+    Op.FOR_ITER_STORE: 0, Op.JUMP_IF_NOT: -2, Op.JUMP_IF_NOT_L: -1, Op.JUMP_IF_NOT_I: -1,
+    Op.JUMP_IF_NOT_LL: 0, Op.JUMP_IF_NOT_LI: 0,
+}
+# the next instruction is only reached through a jump
+_ENDS_FLOW = frozenset((Op.JUMP, Op.RETURN, Op.RETURN_NIL, Op.PANIC, Op.RESUME, Op.HALT,
+                        Op.CAST_RETURN, Op.RETURN_LOCAL))
+
+
 class _FuncState:
     def __init__(self, proto: TBCFunction, parent: Optional['_FuncState'], fdef=None):
         self.proto = proto
@@ -6742,6 +7182,15 @@ class _FuncState:
         self.captured: Set[str] = set()
         self.last_line = -1
         self.result_slot: Optional[int] = None   # `result` inside #[ensures]
+        self.is_clause = False    # an effect clause (resume allowed, return not)
+        self.handle_depth = 0     # enclosing `handle` bodies in this function
+        # operand stack depth (see _STACK_EFFECT): values above the locals at the
+        # current point; `dead` = the current point is only reachable by a jump
+        self.depth = 0
+        self.dead = False
+        self.depth_ok = True                      # False: lost track (never expected)
+        self.jump_depths: Dict[int, Optional[int]] = {}   # patch pos -> landing depth
+        self.handle_sps: List[int] = []          # depth of the pairs of each enclosing handle
 
 
 class BytecodeCompiler:
@@ -6782,7 +7231,40 @@ class BytecodeCompiler:
                 code += _struct.pack('<H', val)
             elif kind == 's':
                 code += _struct.pack('<h', val)
+        self.track_depth(op, operands)
         return len(code)
+
+    def track_depth(self, op: int, operands):
+        """Follow the operand stack depth over one emitted instruction (see
+        _STACK_EFFECT). Jumps remember the depth where they land."""
+        fs = self.fs
+        effect = _STACK_EFFECT.get(op)
+        if effect is None:
+            spec = _OPERAND_EFFECT.get(op)
+            if spec is None or len(operands) <= spec[0]:
+                fs.depth_ok = False      # an instruction this table does not know
+                return
+            effect = spec[2] - spec[1] * operands[spec[0]]
+        before = fs.depth
+        fs.depth = before + effect
+        landing = _JUMP_LANDING.get(op)
+        if landing is not None:
+            if op == Op.HANDLE:
+                landing -= 2 * operands[0]
+            fs.jump_depths[len(fs.proto.code) - 2] = None if fs.dead else before + landing
+        if op in _ENDS_FLOW:
+            fs.dead = True
+
+    def land_jump(self, at: int):
+        """A forward jump (patch position `at`) lands at the current position."""
+        fs = self.fs
+        landing = fs.jump_depths.pop(at, None)
+        if landing is None:
+            return                       # the jump itself is unreachable
+        if fs.dead:
+            fs.depth, fs.dead = landing, False
+        elif landing != fs.depth:
+            fs.depth_ok = False          # paths disagree (a compiler bug)
 
     def emit_jump(self, op: int, node=None) -> int:
         """Emit a forward jump (single i16 operand); returns the patch position."""
@@ -6791,6 +7273,10 @@ class BytecodeCompiler:
 
     def patch_jump(self, at: int, target: Optional[int] = None):
         code = self.fs.proto.code
+        if target is None:
+            self.land_jump(at)
+        else:
+            self.fs.jump_depths.pop(at, None)     # backward jump: the target is known
         target = len(code) if target is None else target
         rel = target - (at + 2)
         if not -32768 <= rel <= 32767:
@@ -6890,6 +7376,9 @@ class BytecodeCompiler:
         self.module_names = set(getattr(program, 'module_names', set()) or ())
         self.user_method_names: Set[str] = set()
         self.pending: List[Tuple[int, Any, Optional[str]]] = []   # (func idx, FuncDef/lambda, owner type)
+        # effect -> clause arity of the handles that lexically enclose the code being
+        # compiled (same function): performs they handle are checked at compile time
+        self.static_effects: List[Dict[str, int]] = []
 
         traits: Dict[str, TraitDef] = {}
         impls: List[ImplBlock] = []
@@ -7016,11 +7505,11 @@ class BytecodeCompiler:
     # ── capture analysis ────────────────────────────────────────────────────
     @staticmethod
     def captured_names(body) -> Set[str]:
-        """Names referenced inside lambdas (they must live in cells)."""
+        """Names referenced inside lambdas and effect clauses (they must live in cells)."""
         names: Set[str] = set()
         for node in walk(body):
-            if isinstance(node, Lambda):
-                params = {p for p, _ in node.params}
+            if isinstance(node, (Lambda, EffectClause)):
+                params = set(node.params) if isinstance(node, EffectClause) else {p for p, _ in node.params}
                 for inner in walk(node.body):
                     if isinstance(inner, Identifier) and inner.name not in params:
                         names.add(inner.name)
@@ -7121,6 +7610,7 @@ class BytecodeCompiler:
         fs = _FuncState(proto, parent, node)
         fs.captured = self.captured_names(node.body)
         self.fs = fs
+        saved_effects, self.static_effects = self.static_effects, []   # called later: dynamic
         proto.n_params = proto.n_required = len(node.params)
         for pname, _ptype in node.params:
             self.declare_local(pname, node=node)
@@ -7133,6 +7623,7 @@ class BytecodeCompiler:
         else:
             self.compile_expr(node.body, node)
         self.emit(Op.RETURN, node=node)
+        self.static_effects = saved_effects
         proto.n_upvals = len(fs.upvals)
         upvals = fs.upvals
         self.fs = parent
@@ -7198,6 +7689,9 @@ class BytecodeCompiler:
         elif t is Break or t is Continue:
             self.compile_break_continue(node, t is Break)
         elif t is Return:
+            if self.fs.is_clause:
+                self.error(node, "'return' is not allowed in an effect clause")
+            # (handler records of this frame are dropped by RETURN itself)
             for _ in range(self.fs.try_depth):
                 self.emit(Op.END_TRY)
             if node.value is not None:
@@ -7309,6 +7803,10 @@ class BytecodeCompiler:
         for scope in self.fs.scopes:
             known |= {k for k in scope if not k.startswith(' ')}
         close = difflib.get_close_matches(name, [k for k in known if '.' not in k], n=1)
+        if what == "function" and name in RESUME_WORDS:
+            self.error(node, f"unknown function '{name}': resume(...) outside an effect clause",
+                       "resume continues the body of a 'handle' and may only be used in one of "
+                       "its 'with' clauses (not in a nested lambda)")
         self.error(node, f"unknown {what} '{name}'", f"did you mean '{close[0]}'?" if close else "")
 
     BINOPS = {'+': Op.ADD, '-': Op.SUB, '*': Op.MUL, '/': Op.DIV, '%': Op.MOD, '**': Op.POW,
@@ -7376,7 +7874,8 @@ class BytecodeCompiler:
 
     def push_loop(self, continue_target: Optional[int]):
         ctx = {'breaks': [], 'continues': [], 'continue_target': continue_target,
-               'try_depth': self.fs.try_depth}
+               'try_depth': self.fs.try_depth, 'handle_depth': self.fs.handle_depth,
+               'depth': self.fs.depth}
         self.fs.loops.append(ctx)
         return ctx
 
@@ -7400,11 +7899,27 @@ class BytecodeCompiler:
 
     def compile_break_continue(self, node, is_break: bool):
         fs = self.fs
+        if not fs.loops and fs.is_clause:
+            self.error(node, f"'{'break' if is_break else 'continue'}' cannot leave an effect clause",
+                       "finish the clause with a value (or resume) instead")
         if not fs.loops:
             self.error(node, f"'{'break' if is_break else 'continue'}' outside of a loop")
         ctx = fs.loops[-1]
         for _ in range(fs.try_depth - ctx['try_depth']):
             self.emit(Op.END_TRY)
+        leave = fs.handle_depth - ctx['handle_depth']
+        if leave:
+            # leaving `handle` bodies: END_HANDLE drops each record and its clause
+            # pairs (it keeps the value on top - here a dummy nil)
+            self.emit(Op.PUSH_NIL, node=node)
+            for k in range(leave):
+                self.emit_end_handle(fs.handle_sps[-1 - k], node)
+            self.emit(Op.POP, node=node)
+        # values pushed by the expression around the break/continue (`total +=
+        # handle ... continue`): drop them, the loop continues at its own depth
+        if fs.depth_ok and not fs.dead:
+            for _ in range(fs.depth - ctx['depth']):
+                self.emit(Op.POP, node=node)
         if is_break:
             ctx['breaks'].append(self.emit_jump(Op.JUMP, node))
         elif ctx['continue_target'] is not None:
@@ -7699,6 +8214,118 @@ class BytecodeCompiler:
         self.emit(Op.PANIC, node=node)
         self.patch_jump(done)
 
+    # ── effect handlers with resumption (TIL 3.1, docs/TIL_EFFECTS.md) ──────
+    def compile_handle(self, node: EffectHandler):
+        """handle <body> with <clauses>  compiles to
+
+               <clause 1> PUSH_CONST "E1" ... <clause n> PUSH_CONST "En"
+               HANDLE n, end      the n (clause, name) pairs stay on the stack under
+                                  the body; a handler record points at them
+               <body value>
+               END_HANDLE         drop the record and the pairs, keep the body value
+           end:                   a clause that finishes without resume() lands here
+                                  with its value (record, pairs and frames discarded)"""
+        if len(node.handlers) > 255:
+            self.error(node, "too many effect clauses in one handle (max 255)")
+        arities: Dict[str, int] = {}
+        pairs_depth = self.fs.depth          # the handle record's `sp`
+        for clause in node.handlers:
+            self.compile_clause(clause)
+            self.emit(Op.PUSH_CONST, self.m.const(clause.name), node=clause)
+            arities[clause.name] = len(clause.params)
+        at = self.emit(Op.HANDLE, len(node.handlers), 0, node=node) - 2
+        self.fs.handle_depth += 1
+        self.fs.handle_sps.append(pairs_depth)
+        self.static_effects.append(arities)
+        if isinstance(node.expr, Block):
+            self.compile_block_value(node.expr)
+        else:
+            self.compile_expr(node.expr, node)
+        self.static_effects.pop()
+        self.fs.handle_sps.pop()
+        self.fs.handle_depth -= 1
+        self.emit_end_handle(pairs_depth, node)
+        self.patch_jump(at)
+
+    def emit_end_handle(self, pairs_depth: int, node):
+        """END_HANDLE keeps the value on top and cuts the stack back to the pairs."""
+        self.emit(Op.END_HANDLE, node=node)
+        self.fs.depth = pairs_depth + 1
+
+    def compile_clause(self, clause: EffectClause):
+        """A clause is a function with FLAG_EFFECT_CLAUSE that closes over the
+        variables it uses (like a lambda). Its parameters are the perform's
+        arguments; returning from it (= finishing without resume) aborts the handle."""
+        proto = TBCFunction(f"<clause {clause.name}:{clause.line}>")
+        proto.flags |= TBCFunction.FLAG_EFFECT_CLAUSE
+        fidx = len(self.m.funcs)
+        self.m.funcs.append(proto)
+        parent = self.fs
+        fs = _FuncState(proto, parent, clause)
+        fs.captured = self.captured_names(clause.body)
+        fs.is_clause = True
+        self.fs = fs
+        proto.n_params = proto.n_required = len(clause.params)
+        for pname in clause.params:
+            self.declare_local(pname, node=clause)
+        for i, ptype in enumerate(clause.param_types):
+            cast = self.numeric_cast_for(ptype)
+            if cast is not None:
+                self.emit(Op.LOAD_LOCAL, i)
+                self.emit(Op.CAST, cast)
+                self.emit(Op.STORE_LOCAL, i)
+        for pname in clause.params:
+            local = self.find_local(fs, pname)
+            if local.celled:
+                self.emit(Op.MAKE_CELL, local.slot)
+        # Performs in a clause skip the handle that owns it (it is masked while the
+        # clause runs); the handles around that one stay statically known.
+        if isinstance(clause.body, Block):
+            self.compile_block_value(clause.body)
+        else:
+            self.compile_expr(clause.body, clause)
+        self.emit(Op.RETURN, node=clause)
+        proto.n_upvals = len(fs.upvals)
+        upvals = fs.upvals
+        self.fs = parent
+        if not upvals:
+            self.emit(Op.PUSH_FUNC, fidx, node=clause)
+            return
+        for _name, from_local, index, _mut in upvals:
+            if from_local:
+                self.emit(Op.LOAD_LOCAL, index, node=clause)       # pushes the cell itself
+            else:
+                self.emit(Op.LOAD_UPVAL_RAW, index, node=clause)
+        self.emit(Op.MAKE_CLOSURE, fidx, len(upvals), node=clause)
+
+    def compile_perform(self, node: PerformEffect):
+        """perform E(args) -> PERFORM name, default, argc. At run time the VM finds
+        the innermost active handler with a clause for E; without one it calls the
+        top-level function E (TIL 3.0 behaviour, `default`), else `unhandled effect`."""
+        argc = len(node.args)
+        if argc > 255:
+            self.error(node, "too many arguments (max 255)")
+        for scope in reversed(self.static_effects):
+            if node.name in scope:
+                if scope[node.name] != argc:
+                    self.error(node, f"effect '{node.name}' expects {scope[node.name]} argument(s), got {argc}",
+                               "the clause of the enclosing handle takes a different number of parameters")
+                break
+        self.compile_args(node.args, node)
+        default = self.funcs.get(node.name, 0xFFFF) if '.' not in node.name else 0xFFFF
+        if default != 0xFFFF and default >= 0xFFFF:
+            self.error(node, "program too large for the bytecode format")
+        self.emit(Op.PERFORM, self.m.const(node.name), default, argc, node=node)
+
+    def compile_resume(self, node: ResumeExpr):
+        if not self.fs.is_clause:
+            self.error(node, "resume(...) outside an effect clause")
+        if node.value is None:
+            self.emit(Op.PUSH_NIL, node=node)
+        else:
+            self.compile_expr(node.value, node)
+        self.emit(Op.RESUME, node=node)
+
     # ── expressions ─────────────────────────────────────────────────────────
     def try_fold(self, node):
         if isinstance(node, (BinaryOp, UnaryOp)):
@@ -7809,16 +8436,11 @@ class BytecodeCompiler:
         elif t is Block:
             self.compile_block_value(node)
         elif t is EffectHandler:
-            if isinstance(node.expr, Block):
-                self.compile_block_value(node.expr)
-            else:
-                self.compile_expr(node.expr, node)
+            self.compile_handle(node)
         elif t is PerformEffect:
-            if node.name not in self.funcs:
-                self.error(node, f"no handler function '{node.name}' for effect '{node.name}'")
-            for a in node.args:
-                self.compile_expr(a, node)
-            self.emit(Op.CALL, self.funcs[node.name], len(node.args), node=node)
+            self.compile_perform(node)
+        elif t is ResumeExpr:
+            self.compile_resume(node)
         elif t is DurationLit:
             mult = {"ms": 1, "s": 1000, "m": 60000, "h": 3600000}.get(node.unit, 1)
             self.push_int(int(node.value * mult), node)
@@ -8170,6 +8792,7 @@ class TILVM:
 
     CHECK_INTERVAL = 256
     MAX_FRAMES = 2000
+    MAX_HANDLERS = 32     # = TILVM_MAX_HANDLERS of the default C VM build
 
     def __init__(self, module: TBCModule, write=None, read_line=None, max_steps: int = 0,
                  argv: Optional[List[Any]] = None):
@@ -8202,7 +8825,13 @@ class TILVM:
         self.field_names = [[f.encode('utf-8') if isinstance(f, str) else f for f in fields]
                             for _n, fields in module.types]
         self.rng = 0x9E3779B97F4A7C15
-        self.recover: List[list] = []     # [handler_pc, n_frames, sp, deadline_ms or 0]
+        # [handler_pc, n_frames, sp, deadline_ms or 0, n_handlers]
+        self.recover: List[list] = []
+        # Effect handler stack (docs/TIL_EFFECTS.md); both kinds of entry have 6 fields:
+        #   [0, n_frames, sp, n_try, abort_pc, n]     handle: n (clause, name) pairs at stack[sp:]
+        #   [1, n_frames, 0,  n_try, 0,     owner]   a clause of handler #owner is running
+        #                                             (masks #owner and everything above it)
+        self.handlers: List[list] = []
         self.deadlines = 0
         self.tick = 0
         self.stack: list = []
@@ -8911,13 +9540,63 @@ class TILVM:
                 if rf[3]:
                     self.deadlines -= 1
             del self.recover[p.target + 1:]
-        handler, n_frames, sp, deadline = self.recover.pop()
+        handler, n_frames, sp, deadline, n_handlers = self.recover.pop()
         if deadline:
             self.deadlines -= 1
         del self.frames[n_frames:]
         del self.stack[sp:]
+        del self.handlers[n_handlers:]     # handles / running clauses inside the block
         self.stack.append(p.msg)
         self.frames[-1][1] = handler
+        return True
+
+    # ── effect handlers (TIL 3.1, docs/TIL_EFFECTS.md) ──────────────────────
+    EFFECT_NAME_MAX = 64      # effect names in error messages (same cut in the C VM)
+
+    def find_clause(self, name: bytes):
+        """Innermost visible clause for effect `name` -> (handler index, clause value).
+        While a clause runs, its marker hides the owning handler and everything
+        installed after it, so the search continues below the owner."""
+        hs = self.handlers
+        stack = self.stack
+        i = len(hs) - 1
+        while i >= 0:
+            h = hs[i]
+            if h[0] == 1:
+                i = h[5] - 1
+                continue
+            sp = h[2]
+            for j in range(h[5]):
+                if stack[sp + 2 * j + 1] == name:
+                    return i, stack[sp + 2 * j]
+            i -= 1
+        return None
+
+    def pop_recover_to(self, n: int):
+        while len(self.recover) > n:
+            if self.recover.pop()[3]:
+                self.deadlines -= 1
+
+    def leave_frame(self, depth: int, fidx: int, result) -> bool:
+        """RETURN with handler records present: drop the handles the frame installed.
+        Returning from an effect clause (it finished without resume) aborts the
+        handle that owns it: its value becomes the value of the handle expression.
+        Returns True after such an abort (the VM continues at the handle's end)."""
+        hs = self.handlers
+        while hs and hs[-1][1] >= depth:
+            hs.pop()
+        if not self.m.funcs[fidx].flags & TBCFunction.FLAG_EFFECT_CLAUSE:
+            return False
+        if not hs or hs[-1][0] != 1 or hs[-1][1] != depth - 1:
+            raise TILFatal("effect clause returned outside its handler")
+        owner = hs[-1][5]
+        rec = hs[owner]
+        del hs[owner:]
+        self.pop_recover_to(rec[3])
+        del self.frames[rec[1]:]
+        del self.stack[rec[2]:]
+        self.stack.append(result)
+        self.frames[-1][1] = rec[4]
         return True
 
     def check_budget(self, pc: int):
@@ -8975,6 +9654,7 @@ class TILVM:
         stack = self.stack
         frames = self.frames
         funcs = self.m.funcs
+        handlers = self.handlers          # effect handler entries (changed in place only)
         frame = frames[-1]
         pc = frame[1]
         base = frame[2]
@@ -8986,6 +9666,7 @@ class TILVM:
         ADD, SUB, MUL, LT, LE, GT, GE = Op.ADD, Op.SUB, Op.MUL, Op.LT, Op.LE, Op.GT, Op.GE
         JUMP, JUMP_IF_FALSE, JUMP_IF_TRUE = Op.JUMP, Op.JUMP_IF_FALSE, Op.JUMP_IF_TRUE
         CALL, CALL_VALUE, INVOKE, RETURN, RETURN_NIL = Op.CALL, Op.CALL_VALUE, Op.INVOKE, Op.RETURN, Op.RETURN_NIL
+        PERFORM = Op.PERFORM
         LOAD_LOCAL2, LOAD_LOCAL_FIELD, INC_LOCAL, CAST_LOCAL = \
             Op.LOAD_LOCAL2, Op.LOAD_LOCAL_FIELD, Op.INC_LOCAL, Op.CAST_LOCAL
         CAST_RETURN, ADD_STORE_LOCAL, NATIVE_POP, RETURN_LOCAL = \
@@ -9203,6 +9884,12 @@ class TILVM:
                     while self.recover and self.recover[-1][1] >= depth:
                         if self.recover.pop()[3]:
                             self.deadlines -= 1
+                    if handlers and self.leave_frame(depth, frame[0], result):
+                        frame = frames[-1]          # a clause aborted its handle
+                        pc = frame[1]
+                        base = frame[2]
+                        closure = frame[3]
+                        continue
                     frames.pop()
                     del stack[base - frame[4]:]
                     stack.append(result)
@@ -9490,7 +10177,7 @@ class TILVM:
                         ms = self.num(stack.pop(), 'timeout')
                         deadline = _time.monotonic() * 1000.0 + max(ms, 0)
                         self.deadlines += 1
-                    self.recover.append([handler, len(frames), len(stack), deadline])
+                    self.recover.append([handler, len(frames), len(stack), deadline, len(handlers)])
                 elif op == Op.END_TRY:
                     if self.recover and self.recover.pop()[3]:
                         self.deadlines -= 1
@@ -9511,6 +10198,12 @@ class TILVM:
                         while self.recover and self.recover[-1][1] >= depth:
                             if self.recover.pop()[3]:
                                 self.deadlines -= 1
+                        if handlers and self.leave_frame(depth, frame[0], result):
+                            frame = frames[-1]
+                            pc = frame[1]
+                            base = frame[2]
+                            closure = frame[3]
+                            continue
                         frames.pop()
                         del stack[base - frame[4]:]
                         stack.append(result)
@@ -9521,6 +10214,90 @@ class TILVM:
                         base = frame[2]
                         closure = frame[3]
                     # any other value passes through unchanged
+                elif op == PERFORM:
+                    # PERFORM name, default, argc: enter the innermost visible clause for
+                    # the effect (a call: RESUME returns here), else the default function.
+                    # (Kept out of the CALL branch: the hot opcodes after it in this chain
+                    # would pay one more comparison each.)
+                    name = consts[code[pc] | (code[pc + 1] << 8)]
+                    fidx = code[pc + 2] | (code[pc + 3] << 8)
+                    argc = code[pc + 4]
+                    pc += 5
+                    new_closure = None
+                    found = self.find_clause(name) if handlers else None
+                    if found is not None:
+                        new_closure = found[1]
+                        if type(new_closure) is not VMClosure:
+                            self.panic(b"effect '" + name[:self.EFFECT_NAME_MAX] + b"' has no callable clause")
+                        fidx = new_closure.fn
+                        fn = funcs[fidx]
+                        if argc > fn.n_params or argc < fn.n_required:
+                            self.panic(b"effect '" + name[:self.EFFECT_NAME_MAX] + b"' expects " +
+                                       str(fn.n_params).encode() + b" argument(s), got " + str(argc).encode())
+                        if len(handlers) >= self.MAX_HANDLERS:
+                            self.panic("too many nested handlers")
+                        # mark the running clause: it masks its own handler and above
+                        handlers.append([1, len(frames), 0, len(self.recover), 0, found[0]])
+                    elif fidx == 0xFFFF:
+                        self.panic(b"unhandled effect '" + name[:self.EFFECT_NAME_MAX] + b"'")
+                    # enter the function exactly like CALL (no callee slot)
+                    fn = funcs[fidx]
+                    if argc > fn.n_params or argc < fn.n_required:
+                        self.panic(f"{fn.name}() takes {fn.n_params} argument(s), got {argc}")
+                    if len(frames) >= self.MAX_FRAMES:
+                        raise TILFatal("stack overflow (recursion too deep)")
+                    frame[1] = pc
+                    new_base = len(stack) - argc
+                    if argc < fn.n_params:
+                        stack.extend([_UNDEF] * (fn.n_params - argc))
+                    if fn.n_locals > fn.n_params:
+                        stack.extend([None] * (fn.n_locals - fn.n_params))
+                    frame = [fidx, fn.offset, new_base, new_closure, 0]
+                    frames.append(frame)
+                    pc = fn.offset
+                    base = new_base
+                    closure = new_closure
+                    self.check_budget(op_pc)
+                elif op == Op.HANDLE:
+                    # HANDLE n, rel_end: the n (clause, name) pairs below stay on the stack
+                    n = code[pc]
+                    rel = code[pc + 1] | (code[pc + 2] << 8)
+                    pc += 3
+                    if len(handlers) >= self.MAX_HANDLERS:
+                        self.panic("too many nested handlers")
+                    handlers.append([0, len(frames), len(stack) - 2 * n, len(self.recover),
+                                          pc + (rel - 0x10000 if rel >= 0x8000 else rel), n])
+                elif op == Op.END_HANDLE:
+                    # the body finished: drop the record and its pairs, keep the value
+                    hs = handlers
+                    if not hs or hs[-1][0] != 0 or hs[-1][1] != len(frames):
+                        raise TILFatal("END_HANDLE without an active handle")
+                    sp = hs.pop()[2]
+                    v = stack.pop()
+                    del stack[sp:]
+                    stack.append(v)
+                elif op == Op.RESUME:
+                    # inside a clause: TOS becomes the value of the perform, the
+                    # handler stack is exactly as it was at the perform
+                    v = stack.pop()
+                    hs = handlers
+                    depth = len(frames)
+                    k = len(hs) - 1
+                    while k >= 0 and hs[k][0] != 1:
+                        k -= 1
+                    if k < 0 or hs[k][1] != depth - 1 or \
+                            not funcs[frame[0]].flags & TBCFunction.FLAG_EFFECT_CLAUSE:
+                        raise TILFatal("resume outside an effect clause")
+                    n_try = hs[k][3]
+                    del hs[k:]
+                    self.pop_recover_to(n_try)
+                    frames.pop()
+                    del stack[base - frame[4]:]
+                    stack.append(v)
+                    frame = frames[-1]
+                    pc = frame[1]
+                    base = frame[2]
+                    closure = frame[3]
                 elif op == Op.HALT:
                     return
                 elif op == Op.NOP:
@@ -9597,7 +10374,9 @@ def disassemble(m: TBCModule) -> str:
                 note = {v: k for k, v in CAST_KINDS.items()}.get(vals[-1], "?")
             elif op in (Op.NEW_STRUCT, Op.MATCH_TYPE):
                 note = m.types[vals[0]][0] if vals[0] < len(m.types) else "?"
-            elif op in (Op.JUMP, Op.JUMP_IF_FALSE, Op.JUMP_IF_TRUE, Op.TRY, Op.TRY_TIMEOUT, Op.HANDLE):
+            elif op == Op.HANDLE:
+                note = f"{vals[0]} clause(s), abort -> {p + vals[-1] - f.offset:04d}"
+            elif op in (Op.JUMP, Op.JUMP_IF_FALSE, Op.JUMP_IF_TRUE, Op.TRY, Op.TRY_TIMEOUT):
                 note = f"-> {p + vals[-1] - f.offset:04d}"
             elif op in (Op.FOR_ITER, Op.ARG_DEFAULT):
                 note = f"-> {p + vals[-1] - f.offset:04d}"
@@ -9605,6 +10384,8 @@ def disassemble(m: TBCModule) -> str:
                 note = {v: k for k, v in CAST_KINDS.items()}.get(vals[0], "?")
             elif op == Op.PERFORM:
                 note = m.consts[vals[0]].decode('utf-8', 'replace') if vals[0] < len(m.consts) else "?"
+                note += (", no default" if vals[1] == 0xFFFF else
+                         f", default {m.funcs[vals[1]].name if vals[1] < len(m.funcs) else '?'}")
             line = f"  {pc - f.offset:04d}  {name:<18}{' '.join(str(v) for v in vals):<12}"
             if note:
                 line += f"; {note}"
@@ -9866,9 +10647,15 @@ class TILCompiler:
     def compile_to_executable(self, source: str, output: str, filename: str = "<stdin>",
                               quiet: bool = False) -> bool:
         """Compile TIL source to native executable"""
-        
-        c_code = self.compile(source, filename)
-        
+
+        try:
+            c_code = self.compile(source, filename)
+        except NativeUnsupported as e:          # e.g. effect handlers: VM only
+            self.last_c_error = str(e)
+            if not quiet:
+                print(f"error: {e}", file=sys.stderr)
+            return False
+
         # Find C compiler
         cc = self.find_c_compiler()
         if not cc:
@@ -10084,7 +10871,15 @@ def translate_source(source: str, target: str, filename: str = "<stdin>") -> str
     kk-latn, ru). Identifiers, strings and comments are kept as they are."""
     if target not in LANGUAGES:
         raise CompileError(f"unknown language '{target}' (use: {', '.join(LANGUAGES)})")
-    tokens = Lexer(source, filename).tokenize()
+    lexer = Lexer(source, filename)
+    tokens = lexer.tokenize()
+    # contextual keywords (with/resume, localized perform/handle) are known only to
+    # the parser: it retypes the identifier tokens it reads as keywords. A file that
+    # does not parse keeps those words as they are.
+    try:
+        Parser(list(tokens), filename, source=source, languages=lexer.languages).parse()
+    except Exception:          # noqa: BLE001 - best effort, see above
+        pass
     kw_table = ENGLISH_KEYWORDS if target == 'en' else LANGUAGES[target][0]
     alias_table = LANGUAGES[target][1]
     word_for: Dict[TokenType, str] = {}
@@ -10094,6 +10889,9 @@ def translate_source(source: str, target: str, filename: str = "<stdin>") -> str
         for word, ttype in kw_table.items():
             if ttype not in word_for or word_for[ttype] in ENGLISH_KEYWORDS:
                 word_for[ttype] = word
+    for word, ttype in CONTEXTUAL_KEYWORDS.get(target, {}).items():
+        word_for[ttype] = word
+    ctx_words = {w for tbl in CONTEXTUAL_KEYWORDS.values() for w in tbl}
     true_word = next((w for w, t in kw_table.items() if t == TokenType.BOOL and w in TRUE_WORDS), 'true')
     false_word = next((w for w, t in kw_table.items() if t == TokenType.BOOL and w not in TRUE_WORDS), 'false')
     if target == 'en':
@@ -10122,7 +10920,8 @@ def translate_source(source: str, target: str, filename: str = "<stdin>") -> str
             new = canonical_to_alias.get(canon, canon) if target != 'en' or text != canon else text
             if target == 'en':
                 new = canon
-        elif text in ENGLISH_KEYWORDS or text in KEYWORDS or any(text in LANGUAGES[c][0] for c in LANGUAGES):
+        elif text in ENGLISH_KEYWORDS or text in KEYWORDS or text in ctx_words or \
+                any(text in LANGUAGES[c][0] for c in LANGUAGES):
             new = word_for.get(tok.type, text)
         else:
             continue
@@ -10142,6 +10941,9 @@ def translate_source(source: str, target: str, filename: str = "<stdin>") -> str
 _REPL_MARK = "\x00til-repl\x00"
 _REPL_DEF_RE = re.compile(r'^(struct|enum|impl|trait|fn|pub|cap)\b|^#\[|'
                           r'^[^\W\d]\w*\s*\([^)]*\)\s*->|^[^\W\d]\w*\s*\(\s*\w+\s*:')
+# a line starting with `handle` or ending in `handle` (any language: the localized
+# words are contextual, `өңдеу(x)` is a call) opens a multi-line block
+_REPL_HANDLE_RE = re.compile(r'^handle\b|\b(%s)$' % '|'.join(HANDLE_WORDS))
 
 
 def repl_program(definitions: List[str], history: List[str], block: str) -> Tuple[str, bool]:
@@ -10153,7 +10955,13 @@ def repl_program(definitions: List[str], history: List[str], block: str) -> Tupl
         isinstance(stmts[0].expr, Call) and isinstance(stmts[0].expr.func, Identifier)
         and stmts[0].expr.func.name in ('print', 'println')))
     if is_expr:
-        body = f"    let __v = {block.strip()}\n    if __v != None\n        print(__v)"
+        # a multi-line expression (`handle` + body + `with` + clauses): its other
+        # lines keep their indentation relative to the first one
+        lines = block.rstrip().split("\n")
+        ind = len(lines[0]) - len(lines[0].lstrip())
+        expr = "\n".join([lines[0].strip()] + [
+            "    " + (l[ind:] if not l[:ind].strip() else l.lstrip()) for l in lines[1:]])
+        body = f"    let __v = {expr}\n    if __v != None\n        print(__v)"
     replay = "\n".join("    " + l for h in history for l in h.split("\n"))
     source = "\n".join(definitions) + "\nmain()\n" + (replay + "\n" if replay else "") + \
         f'    print("{_REPL_MARK}")\n' + body + "\n"
@@ -10204,7 +11012,8 @@ def run_repl():
             definitions.append(block)
             print("ok")
             continue
-        if re.match(r'^(if|for|while|loop|match|intent)\b', stripped):
+        if re.match(r'^(if|for|while|loop|match|intent)\b', stripped) or \
+                _REPL_HANDLE_RE.search(stripped):        # `handle` / `let x = handle` + body + with
             block = read_block(line)
         else:
             block = line

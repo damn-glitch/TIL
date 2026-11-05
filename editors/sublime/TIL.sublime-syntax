@@ -33,7 +33,7 @@ contexts:
       scope: constant.numeric.integer.til
 
     # Keywords
-    - match: '\b(if|else|elif|for|while|loop|match|in|return|break|continue)\b'
+    - match: '\b(if|else|elif|for|while|loop|match|in|return|break|continue|retry|timeout|perform|handle|with|resume)\b'
       scope: keyword.control.til
     - match: '\b(fn|let|var|const|mut|struct|enum|impl|trait|type|pub)\b'
       scope: keyword.declaration.til

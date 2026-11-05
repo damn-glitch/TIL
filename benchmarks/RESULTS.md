@@ -117,3 +117,31 @@ output. The AVR and Cortex-M (QEMU) ports print the same as the reference VM for
 Z80: SDCC compiles the TIL 3.1 lean build with warnings only, and the code is
 smaller than before — SDCC generates much better code for the registers kept in
 C locals than for `vm->st.sp` accesses through the VM pointer.
+
+## After merging effects with resumption (feature 8)
+
+The effect opcodes (`HANDLE`/`END_HANDLE`/`PERFORM`/`RESUME`) were ported into
+this interpreter; the only cost on code without handlers is one test of
+`n_handlers` per return. Same machine and compiler, benchmark bytecode
+byte-identical before and after; base = the faster VM before the merge.
+
+| benchmark | instructions before | after | change | CPU time before (ms) | after (ms) |
+|---|---:|---:|---:|---:|---:|
+| fib | 157.3 M | 163.7 M | +4.0% | 12.4 | 12.2 |
+| loops | 295.0 M | 295.0 M | 0.0% | 27.7 | 27.4 |
+| arrays | 240.3 M | 239.8 M | −0.2% | 19.0 | 18.6 |
+| strings | 136.8 M | 136.2 M | −0.5% | 18.5 | 18.7 |
+| maps | 112.4 M | 112.3 M | −0.1% | 9.6 | 10.0 |
+| structs | 227.5 M | 229.9 M | +1.1% | 25.0 | 24.2 |
+| closures | 251.6 M | 256.6 M | +2.0% | 22.0 | 21.3 |
+
+Instructions: valgrind `callgrind`, gcc 13.3 `-O2`; times: medians of 60
+interleaved runs (differences within the ±3% noise of this machine). The extra
+instructions on call-heavy code come from register allocation around the
+return path, not from the test itself. Inlining the effect helpers into the
+interpreter (GCC's default for static functions called once) costs another
+0.5–4% of instructions on every benchmark, so they are marked `TV_NOINLINE`. `TIL_BENCH=1` against TIL 3.0
+after the merge: fib 2.81x, loops 2.66x, arrays 3.08x, strings 2.43x. An
+effects-heavy program (300 000 resumed performs in a fused loop, 100 000
+aborted handles around a `for` loop) runs 2.2x faster than on the effects
+branch's TIL 3.0-style interpreter.

@@ -115,7 +115,10 @@ and `compile_to_bytecode(..., fuse=False)` turn it off):
    `ARG_DEFAULT` and `HANDLE`) and the pcs of the **line table**;
 2. a sequence is fused only when none of its instructions *after the first* is
    a jump target or has a line-table entry. Sequences never contain calls,
-   `TRY`/`END_TRY` (recovery points), `PANIC` or effect instructions;
+   `TRY`/`END_TRY` (recovery points), `PANIC` or effect instructions
+   (`HANDLE`/`END_HANDLE`/`PERFORM`/`RESUME` are also refused explicitly,
+   `_NEVER_FUSED`); a perform resumes at the instruction after it and an
+   aborted handle continues at the `HANDLE` target, both instruction starts;
 3. `JUMP 0` (a jump to the next instruction, left behind by `if` without
    `else`) is removed;
 4. among all possible choices, dynamic programming picks the one with the
@@ -145,8 +148,11 @@ instructions and is 10–25% smaller.
   live in C locals. `vm->st.sp` and the frame's `pc` are written back only
   before a helper that works on the stack, before anything that can allocate
   (the collector scans `st.sp` slots) and before returning to the host — the
-  saved state is exactly what TIL 3.0 saved, so raw snapshots
-  (`tilvm_snapshot` / `tilvm_restore`) keep their format.
+  interpreter adds nothing to the saved state, so raw snapshots
+  (`tilvm_snapshot` / `tilvm_restore`) keep the format of TIL 3.0. (Effect
+  handlers, merged later, add their entries to `tilvm_state`; the struct size
+  in the snapshot header keeps builds with and without them apart, see
+  `docs/TIL_EFFECTS.md`.)
 * **Fast paths** for integer arithmetic, comparisons, compare-and-branch,
   array indexing, `array.push`, field access and calls; everything else goes
   through the TIL 3.0 helpers. Superinstruction slow paths push their operands
@@ -168,6 +174,14 @@ instructions and is 10–25% smaller.
   budget). Steps, `tick`, yields and timeouts are unchanged. (A feature that
   needs work every N steps, such as idling for energy saving, adds a term to
   `refuel()` and its check to the slow path.)
+* **Effects** (`docs/TIL_EFFECTS.md`): `PERFORM` enters the clause or default
+  function through the same `call_fn` path as `CALL` (one step), every return
+  path (`RETURN`, `RETURN_NIL`, `UNWRAP_OR_RETURN`, `RETURN_LOCAL`,
+  `CAST_RETURN`) goes through `do_return`, which drops the frame's handler
+  entries and performs clause aborts, and `RESUME` pops the clause frame in the
+  loop. The effect helpers (`effect_target`, `effect_leave`) are kept out of line
+  (`TV_NOINLINE`): inlined into the interpreter they cost the hot handlers
+  registers (up to 4% more executed instructions on the benchmarks).
 * **Strings and maps.** `find` / `contains` / `split` / `count` / `replace`
   locate candidates with `memchr`; map lookups compare int and string keys
   directly; f-strings are measured and built with a single allocation;
@@ -177,7 +191,10 @@ Code size (`arm-none-eabi-gcc -Os -mcpu=cortex-m0 -mthumb -DTILVM_INT_BITS=32
 -DTILVM_FLOAT=0`, `tilvm.o` text): `TILVM_LEAN` 20 335 → 21 315 bytes (+4.8%);
 full build 26 831 → 30 927 bytes (+15%; with computed goto, `-O2`-style builds,
 about 2 KB more). The lean build keeps only the compact slow paths of the
-superinstructions.
+superinstructions. These figures are without effect handlers (TIL 3.1 feature 8,
+included by default): they add about 1.6-1.8 KB (`TILVM_LEAN` with the flags
+above: 23 125 bytes; `TILVM_NO_EFFECTS` takes them out again, see
+`docs/TIL_EFFECTS.md`).
 
 ## 4. The reference VM (`src/til.py`, class `TILVM`)
 
