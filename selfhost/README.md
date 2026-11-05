@@ -131,13 +131,13 @@ items listed under *Not supported*:
 
 ### Known differences from the Python compiler
 
+They never change the behaviour of a valid program unless stated:
+
 * **No type inference (`E-TYPE`).** `til` (the Python compiler) also runs the
   gradual type checker of the typed native backend (`src/tiltypes.py`) and
   rejects definite type errors such as `let x: int = "a"`; tilc does not, so
   it accepts such a program (the VM then runs it with the value it got). Every
   program `til` accepts, tilc accepts with identical bytes.
-
-They never change the behaviour of a valid program unless stated:
 
 * A float constant expression whose value is NaN (`1e400 - 1e400`) is not
   folded (its bit pattern in the Python compiler depends on the CPU); the
