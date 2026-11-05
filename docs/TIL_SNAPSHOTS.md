@@ -169,10 +169,10 @@ STATE (16 bytes)
                               takes the low 32 bits, 0 -> the default seed)
     22    2  u16 tick         deadline-check counter, 0..255 (both VMs look at
                               the deadlines every 256 steps while one exists)
-    24    1  u8  energy mode  battery saving (design §11): 0 performance, 1 balanced, 2 low
-                              performance, 1 balanced, 2 low. Written 0 by
-                              this version; readers accept 0..2 (other values
-                              are corrupt) and ignore it until §11 lands
+    24    1  u8  energy mode  battery saving (design §11, docs/TIL_ENERGY.md):
+                              0 performance, 1 balanced, 2 low; written from
+                              the VM's mode and restored on load (other
+                              values are corrupt: -4)
     25    1  u8  reserved = 0
 GLOBALS COUNT
     26    2  u16 G            must equal the program's global count
