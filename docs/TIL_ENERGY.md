@@ -160,8 +160,9 @@ with a model of the rule computed from a step trace.
   `tilvm_state` (it took the former padding byte after `failed`, so the
   struct did not change size) and the attribute `TILVM.energy` in the
   reference VM. Raw snapshots (`tilvm_snapshot`, `tilvm --snapshot-after`)
-  keep it; portable snapshots (`.tilp`) should store it with the other state
-  flags. The idle counter (`vm->idle_count`, `TILVM.idle_count`) is a
+  keep it; portable snapshots (`.tilp`) store it in their state header (byte
+  24, docs/TIL_SNAPSHOTS.md), so a program paused in low mode on a PC keeps
+  saving energy on the calculator. The idle counter (`vm->idle_count`, `TILVM.idle_count`) is a
   statistic of one run, not program state.
 * `vm->flags` (the header byte) gets bit 7 in the C VM when some function is
   energy-low (computed by `tilvm_load`).

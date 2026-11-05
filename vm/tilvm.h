@@ -38,7 +38,9 @@
  *                      TILVM_LEAN and -Os builds), 0 = smaller code, same results
  *   TILVM_NO_STDIO     no <stdio.h>: the host must set vm->write
  *   TILVM_NO_TIME      no <time.h>: timeouts count steps (1 ms = 1000 steps)
- *   TILVM_NO_MATH      no <math.h>: sqrt/sin/... use built-in approximations
+ *   TILVM_NO_MATH      no <math.h>: exact floor/ceil/fmod, correctly rounded sqrt, pow
+ *                      with integer exponents; sin/cos/tan/log/exp and pow with a
+ *                      fractional exponent report an error (vm/README.md)
  *   TILVM_ADDR16       16-bit address space (Z80): 16-bit bytecode offsets and object
  *                      lengths (programs and heap below 64 KB) - much smaller code
  *   TILVM_LEAN         smallest code for 8-bit CPUs: the whole language core, but
@@ -392,7 +394,12 @@ typedef struct tilvm {
 #define TILVM_EXIT   3   /* exit(n) was called: see st.exit_code */
 
 /* Load a program. The bytecode buffer must stay valid while the VM runs.
- * Returns 0 on success, a negative error code otherwise. */
+ * Returns 0 on success, a negative error code otherwise: -1 not TIL bytecode,
+ * -2 unknown version, -3 uses floats (build without), -4 > TILVM_MAX_CONSTS,
+ * -5 truncated or malformed, -6 integer constant too large, -7 > TILVM_MAX_TYPES,
+ * -8 too many globals for the stack, -10 > TILVM_MAX_FUNCS / above 64 KB (ADDR16).
+ * Any `size` bytes are loaded safely (nothing outside them is read, also later
+ * by error reports); the instructions of a file that loaded are trusted. */
 int tilvm_load(tilvm *vm, const uint8_t *bytecode, uint32_t size);
 
 /* Run to completion. Returns the program's exit code (0 = success). */

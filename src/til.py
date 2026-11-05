@@ -9205,6 +9205,53 @@ class VMCell:
 _UNDEF = object()   # argument slot not supplied by the caller (use the default)
 
 
+class _MapBool:
+    """true / false as a key of a map (a Python dict): the dict would merge them with
+    the keys 1 / 0 (True == 1 in Python); TIL keeps them apart, like the C VM. Two
+    singletons, MAP_TRUE and MAP_FALSE, only ever inside dicts: everything that
+    hands map keys to a program (iter(), keys(), printing, snapshots) gives the bool."""
+    __slots__ = ('v',)
+
+    def __init__(self, v: bool):
+        self.v = v
+
+    def __repr__(self):
+        return 'MAP_TRUE' if self.v else 'MAP_FALSE'
+
+    def __reduce__(self):
+        return 'MAP_TRUE' if self.v else 'MAP_FALSE'
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+MAP_TRUE, MAP_FALSE = _MapBool(True), _MapBool(False)
+
+
+def map_keys(d: dict) -> list:
+    """The keys of a VM map as TIL values."""
+    keys = list(d.keys())
+    if MAP_TRUE in d or MAP_FALSE in d:
+        keys = [k.v if type(k) is _MapBool else k for k in keys]
+    return keys
+
+
+def c_pow(x: float, y: float) -> float:
+    """C99 pow() (both VMs' float **): math.pow() without its exceptions."""
+    try:
+        return _math.pow(x, y)
+    except (OverflowError, ValueError):
+        odd = _math.isfinite(y) and y == _math.floor(y) and _math.fmod(y, 2.0) != 0.0
+        if x == 0.0:                    # pow(+-0, y < 0): +-inf
+            return _math.copysign(float('inf'), x) if odd else float('inf')
+        if x != x or y != y or (x < 0 and _math.isfinite(y) and y != _math.floor(y)):
+            return float('nan')         # a negative number to a fractional power
+        return float('-inf') if x < 0 and odd else float('inf')     # overflow
+
+
 def fmt_g(x: float) -> bytes:
     """C printf("%g") formatting (TIL's float output on every backend)."""
     if x != x:
@@ -9229,16 +9276,53 @@ def c_pow(a: float, b: float) -> float:
         return float('nan')                        # negative ** fractional
 
 
-def til_format_spec(v, spec: bytes, to_str, to_int=None) -> bytes:
-    """f-string format specs: [<>^][0][width][.prec][f|e|%|d|x|X|o|b].
-    `to_int` converts a float for d/x/X/o/b as int() does (the VM's cast: wraps
-    to 64 bits, an error for nan/inf)."""
-    m = re.match(rb'^([<>^]?)(0?)(\d*)(?:\.(\d+))?([fdxXobe%]?)$', spec)
-    if not m:
+FMT_MAX_WIDTH, FMT_MAX_PREC = 60, 30     # = format_slot() in vm/tilvm.c
+# Limits of the reference VM's builtins, so that a huge argument is a TIL runtime
+# error (as on the C VM) instead of exhausting the host: the longest string
+# repeat() makes (= TV_STR_MAX of the default C VM build: "string too long"), the
+# most elements range() makes (C VM: 65535, "range too large"), the longest
+# sleep_ms() (the C VM's millisecond clock arithmetic wraps above 2^31 - 1).
+STR_MAX = 0xFFFFFF
+RANGE_MAX = 0xFFFFFF
+SLEEP_MAX_MS = 0x7FFFFFFF
+
+
+def _spec_digits(spec: bytes, k: int):
+    """The decimal digits of a format spec at position k -> (value, next position)."""
+    j = k
+    while j < len(spec) and 0x30 <= spec[j] <= 0x39:
+        j += 1
+    return (int(spec[k:j]) if j > k else 0), j
+
+
+def til_format_spec(v, spec: bytes, to_str) -> bytes:
+    """f-string format specs: [<>^][0][width][.prec][f|e|%|d|x|X|o|b], read exactly
+    like format_slot() in vm/tilvm.c: a width above 60 counts as 60, a precision
+    above 30 as 30, `.` without digits is precision 0, and any other spec gives the
+    value's text unpadded. An int kind takes a float's exact integer part (nan/inf:
+    a TIL runtime error, as for int())."""
+    k, n = 0, len(spec)
+    align = zero = kind = b''
+    if k < n and spec[k] in b'<>^':
+        align = spec[k:k + 1]
+        k += 1
+    if k < n and spec[k] == 0x30:
+        zero = b'0'
+        k += 1
+    width, k = _spec_digits(spec, k)
+    prec = None
+    if k < n and spec[k] == 0x2E:
+        prec, k = _spec_digits(spec, k + 1)
+    if k < n:
+        kind = spec[k:k + 1]
+        k += 1
+    if kind == b'\0':
+        kind = b''                      # the C VM reads a NUL byte as "no kind"
+    if k != n or (kind and kind not in b'fdxXobe%'):
         return to_str(v)
-    align, zero, width, prec, kind = m.groups()
-    width = int(width) if width else 0
-    prec = int(prec) if prec is not None else None
+    width = min(width, FMT_MAX_WIDTH)
+    if prec is not None:
+        prec = min(prec, FMT_MAX_PREC)
     is_num = isinstance(v, (int, float)) and not isinstance(v, bool)
     if kind in (b'f', b'e', b'%') and is_num:
         p = 6 if prec is None else prec
@@ -9247,7 +9331,9 @@ def til_format_spec(v, spec: bytes, to_str, to_int=None) -> bytes:
         if kind == b'%':
             body += b'%'
     elif kind in (b'd', b'x', b'X', b'o', b'b') and is_num:
-        n = v if type(v) is int else (to_int(v) if to_int else wrap_int64(int(v)))
+        if v != v or v in (float('inf'), float('-inf')):
+            raise TILPanic(b"cannot convert nan/inf to int")
+        n = wrap_int64(int(v))          # as int(x): wraps to 64 bits (vm/tilvm.c: f_to_int)
         digits = {b'd': '%d', b'x': '%x', b'X': '%X', b'o': '%o'}.get(kind)
         body = (digits % abs(n)).encode() if digits else bin(abs(n))[2:].encode()
         if n < 0:
@@ -9885,6 +9971,8 @@ class TILVM:
                 fn + b": " + self.to_str(x, depth + 1, True) for fn, x in zip(fields, v.f)) + b" }"
         if tv is VMClosure:
             return b"<fn " + self.m.funcs[v.fn].name.encode('utf-8') + b">"
+        if tv is _MapBool:
+            return b"true" if v.v else b"false"
         return b"?"
 
     @staticmethod
@@ -9923,6 +10011,8 @@ class TILVM:
             return True
         if ta is VMStruct:
             return a.t == b.t and all(self.equal(x, y, depth + 1) for x, y in zip(a.f, b.f))
+        if ta is VMClosure:     # a function without upvalues is the same value everywhere (C VM)
+            return a.fn == b.fn and not a.up and not b.up
         return a == b
 
     def panic(self, msg):
@@ -9968,8 +10058,10 @@ class TILVM:
                         return float('nan')
                     return _math.copysign(float('inf'), a) * _math.copysign(1.0, b)
                 return a / b
-            if op == Op.MOD:            # C's fmod (vm/tilvm.c): nan for x % 0 and inf % y
-                return _math.fmod(a, b) if b != 0.0 and a - a == 0.0 else float('nan')
+            if op == Op.MOD:
+                if b == 0.0 or a - a != 0.0:        # C fmod(): nan for x % 0 and inf % y
+                    return float('nan') if b == b else b
+                return _math.fmod(a, b)
             if op == Op.POW:
                 return c_pow(a, b)
         if op == Op.ADD:
@@ -9979,6 +10071,8 @@ class TILVM:
                 return a + b
         if op == Op.MUL:
             if ta is bytes and tb is int:
+                if b > 0 and len(a) > STR_MAX // b:
+                    self.panic("string too long")
                 return a * max(b, 0)
             if ta is list and tb is int:
                 return a * max(b, 0)
@@ -10071,10 +10165,14 @@ class TILVM:
 
     def map_key(self, k):
         tk = type(k)
-        if tk is bytes or tk is int or k is None or tk is bool:
+        if tk is bytes or tk is int or k is None:
             return k
-        if tk is float:      # 2.0 -> 2 (a whole number in int64 range; inf, nan and 1e300 stay floats)
-            return int(k) if k - k == 0.0 and k == int(k) and -2.0 ** 63 <= k < 2.0 ** 63 else k
+        if tk is bool:
+            return MAP_TRUE if k else MAP_FALSE
+        if tk is float:
+            # an integral float in the int64 range is the int key (nan, inf and larger
+            # floats stay floats, as in the C VM)
+            return int(k) if -9223372036854775808.0 <= k < 9223372036854775808.0 and k == int(k) else k
         self.panic(f"{self.type_name(k).decode()} cannot be a map key")
 
     def index_set(self, obj, idx, val):
@@ -10123,7 +10221,7 @@ class TILVM:
         if name == 'iter':
             v = args[0]
             if type(v) is dict:
-                return list(v.keys())
+                return map_keys(v)
             if type(v) in (list, bytes):
                 return v
             self.panic(f"{self.type_name(v).decode()} is not iterable")
@@ -10151,7 +10249,7 @@ class TILVM:
                 if name == 'log':
                     return _math.log(x) if x > 0 else (float('-inf') if x == 0 else float('nan'))
                 if name == 'round':
-                    return _math.copysign(_math.floor(abs(x) + 0.5), x) if x == x else x
+                    return _math.copysign(_math.floor(abs(x) + 0.5), x) if x - x == 0.0 else x
                 if name in ('floor', 'ceil') and (x != x or x in (float('inf'), float('-inf'))):
                     return x
                 return float(getattr(_math, name)(x))
@@ -10171,6 +10269,8 @@ class TILVM:
         if name == 'sum':
             total = 0
             for v in args[0] if len(args) == 1 and type(args[0]) is list else args:
+                if type(v) is not int and type(v) is not float:
+                    self.panic("sum() needs numbers")
                 total = self.arith(Op.ADD, total, v)
             return total
         if name == 'input':
@@ -10178,26 +10278,39 @@ class TILVM:
                 self.write(self.to_str(args[0]))
             return self.read_line()
         if name == 'chr':
-            n = self.num(args[0], 'chr')
-            try:
-                return chr(int(n)).encode('utf-8')
-            except (ValueError, OverflowError):
+            n = args[0]
+            if type(n) is not int:
+                self.panic("chr() needs an integer")
+            if not 0 <= n <= 0x10FFFF or 0xD800 <= n <= 0xDFFF:
                 self.panic("chr() argument out of range")
+            return chr(n).encode('utf-8')
         if name == 'ord':
             s = args[0]
             if type(s) is not bytes or not s:
                 self.panic("ord() expects a non-empty string")
-            return ord(s.decode('utf-8', 'replace')[0]) if s[0] >= 0x80 else s[0]
+            # the first UTF-8 sequence, read like the C VM (no validation)
+            c, n = s[0], len(s)
+            if c >= 0xF0 and n >= 4:
+                return ((c & 7) << 18) | ((s[1] & 63) << 12) | ((s[2] & 63) << 6) | (s[3] & 63)
+            if c >= 0xE0 and n >= 3:
+                return ((c & 15) << 12) | ((s[1] & 63) << 6) | (s[2] & 63)
+            if c >= 0xC0 and n >= 2:
+                return ((c & 31) << 6) | (s[1] & 63)
+            return c
         if name == 'range':
             a, b = args[0], args[1]
             incl = len(args) > 2 and self.truthy(args[2])
             if type(a) is not int or type(b) is not int:
                 self.panic("range bounds must be integers")
+            if b - a + incl > RANGE_MAX:     # the C VM's limit is 65535 (arrays)
+                self.panic("range too large")
             return list(range(a, b + 1 if incl else b))
         if name == 'type_of':
             return self.type_name(args[0])
         if name == 'format':
-            return til_format_spec(args[0], args[1], self.to_str, lambda x: self.cast(0, x))
+            if type(args[1]) is not bytes:
+                self.panic(f"format() expects a spec string, got {self.type_name(args[1]).decode()}")
+            return til_format_spec(args[0], args[1], self.to_str)
         if name == 'clock_ms':
             return int(_time.monotonic() * 1000)
         if name == 'random':
@@ -10207,18 +10320,25 @@ class TILVM:
             r = (self.rng * 0x2545F4914F6CDD1D) & INT64_MASK
             if len(args) >= 2:
                 lo, hi = args[0], args[1]
-                if hi < lo:
+                if type(lo) is not int or type(hi) is not int or hi < lo:
                     self.panic("random(lo, hi) needs lo <= hi")
                 return lo + (r % (hi - lo + 1))
             return (r >> 11) / float(1 << 53)
         if name == 'seed':
+            if type(args[0]) is not int:
+                self.panic("seed() needs an integer")
             self.rng = (args[0] & INT64_MASK) or 0x9E3779B97F4A7C15
             return None
         if name == 'sleep_ms':
-            _time.sleep(max(0, self.num(args[0], 'sleep_ms')) / 1000.0)
+            ms = args[0]
+            if type(ms) is not int:
+                self.panic("sleep_ms() needs an integer")
+            _time.sleep(min(max(0, ms), SLEEP_MAX_MS) / 1000.0)
             return None
         if name == 'exit':
-            raise TILExit(int(args[0]) if args else 0)
+            if args and type(args[0]) is not int:
+                self.panic("exit() needs an integer")
+            raise TILExit(args[0] & 0xFF if args else 0)
         if name == 'panic':
             self.panic(self.to_str(args[0]) if args else b"panic")
         if name in ('read_file', 'write_file', 'file_exists'):
@@ -10340,9 +10460,12 @@ class TILVM:
         return None
 
     # ── builtin methods ─────────────────────────────────────────────────────
+    # The checks (argument count and types) and their order are those of
+    # str_method / array_method / map_method / variant_method in vm/tilvm.c.
     def call_method(self, mid: int, recv, args: list):
         name = METHODS[mid] if mid < len(METHODS) else '?'
         argc = len(args)
+        a1 = args[0] if argc else None
         tr = type(recv)
         if name == 'to_string':
             return self.to_str(recv)
@@ -10350,98 +10473,109 @@ class TILVM:
             s = recv
             if name == 'len':
                 return len(s)
-            if name in ('contains', 'starts_with', 'ends_with', 'find', 'index_of', 'count',
-                        'eq', 'split', 'replace') and argc and type(args[0]) is not bytes:
-                self.panic(f"str.{name} expects a string argument")
-            if name == 'contains':
-                return args[0] in s
-            if name == 'starts_with':
-                return s.startswith(args[0])
-            if name == 'ends_with':
-                return s.endswith(args[0])
+            if name == 'is_empty':
+                return len(s) == 0
+            if name in ('contains', 'starts_with', 'ends_with', 'find', 'index_of', 'count', 'eq'):
+                if type(a1) is not bytes:
+                    self.panic(f"str.{name} expects a string argument")
+                if name == 'contains':
+                    return a1 in s
+                if name == 'starts_with':
+                    return s.startswith(a1)
+                if name == 'ends_with':
+                    return s.endswith(a1)
+                if name == 'count':
+                    return s.count(a1) if a1 else 0
+                if name == 'eq':
+                    return s == a1
+                return s.find(a1)
+            if name == 'get':
+                return self.index_get(s, a1)
             if name == 'trim':
                 return s.strip(b' \t\r\n')
             if name == 'to_upper':
                 return s.upper()
             if name == 'to_lower':
                 return s.lower()
-            if name == 'replace':
-                return s if not args[0] else s.replace(args[0], self.to_str(args[1]))
             if name == 'slice':
-                n = len(s)
-                a = max(0, min(args[0], n))
-                b = max(0, min(args[1] if argc > 1 else n, n))
-                return s[a:b] if a < b else b""
-            if name in ('find', 'index_of'):
-                return s.find(args[0])
-            if name == 'count':
-                return s.count(args[0]) if args[0] else 0
-            if name == 'eq':
-                return s == args[0]
-            if name == 'split':
-                if not argc:
-                    return s.split()
-                return s.split(args[0]) if args[0] else [bytes([c]) for c in s]
+                lo, hi = self.slice_bounds(args, len(s))
+                return s[lo:hi]
             if name == 'repeat':
-                return s * max(args[0], 0)
+                if type(a1) is not int:
+                    self.panic("repeat() needs an integer")
+                times = max(a1, 0)
+                if times and len(s) > STR_MAX // times:
+                    self.panic("string too long")
+                return s * times
+            if name == 'replace':
+                if argc < 2 or type(a1) is not bytes:
+                    self.panic("replace() needs two strings")
+                return s.replace(a1, self.to_str(args[1])) if a1 else s
+            if name == 'split':
+                if argc and type(a1) is not bytes:
+                    self.panic("split() needs a string separator")
+                if not argc:
+                    return [w for w in re.split(rb'[ \t\n\r]+', s) if w]
+                return s.split(a1) if a1 else [bytes([c]) for c in s]
             if name == 'to_int':
                 return self.cast(0, s)
             if name == 'to_float':
                 return self.cast(1, s)
-            if name == 'is_empty':
-                return len(s) == 0
-            if name == 'get':
-                return self.index_get(s, args[0])
         elif tr is list:
             a = recv
             if name == 'len':
                 return len(a)
+            if name == 'is_empty':
+                return len(a) == 0
             if name == 'push':
-                a.append(args[0])
+                if not argc:
+                    self.panic("push() needs a value")
+                a.append(a1)
                 return None
             if name == 'pop':
                 if not a:
                     self.panic("pop() from empty array")
                 return a.pop()
-            if name == 'get':
-                return self.index_get(a, args[0])
-            if name == 'set':
-                self.index_set(a, args[0], args[1])
-                return None
-            if name == 'contains':
-                return any(self.equal(x, args[0]) for x in a)
-            if name == 'index_of':
-                for i, x in enumerate(a):
-                    if self.equal(x, args[0]):
-                        return i
-                return -1
-            if name == 'count':
-                return sum(1 for x in a if self.equal(x, args[0]))
-            if name == 'insert':
-                i = args[0]
-                if type(i) is not int or not 0 <= i <= len(a):
-                    self.panic(f"insert index out of bounds: {i}")
-                a.insert(i, args[1])
-                return None
-            if name == 'remove':
-                i = args[0]
-                if type(i) is not int or not 0 <= i < len(a):
-                    self.panic(f"remove index out of bounds: {i}")
+            if name in ('get', 'set', 'insert', 'remove'):
+                i = a1
+                if type(i) is not int:
+                    self.panic("index must be an integer")
+                if name == 'insert':
+                    if not 0 <= i <= len(a):
+                        self.panic(f"insert index out of bounds: {i}")
+                    if argc < 2:
+                        self.panic("insert() needs an index and a value")
+                    a.insert(i, args[1])
+                    return None
+                if not 0 <= i < len(a):
+                    if name == 'remove':
+                        self.panic(f"remove index out of bounds: {i}")
+                    self.panic(f"index out of bounds: index {i}, length {len(a)}")
+                if name == 'get':
+                    return a[i]
+                if name == 'set':
+                    if argc < 2:
+                        self.panic("set() needs an index and a value")
+                    a[i] = args[1]
+                    return None
                 return a.pop(i)
+            if name in ('contains', 'index_of', 'count'):
+                if not argc:
+                    self.panic("method needs a value")
+                if name == 'contains':
+                    return any(self.equal(x, a1) for x in a)
+                if name == 'index_of':
+                    for i, x in enumerate(a):
+                        if self.equal(x, a1):
+                            return i
+                    return -1
+                return sum(1 for x in a if self.equal(x, a1))
             if name == 'reverse':
                 a.reverse()
                 return None
             if name == 'sort':
                 self.sort_array(a)
                 return None
-            if name == 'join':
-                sep = args[0] if argc else b""
-                return self.to_str(sep).join(self.to_str(x) for x in a)
-            if name == 'slice':
-                n = len(a)
-                lo = max(0, min(args[0], n))
-                hi = max(0, min(args[1] if argc > 1 else n, n))
-                return a[lo:hi] if lo < hi else []
             if name == 'first':
                 return a[0] if a else None
             if name == 'last':
@@ -10449,39 +10583,52 @@ class TILVM:
             if name == 'clear':
                 a.clear()
                 return None
-            if name == 'is_empty':
-                return len(a) == 0
-            if name == 'copy':
-                return list(a)
             if name in ('sum', 'min', 'max'):
                 return self.call_native(NATIVE_ID[name], [a])
+            if name == 'copy':
+                return list(a)
+            if name == 'slice':
+                lo, hi = self.slice_bounds(args, len(a))
+                return a[lo:hi]
+            if name == 'join':
+                sep = self.to_str(a1) if argc else b""
+                return sep.join(self.to_str(x) for x in a)
         elif tr is dict:
             d = recv
             if name == 'len':
                 return len(d)
-            if name == 'set':
-                d[self.map_key(args[0])] = args[1]
-                return None
-            if name == 'get':
-                return self.index_get(d, args[0])
-            if name == 'get_or':
-                return d.get(self.map_key(args[0]), args[1])
-            if name in ('has', 'contains'):
-                return self.map_key(args[0]) in d
-            if name in ('delete', 'remove'):
-                d.pop(self.map_key(args[0]), None)
-                return None
-            if name == 'keys':
-                return list(d.keys())
-            if name == 'values':
-                return list(d.values())
             if name == 'is_empty':
                 return len(d) == 0
+            if name == 'set':
+                if argc < 2:
+                    self.panic("set() needs a key and a value")
+                d[self.map_key(a1)] = args[1]
+                return None
+            if name in ('get', 'get_or', 'has', 'contains', 'delete', 'remove'):
+                if name == 'get_or' and argc < 2:
+                    self.panic("get_or() needs a key and a default")
+                if not argc:
+                    self.panic("map method needs a key")
+                key = self.map_key(a1)
+                if name in ('has', 'contains'):
+                    return key in d
+                if name in ('delete', 'remove'):
+                    d.pop(key, None)
+                    return None
+                if key in d:
+                    return d[key]
+                if name == 'get_or':
+                    return args[1]
+                self.panic(b"key not found: " + self.to_str(a1))
+            if name == 'keys':
+                return map_keys(d)
+            if name == 'values':
+                return list(d.values())
+            if name == 'copy':
+                return dict(d)
             if name == 'clear':
                 d.clear()
                 return None
-            if name == 'copy':
-                return dict(d)
         elif recv is None or (tr is VMStruct and recv.t <= TYPE_ERR):
             kind = -1 if recv is None else recv.t
             ok = kind in (TYPE_SOME, TYPE_OK)
@@ -10497,18 +10644,63 @@ class TILVM:
             if name == 'expect':
                 if ok:
                     return recv.f[0]
-                self.panic(self.to_str(args[0]))
+                self.panic(self.to_str(a1) if argc else b"expect() failed")
             if name == 'unwrap_or':
-                return recv.f[0] if ok else args[0]
+                if not argc:
+                    self.panic("unwrap_or() needs a default")
+                return recv.f[0] if ok else a1
             if name == 'error':
                 return recv.f[0] if kind == TYPE_ERR else None
         self.panic(f"no method '{name}' on {self.type_name(recv).decode()}")
+
+    def slice_bounds(self, args: list, n: int):
+        """slice(lo = 0, hi = n) of a string or array: integer bounds, clamped to 0..n."""
+        lo = args[0] if args else 0
+        hi = args[1] if len(args) > 1 else n
+        if type(lo) is not int or type(hi) is not int:
+            self.panic("index must be an integer")
+        lo = min(max(lo, 0), n)
+        hi = min(max(hi, 0), n)
+        return lo, max(lo, hi)
+
+    def builtin_failure(self, e: Exception, op_pc: int) -> TILPanic:
+        """Safety net of execute(): a Python exception that escapes a builtin (a native
+        or a builtin method; their own checks give the C VM's messages, so this means
+        a check is missing) becomes a TIL runtime error that retry/timeout can catch,
+        not an internal crash; so does a value too large for the host's memory.
+        Anything else is a bug of the VM, or control flow of a host (the debugger's
+        pause, raised at an instruction boundary): raised again."""
+        if type(e).__module__ != 'builtins':
+            raise e
+        if isinstance(e, MemoryError):
+            return TILPanic(b"out of memory")
+        code = self.code
+        op = code[op_pc]
+        if op == Op.NATIVE or op == Op.NATIVE_POP:
+            nid = code[op_pc + 1]
+            name = NATIVES[nid] if nid < len(NATIVES) else '?'
+        elif op == Op.INVOKE:
+            mid = code[op_pc + 3]
+            name = METHODS[mid] if mid < len(METHODS) else '?'
+        else:
+            raise e
+        return TILPanic(f"{name}(): invalid arguments")
 
     def sort_array(self, a: list):
         if not a:
             return
         if all(type(x) in (int, float) for x in a) or all(type(x) is bytes for x in a):
-            a.sort()
+            if any(x != x for x in a):
+                # nan compares false with everything: the order is that of the C VM's
+                # stable insertion sort (sorted() could give another one)
+                for i in range(1, len(a)):
+                    key, j = a[i], i
+                    while j > 0 and key < a[j - 1]:
+                        a[j] = a[j - 1]
+                        j -= 1
+                    a[j] = key
+            else:
+                a.sort()
         else:
             self.panic("sort() needs an array of numbers or of strings")
 
@@ -10829,7 +11021,7 @@ class TILVM:
                     out.append(TILP_MAP)
                     out += pack('<I', len(o))
                     for x, y in o.items():
-                        value(x)
+                        value(x.v if type(x) is _MapBool else x)
                         value(y)
                 elif t is VMStruct:
                     out.append(TILP_STRUCT)
@@ -11089,7 +11281,7 @@ class TILVM:
                     k = res(k)
                     if not (k is None or type(k) in (bool, int, float, bytes)):
                         raise SnapshotError(-4, "bad map key")
-                    o[k] = res(v)
+                    o[(MAP_TRUE if k else MAP_FALSE) if type(k) is bool else k] = res(v)
             elif t is VMStruct:
                 o.f = [res(x) for x in raw]
             elif t is VMClosure:
@@ -11840,6 +12032,13 @@ class TILVM:
                 e.pc = op_pc
             frame[1] = pc
             raise
+        except (TILExit, TILPause, RecursionError):
+            raise
+        except Exception as e:      # noqa: BLE001 - see builtin_failure()
+            p = self.builtin_failure(e, op_pc)
+            p.pc = op_pc
+            frame[1] = pc
+            raise p from e
 
 
 def disassemble(m: TBCModule) -> str:
@@ -12462,6 +12661,149 @@ def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
     return program
 
 
+# ── classic C backend: operand order (TIL 3.1 review) ─────────────────────────
+_CLASSIC_PURE_CALLS = frozenset({
+    'len', 'str', 'int', 'float', 'bool', 'abs', 'sqrt', 'pow', 'sin', 'cos', 'tan', 'log',
+    'exp', 'floor', 'ceil', 'round', 'min', 'max', 'chr', 'ord', 'range', 'type_of', 'format',
+    'sum', 'str_bytes', 'args', 'file_exists', 'Some', 'Ok', 'Err'})
+_CLASSIC_PURE_METHODS = frozenset({
+    'len', 'contains', 'starts_with', 'ends_with', 'trim', 'to_upper', 'to_lower', 'replace',
+    'slice', 'find', 'index_of', 'count', 'eq', 'split', 'repeat', 'is_empty', 'get', 'join',
+    'first', 'last', 'has', 'keys', 'values', 'get_or', 'is_some', 'is_none', 'is_ok', 'is_err',
+    'unwrap_or', 'to_string', 'copy', 'unwrap', 'error'})
+
+
+def classic_order_hazard(program: 'Program') -> Optional[ASTNode]:
+    """The classic C backend (`--no-types`, or no src/tiltypes.py) writes
+    operands as one C expression, and C does not define the order in which they
+    are evaluated, while the VMs evaluate left to right (`G += f()` reads G
+    before the call). Returns a node where that order is observable -- the
+    program then runs on the VM -- or None:
+
+    * an operand list (operator, call arguments and receiver, literal
+      elements, struct fields, f-string parts, index) with an operand that has
+      side effects (calls a function that prints, assigns a global, a field or
+      an element, calls a mutating method, ...) and another operand that reads
+      something such a call could change (a global, a field, an element, any
+      call);
+    * an assignment whose value has side effects and whose target is a field
+      or an element, or a compound assignment (`+=` ...) to a global.
+    """
+    funcs: Dict[str, List[FuncDef]] = {}
+    globals_: Set[str] = set()
+    consts: Set[str] = set()
+    types: Set[str] = set()
+    literal = (IntLit, FloatLit, StringLit, BoolLit, CharLit)
+    for st in program.statements:
+        if isinstance(st, FuncDef):
+            funcs.setdefault(st.name, []).append(st)
+        elif isinstance(st, ImplBlock):
+            for m in st.methods:
+                funcs.setdefault(m.name, []).append(m)
+        elif isinstance(st, VarDecl):
+            globals_.add(st.name)
+            if not st.mutable and isinstance(st.value, literal):
+                consts.add(st.name)
+        elif isinstance(st, (StructDef, EnumDef)):
+            types.add(st.name)
+    mutable_globals = globals_ - consts
+
+    def direct_impure(body) -> Tuple[bool, Set[str]]:
+        """(impure by itself, names of the user functions / methods it calls)."""
+        calls: Set[str] = set()
+        for n in walk(body):
+            if isinstance(n, Assignment):
+                t = n.target
+                if not isinstance(t, Identifier) or t.name in mutable_globals:
+                    return True, calls
+            elif isinstance(n, (PerformEffect, RetryExpr, TimeoutExpr, IntentBlock, EffectHandler)):
+                return True, calls
+            elif isinstance(n, Call):
+                f = n.func
+                if isinstance(f, Identifier):
+                    if f.name in funcs:
+                        calls.add(f.name)
+                    elif f.name not in _CLASSIC_PURE_CALLS and f.name not in types:
+                        return True, calls      # print, input, a closure value, ...
+                elif isinstance(f, Attribute):
+                    if f.attr in funcs:
+                        calls.add(f.attr)
+                    elif f.attr not in _CLASSIC_PURE_METHODS:
+                        return True, calls      # push, pop, sort, ...
+                else:
+                    return True, calls
+        return False, calls
+
+    summary = {name: direct_impure(fd) for name, defs in funcs.items() for fd in defs[:1]}
+    for name, defs in funcs.items():
+        for fd in defs[1:]:
+            imp, calls = direct_impure(fd)
+            summary[name] = (summary[name][0] or imp, summary[name][1] | calls)
+    impure = {name for name, (imp, _c) in summary.items() if imp}
+    changed = True
+    while changed:
+        changed = False
+        for name, (_imp, calls) in summary.items():
+            if name not in impure and calls & impure:
+                impure.add(name)
+                changed = True
+
+    def effectful(node) -> bool:
+        imp, calls = direct_impure(node)
+        return imp or bool(calls & impure)
+
+    def stable(node) -> bool:
+        """Nothing a call could change: literals, locals, constants, operators."""
+        for n in walk(node):
+            if isinstance(n, (Call, Index, Lambda, Assignment)):
+                return False
+            if isinstance(n, Attribute) and not (isinstance(n.obj, Identifier) and n.obj.name in types):
+                return False
+            if isinstance(n, Identifier) and n.name in mutable_globals:
+                return False
+        return True
+
+    def operand_lists(n):
+        if isinstance(n, BinaryOp) and n.op not in ('and', 'or'):
+            yield [n.left, n.right]
+        elif isinstance(n, Call):
+            ops = list(n.args)
+            if isinstance(n.func, Attribute):
+                ops = [n.func.obj] + ops
+            elif not isinstance(n.func, Identifier):
+                ops = [n.func] + ops
+            yield ops
+        elif isinstance(n, (ArrayLit, TupleLit)):
+            yield list(n.elements)
+        elif isinstance(n, DictLit):
+            yield [x for pair in n.pairs for x in pair]
+        elif isinstance(n, StructInit):
+            yield list(n.fields.values())
+        elif isinstance(n, FStringLit):
+            yield [x for part in n.parts if isinstance(part, (list, tuple)) and part and part[0] == 'expr'
+                   for x in part[1:] if isinstance(x, ASTNode)]
+        elif isinstance(n, Index):
+            yield [n.obj, n.index]
+        elif isinstance(n, Range):
+            yield [n.start, n.end]
+
+    for st in program.statements:
+        for n in walk(st):
+            if isinstance(n, Assignment) and effectful(n.value):
+                t = n.target
+                if isinstance(t, (Attribute, Index)) or (n.op != '=' and isinstance(t, Identifier)
+                                                         and t.name in mutable_globals):
+                    return n
+            for ops in operand_lists(n):
+                ops = [o for o in ops if o is not None]
+                if len(ops) < 2:
+                    continue
+                for i, o in enumerate(ops):
+                    if effectful(o) and any(not stable(p) for j, p in enumerate(ops) if j != i):
+                        return n
+    return None
+
+
 class TILCompiler:
     def __init__(self):
         self.verbose = False
@@ -12532,6 +12874,13 @@ class TILCompiler:
         if self.verbose:
             print(f"[TIL] Generating C code...")
         
+        hazard = classic_order_hazard(ast)
+        if hazard is not None:
+            raise NativeUnsupported(
+                f"native backend: line {getattr(hazard, 'line', 0)}: the classic C backend cannot keep "
+                "the VMs' left-to-right order of evaluation here (an operand with side effects next "
+                "to one it could change); run it on the TIL VM, or without --no-types")
+
         codegen = CCodeGenerator()
         c_code = codegen.generate(ast)
         

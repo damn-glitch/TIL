@@ -568,7 +568,7 @@ def test_timeout_fires_after_its_time_only(tmp_path, flags):
     step = 1 << 26 if big else 64
     out, status, elapsed = clock_run(tmp_path, str(ms) if big else str(ms), 0xF0000000, step, 50000000, flags)
     assert status == 0 and out.startswith("fired: timeout"), out
-    assert ms < elapsed <= ms + 2 * step, (elapsed, ms)
+    assert ms < elapsed <= ms + 3 * step, (elapsed, ms)       # a few clock reads after the deadline
 
 
 @needs_cc
@@ -608,3 +608,424 @@ def test_signed_zeros():
 def test_signed_zeros_without_libm(flags):
     rc, out, err = run_exe(build('zeros', flags), tbc_bytes(ZEROS))
     assert (rc, out) == (0, py_out(ZEROS)), err
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5. float formatting: exact digits in every build
+# ═══════════════════════════════════════════════════════════════════════════
+
+# builds whose float output must equal the reference VM byte for byte
+FLOAT_BUILDS = {
+    'stdio': [],
+    'nostdio': ['-DTILVM_NO_STDIO'],
+    'nomath': ['-DTILVM_NO_MATH'],
+    'nostdio-nomath': ['-DTILVM_NO_STDIO', '-DTILVM_NO_MATH'],
+}
+
+REVIEW_FLOATS = '''
+main()
+    print(-0.0 * 1.0, 999999.5, 123456.5, 65081.35, 2877580 / 8.0, 7158252 / 8.0, 65023 / 8.0)
+    print(f"{1e45:.1f}")
+    print(f"{1e21:.1%}")
+    print(f"{0.005:.2f} {-0.015:.2f} {1e100:.3f} {0.125:.2f} {0.375:.2f} {2.5:.0f} {3.5:.0f}")
+    print(f"{72465 / 100.0:.3e} {1.0 / 3.0:.17f} {5e-324:.3e} {1.7976931348623157e308:.30e}")
+    print(f"{1e100:.2f}")
+    print(len(f"{1e300:.1f}"), len(f"{1.7976931348623157e308:.30f}"))
+    let z = 1e308 * 10.0
+    let n = z - z
+    print(f"{n:.3e}", f"{n:.1f}", f"{-n:.1f}", str(n), str(-n), f"{n}", f"{n:.5}", f"{z:.2f}", f"{-z:e}")
+    print(f"{n:08.2f}|{-z:>8.1f}|{0.1:.30}|{1e-310:.20}|{2.0 ** -1074:.25e}")
+    print(1e16, 1e-5, 0.0001, 123456789.0, 1.5e300, 5e-324, 2.2250738585072014e-308)
+'''
+
+
+@pytest.fixture(scope='module')
+def review_floats_ref():
+    out = py_out(REVIEW_FLOATS)
+    lines = out.splitlines()
+    assert lines[:7] == ['-0', '1e+06', '123456', '65081.3', '359698', '894782', '8127.88']
+    assert lines[7] == '%.1f' % 1e45 and lines[8] == '%.1f%%' % (1e21 * 100)
+    assert lines[9].split()[:2] == ['0.01', '-0.01'] and lines[11] == '%.2f' % 1e100
+    assert lines[12:14] == ['303', str(len('%.30f' % 1.7976931348623157e308))]
+    assert lines[14:21] == ['nan'] * 7
+    return out
+
+
+@needs_cc
+@pytest.mark.parametrize("name", sorted(FLOAT_BUILDS))
+def test_review_float_cases(review_floats_ref, name):
+    rc, out, err = run_exe(build('fmt-' + name, FLOAT_BUILDS[name]), tbc_bytes(REVIEW_FLOATS))
+    assert (rc, out) == (0, review_floats_ref), err
+
+
+def random_doubles(rnd, n):
+    special = [0.5, 1.5, 2.5, 0.125, 999999.5, 123456.5, 65081.35, 0.005, 1e21, 1e45, 1e100, 5e-324,
+               2.2250738585072014e-308, 1.7976931348623157e308, 0.1, 0.3, 9.5, 99.95, 1e15, 1e16, 1e17]
+    vals = []
+    while len(vals) < n:
+        k = rnd.randrange(8)
+        if k == 0:
+            v = struct.unpack('<d', struct.pack('<Q', rnd.getrandbits(64)))[0]
+        elif k == 1:
+            v = rnd.choice(special)
+        elif k == 2:
+            v = rnd.randrange(-10 ** 6, 10 ** 6) + rnd.choice([0, 0.5, 0.25, 0.125, 0.05])
+        elif k == 3:
+            v = float(rnd.randrange(1, 10 ** 17)) * 10.0 ** rnd.randrange(-30, 30)
+        else:
+            v = rnd.uniform(1, 10) * 10.0 ** rnd.randrange(-320, 308) * rnd.choice([1, -1])
+        if v == v and v not in (float('inf'), float('-inf')):
+            vals.append(v)
+    return vals
+
+
+SPECS = ['.0f', '.1f', '.2f', '.6f', '.17f', '.30f', '.0e', '.3e', '.16e', '.30e', '.1', '.6', '.17', '.30',
+         '.0%', '.3%', '12.3f', '012.3f', '<15.2e', '^20.4', 'd', 'x']
+
+
+def format_program(vals) -> str:
+    src = ['main()']
+    for i, v in enumerate(vals):
+        src.append(f'    let v{i} = {v!r}')
+        src += [f'    print(f"{{v{i}:{sp}}}")' for sp in SPECS]
+        src += [f'    print(v{i})', f'    print(str(-v{i}))']
+    return '\n'.join(src) + '\n'
+
+
+@needs_cc
+@pytest.mark.parametrize("seed", [1, 2])
+def test_random_float_formatting_matches_the_reference_vm(seed):
+    """Random doubles of every magnitude in %g, .Nf, .Ne, .Ng, %, d, x."""
+    src = format_program(random_doubles(random.Random(seed), 70))
+    ref = py_out(src)
+    for name in ('stdio', 'nostdio-nomath'):
+        rc, out, err = run_exe(build('fmt-' + name, FLOAT_BUILDS[name], sanitize=True), tbc_bytes(src))
+        assert rc == 0, err
+        for a, b in zip(ref.splitlines(), out.splitlines()):
+            assert a == b, name
+        assert out == ref
+
+
+def f32(x: float) -> float:
+    return ctypes.c_float(x).value
+
+
+@needs_cc
+@pytest.mark.parametrize("flags", [['-DTILVM_INT_BITS=32', '-DTILVM_FLOAT=1'],
+                                   ['-DTILVM_INT_BITS=32', '-DTILVM_FLOAT=1', '-DTILVM_NO_STDIO', '-DTILVM_NO_MATH']])
+def test_float32_builds_print_the_float32_value(flags):
+    """The rule of TILVM_FLOAT=1 builds: a float prints exactly as the reference VM
+    prints the same float32 value (converted to a double: exact)."""
+    rnd = random.Random(5)
+    vals = []
+    while len(vals) < 80:
+        k = rnd.randrange(4)
+        if k == 0:
+            v = struct.unpack('<f', struct.pack('<I', rnd.getrandbits(32)))[0]
+        elif k == 1:
+            v = rnd.choice([0.5, 1.5, 2.5, 999999.5, 123456.5, 65081.35, 0.005, 1e21, 1e38, 1e-45, 3.4e38, 0.1])
+        elif k == 2:
+            v = rnd.randrange(-10 ** 6, 10 ** 6) + rnd.choice([0, 0.5, 0.25, 0.05])
+        else:
+            v = rnd.uniform(1, 10) * 10.0 ** rnd.randrange(-44, 38)
+        v = f32(v)
+        if v == v and abs(v) != float('inf'):
+            vals.append(v)
+    specs = ['.0f', '.1f', '.2f', '.6f', '.12f', '.0e', '.3e', '.8e', '.1', '.6', '.9', '.0%', '.3%', '012.3f']
+    src, expect = ['main()'], []
+    for i, v in enumerate(vals):
+        src.append(f'    let v{i} = float("{v!r}")')                # parsed: correctly rounded to float32
+        src.append(f'    let c{i} = {v!r}')                          # a constant: rounded when it loads
+        for sp in specs:
+            src.append(f'    print(f"{{v{i}:{sp}}}")')
+            x = f32(v * 100.0) if sp.endswith('%') else v
+            expect.append(til.til_format_spec(x, sp.replace('%', 'f').encode(), til.fmt_g).decode()
+                          + ('%' if sp.endswith('%') else ''))
+        src += [f'    print(v{i})', f'    print(str(-v{i}))', f'    print(c{i})']
+        expect += [til.fmt_g(v).decode(), til.fmt_g(-v).decode(), til.fmt_g(v).decode()]
+    rc, out, err = run_exe(build('f32', flags), tbc_bytes('\n'.join(src) + '\n'))
+    assert rc == 0, err
+    assert out.splitlines() == expect
+
+
+@needs_cc
+def test_float32_constants_are_correctly_rounded():
+    rnd = random.Random(9)
+    vals = [rnd.uniform(1, 10) * 10.0 ** rnd.randrange(-50, 39) for _ in range(300)]
+    vals += [struct.unpack('<d', struct.pack('<Q', rnd.getrandbits(64)))[0] for _ in range(300)]
+    vals = [v for v in vals if v == v and abs(v) != float('inf')]
+    src = 'main()\n' + ''.join(f'    print(f"{{{v!r}:.9e}}")\n' for v in vals)
+    rc, out, err = run_exe(build('f32', ['-DTILVM_INT_BITS=32', '-DTILVM_FLOAT=1']), tbc_bytes(src))
+    assert rc == 0, err
+    assert out.splitlines() == ['%.9e' % f32(v) for v in vals]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. TILVM_NO_MATH
+# ═══════════════════════════════════════════════════════════════════════════
+
+def nomath_values(rnd, n):
+    vals = [1e30, 2.0, 0.5, 3.0, 1e-300, 5e-324, 1.7976931348623157e308, 2.2250738585072014e-308, 1e19,
+            -1e19, 4503599627370495.5, -4503599627370495.5, 1e20, 0.1]
+    while len(vals) < n:
+        k = rnd.randrange(3)
+        if k == 0:
+            v = struct.unpack('<d', struct.pack('<Q', rnd.getrandbits(63)))[0]
+        elif k == 1:
+            v = rnd.uniform(0, 10) * 10.0 ** rnd.randrange(-310, 308)
+        else:
+            v = rnd.uniform(-1e6, 1e6)
+        if v == v and abs(v) != float('inf'):
+            vals.append(v)
+    return vals
+
+
+@needs_cc
+@pytest.mark.parametrize("flags", [['-DTILVM_NO_MATH'], ['-DTILVM_NO_STDIO', '-DTILVM_NO_MATH']])
+def test_nomath_floor_ceil_fmod_sqrt_are_exact(flags):
+    rnd = random.Random(11)
+    vals = nomath_values(rnd, 150)
+    divs = [3.0, 0.1, 1e-300, 7.5e10, 2.5, 1e300, 5e-324, 1.0]
+    src = ['main()']
+    for i, v in enumerate(vals):
+        d = divs[i % len(divs)]
+        src.append(f'    let v{i} = {v!r}')
+        src.append(f'    print(f"{{sqrt(abs(v{i})):.17}} {{floor(v{i}):.17}} {{ceil(v{i}):.17}} '
+                   f'{{v{i} % {d!r}:.17}} {{-v{i} % {d!r}:.17}} {{round(v{i}):.17}}")')
+    src = '\n'.join(src) + '\n'
+    rc, out, err = run_exe(build('nomath', flags, sanitize=True), tbc_bytes(src))
+    assert rc == 0, err
+    assert out == py_out(src)
+    assert run_vm(f'main()\n    print(f"{{sqrt(1e30):.17}} {{floor(1e19):.17}} {{1e20 % 3.0}}")\n')[1] == \
+        "1000000000000000 1e+19 1\n"
+
+
+@needs_cc
+def test_nomath_float32_sqrt_is_correctly_rounded():
+    rnd = random.Random(12)
+    vals = [f32(abs(struct.unpack('<f', struct.pack('<I', rnd.getrandbits(31)))[0])) for _ in range(300)]
+    vals = [v for v in vals if v == v and v != float('inf')]
+    src = 'main()\n    var v = 0.0\n' + ''.join(f'    v = float("{v!r}")\n    print(f"{{sqrt(v):.9e}}")\n'
+                                                for v in vals)
+    flags = ['-DTILVM_INT_BITS=32', '-DTILVM_FLOAT=1', '-DTILVM_NO_MATH', '-DTILVM_NO_STDIO']
+    rc, out, err = run_exe(build('nomath32', flags), tbc_bytes(src))
+    assert rc == 0, err
+    assert out.splitlines() == ['%.9e' % f32(math.sqrt(v)) for v in vals]
+
+
+POW_CASES = '''
+main()
+    let z = 0.0
+    let inf = 1e308 * 10.0
+    print(2.0 ** 60.0, 0.5 ** 1074.0, (-3.0) ** 3.0, 2.0 ** -3.0, 10.0 ** 22.0, 2.0 ** 1e10, (-2.0) ** 1e10)
+    print(z ** -1.0, (-z) ** -1.0, z ** -2.0, z ** 0.5, z ** -0.5, inf ** 0.5, inf ** -0.5, 1.0 ** 0.5)
+    print((-8.0) ** (1.0 / 3.0), 0.5 ** inf, 2.0 ** inf, 2.0 ** -inf, (-1.0) ** inf, (inf - inf) ** 0.0, 1.0 ** (inf - inf))
+    print(pow(2, 10), pow(1.5, 2.0), 1e308 ** 2.0, (-1e308) ** 3.0, 10.0 ** 400.0)
+    let r = retry(1)
+        str(2.0 ** 0.5)
+    else
+        "E:" + error
+    print(r)
+'''
+
+
+@needs_cc
+def test_nomath_pow():
+    ref = py_out(POW_CASES).splitlines()
+    assert ref[-1] == '1.41421'
+    rc, out, err = run_exe(build('nomath', ['-DTILVM_NO_MATH'], sanitize=True), tbc_bytes(POW_CASES))
+    assert rc == 0, err
+    assert out.splitlines() == ref[:-1] + ["E:pow with a fractional exponent is not available in this VM build"]
+    rc, out, err = run_exe(cvm_binary(), tbc_bytes(POW_CASES))
+    assert (rc, out.splitlines()) == (0, ref), err
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. portable snapshots: frames, recovery points and handlers vs the bytecode
+# ═══════════════════════════════════════════════════════════════════════════
+
+def tp_ops_from_python() -> list:
+    """TP_OPS of vm/tilvm.c, computed from the compiler's stack-effect tables."""
+    rows = []
+    for op in range(0xC0):
+        if op not in til._STACK_EFFECT and op not in til._OPERAND_EFFECT:
+            rows.append(7)
+            continue
+        n = sum(til._OPERAND_SIZE[k] for k in til.OP_OPERANDS.get(op, ''))
+        eff = 0 if op in til._OPERAND_EFFECT else til._STACK_EFFECT[op]
+        rows.append(n | (eff + 3) << 3 | (op in til._JUMP_LANDING) << 6 |
+                    (op in til._ENDS_FLOW or op == til.Op.END_HANDLE) << 7)
+    return rows
+
+
+def test_snapshot_depth_table_matches_the_compiler():
+    src = open(TILVM_C, encoding='utf-8').read()
+    body = re.search(r'static const uint8_t TP_OPS\[0xC0\] = \{(.*?)\};', src, re.S).group(1)
+    assert [int(x, 16) for x in re.findall(r'0x([0-9A-F]{2})', body)] == tp_ops_from_python()
+    # the operand-dependent effects tp_depth computes are exactly _OPERAND_EFFECT's
+    names = {til.Op.CALL: 'OP_CALL', til.Op.CALL_VALUE: 'OP_CALL_VALUE', til.Op.INVOKE: 'OP_INVOKE',
+             til.Op.NATIVE: 'OP_NATIVE', til.Op.NEW_ARRAY: 'OP_NEW_ARRAY', til.Op.NEW_MAP: 'OP_NEW_MAP',
+             til.Op.NEW_STRUCT: 'OP_NEW_STRUCT', til.Op.MAKE_CLOSURE: 'OP_MAKE_CLOSURE', til.Op.CONCAT: 'OP_CONCAT',
+             til.Op.PERFORM: 'OP_PERFORM', til.Op.NATIVE_POP: 'OP_NATIVE_POP'}
+    assert set(names) == set(til._OPERAND_EFFECT)
+    depth_fn = src[src.index('static long tp_depth('):src.index('static int tp_at(')]
+    for op, name in names.items():
+        assert name in depth_fn, name
+
+
+CALLS = '''
+struct Box
+    f: fn(int) -> int
+    k: int
+
+impl Box
+    apply(self, x: int) -> int
+        var t = 0
+        for i in 0..x
+            t += i
+        return self.f(t) + self.k
+
+twice(n: int) -> int
+    var s = 0
+    for i in 0..n
+        s += 2
+    return s
+
+main()
+    let add = |v| twice(v) + 1
+    let b = Box { f: add, k: 7 }
+    var total = 0
+    for i in 0..4
+        total += b.apply(i) + add(i) + b.f(i)
+    let r = retry(2)
+        let t = timeout(100000)
+            twice(total)
+        else
+            -1
+        t + [1, 2, 3].map(|q| twice(q)).sum()
+    else
+        0
+    let h = handle
+        perform Ask(3) + twice(2)
+    with
+        Ask(n) =>
+            var w = 0
+            for j in 0..n
+                w += twice(j)
+            resume(w)
+    print(total, r, h)
+'''
+
+
+def snapshot_layout(data: bytes):
+    """Offsets of the frame, recovery point and handler records of a .tilp."""
+    p = 30
+    frames = []
+    for _ in range(struct.unpack_from('<H', data, 28)[0]):
+        frames.append(p)
+        p += 13
+    tries = []
+    for _ in range(struct.unpack_from('<H', data, p)[0]):
+        tries.append(p + 2 + 14 * len(tries))
+    p += 2 + 14 * len(tries)
+    handlers = [p + 2 + 13 * i for i in range(struct.unpack_from('<H', data, p)[0])]
+    return frames, tries, handlers
+
+
+def resign(b: bytearray) -> bytes:
+    struct.pack_into('<I', b, len(b) - 4, zlib.crc32(bytes(b[:-4])) & 0xFFFFFFFF)
+    return bytes(b)
+
+
+def forgeries(data: bytes):
+    frames, tries, handlers = snapshot_layout(data)
+    out = []
+    for i, off in enumerate(frames):
+        if i:
+            for delta in (1, -1, 2):
+                b = bytearray(data)
+                struct.pack_into('<H', b, off + 6, (struct.unpack_from('<H', b, off + 6)[0] + delta) & 0xFFFF)
+                out.append(('base', resign(b)))
+            b = bytearray(data)
+            b[off + 8] ^= 1
+            out.append(('extra', resign(b)))
+    for off in tries:
+        b = bytearray(data)
+        struct.pack_into('<H', b, off + 10, struct.unpack_from('<H', b, off + 10)[0] + 1)
+        out.append(('try sp', resign(b)))
+    for off in handlers:
+        if data[off] == 0:
+            b = bytearray(data)
+            struct.pack_into('<H', b, off + 3, struct.unpack_from('<H', b, off + 3)[0] + 2)
+            out.append(('handler sp', resign(b)))
+    return out
+
+
+def test_forged_snapshots_are_refused_by_the_reference_vm():
+    tbc = tbc_bytes(CALLS)
+    vm = til.TILVM(til.TBCModule.from_bytes(tbc), write=lambda b: None)
+    n = 0
+    kinds = set()
+    while vm.run_steps(3) == vm.YIELD:
+        data = vm.save_portable()
+        fresh = til.TILVM(til.TBCModule.from_bytes(tbc), write=lambda b: None)
+        fresh.load_portable(data)                               # the genuine one loads
+        for what, forged in forgeries(data):
+            bad = til.TILVM(til.TBCModule.from_bytes(tbc), write=lambda b: None)
+            try:
+                bad.load_portable(forged)
+            except til.SnapshotError as e:
+                assert e.code in (-4, -5), (what, e)           # -5: a stack limit of the forged base
+                n += 1
+                kinds.add(what)
+                continue
+            pytest.fail(f"forged {what} accepted at step {vm.steps}")
+    assert n > 100 and kinds == {'base', 'extra', 'try sp', 'handler sp'}
+
+
+@needs_cc
+def test_forged_snapshots_are_refused_by_the_c_vm(tmp_path):
+    tbc = tbc_bytes(CALLS)
+    tbc_path = tmp_path / 'calls.tbc'
+    tbc_path.write_bytes(tbc)
+    exe = build('asan-vm', sanitize=True)
+    out = []
+    vm = til.TILVM(til.TBCModule.from_bytes(tbc), write=out.append)
+    ref = run_vm(tbc)[1]
+    checked = 0
+    while vm.run_steps(7) == vm.YIELD:
+        data = vm.save_portable()
+        snap = tmp_path / 's.tilp'
+        snap.write_bytes(data)
+        r = subprocess.run([exe, '--resume-portable', str(snap), str(tbc_path)], capture_output=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        assert b"".join(out).decode() + r.stdout.decode() == ref        # continues where it paused
+        for what, forged in forgeries(data)[:6]:
+            snap.write_bytes(forged)
+            r = subprocess.run([exe, '--resume-portable', str(snap), str(tbc_path)], capture_output=True,
+                               timeout=60)
+            assert r.returncode == 2, (what, r.stdout, r.stderr)
+            assert b"the snapshot is damaged or incomplete" in r.stderr or b"does not fit" in r.stderr, r.stderr
+            checked += 1
+    assert checked > 20
+
+
+@needs_cc
+def test_reviewer_forged_frame_base(tmp_path):
+    """The repro: frame 1 (main) moved up by 2 slots, checksum fixed - main's caller
+    (__start__) calls it with nothing on its operand stack."""
+    tbc = tbc_bytes(CALLS)
+    vm = til.TILVM(til.TBCModule.from_bytes(tbc), write=lambda b: None)
+    assert vm.run_steps(3) == vm.YIELD
+    data = bytearray(vm.save_portable())
+    frames, _, _ = snapshot_layout(bytes(data))
+    struct.pack_into('<H', data, frames[1] + 6, struct.unpack_from('<H', data, frames[1] + 6)[0] + 2)
+    forged = resign(data)
+    with pytest.raises(til.SnapshotError) as info:
+        til.TILVM(til.TBCModule.from_bytes(tbc), write=lambda b: None).load_portable(forged)
+    assert info.value.code == -4
+    (tmp_path / 'f.tilp').write_bytes(forged)
+    (tmp_path / 'f.tbc').write_bytes(tbc)
+    r = subprocess.run([cvm_binary(), '--resume-portable', str(tmp_path / 'f.tilp'), str(tmp_path / 'f.tbc')],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "the snapshot is damaged or incomplete" in r.stderr

@@ -195,18 +195,11 @@ value) and `sleep_ms()` busy-waits as on a desktop.
 
 ## Limits and differences from the desktop VM
 
-* **Float formatting**: `TILVM_NO_STDIO` builds (this one, and calculator
-  builds) format floats with the VM's own printf-free code
-  (`fmt_gp`/`fmt_fixed`/`fmt_exp` in `vm/tilvm.c`), which is not exact: it
-  differs from printf for exact ties and near-ties, `-0.0`, 17 significant
-  digits and huge fixed-point numbers, e.g. `print(123456.5)` gives `123457`
-  (desktop `123456`), `print(2877580 / 8.0)` gives `359697` (desktop
-  `359698`), `f"{0.005:.2f}"` gives `0.00` (desktop `0.01`),
-  `f"{1.0 / 3.0:.17f}"` ends in `...330` (desktop `...331`), `print(-0.0)`
-  gives `0`. In a sample of about 8000 ordinary values (`i / 7.0`, `i * 1.1`,
-  `n / 8.0`, ...) printed with `%g`, `.1f`, `.2f` and `.3e`, about 0.5%
-  printed differently. `tests/test_playground.py::test_float_formatting_matches_printf`
-  tracks this as an expected failure.
+* **Float formatting** is exact, as on the desktop and in the reference VM:
+  every build of `vm/tilvm.c` prints the digits of a float's exact binary
+  value rounded half to even (`print(123456.5)` gives `123456`,
+  `f"{0.005:.2f}"` gives `0.01`, `f"{1e100:.2f}"` all 101 digits), without
+  printf (`tests/test_playground.py::test_float_formatting_matches_printf`).
 * **Float parsing** (`float(s)`, `s.to_float()`) is exact, as on the desktop
   and in the reference VM: same syntax (exponents, `inf`, `nan`, `_` between
   digits, ASCII whitespace) and the correctly rounded value, in every build of

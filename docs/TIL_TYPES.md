@@ -35,7 +35,12 @@ typed arrays and an inline loop for `map`, and prints exactly what the VMs print
 
 The implementation is `src/tiltypes.py`. It is optional: `src/til.py` loads it
 like the other TIL 3.1 tool modules and keeps the TIL 3.0 behaviour (no E-TYPE,
-classic C backend) when it is missing or when `TIL_NO_TYPES=1` is set.
+classic C backend) when it is missing or when `TIL_NO_TYPES=1` is set. The
+classic backend writes operands as one C expression; where their order would
+be observable (an operand with side effects next to one it could change, a
+value with side effects stored into a field or element, `G += f()`), it
+reports the program as unsupported and `til run` uses the VM
+(`classic_order_hazard` in `src/til.py`).
 
 ## 1. The type system
 
@@ -164,8 +169,16 @@ In particular the native code reproduces:
   containers), f-string format specs (`{x:.2f}`, `{n:x}`, `{s:>8}`, …; `{x:d}`,
   `{x:x}`, `{x:b}` of a float beyond the 64-bit range print the exact integer,
   like Python's `int(x)` on the reference VM);
-* `print(a, b, c)` evaluates all arguments before printing any; operands and
-  arguments are evaluated left to right (C leaves the order unspecified);
+* the VMs' order of evaluation, side effects and run-time errors included (C
+  leaves the order of operands unspecified, so every step that could be
+  observed is a separate C statement): `print(a, b, c)` evaluates all
+  arguments before printing any; operands, arguments, the elements of array,
+  map and struct literals and f-string parts left to right; the receiver of a
+  method and a called function value before the arguments; `x op= v` reads `x`
+  before evaluating `v` (`G += f()` where `f` changes `G`), also for fields,
+  elements and strings; `a[i] (op)= v` and `p.f (op)= v` evaluate `a`, `i`
+  (`p`), read the old value, evaluate `v`, then store (the store checks the
+  index or a `None` struct, after `v` ran) — `v` may even grow the array;
 * integer division/modulo truncating toward zero, `division by zero`,
   `2 ** -1 == 0`, wrapping overflow, shifts, `int(x)` of floats, Python-exact
   comparisons between ints and floats (`2**53 + 1 != 2.0**53`), `floor()` and
@@ -315,20 +328,24 @@ pointers; all of these now match the VMs.
 integrated tree (`tests/test_*.py`: all 14 features) plus the examples,
 measured the same way (`python3 tools/native_coverage.py tests/test_*.py`;
 13 programs that call `sleep()` were left out, because the in-process VM really
-sleeps): 826 programs, 807 compared, **580 compiled natively: 578 with output
+sleeps): 839 programs, 819 compared, **591 compiled natively: 589 with output
 identical to the VM, 0 different**, and 2 that stop with one of the explicit
 run-time errors above (`chr(0)` and `sort()` of nan in `tests/test_types.py`,
-status `native-refused`). The 227 fallbacks: effect handlers 85, VM-only
-natives (graphics, keys, `energy_mode()`) 58, dynamic values 44, and 40 for
-the other reasons listed in §3 (a global read before it is set 9, a `None`
-that a native number cannot hold 9, closures capturing a variable that
-changes 5, `perform` of an effect without a default function 5, `bytes_to_str`
-4, ...). 11 programs hit a VM limit; the 8 programs the VM cannot compile are
-the deliberately wrong E-TYPE examples of `tests/test_types.py`. Over the same
+status `native-refused`). The 228 fallbacks: effect handlers 85, VM-only
+natives (graphics, keys, `energy_mode()`) 58, dynamic values 45, and 40 for
+the other reasons listed in §3 (a `None` that a native number cannot hold 10,
+a global read before it is set 9, closures capturing a variable that changes
+5, `perform` of an effect without a default function 5, `bytes_to_str` 4,
+...). 11 programs hit a VM limit; the 9 programs the VM cannot compile are
+deliberately wrong E-TYPE examples (`tests/test_types.py`, one in
+`tests/test_i18n.py`). The evaluation-order programs of `tests/test_types.py`
+(`EVAL_ORDER`) and 80 generated programs that mix side effects, compound
+assignments and run-time errors in nested operands give the VMs' output too. Over the same
 corpus (and the self-hosted compiler `selfhost/tilc.til`, 8300 lines,
 inferred in about 0.5 s) the inference never
 fails and reports E-TYPE only for deliberately wrong programs (those of
-`tests/test_types.py` and the type-mismatch test of `tests/test_compiler.py`);
+`tests/test_types.py`, the type-mismatch test of `tests/test_compiler.py` and
+the translated E-TYPE test of `tests/test_i18n.py`);
 no program of `tests/test_effects*.py` gets one.
 
 ## 5. Implementation notes
@@ -379,8 +396,6 @@ Not part of the native backend, found while testing it: the C VM compares an
 reference VM and natively), truncates very long fixed-point formats
 (`{1e100:.1f}`), gives `-0` for `ceil(-0.5)` and `floor(-0.0)` (the reference VM
 and the native code give `0`), and formats a float beyond the 64-bit range with
-`{x:d}`/`{x:x}`/`{x:o}`/`{x:b}` after wrapping it to an int64 (the reference VM
-prints the exact integer). The reference VM itself stops with an internal error
-(`cannot convert float infinity to integer`, not a TIL run-time error that
-`retry` could catch) for `{x:d}` of `inf`/`nan`; the C VM prints
-`-9223372036854775808`.
+`{x:d}`/`{x:x}`/`{x:o}`/`{x:b}` after wrapping it to an int64, like `int(x)` (the
+reference VM prints the exact integer). For `inf`/`nan` both VMs report
+`cannot convert nan/inf to int`, an error `retry` catches.

@@ -169,10 +169,10 @@ STATE (16 bytes)
                               takes the low 32 bits, 0 -> the default seed)
     22    2  u16 tick         deadline-check counter, 0..255 (both VMs look at
                               the deadlines every 256 steps while one exists)
-    24    1  u8  energy mode  battery saving (design §11): 0 performance, 1 balanced, 2 low
-                              performance, 1 balanced, 2 low. Written 0 by
-                              this version; readers accept 0..2 (other values
-                              are corrupt) and ignore it until §11 lands
+    24    1  u8  energy mode  battery saving (design §11, docs/TIL_ENERGY.md):
+                              0 performance, 1 balanced, 2 low; written from
+                              the VM's mode and restored on load (other
+                              values are corrupt: -4)
     25    1  u8  reserved = 0
 GLOBALS COUNT
     26    2  u16 G            must equal the program's global count
@@ -304,16 +304,38 @@ frame's locals lie below the next frame's arguments (the top frame's below
 `S`); a frame's closure is a closure object of the frame's function; recovery
 points and handler records satisfy the invariants of `docs/TIL_EFFECTS.md`
 (ordered by frames, a running clause's owner is an earlier `handle`, pairs
-below `S`); struct field and closure upvalue counts match the program;
+below `S`); the frames, recovery points and handle records sit where the
+bytecode puts them (below); struct field and closure upvalue counts match the program;
 upvalues are cells; map keys are `None`, bools, numbers or strings; object
 ids are assigned in order and every id is defined; integers fit the build
 (-6), floats exist in it (-7); the screen size is 0x0 or within 1..4096 and
 the build's limits (-8); objects fit the heap and the build's string / array
 limits (-5); then the object count and the checksum, and (the whole file
-being there) no bytes after it. A snapshot is otherwise trusted like
-the bytecode itself (a VM does not re-verify that, say, a local the code
-treats as a cell holds a cell): the checks catch damage, truncation and
-mismatched programs, not deliberately forged files.
+being there) no bytes after it.
+
+**Stack depths.** The operand stack depth (values above a frame's locals) at
+an instruction is fixed by the bytecode. Both VMs compute it by one linear
+pass over the function's code from its first instruction (depth 0), with the
+stack effects of the compiler (`_STACK_EFFECT` / `_OPERAND_EFFECT` in
+`src/til.py`, `TP_OPS` in `vm/tilvm.c`), following forward jumps (a jump
+target gets the depth of the first jump that reaches it; after an
+instruction that does not fall through, and after `END_HANDLE`, the depth is
+only known where a jump lands). Then (-4 otherwise): every frame's pc is an
+instruction with a known depth; a frame below the top frame is just after a
+call - `CALL f` (the next frame runs `f`, no callee slot), `CALL_VALUE` (a
+callee slot), `INVOKE` (either) or `PERFORM` (no callee slot; a clause or
+the default function) - and the next frame's `base - extra` is where that
+call's result goes (its base + locals + depth after the call - 1); the top
+frame's base + locals + depth is `S`; a recovery point's handler pc and a
+handle's abort pc are at depth `sp + 1` (the message / value pushed there)
+in frame `frames - 1`; a running clause's frame runs a clause, called by a
+`PERFORM`. So a forged file cannot make a VM return into the wrong slot or
+pop below a frame. The C VM keeps the pending jumps in the (still empty)
+arena, 8 bytes each: a function with more pending forward jumps than fit is
+-5 there. A snapshot is otherwise trusted like the bytecode itself (a VM does
+not re-verify that, say, a local the code treats as a cell holds a cell): the
+checks catch damage, truncation, mismatched programs and inconsistent call
+stacks, not every forged value.
 
 ### 3.5 Limits
 

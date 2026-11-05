@@ -206,6 +206,10 @@ They never change the behaviour of a valid program unless stated:
   combines, so the choice is still exactly the Python pass's; only beyond
   60,000 instructions without such a point (one line of 30,000 `a, a, ...`
   elements) the cut is forced and the code may differ (still correct).
+  Because the bytes differ, a portable snapshot (`.tilp`) saved from the
+  Python-compiled `.tbc` of such a program does not resume on the tilc-built
+  one (snapshots name the exact bytecode by hash); use the same `.tbc` on
+  both devices.
 
 Quirks of the Python compiler that tilc reproduces on purpose (so that both
 give the same result; reported to the integrator):
