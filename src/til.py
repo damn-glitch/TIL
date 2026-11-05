@@ -6782,6 +6782,23 @@ CAST_KINDS = {'int': 0, 'float': 1, 'str': 2, 'bool': 3}
 BUILTIN_TYPES = [('Some', ['value']), ('Ok', ['value']), ('Err', ['error'])]
 TYPE_SOME, TYPE_OK, TYPE_ERR = 0, 1, 2
 
+# Optional debug-info section (TIL 3.1; docs/TIL_DEBUGGER.md), right after the
+# line table:  n u16, then n records  func u16, slot u8, name u16, start_pc u32, end_pc u32
+# (name = index of a string constant; pcs absolute in the code section, like the
+# line table). Three kinds of record:
+#   * a local: func = function index, slot = its local slot; live while
+#     start_pc <= pc < end_pc (from just after its first store to the end of its scope)
+#   * a global: func = DEBUG_GLOBAL; start_pc = end_pc = the global's index (the u16
+#     operand of LOAD_GLOBAL - the u8 slot field, 0 here, could not hold indices > 255)
+#   * an upvalue: func = DEBUG_UPVAL, slot = the upvalue's index; start_pc = end_pc =
+#     the index of the function (lambda / effect clause) whose closure holds it
+# Written only on request (`til build --debug-info`, `til debug`), never with
+# --strip, so default bytecode is unchanged. Both VMs ignore it (the C VM stops
+# reading after the line table); TBCModule.from_bytes reads it.
+DEBUG_GLOBAL = 0xFFFF
+DEBUG_UPVAL = 0xFFFE
+DEBUG_RECORD = '<HBHII'                 # 13 bytes per record
+
 
 class TBCFunction:
     FLAG_METHOD = 1      # param 0 is `self`
@@ -6800,6 +6817,11 @@ class TBCFunction:
         self.code = bytearray()
         self.lines: List[Tuple[int, int]] = []   # (offset in code, source line)
         self.offset = 0                           # absolute offset in module code
+        # debug info (BytecodeCompiler(debug_info=True) or a file's debug section):
+        # [slot, name, start, end] = local `name` lives in `slot` while start <= pc < end
+        # (offsets in code, like `lines`); upval_names[i] = name of upvalue i
+        self.locals: List[list] = []
+        self.upval_names: List[str] = []
 
 
 class TBCModule:
@@ -6818,6 +6840,7 @@ class TBCModule:
         self.lines: List[Tuple[int, int]] = []
         self.uses_float = False
         self.version = TBC_VERSION           # of a loaded file (written files: TBC_VERSION)
+        self.debug_info = False              # write the debug-info section (see DEBUG_RECORD)
 
     def const(self, value) -> int:
         if isinstance(value, str):
@@ -6847,6 +6870,21 @@ class TBCModule:
                 self.lines.append((f.offset + off, line))
         self.code = bytes(code)
         self.methods.sort(key=lambda m: (m[0], m[1]))
+
+    def debug_records(self) -> List[Tuple[int, int, str, int, int]]:
+        """Records of the debug-info section, in file order: (func, slot, name,
+        start_pc, end_pc) with absolute pcs (call link() first)."""
+        recs = []
+        for i, f in enumerate(self.funcs):
+            for slot, name, start, end in sorted(f.locals, key=lambda r: (r[2], r[0], r[3], r[1])):
+                if end > start:
+                    recs.append((i, slot, name, f.offset + start, f.offset + end))
+        for i, f in enumerate(self.funcs):
+            for k, name in enumerate(f.upval_names):
+                recs.append((DEBUG_UPVAL, k, name, i, i))
+        for g, name in enumerate(self.globals):
+            recs.append((DEBUG_GLOBAL, 0, name, g, g))
+        return recs
 
     # ── serialization ───────────────────────────────────────────────────────
     def to_bytes(self, strip: bool = False) -> bytes:
@@ -6886,6 +6924,14 @@ class TBCModule:
         out += _struct.pack('<H', min(len(lines), 0xFFFF))
         for pc, line in lines[:0xFFFF]:
             out += _struct.pack('<IH', pc, min(line, 0xFFFF))
+        if self.debug_info and not strip:
+            recs = self.debug_records()
+            if len(recs) > 0xFFFF or len(self.funcs) >= DEBUG_UPVAL:
+                raise CompileError("program too large for debug info (more than 65535 variables or "
+                                   "65533 functions); build without --debug-info")
+            out += _struct.pack('<H', len(recs))
+            for func, slot, name, start, end in recs:
+                out += _struct.pack(DEBUG_RECORD, func, slot, self.const(name), start, end)
         return bytes(out)
 
     def serialize(self, strip: bool = False) -> bytes:
@@ -6895,6 +6941,10 @@ class TBCModule:
             self.const(name)
             for fld in fields:
                 self.const(fld)
+        if self.debug_info and not strip:       # variable names: string constants
+            self.link()
+            for rec in self.debug_records():
+                self.const(rec[2])
         return self.to_bytes(strip)
 
     @staticmethod
@@ -6952,6 +7002,12 @@ class TBCModule:
         pos += n
         for _ in range(rd('H')):
             m.lines.append(rd('IH'))
+        debug = None
+        if pos < len(data):                     # the optional debug-info section
+            size = _struct.calcsize(DEBUG_RECORD)
+            if pos + 2 > len(data) or pos + 2 + size * _struct.unpack_from('<H', data, pos)[0] > len(data):
+                raise ValueError("truncated debug-info section")
+            debug = [rd(DEBUG_RECORD[1:]) for _ in range(rd('H'))]
         # split the code section back into functions (so the module can be re-linked)
         order = sorted(range(len(m.funcs)), key=lambda i: m.funcs[i].offset)
         for k, i in enumerate(order):
@@ -6959,7 +7015,33 @@ class TBCModule:
             end = m.funcs[order[k + 1]].offset if k + 1 < len(order) else len(m.code)
             f.code = bytearray(m.code[f.offset:end])
             f.lines = [(pc - f.offset, line) for pc, line in m.lines if f.offset <= pc < end]
+        if debug is not None:
+            m.read_debug_records(debug)
         return m
+
+    def read_debug_records(self, recs):
+        """Debug-info records (func, slot, name const, start_pc, end_pc) of a file ->
+        per-function locals and upvalue names, names of the globals."""
+        self.debug_info = True
+
+        def name_of(ix):
+            if ix >= len(self.consts) or not isinstance(self.consts[ix], bytes):
+                raise ValueError(f"bad debug-info section (name {ix} is not a string constant)")
+            return self.consts[ix].decode('utf-8', 'replace')
+        for func, slot, name, start, end in recs:
+            if func == DEBUG_GLOBAL:
+                if start < len(self.globals):
+                    self.globals[start] = name_of(name)
+            elif func == DEBUG_UPVAL:
+                if start < len(self.funcs):
+                    names = self.funcs[start].upval_names
+                    names.extend("?" for _ in range(slot + 1 - len(names)))
+                    names[slot] = name_of(name)
+            elif func < len(self.funcs):
+                f = self.funcs[func]
+                f.locals.append([slot, name_of(name), start - f.offset, end - f.offset])
+            else:
+                raise ValueError(f"bad debug-info section (function {func} does not exist)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -7094,6 +7176,30 @@ def _encode_insn(op: int, vals: List[int]) -> bytes:
     return bytes(out)
 
 
+def _remap_live_ranges(new_pc: Dict[int, int], records: List[list]):
+    """Debug info after fuse_superinstructions(): move the [slot, name, start, end]
+    live ranges to the new pcs. A range that ends inside a superinstruction lasts
+    until that instruction ends (`y` in `LOAD_LOCAL y; RETURN` -> RETURN_LOCAL y)."""
+    import bisect
+    olds = sorted(new_pc)
+    first_of: Dict[int, int] = {}            # new pc -> first old instruction that went there
+    for old in olds:
+        first_of.setdefault(new_pc[old], old)
+
+    def moved(pc: int, is_end: bool) -> int:
+        k = bisect.bisect_left(olds, pc)
+        if k >= len(olds):
+            return new_pc[olds[-1]]
+        at = new_pc[olds[k]]
+        if is_end and olds[k] == pc and first_of[at] != pc:
+            while k < len(olds) and new_pc[olds[k]] == at:
+                k += 1
+            return new_pc[olds[k]] if k < len(olds) else at
+        return at
+    for rec in records:
+        rec[2], rec[3] = moved(rec[2], False), moved(rec[3], True)
+
+
 def fuse_superinstructions(func: 'TBCFunction') -> Optional[Dict[int, int]]:
     """Rewrite one function's code with superinstructions (in place: code and
     line table). Returns the map old pc -> new pc (function-relative), or None
@@ -7167,10 +7273,11 @@ def fuse_superinstructions(func: 'TBCFunction') -> Optional[Dict[int, int]]:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class _Local:
-    __slots__ = ('slot', 'mutable', 'celled', 'name')
+    __slots__ = ('slot', 'mutable', 'celled', 'name', 'dbg')
 
     def __init__(self, name, slot, mutable, celled):
         self.name, self.slot, self.mutable, self.celled = name, slot, mutable, celled
+        self.dbg = None           # its debug-info record [slot, name, start, end] (debug_info=True)
 
 
 # ── operand stack depth while compiling ─────────────────────────────────────
@@ -7254,11 +7361,15 @@ class _FuncState:
 class BytecodeCompiler:
     """Compiles a (resolved) TIL Program into a TBCModule."""
 
-    def __init__(self, source: str = "", filename: str = "<stdin>", fuse: bool = True):
+    def __init__(self, source: str = "", filename: str = "<stdin>", fuse: bool = True,
+                 debug_info: bool = False):
         self.reporter = ErrorReporter(source, filename)
         self.filename = filename
         self.m = TBCModule()
         self.fuse = fuse          # peephole pass: superinstructions (til ... --no-fuse turns it off)
+        # record variable names and live ranges (the module's debug-info section:
+        # til build --debug-info, til debug); off by default: the bytecode is unchanged
+        self.debug_info = debug_info
 
     # ── errors ──────────────────────────────────────────────────────────────
     def error(self, node, msg: str, hint: str = ""):
@@ -7372,8 +7483,13 @@ class BytecodeCompiler:
         self.fs.scopes.append({})
 
     def end_scope(self):
-        self.fs.scopes.pop()
+        scope = self.fs.scopes.pop()
         # slots are not reused, which keeps closures/cells simple and safe
+        if self.debug_info:
+            end = len(self.fs.proto.code)
+            for local in scope.values():
+                if local.dbg is not None and local.dbg[3] is None:
+                    local.dbg[3] = end          # the variable's scope ends here
 
     def declare_local(self, name: str, mutable: bool = True, node=None) -> _Local:
         fs = self.fs
@@ -7383,8 +7499,24 @@ class BytecodeCompiler:
             self.error(node, "too many local variables in one function (max 250)")
         fs.proto.n_locals = max(fs.proto.n_locals, fs.next_slot)
         local = _Local(name, slot, mutable, name in fs.captured)
+        if self.debug_info and not name.startswith(' '):      # not a compiler temporary
+            here = len(fs.proto.code)
+            old = fs.scopes[-1].get(name)
+            if old is not None and old.dbg is not None and old.dbg[3] is None:
+                old.dbg[3] = here               # `let x` again in the same scope hides it
+            local.dbg = [slot, name, here, None]   # parameters: live from the start
+            fs.proto.locals.append(local.dbg)
         fs.scopes[-1][name] = local
         return local
+
+    def finish_debug_info(self, fs: '_FuncState'):
+        """End of a function: close the ranges of its remaining locals, name its upvalues."""
+        if self.debug_info:
+            end = len(fs.proto.code)
+            for rec in fs.proto.locals:
+                if rec[3] is None:
+                    rec[3] = end
+            fs.proto.upval_names = [u[0] for u in fs.upvals]
 
     def hidden_local(self) -> int:
         return self.declare_local(f" tmp{self.fs.next_slot}").slot
@@ -7418,6 +7550,8 @@ class BytecodeCompiler:
         self.emit(Op.STORE_LOCAL, local.slot, node=node)
         if local.celled:
             self.emit(Op.MAKE_CELL, local.slot, node=node)
+        if local.dbg is not None:
+            local.dbg[2] = len(self.fs.proto.code)     # live once it holds its value
 
     # ── program ─────────────────────────────────────────────────────────────
     def compile_program(self, program: Program) -> TBCModule:
@@ -7508,6 +7642,7 @@ class BytecodeCompiler:
             self.emit(Op.CALL, self.funcs["main"], 0)
             self.emit(Op.POP)
         self.emit(Op.HALT)
+        start_fs = self.fs
 
         # compile bodies (lambdas and prelude functions are appended as we go)
         i = 0
@@ -7515,9 +7650,13 @@ class BytecodeCompiler:
             fidx, fdef, owner = self.pending[i]
             self.compile_function(fidx, fdef, owner)
             i += 1
+        self.finish_debug_info(start_fs)
+        m.debug_info = self.debug_info
         if self.fuse:
             for f in m.funcs:
-                fuse_superinstructions(f)
+                new_pc = fuse_superinstructions(f)
+                if new_pc and f.locals:          # the shorter code moved the live ranges
+                    _remap_live_ranges(new_pc, f.locals)
         return m
 
     def declare_enum(self, e: EnumDef):
@@ -7626,6 +7765,7 @@ class BytecodeCompiler:
             self.patch_jump(skip)
         self.compile_block_stmts(fdef.body)
         self.emit_return_nil(fdef)
+        self.finish_debug_info(fs)
         self.fs = parent_fs
 
     def emit_return_nil(self, node):
@@ -7681,6 +7821,7 @@ class BytecodeCompiler:
         else:
             self.compile_expr(node.body, node)
         self.emit(Op.RETURN, node=node)
+        self.finish_debug_info(fs)
         self.static_effects = saved_effects
         proto.n_upvals = len(fs.upvals)
         upvals = fs.upvals
@@ -8343,6 +8484,7 @@ class BytecodeCompiler:
         else:
             self.compile_expr(clause.body, clause)
         self.emit(Op.RETURN, node=clause)
+        self.finish_debug_info(fs)
         proto.n_upvals = len(fs.upvals)
         upvals = fs.upvals
         self.fs = parent
@@ -10257,6 +10399,8 @@ class TILVM:
         try:
             while True:
                 op_pc = pc
+                # @line-event: `til debug` (src/tildebug.py) runs a copy of execute() with its
+                # line-event check put here; normal runs have nothing here and pay nothing
                 op = code[pc]
                 pc += 1
                 if op == LOAD_LOCAL:
@@ -10896,6 +11040,9 @@ def disassemble(m: TBCModule) -> str:
     for i, (name, fields) in enumerate(m.types):
         if i > TYPE_ERR:
             out.append(f"; type #{i} {name} {{ {', '.join(fields)} }}")
+    if m.debug_info:
+        for g, name in enumerate(m.globals):
+            out.append(f"; global #{g} {name}")
     bounds = sorted((f.offset, i) for i, f in enumerate(m.funcs))
     ends = {idx: (bounds[k + 1][0] if k + 1 < len(bounds) else len(m.code))
             for k, (_off, idx) in enumerate(bounds)}
@@ -10914,6 +11061,11 @@ def disassemble(m: TBCModule) -> str:
         out.append("")
         out.append(f"fn #{i} {f.name}  params={f.n_params} required={f.n_required} "
                    f"locals={f.n_locals} upvals={f.n_upvals}" + (f" [{', '.join(flags)}]" if flags else ""))
+        if m.debug_info:
+            for slot, lname, start, stop in sorted(f.locals, key=lambda r: (r[2], r[0])):
+                out.append(f";   local {lname}: slot {slot}, live {start:04d}-{stop:04d}")
+            for k, uname in enumerate(f.upval_names):
+                out.append(f";   upvalue {uname}: #{k}")
         pc, end = f.offset, ends[i]
         while pc < end:
             op = m.code[pc]
@@ -10973,15 +11125,16 @@ def disassemble(m: TBCModule) -> str:
 
 
 def compile_to_bytecode(source: str, filename: str = "<stdin>", verify: bool = True,
-                        fuse: bool = True) -> TBCModule:
+                        fuse: bool = True, debug_info: bool = False) -> TBCModule:
     """TIL source -> bytecode module (parse, resolve imports, verify, compile).
-    fuse=False skips the superinstruction pass (til ... --no-fuse)."""
+    fuse=False skips the superinstruction pass (til ... --no-fuse); debug_info=True
+    records variable names for the debugger (til build --debug-info)."""
     program = resolve_imports(parse_source(source, filename), filename)
     if verify:
         errors = SemanticChecker(source, filename).check(program)
         if errors:
             raise CompileError("\n\n".join(errors))
-    module = BytecodeCompiler(source, filename, fuse=fuse).compile_program(program)
+    module = BytecodeCompiler(source, filename, fuse=fuse, debug_info=debug_info).compile_program(program)
     if verify:
         errors = type_errors(program, source, filename)
         if errors:
@@ -11667,6 +11820,7 @@ Options:
   --target <t>            build: native | vm (.tbc) | c-vm (one C file: VM +
                           program, for calculators/MCUs) | c (generated C)
   --strip                 vm/c-vm: drop line tables (smallest bytecode)
+  --debug-info            vm/c-vm/dis: add variable names for debuggers (til debug)
   --no-fuse               VM bytecode without superinstructions (0x80-0xBF)
   --device <name>         vm/c-vm: fail the build unless it fits the device (til fit)
   --max-steps <n>         VM sandbox: stop after n loop iterations/calls
@@ -11918,6 +12072,7 @@ RUN_FLAG_OPTIONS = {
     '--screen-ansi': 'screen_ansi',  # graphics: draw the screen in the terminal
     '--prove': 'prove',              # check: prove contracts for all inputs
     '--no-fuse': 'no_fuse',          # run/build/dis: bytecode without superinstructions
+    '--debug-info': 'debug_info',    # build/dis: add variable names (the debug-info section)
 }
 
 
@@ -12580,7 +12735,8 @@ def main():
             return 0
 
         if command == 'dis':
-            print(disassemble(compile_to_bytecode(source, input_file, compiler.verify, fuse)))
+            print(disassemble(compile_to_bytecode(source, input_file, compiler.verify, fuse,
+                                                  bool(opts.get('debug_info')))))
             return 0
 
         base = os.path.splitext(os.path.basename(input_file))[0]
@@ -12612,7 +12768,8 @@ def main():
             return foreground_exit(rc)
 
         if target in ('vm', 'tbc'):
-            module = compile_to_bytecode(source, input_file, compiler.verify, fuse)
+            module = compile_to_bytecode(source, input_file, compiler.verify, fuse,
+                                         bool(opts.get('debug_info')))
             data = module.serialize(strip=strip)
             out = output_file or base + '.tbc'
             if opts.get('device') and not run_fit_check(data, opts['device'], input_file):
@@ -12624,7 +12781,8 @@ def main():
             return 0
 
         if target in ('c-vm', 'calc', 'embed'):
-            module = compile_to_bytecode(source, input_file, compiler.verify, fuse)
+            module = compile_to_bytecode(source, input_file, compiler.verify, fuse,
+                                         bool(opts.get('debug_info')))
             data = module.serialize(strip=strip)
             if opts.get('device') and not run_fit_check(data, opts['device'], input_file):
                 print("Build failed: nothing written", file=sys.stderr)
