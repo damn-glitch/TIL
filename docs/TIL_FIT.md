@@ -129,11 +129,11 @@ builds) and 32 effect handler entries (`TILVM_MAX_HANDLERS`).
   all examples in QEMU / simavr, the Z80 build in the ucsim simulator. Measured with
   arm-none-eabi-gcc 13.2 `-Os` + newlib-nano: VM code 53.2 KB of the 256 KB flash
   (storage = 256 − 56 KB), 80 bytes of other static data; with avr-gcc 7.3 `-Os`:
-  VM code 69.1 KB of the 128 KB flash (storage = 128 − 73 KB, which also leaves the
+  VM code 74 KB of the 128 KB flash (storage = 128 − 75 KB, which also leaves the
   flash copy of the VM's tables and of the bytecode room).
 * **AVR keeps constant data in RAM** (Harvard architecture, no `PROGMEM` in the
   VM, except the 5x7 font, which `TILVM_ROM=__flash` keeps in flash): the VM's
-  string tables and error messages take 3630 bytes of RAM (full build) or 2680
+  string tables and error messages take 3860 bytes of RAM (full build) or 2790
   bytes (lean build), measured as `.data` minus the program with avr-gcc
   (`TIL_TEST_CROSS=1 pytest tests/test_fit.py` links the AVR and Cortex-M ports and
   compares their `.data`/`.bss` with the model). The AVR port also copies the

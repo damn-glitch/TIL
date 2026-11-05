@@ -277,20 +277,20 @@ _device('cortex-m3-64k', title="ARM Cortex-M3 board, 64 KB RAM / 256 KB flash",
 _device('atmega1284', title="ATmega1284P, 16 KB RAM / 128 KB flash",
         cpu="8-bit AVR @ 16-20 MHz, verified in simavr",
         int_bits=32, float=1, heap=5120, stack=160, frames=24, consts=160, types=24, try_depth=6,
-        mark_stack=16, rom='__flash', no_stdio=True, no_time=True, storage=128 * KB - 73 * KB,
-        ram=16 * KB, c_stack=1536, vm_static_ram=3630, bytecode_in_ram=True, abi='avr', clock=False,
-        source="vm/ports/avr/Makefile (verified profile); avr-gcc -Os: VM code 69.1 KB, VM "
-               "strings/tables in RAM 3630 bytes (the font in flash); the port copies the bytecode "
+        mark_stack=16, rom='__flash', no_stdio=True, no_time=True, storage=128 * KB - 75 * KB,
+        ram=16 * KB, c_stack=1536, vm_static_ram=3860, bytecode_in_ram=True, abi='avr', clock=False,
+        source="vm/ports/avr/Makefile (verified profile); avr-gcc -Os: VM code 74 KB, VM "
+               "strings/tables in RAM 3860 bytes (the font in flash); the port copies the bytecode "
                "to RAM")
 _device('arduino-mega', title="Arduino Mega 2560 (ATmega2560), 8 KB RAM / 256 KB flash",
         cpu="8-bit AVR @ 16 MHz",
         int_bits=16, float=1, heap=1536, stack=96, frames=16, consts=96, types=16, try_depth=4,
         max_handlers=8, mark_stack=16, lean=True, no_gfx=True, rom='__flash', no_stdio=True,
-        no_time=True, storage=256 * KB - 48 * KB, ram=8 * KB, c_stack=1536, vm_static_ram=2680,
+        no_time=True, storage=256 * KB - 48 * KB, ram=8 * KB, c_stack=1536, vm_static_ram=2790,
         bytecode_in_ram=True, abi='avr', clock=False,
         source="lean 16-bit build in the style of `make tiny`, sized for 8 KB (8 effect handler "
                "entries, no screen natives: the board has no display); avr-gcc -Os: VM code "
-               "44.9 KB, VM strings/tables in RAM 2680 bytes; bytecode copied to RAM")
+               "44.9 KB, VM strings/tables in RAM 2790 bytes; bytecode copied to RAM")
 _device('esp32', title="ESP32 (ESP32-WROOM-32), 520 KB SRAM / 4 MB flash",
         cpu="Xtensa LX6 dual-core @ 240 MHz",
         int_bits=32, float=1, heap=64 * KB, stack=2048, frames=256, consts=2048, types=256,

@@ -9267,11 +9267,11 @@ def c_pow(a: float, b: float) -> float:
     try:
         return _math.pow(a, b)
     except OverflowError:                          # |result| too large: inf, negative for x < 0 ** odd n
-        odd = b == _math.floor(b) and _math.fmod(b, 2.0) != 0.0
+        odd = _math.isfinite(b) and b == _math.floor(b) and _math.fmod(b, 2.0) != 0.0
         return float('-inf') if a < 0 and odd else float('inf')
     except ValueError:
         if a == 0.0:                               # 0 ** negative: a pole
-            odd = b == _math.floor(b) and _math.fmod(b, 2.0) != 0.0
+            odd = _math.isfinite(b) and b == _math.floor(b) and _math.fmod(b, 2.0) != 0.0
             return _math.copysign(float('inf'), a) if odd else float('inf')
         return float('nan')                        # negative ** fractional
 
