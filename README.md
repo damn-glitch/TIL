@@ -72,11 +72,24 @@ Commands:
   check <file.til>        Verify effects, capabilities, contracts, names
   translate <file.til>    Translate keywords: --to en | kk | kk-latn | ru
   repl                    Interactive REPL (on the VM)
+  debug <file.til>        Time-travel debugger: breakpoints, step, step BACK, reverse-continue
+  prove <file.til>        Prove #[requires]/#[ensures] for ALL inputs (Z3)
+  fit <file.til>          Will it fit a device?  --device ti84ce|numworks|z80-16|... [--run]
+  pkg <cmd>               Packages: init | add NAME SPEC | install | remove | list | verify
 
 Options:
   --vm / --cvm            run on the Python VM / on the C VM
   --max-steps <n>         VM sandbox limit
   --strip                 smallest bytecode (no line table)
+  --no-fuse               bytecode without superinstructions
+  --device <name>         build: fail unless the program fits the device
+  --lang en|ru|kk         message language (also TIL_LANG, or #[lang: ...] in the program)
+  --screen <file.ppm>     graphics: save the final screen as a PPM image
+  --screen-ansi           graphics: draw the screen in the terminal (24-bit colour)
+  --keys <list>           graphics: scripted keys, e.g. "UP,UP,ENTER,a,ESC"
+  --pause-after <n> --save <f.tilp>   pause after n steps, save a portable snapshot
+  --resume <f.tilp>       continue a saved program (on any TIL VM)
+  -- <args...>            arguments for the program (args())
   -o <file>               Output file name
   -c                      Output C code only (same as --target c)
   -O0, -O1, -O2, -O3      Optimization level (default: -O2)
@@ -106,11 +119,73 @@ running program and resume it later, even after a power cycle).
 |---|---|---|
 | ARM Cortex-M3, 64 KB RAM (NumWorks / STM32 class, QEMU) | 44.7 KB flash, 24 KB RAM | all examples identical |
 | 8-bit AVR ATmega1284P, 16 KB RAM (Arduino class, simavr) | 53.8 KB flash, 10.5 KB RAM | all examples identical |
-| Z80 (TI-83/84 class, ucsim) | compiles, but 70 KB of SDCC code exceeds the 64 KB address space — [status](vm/ports/z80/RESULTS.md) | not yet |
+| Z80 (TI-83/84 class, ucsim) — TIL 3.1 | 16-bit lean build: code ends at 0xBE38 (below 0xC000), 5.7 KB RAM — [results](vm/ports/z80/RESULTS.md) | all examples without floats or values beyond 16 bits identical |
 
 Every program in the test-suite runs on three engines — native C, the Python
 VM and the C VM — and must produce byte-identical output. Details:
 [vm/README.md](vm/README.md).
+
+---
+
+## TIL 3.1 — the 14 ideas, done
+
+| # | Idea | How to use it | Docs |
+|---|---|---|---|
+| 1 | **Self-hosted compiler** — TIL compiled by TIL, so a calculator can compile programs itself | `til run --vm selfhost/tilc.til in.til out.tbc` | [selfhost/README.md](selfhost/README.md) |
+| 2 | **Portable snapshots** — start on a PC, continue on a calculator | `til run --vm prog.til --pause-after 5000 --save s.tilp` → `tilvm --resume-portable s.tilp prog.tbc` | [TIL_SNAPSHOTS.md](docs/TIL_SNAPSHOTS.md) |
+| 3 | **Graphics and keys** — `draw_pixel`, `draw_line`, `draw_text`, `key_pressed`, ... | `til run --vm examples/11_graphics.til --screen-ansi` | [TIL_GRAPHICS.md](docs/TIL_GRAPHICS.md) |
+| 4 | **Time-travel debugger** — step back, reverse-continue | `til debug prog.til` (`b 12`, `c`, `back`, `rc`, `p x`) | [TIL_DEBUGGER.md](docs/TIL_DEBUGGER.md) |
+| 5 | **Online playground** — compiler + VM in the browser (WebAssembly) | open `website/playground/` | [playground](website/playground/README.md) |
+| 6 | **Contract proofs for all inputs** (Z3, 64-bit exact) | `til prove prog.til`, `til check --prove` | [TIL_PROOFS.md](docs/TIL_PROOFS.md) |
+| 7 | **Typed native backend + generics** (inference, `E-TYPE`, monomorphization) | `til run prog.til` | [TIL_TYPES.md](docs/TIL_TYPES.md) |
+| 8 | **Effects with resumption** — `handle ... with E(x) => resume(v)` | `examples/12_effects.til` | [TIL_EFFECTS.md](docs/TIL_EFFECTS.md) |
+| 9 | **Z80** — 16-bit build fits below 0xC000; TI-84 Plus CE port | `make -C vm/ports/z80` | [RESULTS.md](vm/ports/z80/RESULTS.md) |
+| 10 | **Will it fit?** — static + measured memory check per device | `til fit prog.til --device ti84ce` | [TIL_FIT.md](docs/TIL_FIT.md) |
+| 11 | **Battery saving** — `#[energy: low]`, `energy_mode()` | `examples/14_energy.til` | [TIL_ENERGY.md](docs/TIL_ENERGY.md) |
+| 12 | **Error messages in Kazakh and Russian** | `til run --lang kk prog.til`, `TIL_LANG=ru` | [TIL_I18N.md](docs/TIL_I18N.md) |
+| 13 | **2–3× faster VM** — computed goto, superinstructions, caches | `python3 benchmarks/run.py` | [TIL_BYTECODE_V2.md](docs/TIL_BYTECODE_V2.md) |
+| 14 | **Package manager** — `til.json`, `til.lock`, git/archive/path/registry sources | `til pkg add utils ../utils && til pkg install` | [TIL_PACKAGES.md](docs/TIL_PACKAGES.md) |
+
+```til
+# effects with resumption: the handler answers, the body continues
+handle
+    let name = perform Ask("name?")
+    print("hello " + name)
+with
+    Ask(question) => resume("Aigerim")
+```
+
+```til
+# graphics: the VM draws the shapes and the 5x7 font, identical pixels everywhere
+screen_init(96, 64)
+screen_clear(0x1E3A5F)
+draw_circle(70, 32, 12, 0xFFD23F)
+draw_text(2, 2, "TIL 3.1", 0xFFFFFF)
+screen_show()
+```
+
+```bash
+til prove examples/13_proofs.til          # proved / counterexample: x = 9223372036854775807
+til fit game.til --device z80-16          # fits / does not fit: <reasons>
+til run --lang kk broken.til              # қате: ... (Kazakh diagnostics)
+til debug prog.til --commands "b 5; c; p x; back; p x; q"
+```
+
+Measured (details in each document):
+
+* **Speed** (C VM, desktop, vs TIL 3.0): `fib(27)` 2.8×, loops 2.6×, arrays 3.0×,
+  strings 2.4×; the Python reference VM 1.1–2.1× faster.
+* **Native backend**: 97.4% of the test-suite and example programs compile
+  natively (TIL 3.0: 88.7%), with output identical to the VM for every one.
+* **Self-hosting**: `tilc.til` (~8,100 lines of TIL) compiles itself to the same
+  bytes as the Python compiler (stage 1 = stage 2 = stage 3) — 0.4 s on the C VM.
+* **Devices** (emulated): Cortex-M3 55 KB flash / 30 KB RAM, AVR ATmega1284P
+  76 KB flash / 14 KB RAM, Z80 16-bit lean build below 0xC000 / 5.7 KB RAM.
+  The TI-84 Plus CE port is written but has not been built with the CE
+  toolchain or run on a calculator yet.
+
+Every program in the test-suite runs on the Python VM and the C VM (and
+natively where it compiles) and must produce byte-identical output.
 
 ---
 
@@ -619,6 +694,12 @@ The `examples/` directory contains progressive tutorials:
 | `06_enums.til` | Enums with values, match expressions |
 | `07_multilevel.til` | Multi-level programming across all levels |
 | `08_imports.til` | Module imports and reuse |
+| `09_v3_features.til` | TIL 3.0: retry, timeout, ADTs, traits, Option/Result |
+| `10_verified.til` | Effects, capabilities and contracts checked by the compiler |
+| `11_graphics.til` | Screen graphics: shapes, text, pixel checksum (3.1) |
+| `12_effects.til` | Effects with resumption: `handle ... with ... resume` (3.1) |
+| `13_proofs.til` | Contracts proved for all inputs with `til prove` (3.1) |
+| `14_energy.til` | Battery saving: `#[energy: low]`, `energy_mode()` (3.1) |
 | `kazakh/salam.til` | Full program written in Kazakh |
 
 Run any example:
@@ -794,13 +875,16 @@ TIL/
 
 - [x] Full pattern matching with destructuring (VM)
 - [x] Full trait dispatch (dynamic method resolution) (VM)
-- [ ] Self-hosted compiler → compile TIL on the calculator itself
-- [ ] Portable snapshots: start a program on a PC, continue it on a calculator
-- [ ] Calculator graphics & keypad API (`draw_pixel`, `key_pressed`, ...)
-- [ ] Contracts proven with an SMT solver (Level 4 "Formal")
-- [ ] Typed AST + monomorphization for the native backend
-- [ ] WebAssembly build of the VM for an in-browser playground
-- [ ] Package manager, LSP keyword sync
+- [x] Self-hosted compiler → compile TIL on the calculator itself (3.1)
+- [x] Portable snapshots: start a program on a PC, continue it on a calculator (3.1)
+- [x] Calculator graphics & keypad API (`draw_pixel`, `key_pressed`, ...) (3.1)
+- [x] Contracts proven with an SMT solver (Level 4 "Formal") (3.1)
+- [x] Typed AST + monomorphization for the native backend (3.1)
+- [x] WebAssembly build of the VM for an in-browser playground (3.1)
+- [x] Package manager (3.1)
+- [x] Time-travel debugger, effects with resumption, battery saving, Kazakh/Russian messages, 2–3× faster VM, memory-fit check, Z80 16-bit build (3.1)
+- [ ] TI-84 Plus CE: build and run on a real calculator; TI-84 Plus Flash application (banked Z80)
+- [ ] LSP keyword sync
 
 All ideas, in Russian: [docs/TIL_3_IDEAS_RU.md](docs/TIL_3_IDEAS_RU.md)
 

@@ -1,4 +1,11 @@
-# TIL Bytecode (`.tbc`) — Format Specification, version 1
+# TIL Bytecode (`.tbc`) — Format Specification, version 1 (and 2)
+
+> **TIL 3.1 writes version 2.** Version 2 keeps this layout exactly and only
+> appends: natives 34–54 (below), opcodes `0x76–0x79` (effect handlers) and
+> `0x80–0xBF` (superinstructions), header flag bits 2–3 (initial energy mode),
+> function flags 8 (`#[energy: low]`) and 16 (effect clause), and an optional
+> debug-info section after the line table. Both VMs load versions 1 and 2.
+> Details: [TIL_BYTECODE_V2.md](TIL_BYTECODE_V2.md).
 
 TIL 3.0 has two backends:
 
@@ -48,8 +55,9 @@ Floats print like C `printf("%g")` (6 significant digits).
 
 ```
 magic      "TILB"                      4 bytes
-version    u8 = 1
+version    u8 = 1 or 2 (TIL 3.1 writes 2)
 flags      u8   bit0: program uses floats   bit1: has line table
+                bits 2-3 (v2): initial energy mode 0..2 (#[energy: ...] pragma)
 n_globals  u16
 entry      u16  function index of the entry function (__start__)
 
@@ -152,6 +160,15 @@ instruction.
 `print len str int float abs sqrt pow sin cos tan log exp floor ceil round min
 max input chr ord range type_of format clock_ms random seed sleep_ms exit bool
 sum panic iter println` — ids 0..33 in this order.
+
+Version 2 appends ids 34..54: `read_file write_file file_exists args
+bytes_to_str str_bytes screen_init screen_clear draw_pixel draw_line draw_rect
+fill_rect draw_circle draw_text get_pixel screen_show key_pressed wait_key
+screen_width screen_height energy_mode`. The screen and keys natives (40–53)
+are specified in [TIL_GRAPHICS.md](TIL_GRAPHICS.md) — drawing algorithms, the
+5×7 font and the error messages are part of the contract (identical pixels on
+every VM); `energy_mode` in [TIL_ENERGY.md](TIL_ENERGY.md). Argument counts are
+checked at compile time (`NATIVE_ARITY`) and the minimum again at run time.
 
 ### Builtin methods (`INVOKE` method id)
 

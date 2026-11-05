@@ -80,7 +80,7 @@ These are real **practical limitations**, and they represent areas for future im
 ### Roadmap to Independence
 
 1. **Phase 1** (Current): Python-based compiler — fast to develop, easy to modify, proves the language design
-2. **Phase 2** (Future): Self-hosted compiler — write the TIL compiler in TIL itself, eliminating the Python dependency
+2. **Phase 2** (done in TIL 3.1): Self-hosted compiler — `selfhost/tilc.til` is a TIL compiler written in TIL; it compiles itself to the same bytes (bootstrap fixed point) and runs on every TIL VM, including the browser playground
 3. **Phase 3** (Future): Direct native codegen — optional LLVM or custom backend for single-pass compilation
 
 This is the same path Go, Rust, and many other languages followed. You build the language first, prove its design, then bootstrap.
@@ -105,8 +105,8 @@ The answer is **yes**: the Multi-Level Programming System. No other language let
 | "Go has its own compiler" | Go's compiler was written in C for 6 years. Bootstrapping is a maturity milestone, not a prerequisite. |
 | "Double compilation" | Compiling through C is a proven technique (Nim, Chicken Scheme, Vala, etc.) that leverages existing optimizer research. |
 | "Bootstrapping = real language" | C++ started as a C transpiler. Rust started in OCaml. TypeScript runs on JavaScript. Implementation language ≠ language identity. |
-| "Python dependency" | **Valid concern.** A self-hosted compiler is a future goal. |
+| "Python dependency" | **Partly answered.** Since TIL 3.1 the compiler also exists in TIL itself (`selfhost/tilc.til`) and runs on the C VM without Python; the reference toolchain is still the Python one. |
 
 ---
 
-*TIL is a real programming language at an early stage of its toolchain maturity. The path from "compiler written in another language" to "self-hosted compiler" is well-trodden — and TIL is on it.*
+*TIL is a real programming language at an early stage of its toolchain maturity. The path from "compiler written in another language" to "self-hosted compiler" is well-trodden — and TIL has walked it: TIL 3.1 compiles itself.*
