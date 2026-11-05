@@ -1416,6 +1416,11 @@ class IntentBlock(ASTNode):
 @dataclass
 class Program(ASTNode):
     statements: List[ASTNode] = field(default_factory=list)
+    energy: Optional[int] = None    # the #[energy: ...] pragma of the file (ENERGY_MODES value)
+
+# `#[energy: X]` on a function: low = the VMs idle while it runs (FLAG_ENERGY_LOW);
+# medium / high are TIL 3.0 hints for the native backend only
+FUNCTION_ENERGY_LEVELS = ('low', 'medium', 'high')
 
 # Top-level nodes that define things (everything else at the top level is a
 # script statement that runs at program start - see Parser.hoist_script_statements).
@@ -1434,6 +1439,8 @@ class Parser:
         self.pos = 0
         self.current_level = 2  # Default level
         self.pending_attributes: List[str] = []
+        self.energy: Optional[int] = None   # the file's #[energy: ...] pragma (Program.energy)
+        self.seen_definition = False        # a top-level definition was parsed (pragmas come first)
         self.error_reporter = ErrorReporter(source, filename)
         self.languages = languages
         self.in_clause = False   # parsing the code of an effect clause (resume allowed)
@@ -1507,7 +1514,9 @@ class Parser:
         return node
 
     def error(self, msg: str):
-        tok = self.current()
+        self.error_at(self.current(), msg)
+
+    def error_at(self, tok: Token, msg: str):
         hint = get_hint_for_error(msg)
         formatted = self.error_reporter.format_error(tok.line, tok.col, msg, hint=hint)
         raise SyntaxError(formatted)
@@ -1553,9 +1562,11 @@ class Parser:
             stmt = self.parse_top_level()
             if stmt:
                 statements.append(stmt)
+                if isinstance(stmt, DEFINITION_NODES):
+                    self.seen_definition = True
             self.skip_newlines()
 
-        return Program(statements=self.hoist_script_statements(statements))
+        return Program(statements=self.hoist_script_statements(statements), energy=self.energy)
 
     @staticmethod
     def hoist_script_statements(statements: List[ASTNode]) -> List[ASTNode]:
@@ -1597,9 +1608,13 @@ class Parser:
         self.skip_newlines()
         
         # Collect attributes
+        energy_toks = []
         while self.match(TokenType.ATTRIBUTE):
-            attr = self.advance().value
+            tok = self.advance()
+            attr = tok.value
             self.pending_attributes.append(attr)
+            if attr.startswith("energy:"):
+                energy_toks.append(tok)
             
             # Parse level
             if attr.startswith("level:"):
@@ -1609,6 +1624,8 @@ class Parser:
                     pass
             
             self.skip_newlines()
+        if energy_toks:
+            self.place_energy_attributes(energy_toks)
         
         if self.match(TokenType.IMPORT, TokenType.FROM):
             return self.parse_import()
@@ -1649,6 +1666,72 @@ class Parser:
         
         return self.parse_statement()
     
+    def place_energy_attributes(self, toks: List[Token]):
+        """`#[energy: ...]` before a top-level item (docs/TIL_ENERGY.md): it marks
+        the function defined next when it is directly above it (no empty line in
+        between); otherwise - or with the program modes `balanced` / `performance`
+        - it is the program's energy-mode pragma, which must come before every
+        definition of the file (a module's pragma only counts when the module
+        is the program)."""
+        func_next = self.at_function_definition()
+        for tok in toks:
+            level = tok.value[len("energy:"):].strip()
+            attached = func_next and not self.blank_line_after(tok)
+            if attached and level not in ('balanced', 'performance'):
+                continue                      # an attribute of the function (parse_func_body)
+            self.pending_attributes.remove(tok.value)
+            if self.seen_definition:
+                self.error_at(tok, "#[energy: ...] must be directly above a function, or come before "
+                                   "every definition (the program's energy mode)")
+            if level not in ENERGY_MODES:
+                self.error_at(tok, f"unknown energy mode '{level}' (use low, balanced or performance)")
+            if self.energy is not None:
+                self.error_at(tok, "the program's energy mode is set twice")
+            self.energy = ENERGY_MODES[level]
+
+    def at_function_definition(self) -> bool:
+        """The next top-level item is a function definition."""
+        if self.match(TokenType.FN):
+            return True
+        if self.match(TokenType.PUB):
+            nxt = self.peek()
+            if nxt.type == TokenType.FN:
+                return True
+            if nxt.type != TokenType.IDENT:
+                return False
+            self.pos += 1
+            try:
+                return self.is_func_def()
+            finally:
+                self.pos -= 1
+        return self.match(TokenType.IDENT) and self.is_func_def()
+
+    def blank_line_after(self, tok: Token) -> bool:
+        """An empty line comes between `tok` and the next token (comment lines do not count)."""
+        src = self.error_reporter.source or ""
+        i, n = tok.end, len(src)
+        if i < 0:
+            return False
+        while i < n and src[i] != '\n':          # the rest of tok's line
+            if src[i] == '#' and src[i + 1:i + 2] != '[':
+                while i < n and src[i] != '\n':
+                    i += 1
+                break
+            if src[i] not in ' \t\r':
+                return False                      # a token on the same line
+            i += 1
+        while i < n:                              # src[i] is a newline
+            i += 1
+            while i < n and src[i] in ' \t\r':
+                i += 1
+            if i >= n or src[i] == '\n':
+                return True
+            if src[i] != '#' or src[i + 1:i + 2] == '[':
+                return False
+            while i < n and src[i] != '\n':      # a comment line
+                i += 1
+        return True
+
     def parse_pub_item(self) -> ASTNode:
         if self.match(TokenType.STRUCT):
             node = self.parse_struct()
@@ -1816,8 +1899,12 @@ class Parser:
                         effects.append(f"cap:{cap_name}")
                         caps.append(cap_name)
             elif attr.startswith("energy:"):
-                # Energy annotation: #[energy: low|medium|high]
+                # Energy annotation: #[energy: low] (the VMs idle while it runs, see
+                # docs/TIL_ENERGY.md); medium / high only steer the native backend
                 energy_level = attr[len("energy:"):].strip()
+                if energy_level not in FUNCTION_ENERGY_LEVELS:
+                    self.error_at(name_tok, f"unknown energy level '{energy_level}' for a function "
+                                            f"(use #[energy: low])")
                 remaining_attrs.append(f"energy:{energy_level}")
             elif attr.startswith("generic:"):
                 # Generic type params: #[generic: T, U]
@@ -6805,6 +6892,16 @@ DEBUG_UPVAL = 0xFFFE
 DEBUG_RECORD = '<HBHII'                 # 13 bytes per record
 
 
+# Energy saving (docs/TIL_ENERGY.md): the program's mode (the .tbc header
+# flags byte, bits 2-3: the #[energy: ...] pragma; energy_mode(m) at run time).
+# Both VMs idle 1 ms at every step that is a multiple of 512 in mode low, of
+# 4096 in mode balanced, never in mode performance; while a frame of an
+# #[energy: low] function is active they behave as in mode low.
+ENERGY_PERFORMANCE, ENERGY_BALANCED, ENERGY_LOW = 0, 1, 2
+ENERGY_MODES = {'performance': ENERGY_PERFORMANCE, 'balanced': ENERGY_BALANCED, 'low': ENERGY_LOW}
+TBC_ENERGY_SHIFT = 2
+
+
 class TBCFunction:
     FLAG_METHOD = 1      # param 0 is `self`
     FLAG_PROPAGATE = 2   # `?` inside returns None/Err from this function
@@ -6844,6 +6941,7 @@ class TBCModule:
         self.code = b""
         self.lines: List[Tuple[int, int]] = []
         self.uses_float = False
+        self.energy = ENERGY_PERFORMANCE     # initial energy mode (#[energy: ...] pragma)
         self.version = TBC_VERSION           # of a loaded file (written files: TBC_VERSION)
         self.debug_info = False              # write the debug-info section (see DEBUG_RECORD)
         self.raw: Optional[bytes] = None     # from_bytes(): the bytes it was read from
@@ -6897,7 +6995,7 @@ class TBCModule:
         """Write the module (call serialize(): it interns all names first)."""
         self.link()
         out = bytearray()
-        flags = (1 if self.uses_float else 0) | (0 if strip else 2)
+        flags = (1 if self.uses_float else 0) | (0 if strip else 2) | (self.energy << TBC_ENERGY_SHIFT)
         out += TBC_MAGIC + bytes([TBC_VERSION, flags])
         out += _struct.pack('<HH', len(self.globals), self.entry)
         out += _struct.pack('<H', len(self.consts))
@@ -6965,6 +7063,9 @@ class TBCModule:
         m.version = data[4]
         flags = data[5]
         m.uses_float = bool(flags & 1)
+        m.energy = (flags >> TBC_ENERGY_SHIFT) & 3
+        if m.energy > ENERGY_LOW:
+            raise ValueError(f"bad bytecode header (energy mode {m.energy})")
         pos = 6
         def rd(fmt):
             nonlocal pos
@@ -7584,6 +7685,7 @@ class BytecodeCompiler:
     # ── program ─────────────────────────────────────────────────────────────
     def compile_program(self, program: Program) -> TBCModule:
         m = self.m
+        m.energy = program.energy or ENERGY_PERFORMANCE   # the #[energy: ...] pragma
         self.funcs: Dict[str, int] = {}          # function name -> index
         self.fdefs: Dict[str, FuncDef] = {}
         self.struct_types: Dict[str, int] = {}   # struct name -> type index
@@ -7764,6 +7866,8 @@ class BytecodeCompiler:
             proto.flags |= TBCFunction.FLAG_METHOD
         if isinstance(fdef.ret_type, (OptionType, ResultType)):
             proto.flags |= TBCFunction.FLAG_PROPAGATE
+        if "energy:low" in getattr(fdef, 'attributes', ()):
+            proto.flags |= TBCFunction.FLAG_ENERGY_LOW
         for p in params:
             self.declare_local(p.name, mutable=True, node=fdef)
         # default arguments are evaluated by the callee when the slot is unset
@@ -9556,8 +9660,15 @@ class TILVM:
         self._own_stdout = write is None
         self.write = write or self._stdout_write
         self.read_line = read_line or self._stdin_line
-        self.max_steps = max_steps
         self.steps = 0
+        # energy saving (docs/TIL_ENERGY.md): `energy` is the program's mode (0 performance,
+        # 1 balanced, 2 low; C VM: st.energy), `idle_count` the idles so far (tilvm --stats)
+        self.idle_count = 0
+        self.low_funcs = frozenset(i for i, f in enumerate(module.funcs)
+                                   if f.flags & TBCFunction.FLAG_ENERGY_LOW)
+        self._max_steps = self._energy = 0
+        self.max_steps = max_steps
+        self.energy = getattr(module, 'energy', ENERGY_PERFORMANCE)
         self.globals = [None] * len(module.globals)
         self.methods = {(t, n): f for t, n, f in module.methods}
         const_of = {}
@@ -9592,6 +9703,29 @@ class TILVM:
         self.status: Optional[int] = None  # DONE / ERROR / EXIT once the program has ended
         self.exit_code: Optional[int] = None
         self.pause_at = 0                 # run_steps(): pause when steps reaches this (0: never)
+
+    # max_steps and energy are properties: assigning either keeps `_slow` right, the
+    # flag check_budget tests at every step before it looks at the step limit and at
+    # energy saving (a program with neither pays one test per step, as in TIL 3.0)
+    @property
+    def max_steps(self) -> int:
+        """Sandbox: stop after this many steps (0 = no limit)."""
+        return self._max_steps
+
+    @max_steps.setter
+    def max_steps(self, n: int):
+        self._max_steps = n
+        self._slow = bool(n or self._energy or self.low_funcs)
+
+    @property
+    def energy(self) -> int:
+        """The program's energy mode: 0 performance, 1 balanced, 2 low (C VM: st.energy)."""
+        return self._energy
+
+    @energy.setter
+    def energy(self, mode: int):
+        self._energy = mode
+        self._slow = bool(self._max_steps or mode or self.low_funcs)
 
     @staticmethod
     def _stdout_write(data: bytes):
@@ -10039,6 +10173,14 @@ class TILVM:
             if type(args[0]) is not bytes:
                 self.panic(f"str_bytes() expects a string, got {self.type_name(args[0]).decode()}")
             return list(args[0])
+        if name == 'energy_mode':
+            prev = self.energy
+            if args:
+                m = args[0]
+                if type(m) is not int or not ENERGY_PERFORMANCE <= m <= ENERGY_LOW:
+                    self.panic("energy_mode() needs a mode 0 (performance), 1 (balanced) or 2 (low)")
+                self.energy = m
+            return prev
         self.panic(f"{name}() is not available in this VM build")
 
     def path_arg(self, who: str, v) -> str:
@@ -10464,9 +10606,12 @@ class TILVM:
         """One step (a loop back-edge or a call). `pc` = where the program goes on
         (after the jump / at the called function's start): a pause saves it."""
         self.steps += 1
-        if self.max_steps and self.steps > self.max_steps:
-            err = TILFatal(f"step limit exceeded ({self.max_steps})")
-            raise err
+        if self._slow:                  # a step limit or energy saving (see max_steps, energy)
+            steps = self.steps
+            if self._max_steps and steps > self._max_steps:
+                raise TILFatal(f"step limit exceeded ({self._max_steps})")
+            if not steps & 511 and (self._energy or self.low_funcs):
+                self.energy_point()
         if self.deadlines:
             self.tick += 1
             if self.tick >= self.CHECK_INTERVAL:
@@ -10835,6 +10980,25 @@ class TILVM:
         if width:
             self.screen.init(width, height)
         self.started = True
+
+    def energy_point(self):
+        """At a step that is a multiple of 512 (as energy_point in vm/tilvm.c): idle
+        1 ms if the energy mode asks for it - mode 2, or mode 1 at a multiple of
+        4096; mode 2 while a frame of an #[energy: low] function is active."""
+        mode = self._energy
+        if mode != ENERGY_LOW and self.low_funcs:
+            low = self.low_funcs
+            for fr in reversed(self.frames):
+                if fr[0] in low:
+                    mode = ENERGY_LOW
+                    break
+        if mode == ENERGY_LOW or (mode == ENERGY_BALANCED and not self.steps & 4095):
+            self.idle_count += 1
+            self.idle(1)
+
+    def idle(self, ms: int):
+        """Energy saving: give the CPU away for `ms` milliseconds (C VM: vm->host.idle)."""
+        _time.sleep(ms / 1000.0)
 
     def binop(self, op: int, a, b):
         """Binary operator `op` (ADD..GE) exactly as its plain instruction computes it
@@ -11546,6 +11710,10 @@ def disassemble(m: TBCModule) -> str:
         m.link()
     out = [f"; TIL bytecode v{getattr(m, 'version', TBC_VERSION)}: {len(m.funcs)} functions, {len(m.consts)} constants, "
            f"{len(m.globals)} globals, {len(m.code)} bytes of code"]
+    energy = getattr(m, 'energy', ENERGY_PERFORMANCE)
+    if energy:
+        name = {v: k for k, v in ENERGY_MODES.items()}[energy]
+        out.append(f"; energy mode: {name} ({energy}, #[energy: {name}])")
     for i, (name, fields) in enumerate(m.types):
         if i > TYPE_ERR:
             out.append(f"; type #{i} {name} {{ {', '.join(fields)} }}")

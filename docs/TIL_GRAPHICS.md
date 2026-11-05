@@ -66,7 +66,8 @@ vm/tilvm --screen out.ppm --keys "UP,ESC" game.tbc
   output and the `--screen` image, restores the terminal and ends by the
   signal, as an uncaught Ctrl-C does — a shell then also stops a script that
   runs it, and `$?` is 130. On the C VM a native that is running finishes
-  first (a `sleep_ms(5000)` sleeps on); a second Ctrl-C ends it at once.
+  first, except `sleep_ms()`, which idles and ends at once (docs/TIL_ENERGY.md);
+  a second Ctrl-C ends the program at once.
   Through `til run --cvm` the Ctrl-C reaches the C VM, and `til` ends the
   same way after it. `kill` (SIGTERM) ends the program at once — no image —
   and also restores the terminal. (POSIX; on Windows Ctrl-C ends the C VM

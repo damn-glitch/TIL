@@ -1782,6 +1782,9 @@ def _make_probe_vm_class():
             if watched:
                 self.globals = _WatchedGlobals(self.globals, watched, module.globals, self.unset_reads)
 
+        def idle(self, ms):
+            pass                    # energy saving (#[energy: low]): a check does not sleep
+
         def report(self, msg, pc):
             text = msg.decode('utf-8', 'replace')
             if text.startswith("runtime error: "):

@@ -9,7 +9,8 @@
  *   tilvm --resume-portable FILE p.tbc    continue a portable snapshot (from any VM build
  *                                         or `til run --vm`; docs/TIL_SNAPSHOTS.md)
  *   tilvm --stats program.tbc             print memory / GC statistics to stderr
- *                                         (+ high-water marks with -DTILVM_STATS)
+ *                                         (+ high-water marks with -DTILVM_STATS,
+ *                                         + energy mode and idles if it saved energy)
  *   tilvm --screen out.ppm program.tbc    save the screen (screen_init, draw_*) as a PPM at exit
  *   tilvm --screen-ansi program.tbc       draw the screen in the terminal on every screen_show()
  *   tilvm --keys "UP,UP,ENTER,a" p.tbc    scripted keys (default: the keyboard, or stdin's bytes)
@@ -28,10 +29,12 @@
 #ifdef _WIN32
 #include <conio.h>
 #include <io.h>
+#include <windows.h>
 #else
 #include <sys/select.h>
 #include <sys/time.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -198,7 +201,8 @@ static int parse_keys(const char *spec) {
 }
 
 /* Ctrl-C (POSIX): the program ends after its current step - a native that is
- * running, e.g. sleep_ms(), finishes first - then main() flushes the output,
+ * running finishes first (sleep_ms() at once: host_idle is cut short) - then
+ * main() flushes the output,
  * writes the --screen image, restores the terminal and ends the process by
  * SIGINT, as the reference VM does (`til run --vm`). A second Ctrl-C ends it at
  * once. The hooks below notice the flag; run_slices() covers loops that call
@@ -426,12 +430,53 @@ static int read_line_cooked(void *ctx, char *buf, size_t cap) {
     return (int)n;
 }
 
-/* sleep_ms() waits on the clock: Ctrl-C ends the program when the sleep is over. */
-static tilvm_clock_fn vm_clock;
+/* clock_ms(), timeouts and sleep_ms() use the wall clock (milliseconds since the
+ * start): the VM core's default clock() is CPU time, which stands still while
+ * the program sleeps or idles. */
+#ifdef _WIN32
+static uint32_t wall_ms(void) {
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0600
+    return (uint32_t)GetTickCount64();
+#else
+    return (uint32_t)GetTickCount();
+#endif
+}
+#else
+static uint32_t wall_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint32_t)((unsigned long)ts.tv_sec * 1000ul + (unsigned long)ts.tv_nsec / 1000000ul);
+}
+#endif
+static uint32_t wall_start;
 
+/* sleep_ms() waits on the clock, idling in between: Ctrl-C ends the program. */
 static uint32_t clock_hook(void *ctx) {
+    (void)ctx;
     if (interrupted) stop_program();
-    return vm_clock(ctx);
+    return wall_ms() - wall_start;
+}
+
+/* Energy saving (docs/TIL_ENERGY.md): the VM idles 1 ms every 512 / 4096 steps
+ * in the low / balanced modes, and sleep_ms() idles for the time left. The
+ * process really sleeps (no CPU time); Ctrl-C interrupts the sleep. */
+static void host_idle(void *ctx, unsigned long ms) {
+    (void)ctx;
+    if (interrupted) {
+        stop_program();
+        return;
+    }
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    {
+        struct timespec ts;
+        ts.tv_sec = (time_t)(ms / 1000ul);
+        ts.tv_nsec = (long)(ms % 1000ul) * 1000000L;
+        nanosleep(&ts, NULL);           /* EINTR on Ctrl-C: the VM re-checks */
+    }
+#endif
+    if (interrupted) stop_program();
 }
 
 static void install_screen_and_keys(tilvm *v) {
@@ -442,8 +487,9 @@ static void install_screen_and_keys(tilvm *v) {
     v->host.key_pressed = host_key_pressed;
     v->host.wait_key = host_wait_key;
     v->read_line = read_line_cooked;
-    if (v->clock_ms) {
-        vm_clock = v->clock_ms;
+    v->host.idle = host_idle;
+    if (v->clock_ms) {                  /* (TILVM_NO_TIME builds keep counting steps) */
+        wall_start = wall_ms();
         v->clock_ms = clock_hook;
     }
 }
@@ -671,6 +717,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[tilvm] steps=%lu gc=%lu heap=%lu/%ld bytes\n",
                 (unsigned long)vm.st.steps, (unsigned long)vm.st.gc_count,
                 (unsigned long)tilvm_heap_used(&vm), (long)TILVM_HEAP_SIZE);
+        if (vm.idle_count || vm.st.energy || (vm.flags & 0x8C))  /* the program saves energy */
+            fprintf(stderr, "[tilvm] energy_mode=%u idle=%lu\n", (unsigned)vm.st.energy,
+                    (unsigned long)vm.idle_count);
 #ifdef TILVM_STATS
         {   /* high-water marks (til fit --run reads this line) */
             tilvm_stats s;

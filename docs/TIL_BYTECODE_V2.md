@@ -11,6 +11,7 @@ instructions and natives. Numbers are append-only and never change meaning.
 | opcodes `0x76–0x79` (`HANDLE`, `END_HANDLE`, `PERFORM`, `RESUME`) | `docs/dev/TIL_3_1_DESIGN.md` §8 |
 | opcodes `0x80–0xBF`: **superinstructions** | this document |
 | optional **debug-info section** after the line table (variable names, written only with `--debug-info` / by `til debug`) | [TIL_DEBUGGER.md](TIL_DEBUGGER.md#the-debug-info-section) |
+| header flags bits 2–3: the program's initial **energy mode** (`#[energy: ...]` pragma, 0–2; 3 is rejected); function flag 8 = `#[energy: low]` | [TIL_ENERGY.md](TIL_ENERGY.md#bytecode-and-vm-state) |
 
 Both VMs load versions 1 and 2. A version-1 file never contains the new
 opcodes. `--no-fuse` builds contain no superinstructions: such a file runs on a
@@ -176,9 +177,13 @@ instructions and is 10–25% smaller.
   run before the sandbox limit (`max_steps`) or the budget of
   `tilvm_run_steps()` must be looked at; the slow path then performs exactly the
   checks of TIL 3.0, in the same order (step limit, deadlines every 256 steps,
-  budget). Steps, `tick`, yields and timeouts are unchanged. (A feature that
-  needs work every N steps, such as idling for energy saving, adds a term to
-  `refuel()` and its check to the slow path.)
+  budget). Steps, `tick`, yields and timeouts are unchanged. A feature that
+  needs work every N steps adds a term to `refuel()` and its check to the slow
+  path: energy saving ([TIL_ENERGY.md](TIL_ENERGY.md)) makes the counter end
+  at the next multiple of 512 steps while it can be active, idles between the
+  step-limit and the deadline checks, and refuels after `energy_mode()`.
+  `refuel()` is always inlined (as a call it costs the hot handlers
+  registers).
 * **Effects** (`docs/TIL_EFFECTS.md`): `PERFORM` enters the clause or default
   function through the same `call_fn` path as `CALL` (one step), every return
   path (`RETURN`, `RETURN_NIL`, `UNWRAP_OR_RETURN`, `RETURN_LOCAL`,

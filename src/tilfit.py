@@ -412,7 +412,7 @@ VM_STRUCTS: List[Tuple[str, str, List[tuple]]] = [
         _f('magic', 'u32'),
         _f('sp', 'u16'), _f('n_frames', 'u16'), _f('n_try', 'u16'), _f('n_deadlines', 'u16'),
         _f('heap_top', 'tv_size'),
-        _f('halted', 'u8'), _f('exit_code', 'u8'), _f('failed', 'u8'), _f('_pad', 'u8'),
+        _f('halted', 'u8'), _f('exit_code', 'u8'), _f('failed', 'u8'), _f('energy', 'u8'),
         _f('scr_w', 'u16'), _f('scr_h', 'u16'),
         _f('steps', 'u32'), _f('gc_count', 'u32'), _f('tick', 'u32'),
         _f('rng', 'rng'),
@@ -449,7 +449,7 @@ VM_STRUCTS: List[Tuple[str, str, List[tuple]]] = [
         # runtime
         _f('err_msg', 'ptr'), _f('err_val', 'tv_val'), _f('errbuf', 'char', 128),
         _f('mark_sp', 'u16'), _f('mark_overflow', 'u8'), _f('mark_stack', 'tv_ref', 'mark_stack'),
-        _f('st', 'tilvm_state'), _f('mem', 'tilvm.mem')]),
+        _f('idle_count', 'u32'), _f('st', 'tilvm_state'), _f('mem', 'tilvm.mem')]),
         # (tilvm_stats follows with TILVM_STATS: not part of the device builds)
 ]
 # the parts of the VM struct that the report lists (member path, label)
