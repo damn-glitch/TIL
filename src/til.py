@@ -3946,7 +3946,7 @@ def type_errors(program: 'Program', source: str, filename: str) -> List[str]:
     except Exception as e:          # an inference bug must never reject a program
         if os.environ.get('TIL_DEBUG_TYPES'):
             raise
-        print(f"[TIL] type inference skipped (internal error: {type(e).__name__}: {e})", file=sys.stderr)
+        print(localize(f"[TIL] type inference skipped (internal error: {type(e).__name__}: {e})"), file=sys.stderr)
         return []
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -11947,7 +11947,7 @@ class ModuleResolver:
         if not path:
             hint = package_install_hint(module_name, from_file, self.base_path)
             if hint:
-                print(hint, file=sys.stderr)
+                print(localize(hint), file=sys.stderr)
             return None
         key = module_file_key(path)         # one AST per file, whatever path reaches it
         if key in self.loaded:
@@ -12774,13 +12774,13 @@ def save_screen(screen: TILScreen, path: Optional[str], rc: int) -> int:
     if not path:
         return rc
     if not screen.w:
-        print("til: --screen: the program did not call screen_init (no image written)", file=sys.stderr)
+        print(localize("til: --screen: the program did not call screen_init (no image written)"), file=sys.stderr)
         return rc
     try:
         with open(path, 'wb') as f:
             f.write(screen.ppm())
     except OSError:
-        print(f"til: cannot write {path}", file=sys.stderr)
+        print(localize(f"til: cannot write {path}"), file=sys.stderr)
         return rc or 2
     return rc
 
@@ -13134,7 +13134,8 @@ def run_fit_check(data: bytes, device: str, filename: str) -> bool:
     except ImportError as e:
         if getattr(e, 'name', None) != 'tilfit':
             raise
-        print("Error: --device needs the fit checker (tilfit.py), which is not installed", file=sys.stderr)
+        print(localize("Error: --device needs the fit checker (tilfit.py), which is not installed"),
+              file=sys.stderr)
         return False
     return fit.check_build(data, device, filename)
 
@@ -13461,8 +13462,8 @@ def main():
         return 1
     if opts.get('device') and (command != 'build' or target not in ('vm', 'tbc', 'c-vm', 'calc', 'embed')
                                or input_file.endswith('.tbc')):
-        print("Error: --device works with `til build --target vm|c-vm` on a .til source; for a report on "
-              "any program (also .tbc) use `til fit FILE --device NAME`", file=sys.stderr)
+        print(localize("Error: --device works with `til build --target vm|c-vm` on a .til source; for a report "
+                       "on any program (also .tbc) use `til fit FILE --device NAME`"), file=sys.stderr)
         return 1
 
     try:
@@ -13505,7 +13506,7 @@ def main():
             errors = type_errors(ast, source, input_file) if compiler.typed else []
             if errors:
                 for err in errors:
-                    print(err, file=sys.stderr)
+                    print(localize(err), file=sys.stderr)
                 return 1
             proof_errors = run_proofs(ast, source, input_file, bool(opts.get('prove')))
             if proof_errors:
@@ -13571,7 +13572,7 @@ def main():
             data = module.serialize(strip=strip)
             out = output_file or base + '.tbc'
             if opts.get('device') and not run_fit_check(data, opts['device'], input_file):
-                print(f"Build failed: {out} not written", file=sys.stderr)
+                print(localize(f"Build failed: {out} not written"), file=sys.stderr)
                 return 1
             with open(out, 'wb') as f:
                 f.write(data)
@@ -13583,7 +13584,7 @@ def main():
                                          bool(opts.get('debug_info')))
             data = module.serialize(strip=strip)
             if opts.get('device') and not run_fit_check(data, opts['device'], input_file):
-                print("Build failed: nothing written", file=sys.stderr)
+                print(localize("Build failed: nothing written"), file=sys.stderr)
                 return 1
             text = amalgamate_c_vm(data, input_file)
             out = output_file or base + '_vm.c'

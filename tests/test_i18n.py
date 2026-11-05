@@ -1075,3 +1075,239 @@ class TestMergedBranches:
         known = i18n_coverage.Template(["intent '", None, "' failed: division by zero"], 'runtime', 'x:1')
         assert i18n_coverage.coverage_of(tilmsg, broken, [outer, inner])[0] is False
         assert i18n_coverage.coverage_of(tilmsg, known, [outer, inner])[0] is True
+
+
+# ═══════════════════════════════════════════════════════════════
+# THE INTEGRATED TIL 3.1: TOOLS, E-TYPE, NATIVE BACKEND, PACKAGES
+# ═══════════════════════════════════════════════════════════════
+
+try:
+    import z3 as _z3      # noqa: F401  (til prove needs it)
+    HAVE_Z3 = True
+except ImportError:
+    HAVE_Z3 = False
+needs_z3 = pytest.mark.skipif(not HAVE_Z3, reason="z3 is not installed")
+
+
+def _extract(src: str, name: str = 'tilnew.py'):
+    return _texts(i18n_coverage.PyExtractor(src, os.path.join(SRC, name)).run())
+
+
+class TestToolMessages:
+    """The messages of til prove / pkg / fit / debug, the typed backend (E-TYPE,
+    native backend) and the merged features: catalogued, extracted, printed
+    through localize() when a language is chosen."""
+
+    @pytest.mark.parametrize("en,ru,kk", [
+        ("til pkg: error: --update and --frozen cannot be combined",
+         "til pkg: ошибка: --update и --frozen нельзя использовать вместе",
+         "til pkg: қате: --update және --frozen бірге қолданылмайды"),
+        ("til fit --run: --run needs a C compiler (gcc, clang or cc)",
+         "til fit --run: для --run нужен компилятор C (gcc, clang или cc)",
+         "til fit --run: --run үшін C компиляторы керек (gcc, clang немесе cc)"),
+        ("til pkg: error: registry https://r.example/i.json (a 1.0.0): dependency 'b' = 'x y': invalid git URL",
+         "til pkg: ошибка: реестр https://r.example/i.json (a 1.0.0): зависимость 'b' = 'x y': неверный git URL",
+         "til pkg: қате: https://r.example/i.json тізілімі (a 1.0.0): 'b' = 'x y' тәуелділігі: git URL жарамсыз"),
+        ("error[E-TYPE]: argument 'n' of 'f' is int, but the value is the string 'abc', which is not a number",
+         "ошибка[E-TYPE]: аргумент 'n' функции 'f' имеет тип int, но значение — строка 'abc', которая не "
+         "является числом",
+         "қате[E-TYPE]: 'f' функциясының 'n' аргументінің типі — int, бірақ мәні 'abc' жолы, ол сан емес"),
+        ("error[E-TYPE]: unsupported operand types for +: [int] and {str: int}",
+         "ошибка[E-TYPE]: неподдерживаемые типы операндов для +: [int] и {str: int}",
+         "қате[E-TYPE]: + операциясы үшін операнд типтеріне қолдау жоқ: [int] және {str: int}"),
+        ("native backend: a map key has type fn(int) -> str in 'main' (line 4)",
+         "нативный бэкенд: ключ словаря имеет тип fn(int) -> str в 'main' (строка 4)",
+         "нативті бэкенд: сөздік кілтінің типі — fn(int) -> str, 'main' ішінде (4-жол)"),
+        ("native backend: str.upper() (line 3)",                 # code stays as it is
+         "нативный бэкенд: str.upper() (строка 3)",
+         "нативті бэкенд: str.upper() (3-жол)"),
+        ("error[E-PROVE]: cannot prove 'h': unsupported: 'match' is not supported",
+         "ошибка[E-PROVE]: нельзя доказать 'h': не поддерживается: 'match' не поддерживается",
+         "қате[E-PROVE]: 'h' функциясын дәлелдеу мүмкін емес: қолдау жоқ: 'match' қолдау көрсетілмейді"),
+        ("error[E-PROVE]: 'g': division by zero fails for b = 0",
+         "ошибка[E-PROVE]: 'g': деление на ноль нарушается при b = 0",
+         "қате[E-PROVE]: 'g': b = 0 кезінде нөлге бөлу орындалмайды"),
+        ("error[E-IMPORT]: struct 'P' is defined in two files: a.til:1 and b.til:2",
+         "ошибка[E-IMPORT]: структура 'P' определена в двух файлах: a.til:1 и b.til:2",
+         "қате[E-IMPORT]: 'P' құрылымы екі файлда анықталған: a.til:1 және b.til:2"),
+        ("til: cannot resume x.tilp: the snapshot is damaged or incomplete (truncated)",
+         "til: не удаётся продолжить x.tilp: снимок повреждён или неполон (файл обрывается)",
+         "til: x.tilp файлынан жалғастыру мүмкін емес: күй көшірмесі бүлінген немесе толық емес (файл үзіліп қалған)"),
+    ])
+    def test_translated(self, en, ru, kk):
+        assert tilmsg.localize(en, 'ru') == ru
+        assert tilmsg.localize(en, 'kk') == kk
+
+    def test_type_placeholders_take_typed_backend_types(self):
+        for value in ('[int]', '{str: [int]}', 'Option<Point>', 'Result<int, str>', 'fn(int, str) -> bool',
+                      'fn() -> None', 'str or int', '?3', 'dynamic'):
+            assert tilmsg.is_type(value), value
+        for value in ('my list', '[int; 3]', 'negative balance', 'fn(int)', 'Big Point', '[' * 50 + 'int' + ']' * 50):
+            assert not tilmsg.is_type(value), value
+        # a program's own sentence still stays English in its report
+        assert tilmsg.localize_report("runtime error: my list cannot be indexed\n", 'ru') == \
+            "ошибка выполнения: my list cannot be indexed\n"
+
+    def test_tool_prefix_frame(self):
+        assert tilmsg.split_frame("til pkg: error: x") == ('header', 'x')
+        assert tilmsg.split_frame("til fit --run: x") == ('program', 'x')
+        # the frame takes at most three words: a sentence that starts with "til" is no frame
+        assert tilmsg.split_frame("til prove needs the Z3 SMT solver, which is not installed.")[0] is None
+        # the C VM's report reader keeps its strict frame (tilvm / til only)
+        assert tilmsg.localize_report("til pkg: x\n", 'ru') == "til pkg: x\n"
+
+    def test_extraction_of_helpers_and_inheritance(self):
+        src = ("import til\n"
+               "class NativeUnsupported(Exception):\n    pass\n"
+               "def _(text):\n    return til.localize(text)\n"
+               "class Gen:\n"
+               "    def unsupported(self, what, node=None):\n"
+               "        where = f' (line {node})' if node else ''\n"
+               "        raise NativeUnsupported(f'native backend: {what}{where}')\n"
+               "    def go(self, t):\n"
+               "        self.unsupported(f'printing a value of type {t}', 3)\n"
+               "        print(_(f'til fit: unknown device {t}'), file=sys.stderr)\n"
+               "class Constraint:\n"
+               "    def fail(self, s, message):\n        pass\n"
+               "class Arith(Constraint):\n"
+               "    def solve(self, s, a):\n        self.fail(s, f'cannot apply unary - to {a}')\n")
+        texts = _extract(src)
+        assert {"native backend: printing a value of type {} (line {})", "native backend: printing a value of type {}",
+                "til fit: unknown device {}", "cannot apply unary - to {}"} <= texts
+        assert "native backend: {}" not in texts and "native backend: {} (line {})" not in texts
+
+    def test_extraction_of_tool_exceptions(self):
+        src = ("import sys\n"
+               "class PkgError(Exception):\n    pass\n"
+               "class _Internal(Exception):\n    pass\n"
+               "def check(name):\n"
+               "    if not name:\n        raise PkgError('package names must be non-empty strings')\n"
+               "    raise _Internal(f'hidden {name}')\n"
+               "def parse(x):\n    raise ValueError(f'bad value {x}')\n"
+               "def main():\n"
+               "    try:\n        parse(1)\n"
+               "    except ValueError as e:\n        print(f'til fit: {e}', file=sys.stderr)\n")
+        templates = i18n_coverage.PyExtractor(src, os.path.join(SRC, 'tilnew.py')).run()
+        cats = {t.text(): t.category for t in templates}
+        assert cats["package names must be non-empty strings"] == 'tool'
+        assert cats["bad value {}"] == 'tool'                      # printed by the module
+        assert "hidden {}" not in cats                             # a private exception
+        assert cats["til fit: {}"] == 'cli'                        # printed without localize()
+        quiet = "def parse(x):\n    raise ValueError(f'not shown {x}')\n"
+        cats = {t.text(): t.category for t in i18n_coverage.PyExtractor(quiet, os.path.join(SRC, 'tilnew.py')).run()}
+        assert cats == {"not shown {}": 'internal'}               # nothing prints it
+
+    def test_extraction_of_attribute_texts(self):
+        # rep.quoted is always text: expanded in place; fail.outcome is set to sentences
+        # (also through `ok, fail.outcome = self.confirm()`): a placeholder, and messages of their own
+        src = ("class Report:\n"
+               "    def __init__(self, key):\n"
+               "        self.quoted = f\"'{key}' (the global initializers)\" if key == 'S' else f\"'{key}'\"\n"
+               "        self.outcome = ''\n"
+               "class Checker:\n"
+               "    def error(self, msg):\n        pass\n"
+               "    def confirm(self):\n        return False, 'running it does not fail'\n"
+               "    def run(self, rep, fail):\n"
+               "        ok, fail.outcome = self.confirm()\n"
+               "        if ok:\n            fail.outcome = 'the call passes an int or nil'\n"
+               "        self.error(f'{rep.quoted}: cannot prove it, but {fail.outcome}')\n")
+        assert _extract(src) == {"'{}': cannot prove it, but {}", "'{}' (the global initializers): cannot prove it, but {}",
+                                 "the call passes an int or nil", "running it does not fail"}
+
+    def test_runner_messages(self, tmp_path):
+        path = write(tmp_path, 'main.c',
+                     'static const char *portable_error(int rc) {\n'
+                     '    static const char *const why[] = {"the snapshot is damaged or incomplete"};\n'
+                     '    return why[0];\n}\n'
+                     'int main(void) {\n'
+                     '    fprintf(stderr, "tilvm: cannot read %s\\n", path);\n'
+                     '    fprintf(stderr, "[tilvm] steps=%lu\\n", n);\n'
+                     '    fprintf(stderr, "tilvm: the warp core of %d broke\\n", n);\n    return 0;\n}\n')
+        templates = i18n_coverage.extract_runner(path)
+        assert _texts(templates) == {"tilvm: cannot read {}", "the snapshot is damaged or incomplete",
+                                     "tilvm: the warp core of {} broke"}
+        report = i18n_coverage.analyse(templates)
+        assert _texts(report['missing']) == {"tilvm: the warp core of {} broke"}
+        assert not i18n_coverage.enforced_missing(i18n_coverage.analyse(i18n_coverage.extract_runner()))
+
+    def test_english_parts_on_purpose(self):
+        # a nested code part (`str.upper()`) or a line of code in a longer message is English on purpose
+        t = i18n_coverage.Template(["native backend: str.", None, "() (line ", None, ")"], 'compile', 'x:1')
+        assert i18n_coverage.coverage_of(tilmsg, t, allowed=[tilmsg.Entry("str.{method}()", "str.{method}()",
+                                                                          "str.{method}()")])[0] is True
+        assert i18n_coverage.coverage_of(tilmsg, t)[0] is False
+        report = i18n_coverage.analyse([i18n_coverage.Template(
+            ["package '", None, "': archive dependencies must pin the archive's sha256; its current hash is:\n  ",
+             None, "#sha256=", None], 'tool', 'x:1')])
+        assert report['covered'] and not report['missing']
+
+    def test_pkg(self, tmp_path):
+        d = tmp_path / 'app'
+        d.mkdir()
+        r = run_til('pkg', '--lang', 'ru', 'install', cwd=str(d))
+        assert r.returncode == 1
+        assert r.stderr.startswith("til pkg: ошибка: нет til.json ни в "), r.stderr
+        r = run_til('pkg', 'init', cwd=str(d))
+        assert r.returncode == 0 and r.stdout.startswith("created ")          # standard output: English
+        r = run_til('pkg', 'add', '2bad', './x', cwd=str(d), til_lang='kk')
+        assert r.stderr.startswith("til pkg: қате: жарамсыз пакет атауы: '2bad': "), r.stderr
+        r = run_til('pkg', 'install', '--update', '--frozen', cwd=str(d))
+        assert r.stderr == "til pkg: error: --update and --frozen cannot be combined\n"
+
+    def test_fit(self, tmp_path):
+        prog = write(tmp_path, 'ok.til', "main()\n    print(1)\n")
+        r = run_til('fit', '--lang', 'kk', prog, '--device', 'nope')
+        assert r.returncode == 2 and r.stderr.startswith("til fit: белгісіз құрылғы: 'nope'; белгілілері: ")
+        dev = write(tmp_path, 'dev.json', '{"base": "ti84ce", "heap": "x"}')
+        r = run_til('fit', prog, '--device', dev, til_lang='ru')
+        assert r.stderr == "til fit: устройство 'dev': heap должно быть целым числом\n"
+        bad = write(tmp_path, 'bad.til', "main()\n    let x = $\n")
+        r = run_til('fit', '--lang', 'ru', bad, '--device', 'ti84ce')
+        assert r.stderr.startswith("ошибка: неожиданный символ: '$'\n")
+        r = run_til('build', '--lang', 'ru', '--target', 'vm', prog, '--device', 'nope')
+        assert r.stderr.startswith("Ошибка: неизвестное устройство 'nope'")
+
+    def test_prove_command_line(self, tmp_path):
+        prog = write(tmp_path, 'p.til', "main()\n    print(1)\n")
+        r = run_til('prove', '--lang', 'ru', '--timeout', 'abc', prog)
+        assert r.returncode == 2 and r.stderr == "til prove: --timeout: нужно число миллисекунд, получено 'abc'\n"
+        r = run_til('prove', os.path.join(str(tmp_path), 'nope.til'), til_lang='kk')
+        assert r.stderr.startswith("Қате: файл табылмады: ")
+
+    @needs_z3
+    def test_prove_errors(self, tmp_path):
+        prog = write(tmp_path, 'p.til', "#[ensures: result > 0]\nf(x: int) -> int\n    return x + 1\n\n"
+                                        "main()\n    print(f(1))\n")
+        r = run_til('prove', '--lang', 'kk', prog)
+        assert r.returncode == 1
+        assert "қате[E-PROVE]: 'f': x = " in r.stderr and " кезінде #[ensures: result > 0] орындалмайды" in r.stderr
+        assert "= кеңес: осы кіріс деректерімен result = " in r.stderr and "TIL VM-де расталды" in r.stderr
+        assert "Result: " in r.stdout                                   # the report: English
+        # the program's pragma chooses the language too
+        prog = write(tmp_path, 'q.til', "#[lang: ru]\n#[ensures: result > 0]\nf(x: int) -> int\n    return x + 1\n\n"
+                                        "main()\n    print(f(1))\n")
+        r = run_til('prove', prog)
+        assert "ошибка[E-PROVE]: 'f': #[ensures: result > 0] нарушается при x = " in r.stderr
+
+    def test_debug(self, tmp_path):
+        prog = write(tmp_path, 'd.til', "main()\n    let x = 2\n    print(x)\n")
+        r = run_til('debug', '--lang', 'kk', prog, '--commands', 'b 99; p zz; q')
+        assert "99-жолда және одан кейін код жоқ" in r.stdout and "Мұнда 'zz' айнымалысы жоқ" in r.stdout
+
+    def test_type_and_native_backend_errors(self, tmp_path):
+        prog = write(tmp_path, 't.til', "main()\n    let xs = [1, 2]\n    print(xs + 1)\n")
+        r = run_til('check', '--lang', 'ru', prog)
+        assert r.returncode == 1
+        assert r.stderr.startswith("ошибка[E-TYPE]: неподдерживаемые типы операндов для +: [int] и int\n")
+        prog = write(tmp_path, 'n.til', "f(xs)\n    return xs[0]\n\nmain()\n    print(f([1, \"x\"]))\n")
+        r = run_til('build', '--lang', 'kk', prog, '-o', os.path.join(str(tmp_path), 'n.exe'))
+        assert r.returncode == 1
+        assert r.stderr.startswith("нативті бэкенд: элементтің бірыңғай статикалық типі жоқ ")
+        assert "кеңес: бағдарламаны TIL VM-де іске қосыңыз" in r.stderr
+
+    def test_programs_still_see_english(self, tmp_path):
+        # retry/else and intent values are the VMs' English texts whatever the language
+        prog = write(tmp_path, 'v.til', VISIBLE)
+        for vm in ('--vm', '--cvm') if CC else ('--vm',):
+            r = run_til('run', vm, '--lang', 'kk', prog)
+            assert r.stdout == VISIBLE_OUT, vm
