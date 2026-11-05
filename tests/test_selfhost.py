@@ -14,8 +14,8 @@ TIL 3.1 #1: the self-hosted compiler selfhost/tilc.til (TIL written in TIL).
 * Calculator configuration: tilc.tbc runs on an int32/float32 C VM with a
   64 KB heap.
 
-Slow checks (the Python VM compiling all of tilc.til, ~30 s) run with
-TIL_TEST_SLOW=1.
+Slow checks (the Python VM compiling all of tilc.til, ~45 s; 33,000 and 66,000
+constants on a 64 MB heap, ~20 s) run with TIL_TEST_SLOW=1.
 
 Run: python3 -m pytest tests/test_selfhost.py -v
 """
@@ -293,7 +293,7 @@ class TestBootstrap:
             ref = py_compile(f.read(), src_path)
         assert data == ref or not classic_bytecode(ref)
 
-    @pytest.mark.skipif(not SLOW, reason="slow (~30 s): set TIL_TEST_SLOW=1")
+    @pytest.mark.skipif(not SLOW, reason="slow (~45 s): set TIL_TEST_SLOW=1")
     def test_python_vm_bootstrap(self, stage1, tilc):
         """The reference VM running stage 1 compiles all of tilc.til to stage 2."""
         out_path = os.path.join(tilc.dir, 'py-stage2.tbc')
@@ -659,7 +659,123 @@ main()
     var zero = 0
     print(safe_div(1, zero))
 """,
+    # every pattern form, on values that reach their arm (in "match" above,
+    # describe() stops at Some(500): `2..=9` compares a struct with an int)
+    "match_run": """
+enum Shape
+    Circle(float)
+    Rect(float, float)
+    Dot
+
+enum Color
+    Red
+    Green = 5
+    Blue
+
+struct P
+    x: int
+    y: int
+
+let ORIGIN = 0
+var hits = 0
+
+bump(n)
+    hits += n
+
+area(s: Shape) -> float
+    return match s
+        Shape.Circle(r) => 3.0 * r * r
+        Shape.Rect(w, h) => w * h
+        Shape.Dot => 0.0
+
+# patterns that compare with < and > see ints only
+number(n: int) -> str
+    return match n
+        ORIGIN => "origin"
+        1 | 2 => "one or two"
+        3..5 => "three or four"
+        5..=9 => "five to nine"
+        x if x < 0 => f"negative {x}"
+        x if x % 2 == 0 => f"even {x}"
+        _ => "big odd"
+
+describe(v)
+    match v
+        None => print("none")
+        Some(x) if x > 100 => print(f"big some {x}")
+        Some(x) => print(f"some {x}")
+        Ok(x) => print(f"ok {x}")
+        Err(e) => print(f"err {e}")
+        (a, b) => print(f"pair {a + b}")
+        [a, _, c] => print(f"triple {a * c}")
+        [] => print("empty")
+        P { x: px, y: 2 } => print(f"P with y=2, x={px}")
+        P { x: 0, y: py } => print(f"P on the y axis at {py}")
+        "text" => print("a string")
+        true => print("true")
+        _ => print(f"other {v}")
+
+main()
+    for s in [Shape.Circle(1.0), Shape.Rect(2.0, 3.5), Shape.Dot]
+        print(area(s))
+    for n in [0, 1, 2, 3, 4, 5, 9, -7, 12, 13]
+        print(number(n))
+    for v in [None, Some(500), Some(5), Ok(1), Err("bad"), (1, 2), [3, 4, 5], [], P { x: 7, y: 2 },
+              P { x: 0, y: 9 }, P { x: 1, y: 1 }, "text", true, 3.5]
+        describe(v)
+    let c = Color.Green
+    match c
+        Color.Red => print("red")
+        Color.Green => print(f"green {c}")
+        _ => print("blue")
+    let label = match 3
+        1 => "one"
+        3 => "three"
+    print(label)
+    for i in 0..8
+        match i % 4
+            0 => print(f"zero at {i}")
+            1 | 3 => bump(1)
+            _ => bump(100)
+    print(hits)
+""",
 }
+
+# what the IDENTICAL programs print when they run (both VMs, both compilers)
+IDENTICAL_RC = {"contracts": 1, "match": 1}
+MATCH_RUN_OUT = """3
+7
+0
+origin
+one or two
+one or two
+three or four
+three or four
+five to nine
+five to nine
+negative -7
+even 12
+big odd
+none
+big some 500
+some 5
+ok 1
+err bad
+pair 3
+triple 15
+empty
+P with y=2, x=7
+P on the y axis at 9
+other P { x: 1, y: 1 }
+a string
+true
+other 3.5
+green 5
+three
+zero at 0
+zero at 4
+204
+"""
 
 
 @needs_cc
@@ -670,6 +786,18 @@ class TestLanguage:
         rc, out, data = tilc.compile(IDENTICAL[name])
         ref = py_compile(IDENTICAL[name])
         assert data == ref or not classic_bytecode(ref)
+
+    def test_identical_programs_run(self, tilc, tmp_path):
+        """The programs above also run (not only compile to the same bytes):
+        the same exit code and output on both VMs."""
+        for name, src in sorted(IDENTICAL.items()):
+            rc, out, data = tilc.compile(src)
+            assert rc == 0, (name, out)
+            py, c = run_both_vms(data, str(tmp_path))
+            assert py[0] == IDENTICAL_RC.get(name, 0), (name, py)
+            assert c[:2] == py[:2], (name, py, c)
+            if name == "match_run":
+                assert py[1] == MATCH_RUN_OUT
 
     def test_runtime_errors_report_the_same_lines(self, tilc):
         src = "inner(a)\n    let arr = [1, 2]\n    return arr[a]\n\nmain()\n    print(inner(1))\n    print(inner(5))\n"
@@ -858,6 +986,255 @@ class TestEffectChecksAnySpelling:
             assert rc == 0, (name, out)
             ref = py_compile(src, str(main))
             assert data == ref or not classic_bytecode(ref), name
+
+
+# ═══════════════════════════════════════════════════════════════
+# UNICODE, CONSTANT FOLDING, LIMITS (review round 1, continued)
+# ═══════════════════════════════════════════════════════════════
+
+UNICODE_TABLES = os.path.join(ROOT, 'selfhost', 'unicode_tables.py')
+
+
+def unicode_tables():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('unicode_tables', UNICODE_TABLES)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestUnicodeTables:
+    """tilc.til embeds tables of str.isalpha/isdecimal/isdigit/isalnum and
+    isprintable generated by selfhost/unicode_tables.py."""
+
+    def test_in_sync_with_this_python(self):
+        # same Unicode version: byte for byte; older Pythons: every character
+        # they know has the same class (newer versions only add characters)
+        assert unicode_tables().check(tilc_text()) == []
+        r = subprocess.run([sys.executable, UNICODE_TABLES, '--check'], capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout
+
+    def test_check_finds_a_wrong_entry(self):
+        ut = unicode_tables()
+        text = tilc_text()
+        a, b = ut.block_span(text)
+        block = text[a:b]
+        assert '("##3#' in block            # U+0080 starts a run of class 0
+        bad = text[:a] + block.replace('("##3#', '("##3$', 1) + text[b:]   # U+0080 a letter
+        assert ut.check(bad)
+
+
+def python_result(src: str, path: str):
+    """('ok', bytes) or ('error', line, message) of the Python compiler."""
+    try:
+        return ('ok', py_compile(src, path))
+    except (til.CompileError, SyntaxError) as e:
+        m = re.match(r'(?:error(?:\[E-[A-Z]+\])?: )(.*?)\n --> .*?:(\d+):\d+', str(e), re.S)
+        assert m, str(e)
+        return ('error', int(m.group(2)), m.group(1))
+
+
+def assert_like_python(tilc: Tilc, src: str, name: str = "u.til"):
+    """tilc gives the Python compiler's bytes, or its first error at the same line."""
+    path = os.path.join(tilc.dir, name)
+    ref = python_result(src, path)
+    if ref[0] == 'ok':
+        assert check_program(tilc, name, src) in ('same', 'behaviour')
+    else:
+        rc, out, data = tilc.compile(src, name)
+        assert rc == 1 and data is None, f"tilc accepted it; Python: {ref}"
+        assert out.strip() == f"tilc: {path}:{ref[1]}: error: {ref[2]}"
+
+
+P1 = 'main()\n    print(%s)\n'
+# characters of Unicode 13 or older (the oldest Python of the CI matrix)
+LEXICAL = {
+    "bom": '\ufeffmain()\n    print("hi")\n',
+    "bom_inside": 'main()\n    print("hi")\ufeff\n',
+    "nbsp": 'main()\n    let x\u00a0= 1\n',
+    "zero_width": 'main()\n    let x\u200b = 1\n',
+    "line_separator": 'main()\n    let x = 1\u2028\n',
+    "emoji_name": 'main()\n    let a\U0001f600 = 2\n',
+    "roman_numeral_start": 'main()\n    let \u216b = 2\n',
+    "letters": 'main()\n    let na\u00efve_\u65e5\u672c = 3\n    let x\u216b\u0663 = 4\n    let \u01c5 = 5\n'
+               '    print(na\u00efve_\u65e5\u672c, x\u216b\u0663, \u01c5)\n',
+    "arabic_indic": P1 % '\u0661\u0662\u0663 + 1',
+    "devanagari_float": P1 % '\u0663.\u0665e-\u0662',
+    "math_digits": P1 % '\U0001d7d9\U0001d7da_0',
+    "superscript": P1 % '1\u00b2',
+    "superscript_exponent": P1 % '1e\u00b2',
+    "superscript_start": P1 % '\u00b2',
+    "hex_unicode_digit": P1 % '0x\u0661',
+    "int_4300_digits": P1 % ('7' * 4300),
+    "int_4301_digits": P1 % ('7' * 4301),
+    "float_4400_digits": P1 % ('7' * 4400 + '.5'),
+    "escape_spaces": P1 % '"\\u{ 41 }\\u{\u300042\u3000}\\u{43\t}"',
+    "escape_sign_prefix": P1 % '"\\u{+41}\\u{0x42}\\u{0X_43}\\u{-0}\\u{4_4}\\u{\u0664\u0665}"',
+    "escape_negative": P1 % '"\\u{-1}"',
+    "escape_double_underscore": P1 % '"\\u{4__1}"',
+    "escape_trailing_underscore": P1 % '"\\u{41_}"',
+    "escape_superscript": P1 % '"\\u{\u00b2}"',
+    "escape_x1c": P1 % '"\\u{\x1c41}"',
+    "spec_unicode_width": 'main()\n    let x = 5\n    print(f"{x:\u0665}|{x:.\u0662f}")\n',
+    "spec_superscript": 'main()\n    let x = 5\n    print(f"{x:\u00b2}")\n',
+    "pragma_unicode_spaces": '#[\u3000lang\u3000:\u3000ru\u2003]\n\u0444\u0443\u043d\u043a\u0446\u0438\u044f f()\n'
+                             '    \u0432\u0435\u0440\u043d\u0443\u0442\u044c 1\nmain()\n    print(f())\n',
+    "pragma_kelvin_sign": '#[lang: \u212ak-latn]\nnegizgi()\n    basyp_shygaru(1)\n',
+    "attribute_nbsp": '#[\u00a0pure\u00a0]\nsq(x)\n    print(x)\n    return x * x\nmain()\n    print(sq(3))\n',
+}
+
+
+@needs_cc
+class TestUnicodeLexing:
+    """The lexer classifies characters like Python's str methods: a BOM or a
+    zero-width space is an unexpected character (tilc used to take every
+    byte >= 128 for a letter: a BOM renamed main() and the program did
+    nothing), other scripts' digits are numbers, white space is Unicode
+    white space, and \\u{...} is read with int(text, 16)."""
+
+    @pytest.mark.parametrize("name", sorted(LEXICAL))
+    def test_like_python(self, tilc, name):
+        assert_like_python(tilc, LEXICAL[name])
+
+    def test_bom_is_not_a_silent_no_op(self, tilc):
+        rc, out, data = tilc.compile(LEXICAL["bom"], "bom.til")
+        assert rc == 1 and out.strip().endswith(":1: error: Unexpected character: '\ufeff'"), out
+
+    def test_invalid_utf8(self, tilc, tmp_path):
+        """Python reads sources with encoding="utf-8": the UnicodeDecodeError text."""
+        for raw in (b'main()\n    print("a\xff")\n', b'main()\r\n    print("\xe2\x82")\r\n',
+                    b'main()\n    print(1)\n\xf4\x90\x80\x80\n'):
+            path = tmp_path / "bad8.til"
+            path.write_bytes(raw)
+            with pytest.raises(UnicodeDecodeError) as e:
+                raw.decode('utf-8')
+            line = raw[:e.value.start].replace(b'\r\n', b'\n').count(b'\n') + 1
+            rc, out, data = tilc.compile_file(str(path), str(tmp_path / "out.tbc"))
+            assert rc == 1 and out.strip() == f"tilc: {path}:{line}: error: {e.value}"
+
+
+CONTRACT_STR = '#[requires: len(s) == 0]\nf(s)\n    return s\nmain()\n    print(f(%s))\n'
+
+
+@needs_cc
+class TestContractMessages:
+    """E-CONTRACT shows arguments with Python's repr(): characters that are not
+    str.isprintable() are escaped (\\xhh, \\uhhhh, \\Uhhhhhhhh)."""
+
+    @pytest.mark.parametrize("arg", [
+        '"nbsp\\u{a0}|nel\\x85|c1\\u{80}|ls\\u{2028}"',
+        '"\\u{ad}\\u{3000}\\u{180e}\\u{61c}\\u{200b}\\u{feff}\\u{2066}"',
+        '"\\u{e000}\\u{f0000}\\u{10ffff}\\u{378}\\u{e0001}\\u{9f}"',
+        '"printable: \u0259 \U0001f600 \\u{300} \\u{1d400} \\u{d7ff}"',
+        '"quotes \' and \\" \\x1b \\x7f \\t"',
+    ])
+    def test_repr_like_python(self, tilc, arg):
+        assert_like_python(tilc, CONTRACT_STR % arg)
+
+
+BIG = '18446744073709551616'
+CONTRACT_X = '#[requires: %s]\nf(x)\n    return x\nmain()\n    print(f(%s))\n'
+ACCEPT_REJECT = {
+    # the SemanticChecker resolves `Vec<int>.new()` by method name: with a
+    # user new(x) it reports a (false) arity error; tilc does the same
+    "vec_new_user_new": "struct P\n    x: int\nimpl P\n    new(x) -> P\n        return P { x: x }\nmain()\n"
+                        "    var v = Vec<int>.new()\n    v.push(1)\n    print(v, P.new(2))\n",
+    "hashmap_new_user_new": "struct P\n    x: int\nimpl P\n    new(x) -> P\n        return P { x: x }\nmain()\n"
+                            "    var m = HashMap<str, int>.new()\n    print(m)\n",
+    "vec_new_no_conflict": "struct P\n    x: int\nimpl P\n    new() -> P\n        return P { x: 0 }\nmain()\n"
+                           "    var v = Vec<int>.new()\n    print(v, P.new())\n",
+    # a nan argument is a constant of the contract check
+    "nan_argument": CONTRACT_X % ('x == x', '1e309 - 1e309'),
+    "nan_argument_ok": CONTRACT_X % ('x != x', '1e309 * 0.0'),
+    "nan_global": 'let N = 1e309 - 1e309\n' + CONTRACT_X % ('x == x', 'N'),
+    # literals of 2^63 and more are exact in constant folding
+    "big_argument_ok": CONTRACT_X % ('x > 0', '9223372036854775808'),
+    "big_argument_bad": CONTRACT_X % ('x < 0', '9223372036854775808'),
+    "big_argument_div": CONTRACT_X % ('x / 2 == 0', BIG),
+    "big_argument_float": CONTRACT_X % ('x < 1.0', BIG),
+    "big_folding": P1 % ', '.join([
+        BIG + ' / 2', BIG + ' % 7', '-' + BIG + ' / 3', '9223372036854775808 / -1', '100 / ' + BIG,
+        '-7 % ' + BIG, BIG + ' == 0', 'not ' + BIG, BIG + ' or 3', BIG + ' < 18446744073709551617',
+        BIG + ' * 1.0', BIG + ' == 1.8446744073709552e19', '0x1_0000_0000_0000_0000 / 16',
+        '340282366920938463463374607431768211457 % 1000', '-' + BIG, '~' + BIG, BIG + ' + 1']),
+    "big_division_by_zero": P1 % (BIG + ' / 0'),
+    "big_const": 'const BIG = ' + BIG + '\nmain()\n    print(BIG / 2, BIG > 0, BIG % 10)\n',
+    # nan comparisons and truthiness fold (only a nan result is left to run time)
+    "nan_comparisons": P1 % '(1e309 - 1e309) != 0.0, not (1e309 - 1e309), (1e309 - 1e309) < 1',
+}
+
+
+@needs_cc
+class TestAcceptRejectLikePython:
+    @pytest.mark.parametrize("name", sorted(ACCEPT_REJECT))
+    def test_like_python(self, tilc, name):
+        assert_like_python(tilc, ACCEPT_REJECT[name])
+
+
+@needs_cc
+class TestLimits:
+    """Valid programs that tilc used to fail on with VM errors."""
+
+    def test_function_over_64k_of_bytecode(self, tilc):
+        # the code buffer was one VM array (at most 65535 elements)
+        src = "main()\n" + "".join(f"    print(i_{i % 7} % 100)\n" for i in range(12000))
+        src = "".join(f"let i_{k} = {k}\n" for k in range(7)) + src
+        ref = py_compile(src)
+        assert len(ref) > 70000
+        rc, out, data = tilc.compile(src)
+        assert rc == 0, out
+        assert data == ref
+
+    def test_long_operator_chains(self, tilc):
+        # flat chains are folded and compiled with loops (no deep recursion)
+        # (sizes the Python compiler handles under pytest; it stops near 1000)
+        for src in (P1 % ' + '.join(['1'] * 850), P1 % ('not ' * 800 + 'true'), P1 % ('-' * 800 + '1'),
+                    'main()\n    let x = 3\n    print(' + ' + '.join(['x', '1'] * 150) + ')\n',
+                    'main()\n    let x = 3\n    print(' + ' and '.join(['x > 1'] * 300) + ')\n',
+                    'main()\n    let f = |y| ' + ' + '.join(['y'] * 300) + '\n    print(f(2))\n'):
+            assert_like_python(tilc, src)
+
+    def test_chain_longer_than_python_can_compile(self, tilc):
+        """The Python compiler stops at ~1000 terms (recursion limit); tilc does not."""
+        src = "main()\n    let x = 2\n    print(" + " + ".join(["x"] * 3000) + ")\n"
+        rc, out, data = tilc.compile(src)
+        assert rc == 0, out
+        assert run_vm(data) == (0, "6000\n")
+
+    def test_unwritable_output(self, tilc):
+        src_path = os.path.join(tilc.dir, "ok.til")
+        with open(src_path, "w", encoding="utf-8") as f:
+            f.write("main()\n    print(1)\n")
+        rc, out, data = tilc.compile_file(src_path, "/nonexistent-dir/out.tbc")
+        assert rc == 1 and out.startswith("tilc: cannot write /nonexistent-dir/out.tbc ("), out
+
+    def test_long_programs_on_the_calculator(self, tilc):
+        """64 KB heap: script statements share one item, code and line tables
+        are kept as bytes (tilc used to stop after ~100 script statements or
+        ~240 statements in a function)."""
+        vm = cvm_binary("host", CALC_FLAGS)
+        for src in ("".join(f"print({i})\n" for i in range(1000)),
+                    "main()\n" + "".join(f"    print({i})\n" for i in range(800))):
+            rc, out, data = tilc.compile(src, "long.til", vm=vm)
+            assert rc == 0, out
+            assert data == py_compile(src)
+
+    @pytest.mark.skipif(not SLOW, reason="slow (~20 s, 64 MB heap): set TIL_TEST_SLOW=1")
+    def test_constant_table(self, tilc):
+        """More than 32767 constants (a C VM map holds at most that many) and the
+        65535-constant limit of the format, reported like the Python compiler."""
+        vm = cvm_binary("host", ('-DTILVM_HEAP_SIZE=67108864',))
+        for n in (33000, 66000):
+            src = "main()\n" + "".join(f"    print({100000 + i})\n" for i in range(n))
+            path = os.path.join(tilc.dir, f"consts{n}.til")
+            ref = python_result(src, path)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(src)
+            rc, out, data = tilc.compile_file(path, os.path.join(tilc.dir, "out.tbc"), vm=vm, timeout=300)
+            if ref[0] == 'ok':
+                assert rc == 0 and data == ref[1], out
+            else:
+                assert out.strip() == f"tilc: {path}:{ref[1]}: error: {ref[2]}"
 
 
 # ═══════════════════════════════════════════════════════════════
