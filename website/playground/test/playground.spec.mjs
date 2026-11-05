@@ -133,20 +133,23 @@ async function checkInput(page) {
     await page.press('#stdin-text', 'Enter');
 }
 
-async function checkStop(page, marker) {
+async function checkStop(page, marker, limits = { answer: 1000, stop: 5000 }) {
     await page.click('#run');
     await page.waitForFunction((m) => document.getElementById('output').textContent.includes(m), marker,
         { timeout: 15000 });
     await page.waitForTimeout(400);
     assert.equal(await state(page), 'running', 'still running');
-    // the page answers while the program runs
-    const t1 = Date.now();
-    assert.equal(await page.evaluate(() => 6 * 7), 42);
-    assert.ok(Date.now() - t1 < 1000, `the page stays responsive (${Date.now() - t1} ms)`);
+    // the page answers while the program runs (several times: every slice must be short)
+    for (let i = 0; i < 3; i++) {
+        const t1 = Date.now();
+        assert.equal(await page.evaluate(() => 6 * 7), 42);
+        assert.ok(Date.now() - t1 < limits.answer, `the page stays responsive (${Date.now() - t1} ms)`);
+        await page.waitForTimeout(150);
+    }
     const t0 = Date.now();
     await page.click('#stop');
-    assert.equal(await waitState(page, ['stopped'], 5000), 'stopped');
-    assert.ok(Date.now() - t0 < 5000, 'Stop reacts quickly');
+    assert.equal(await waitState(page, ['stopped'], limits.stop), 'stopped');
+    assert.ok(Date.now() - t0 < limits.stop, `Stop reacts quickly (${Date.now() - t0} ms)`);
     const steps = await page.textContent('#stats');
     await page.waitForTimeout(300);
     assert.equal(await page.textContent('#stats'), steps, 'no more steps after Stop');
@@ -338,6 +341,24 @@ describe('compile pipeline (mock tilc.tbc)', { skip: HAS_MOCK ? false : 'TEST_AS
             const exp = prog.expect;
             await setSource(page, prog.source);
             if (prog.name === 'infinite') { await checkStop(page, 'spinning'); return; }
+            if (prog.name === 'costly_steps') {
+                /* every loop iteration copies and sorts 500 numbers: slices are
+                 * bounded by time, not by a number of steps */
+                await checkStop(page, 'sorting', { answer: 500, stop: 2500 });
+                return;
+            }
+            if (prog.name === 'input_eof') {
+                await page.click('#run');
+                await checkInput(page);
+                await page.waitForFunction(() => document.body.dataset.state === 'waiting-line' &&
+                    document.getElementById('output').textContent.includes('second?'));
+                await page.fill('#stdin-text', 'two');
+                await page.press('#stdin-text', 'Control+d');
+                assert.equal(await waitState(page, FINAL), 'done');
+                assert.equal(await output(page), 'first? Aigerim\nsecond? two\nend of input\nthird? [Aigerim] [two] []\n',
+                    'Ctrl+D delivers the typed text, then the end of input');
+                return;
+            }
             if (prog.name === 'flood') {
                 await checkStop(page, 'xxxxxxxxxx\nline ');      /* line 1 is trimmed away quickly */
                 const kept = await page.evaluate(() => document.getElementById('output').textContent.length);
@@ -381,7 +402,14 @@ describe('compile pipeline (mock tilc.tbc)', { skip: HAS_MOCK ? false : 'TEST_AS
             if (exp.error_line) {
                 assert.equal(await page.evaluate(() => document.body.dataset.errorLine), String(exp.error_line));
             }
-            if (exp.status_contains) assert.ok((await page.textContent('#state')).includes(exp.status_contains));
+            if (exp.status_contains) {
+                const status = await page.textContent('#state');
+                assert.ok(status.includes(exp.status_contains), `status "${status}"`);
+            }
+            if (exp.no_error_line) {
+                assert.equal(await page.evaluate(() => document.body.dataset.errorLine), undefined,
+                    'no line of the program is blamed');
+            }
             if (exp.graphics) assert.ok(await nonBlackPixels(page) > 50, 'the canvas shows the picture');
             if (prog.name === 'compile_error') {
                 assert.match(text, /--> \/main\.til:2:\d+/);
@@ -389,6 +417,29 @@ describe('compile pipeline (mock tilc.tbc)', { skip: HAS_MOCK ? false : 'TEST_AS
             }
         });
     }
+
+    it('lets Tab and Shift+Tab leave the screen (no keyboard trap)', async (t) => {
+        await setSource(page, program('keys').source);
+        await page.click('#run');
+        const st = await waitState(page, ['waiting-key', ...FINAL]);
+        if (st === 'error' && notAvailable(await output(page)) && !GRAPHICS) {
+            t.skip('no key natives in this VM build');
+            return;
+        }
+        assert.equal(st, 'waiting-key');
+        const focused = () => page.evaluate(() => document.activeElement && document.activeElement.id);
+        assert.equal(await focused(), 'screen', 'the screen takes the focus for the keys');
+        await page.keyboard.press('Tab');
+        assert.notEqual(await focused(), 'screen', 'Tab moves the focus on');
+        assert.equal(await state(page), 'waiting-key', 'Tab is not a key for the program');
+        await page.keyboard.press('Shift+Tab');
+        assert.equal(await focused(), 'screen', 'Shift+Tab comes back');
+        await page.keyboard.press('ArrowRight');
+        await page.waitForFunction(() => document.getElementById('output').textContent.includes('key 4'));
+        await page.keyboard.press('Escape');
+        assert.equal(await waitState(page, FINAL), 'done');
+        assert.equal(await output(page), 'key 4\nbye\n');
+    });
 
     it('takes keys from the on-screen key bar on a touch screen', async (t) => {
         const mobile = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
@@ -425,6 +476,116 @@ describe('compile pipeline (mock tilc.tbc)', { skip: HAS_MOCK ? false : 'TEST_AS
     });
 });
 
+/* ───────────────────── editor, links, theme, drafts ───────────────────── */
+describe('editor and page', () => {
+    it('indents with Tab, outdents with Shift+Tab, indents after a block opener', async () => {
+        const page = await openPage();
+        try {
+            await page.fill('#code', '');
+            await page.focus('#code');
+            await page.keyboard.type('if x > 1');
+            await page.keyboard.press('Enter');
+            await page.keyboard.type('print(x)');
+            assert.equal(await page.inputValue('#code'), 'if x > 1\n    print(x)', 'auto-indent after "if"');
+            await page.keyboard.press('Shift+Tab');
+            assert.equal(await page.inputValue('#code'), 'if x > 1\nprint(x)');
+            await page.keyboard.press('Home');
+            await page.keyboard.press('Tab');
+            assert.equal(await page.inputValue('#code'), 'if x > 1\n    print(x)',
+                'Tab after Shift+Tab indents again (the line is not replaced)');
+            await page.keyboard.press('Control+a');
+            await page.keyboard.press('Tab');
+            assert.equal(await page.inputValue('#code'), '    if x > 1\n        print(x)', 'Tab indents selected lines');
+            await page.keyboard.press('Shift+Tab');
+            assert.equal(await page.inputValue('#code'), 'if x > 1\n    print(x)');
+            await page.keyboard.press('Control+End');
+            await page.keyboard.press('Enter');
+            await page.keyboard.press('Backspace');
+            assert.equal(await page.inputValue('#code'), 'if x > 1\n    print(x)\n', 'Backspace removes one indent level');
+        } finally {
+            await page.close();
+        }
+    });
+
+    it('opens plain #s= links', async () => {
+        const source = 'print("a plain link: сәлем")\n';
+        const hash = '#s=' + Buffer.from(source, 'utf8').toString('base64url');
+        const page = await openPage('', hash);
+        try {
+            assert.equal(await page.inputValue('#code'), source);
+        } finally {
+            await page.close();
+        }
+    });
+
+    it('refuses a compiler from another origin', async () => {
+        const page = await openPage('?compiler=' + encodeURIComponent('https://example.com/evil.tbc'));
+        try {
+            assert.notEqual(await page.evaluate(() => document.body.dataset.compiler), 'custom');
+            assert.match(await output(page), /same-origin/);
+        } finally {
+            await page.close();
+        }
+    });
+
+    it('switches the theme and remembers it', async () => {
+        const context = await browser.newContext({ colorScheme: 'light' });
+        try {
+            const page = await context.newPage();
+            await page.goto(`${BASE}/playground/`);
+            await page.waitForFunction(() => document.body.dataset.state === 'idle');
+            const bg = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+            const light = await bg();
+            await page.click('#theme');
+            assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'dark');
+            assert.notEqual(await bg(), light, 'the colours change');
+            await page.reload();
+            await page.waitForFunction(() => document.body.dataset.state === 'idle');
+            assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'dark', 'remembered');
+            await page.click('#theme');
+            assert.equal(await page.evaluate(() => document.documentElement.dataset.theme), 'light');
+        } finally {
+            await context.close();
+        }
+    });
+
+    it('keeps the user\'s code when an example or a link replaces it', async () => {
+        const context = await browser.newContext();
+        const mine = '# my own program\nprint("precious")\n';
+        const open = async (hash = '') => {
+            const p = await context.newPage();
+            await p.goto(`${BASE}/playground/${hash}`);
+            await p.waitForFunction(() => document.body.dataset.state === 'idle');
+            return p;
+        };
+        try {
+            const page = await open();
+            await page.fill('#code', mine);
+            await page.waitForTimeout(500);                      /* the draft is saved */
+            await loadExample(page, 'hello');
+            assert.notEqual(await page.inputValue('#code'), mine);
+            await page.click('#toast .toast-action');            /* Undo */
+            assert.equal(await page.inputValue('#code'), mine, 'Undo restores the code');
+            await loadExample(page, 'hello');
+            await page.selectOption('#examples', '__previous__');
+            assert.equal(await page.inputValue('#code'), mine, 'the examples menu restores it too');
+            await page.close();
+
+            const linked = await open('#example=kazakh');            /* a link from the landing page */
+            assert.match(await linked.inputValue('#code'), /қайтару/);
+            assert.equal(await linked.evaluate(() => localStorage.getItem('til-playground-draft')), mine,
+                'opening a link does not overwrite the saved draft');
+            await linked.close();
+
+            const again = await open();
+            assert.equal(await again.inputValue('#code'), mine, 'the draft comes back');
+            await again.close();
+        } finally {
+            await context.close();
+        }
+    });
+});
+
 /* ───────────────────── page behaviour without a compiler ───────────────────── */
 describe('without an in-browser compiler', () => {
     it('refuses edited code with a clear message (precompiled mode only)', async (t) => {
@@ -437,6 +598,27 @@ describe('without an in-browser compiler', () => {
             await setSource(page, 'print("my own code")\n');
             assert.equal(await run(page), 'no-compiler');
             assert.match(await output(page), /no in-browser compiler/);
+        } finally {
+            await page.close();
+        }
+    });
+
+    it('the landing page says what this build cannot do yet', async () => {
+        const page = await browser.newPage();
+        try {
+            await page.route(/^https?:\/\/(?!127\.0\.0\.1)/, (route) => route.abort());   /* no web fonts */
+            await page.goto(`${BASE}/`, { waitUntil: 'domcontentloaded' });
+            const info = JSON.parse(fs.readFileSync(path.join(SITE_DIR, 'playground', 'build-info.json'), 'utf8'));
+            const complete = info.compiler === 'tilc' && info.graphics !== false;
+            if (complete) {
+                await page.waitForTimeout(500);
+                assert.equal(await page.isVisible('#playground-note'), false);
+            } else {
+                await page.waitForSelector('#playground-note', { state: 'visible' });
+                const note = await page.textContent('#playground-note');
+                if (info.compiler !== 'tilc') assert.match(note, /in-browser compiler/);
+                if (info.graphics === false) assert.match(note, /graphics/);
+            }
         } finally {
             await page.close();
         }

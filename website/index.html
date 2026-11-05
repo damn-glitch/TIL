@@ -462,6 +462,12 @@
             color: var(--text-primary);
         }
 
+        .playground-note {
+            margin-top: 1rem;
+            font-size: 0.9rem;
+            color: var(--yellow);
+        }
+
         .playground-preview .k { color: var(--purple); }
         .playground-preview .s { color: var(--green); }
         .playground-preview .c { color: var(--text-secondary); }
@@ -731,13 +737,14 @@
     <!-- Playground -->
     <section class="playground" id="playground">
         <h2 class="section-title">Try It Now</h2>
-        <p class="section-subtitle">The real compiler and VM, running in your browser - no installation</p>
+        <p class="section-subtitle">The self-hosted compiler and the TIL VM, running in your browser - no installation</p>
 
         <div class="playground-cta">
             <div>
                 <h3>TIL Playground</h3>
-                <p>Write TIL, press Run: the program is compiled and executed right in your browser by the
-                   TIL VM compiled to WebAssembly - nothing is sent to a server.</p>
+                <p>Write TIL, press Run: the self-hosted TIL compiler and the TIL VM, compiled to
+                   WebAssembly, compile and run the program right in your browser - nothing is sent to a
+                   server.</p>
                 <ul>
                     <li>output, runtime errors with line numbers, <code>input()</code></li>
                     <li>graphics on a canvas and keyboard input for games</li>
@@ -751,6 +758,7 @@
                     <a href="/playground/#example=russian">Русский</a>
                     <a href="/playground/#example=input">input()</a>
                 </div>
+                <p class="playground-note" id="playground-note" hidden></p>
             </div>
             <pre class="playground-preview" aria-label="Example TIL program"><span class="c"># main.til</span>
 <span class="k">struct</span> Point
@@ -829,6 +837,21 @@ print(<span class="s">f"|p| = {p.length()}"</span>)
             }
         }
         
+        // Say what the deployed playground build cannot do yet (development builds)
+        fetch('/playground/build-info.json', { cache: 'no-cache' })
+            .then((r) => (r.ok ? r.json() : null))
+            .then((info) => {
+                if (!info) return;
+                const missing = [];
+                if (info.compiler !== 'tilc') missing.push('the in-browser compiler (only the bundled examples run, precompiled)');
+                if (info.graphics === false) missing.push('graphics and keys');
+                if (!missing.length) return;
+                const note = document.getElementById('playground-note');
+                note.textContent = `Preview build: not in this build yet - ${missing.join('; ')}.`;
+                note.hidden = false;
+            })
+            .catch(() => {});
+
         // Smooth scroll
         document.querySelectorAll('a[href^="#"]').forEach(anchor => {
             anchor.addEventListener('click', function (e) {

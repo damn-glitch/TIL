@@ -4,9 +4,10 @@
  * Pipeline (see README.md):
  *   1. VM instance A runs the self-hosted compiler tilc.tbc with the virtual
  *      file system {"/main.til": source} and args ["/main.til", "/main.tbc"].
- *   2. VM instance B loads /main.tbc and runs it in slices (a few milliseconds
- *      per animation frame), so the page stays responsive; wait_key(),
- *      input() and sleep_ms() pause the program without blocking the page.
+ *   2. VM instance B loads /main.tbc and runs it in time slices of a few
+ *      milliseconds (wh_run checks the clock every few steps), so the page
+ *      stays responsive; wait_key(), input() and sleep_ms() pause the program
+ *      without blocking the page.
  * Without tilc.tbc (development builds) the bundled examples run from
  * bytecode precompiled by the desktop compiler (examples/*.tbc).
  */
@@ -25,15 +26,15 @@
     };
 
     const DRAFT_KEY = 'til-playground-draft';
+    const PREVIOUS_KEY = 'til-playground-previous';
     const THEME_KEY = 'til-playground-theme';
-    const SLICE_START = 20000;          /* steps per wh_run call (adapted to the machine) */
-    const SLICE_MIN = 1000;
-    const SLICE_MAX = 4000000;
-    const FRAME_MS = 10;                /* VM time per animation frame */
+    const SLICE_MS = 8;                 /* VM time per task: wh_run returns after about this long */
+    const MAX_TIMER_MS = 1 << 30;       /* setTimeout cannot wait longer than 2^31-1 ms */
     const OUTPUT_MAX = 400000;          /* characters kept in the output panel */
     const OUTPUT_CHUNK = 8192;          /* characters per output block */
-    const FRAME_OUTPUT = 100000;        /* stop a frame's slices early after this much output */
+    const FRAME_OUTPUT = 100000;        /* flush to the page at once beyond this much pending output */
     const INDENT = '    ';
+    const PREVIOUS_ID = '__previous__'; /* the examples menu entry that restores replaced code */
 
     const app = {
         runtime: null,
@@ -41,7 +42,11 @@
         programVM: null,
         compiler: { kind: 'loading', bytes: null, url: '' },
         examples: [],
+        features: { graphics: true },   /* what this build's VM implements (build-info.json) */
         currentExample: '',
+        fromLink: false,                /* the editor holds a shared link's code, unedited */
+        previous: '',                   /* the user's code that an example or link replaced */
+        presentRaf: 0,
         run: null,
         errorLineNo: 0,
         lineCount: 0,
@@ -69,11 +74,20 @@
     }
 
     let toastTimer = 0;
-    function toast(text) {
+    /* a short message; with `action` ({label, run}) it has a button and stays longer */
+    function toast(text, action) {
         ui.toast.textContent = text;
+        if (action) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'toast-action';
+            button.textContent = action.label;
+            button.addEventListener('click', () => { ui.toast.hidden = true; action.run(); });
+            ui.toast.append(' ', button);
+        }
         ui.toast.hidden = false;
         clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => { ui.toast.hidden = true; }, 2600);
+        toastTimer = setTimeout(() => { ui.toast.hidden = true; }, action ? 10000 : 2600);
     }
 
     /* ───────────────────────────── output panel ────────────────────────── */
@@ -295,18 +309,28 @@
         return { start, end: endNl < 0 ? v.length : endNl };
     }
 
+    /* (Out)dent the lines of the selection. With no selection (Shift+Tab on a
+     * line) the cursor stays a cursor, so a following Tab indents again
+     * instead of replacing the line. */
     function indentSelection(outdent) {
         const ta = ui.code;
+        const caret = ta.selectionStart === ta.selectionEnd ? ta.selectionStart : -1;
         const { start, end } = selectedLines();
-        const lines = ta.value.slice(start, end).split('\n');
-        const changed = lines.map((l) => {
+        const original = ta.value.slice(start, end);
+        const changed = original.split('\n').map((l) => {
             if (!outdent) return l.length ? INDENT + l : l;
             const m = /^ {1,4}|^\t/.exec(l);
             return m ? l.slice(m[0].length) : l;
         }).join('\n');
+        if (changed === original) return;
         ta.setSelectionRange(start, end);
         insertText(changed);
-        ta.setSelectionRange(start, start + changed.length);
+        if (caret >= 0) {
+            const pos = Math.max(start, caret + changed.length - original.length);
+            ta.setSelectionRange(pos, pos);
+        } else {
+            ta.setSelectionRange(start, start + changed.length);
+        }
     }
 
     function onEditorKey(e) {
@@ -351,19 +375,71 @@
         }
     }
 
+    /* The saved draft is the code the user last edited: examples and shared
+     * links do not replace it until the user edits them. */
     let draftTimer = 0;
+    function saveDraft() {
+        clearTimeout(draftTimer);
+        try { localStorage.setItem(DRAFT_KEY, ui.code.value); } catch (e) { /* storage disabled */ }
+    }
+
     function onEditorInput() {
         updateGutter();
         if (app.errorLineNo) clearErrorLine();
         clearTimeout(draftTimer);
-        draftTimer = setTimeout(() => {
-            try { localStorage.setItem(DRAFT_KEY, ui.code.value); } catch (e) { /* storage disabled */ }
-        }, 300);
+        draftTimer = setTimeout(saveDraft, 300);
         if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+        app.fromLink = false;
         if (app.currentExample) {
             app.currentExample = '';
             ui.examples.value = '';
         }
+    }
+
+    /* the editor holds the user's own code (not an unmodified example or link) */
+    function isOwnCode() {
+        return !app.currentExample && !app.fromLink && ui.code.value.trim() !== '';
+    }
+
+    /* Show an example's or a shared link's code. The user's own code it
+     * replaces is kept: Undo in a message, and "Your previous code" in the
+     * examples menu (also after a reload). */
+    function replaceCode(text, what) {
+        const old = ui.code.value;
+        const keep = isOwnCode() && old !== text;
+        if (keep) rememberPrevious(old);
+        setCode(text);
+        if (keep) toast(`${what} replaced your code`, { label: 'Undo', run: restorePrevious });
+    }
+
+    function rememberPrevious(text) {
+        app.previous = text;
+        try { localStorage.setItem(PREVIOUS_KEY, text); } catch (e) { /* storage disabled */ }
+        updatePreviousOption();
+    }
+
+    function restorePrevious() {
+        const text = app.previous;
+        if (!text) return;
+        if (isOwnCode() && ui.code.value !== text) rememberPrevious(ui.code.value);
+        setCode(text);
+        app.currentExample = '';
+        app.fromLink = false;
+        ui.examples.value = '';
+        if (location.hash) history.replaceState(null, '', location.pathname + location.search);
+        saveDraft();
+    }
+
+    function updatePreviousOption() {
+        let opt = ui.examples.querySelector(`option[value="${PREVIOUS_ID}"]`);
+        if (!app.previous) { if (opt) opt.remove(); return; }
+        if (!opt) {
+            opt = document.createElement('option');
+            opt.value = PREVIOUS_ID;
+            ui.examples.insertBefore(opt, ui.examples.options[1] || null);
+        }
+        const first = app.previous.split('\n').find((l) => l.trim()) || '';
+        opt.textContent = `↩ Your previous code: ${first.trim().slice(0, 32)}${first.trim().length > 32 ? '…' : ''}`;
     }
 
     /* ───────────────────────────── theme ───────────────────────────────── */
@@ -397,7 +473,7 @@
         for (const ex of app.examples) {
             const opt = document.createElement('option');
             opt.value = ex.id;
-            opt.textContent = ex.title;
+            opt.textContent = ex.title + (ex.screen && !app.features.graphics ? ' (needs graphics: not in this build)' : '');
             ui.examples.appendChild(opt);
         }
     }
@@ -410,15 +486,20 @@
     async function loadExample(id) {
         const ex = app.examples.find((e) => e.id === id);
         if (!ex) { toast(`no example "${id}"`); return false; }
+        let source;
         try {
-            setCode(await exampleSource(ex));
+            source = await exampleSource(ex);
         } catch (e) {
             toast(`cannot load the example: ${e.message}`);
             return false;
         }
+        replaceCode(source, `The example "${ex.title}"`);
         app.currentExample = id;
+        app.fromLink = false;
         ui.examples.value = id;
-        try { localStorage.setItem(DRAFT_KEY, ui.code.value); } catch (e) { /* storage disabled */ }
+        if (ex.screen && !app.features.graphics && ui.toast.hidden) {
+            toast('This example needs the screen natives, which this playground build does not have yet');
+        }
         return true;
     }
 
@@ -499,8 +580,9 @@
             const r = await sourceFromHash(location.hash);
             if (r === null) return false;
             if (typeof r === 'object') return loadExample(r.example);
-            setCode(r);
+            replaceCode(r, 'The shared code');
             app.currentExample = '';
+            app.fromLink = true;
             ui.examples.value = '';
             return true;
         } catch (e) {
@@ -551,15 +633,42 @@
     }
 
     /* ───────────────────────────── running ─────────────────────────────── */
-    /* The source line of the first diagnostic in a compiler or VM report:
-     *   " --> /main.til:3:9"              (src/til.py style)
-     *   "tilc: /main.til:3: error: ..."   (FILE:LINE[:COL]: error|warning)
-     *   "  at main (line 3)"              (runtime error traces) */
+    /* The line of the first runtime error in a VM report ("  at main (line 3)"). */
     function errorLineFrom(text) {
-        const m = /-->\s*[^\n]*?:(\d+):\d+/.exec(text) ||
-            /[^\s:]+:(\d+)(?::\d+)?:\s*(?:error|warning)\b/i.exec(text) ||
-            /\(line (\d+)\)/.exec(text) || /\bline (\d+)/i.exec(text);
+        const m = /\(line (\d+)\)/.exec(text) || /\bline (\d+)/i.exec(text);
         return m ? parseInt(m[1], 10) : 0;
+    }
+
+    /* The line of the first compiler diagnostic about the program (/main.til):
+     *   " --> /main.til:3:9"                       (src/til.py style)
+     *   "tilc: /main.til:3: error: ..."            (tilc: error, unsupported, ...)
+     * Lines of the compiler's own source (a crash trace of tilc) never count. */
+    function compileErrorLine(text) {
+        const m = /-->\s*\/main\.til:(\d+):\d+/.exec(text) || /\/main\.til:(\d+)(?::\d+)?:/.exec(text);
+        return m ? parseInt(m[1], 10) : 0;
+    }
+
+    /* Tasks without the 4 ms clamp of nested setTimeout(0) and without waiting
+     * for the next animation frame: a MessageChannel message per task. The
+     * browser still renders and handles input between tasks. */
+    const taskQueue = [];
+    const taskChannel = new MessageChannel();
+    taskChannel.port1.onmessage = () => { const fn = taskQueue.shift(); if (fn) fn(); };
+    function postTask(fn) {
+        taskQueue.push(fn);
+        taskChannel.port2.postMessage(0);
+    }
+
+    /* Output, screen and statistics reach the page once per animation frame. */
+    function requestPresent() {
+        if (document.hidden) { presentNow(); return; }
+        if (!app.presentRaf) app.presentRaf = requestAnimationFrame(() => { app.presentRaf = 0; presentNow(); });
+    }
+
+    function presentNow() {
+        flushOutput();
+        presentScreen();
+        if (app.run) updateStats(app.run);
     }
 
     class Run {
@@ -569,9 +678,8 @@
             this.done = false;
             this.phase = 'compile';
             this.vm = null;
-            this.raf = 0;
+            this.queued = false;
             this.timer = 0;
-            this.slice = SLICE_START;
             this.sleepUntil = 0;
             this.started = performance.now();
             this.runStarted = 0;
@@ -635,9 +743,17 @@
                     const text = log.map((x) => x[0]).join('');
                     for (const [t, stream] of log) appendOutput(t, stream === 2 ? 'o-err' : 'o-compile');
                     if (ok) note('the compiler finished without writing /main.tbc');
-                    const line = errorLineFrom(text);
-                    markErrorLine(line);
-                    this.finish('compile-error', line ? `Compile error (line ${line})` : 'Compile error');
+                    if (st === STATUS.ERROR || st === STATUS.HOST_ERROR) {
+                        /* the compiler itself failed (e.g. its call depth for a deeply
+                         * nested expression): not a diagnostic about a line */
+                        note('the compiler stopped with an internal error (see above)');
+                        markErrorLine(0);
+                        this.finish('compile-error', 'Compiler failed (internal error)');
+                    } else {
+                        const line = compileErrorLine(text);
+                        markErrorLine(line);
+                        this.finish('compile-error', line ? `Compile error (line ${line})` : 'Compile error');
+                    }
                     resolve(null);
                 });
             });
@@ -656,7 +772,6 @@
                 return;
             }
             this.phase = 'run';
-            this.slice = SLICE_START;
             this.runStarted = performance.now();
             setState('running', 'Running…');
             this.drive(vm, (st) => this.programFinished(st));
@@ -672,16 +787,24 @@
             }
             const line = errorLineFrom(vm.errorText);
             markErrorLine(line);
+            if (!app.features.graphics && /\b(screen_\w+|draw_\w+|fill_rect|get_pixel|key_pressed|wait_key)\(\) is not available/.test(vm.errorText)) {
+                note('this playground build has no screen and key natives yet');
+            }
             if (st === STATUS.ERROR) this.finish('error', line ? `Runtime error at line ${line}` : 'Runtime error');
             else this.finish('error', 'Stopped by the playground (see the output)');
+        }
+
+        /* the program's screen as it is now (like the desktop VM's --screen at the end) */
+        showFinalScreen() {
+            if (this.phase === 'run' && app.programVM) app.programVM.showFinalScreen();
         }
 
         finish(state, text) {
             this.done = true;
             this.cancelTimers();
             hideStdin();
-            flushOutput();
-            presentScreen();
+            this.showFinalScreen();
+            presentNow();
             updateStats(this);
             setState(state, text);
         }
@@ -689,57 +812,56 @@
         drive(vm, onFinish) {
             this.vm = vm;
             this.onFinish = onFinish;
-            this.schedule(0);
+            this.schedule();
         }
 
-        schedule(delay) {
+        /* run the next slice as soon as possible */
+        schedule() {
+            if (this.stopped || this.done || this.queued) return;
+            this.queued = true;
+            const go = () => { this.queued = false; this.timer = 0; this.step(); };
+            if (document.hidden) this.timer = setTimeout(go, 0);   /* background tab: let the browser throttle */
+            else postTask(go);
+        }
+
+        /* sleep_ms(): wait until performance.now() >= this.sleepUntil; a timer for
+         * the whole milliseconds (set from a task, so it is never clamped), then
+         * tasks for the last fraction of a millisecond */
+        sleepWait() {
             if (this.stopped || this.done) return;
-            if (delay > 0) {
-                this.timer = setTimeout(() => { this.timer = 0; this.schedule(0); }, delay);
-            } else if (document.hidden) {
-                this.timer = setTimeout(() => { this.timer = 0; this.step(); }, 0);
+            const left = this.sleepUntil - performance.now();
+            if (left <= 0) {
+                this.sleepUntil = 0;
+                if (document.body.dataset.state === 'sleeping') setState('running', 'Running…');
+                this.schedule();
+            } else if (left < 1) {
+                postTask(() => this.sleepWait());
             } else {
-                this.raf = requestAnimationFrame(() => { this.raf = 0; this.step(); });
+                this.timer = setTimeout(() => { this.timer = 0; postTask(() => this.sleepWait()); },
+                    Math.min(left, MAX_TIMER_MS));
             }
         }
 
         step() {
-            if (this.stopped || this.done) return;
+            if (this.stopped || this.done || this.sleepUntil) return;
             const vm = this.vm;
-            const start = performance.now();
-            if (this.sleepUntil) {
-                const left = this.sleepUntil - start;
-                if (left > 1) { this.schedule(left > 30 ? left - 12 : 0); return; }
-                this.sleepUntil = 0;
-                setState(this.phase === 'run' ? 'running' : 'compiling', this.phase === 'run' ? 'Running…' : 'Compiling with tilc…');
-            }
-            let st;
-            for (;;) {
-                const t = performance.now();
-                st = vm.run(this.slice);
-                const dt = performance.now() - t;
-                if (st !== STATUS.YIELD) break;
-                if (dt < 2 && this.slice < SLICE_MAX) this.slice *= 2;
-                else if (dt > 8 && this.slice > SLICE_MIN) this.slice = Math.max(SLICE_MIN, this.slice >> 1);
-                if (performance.now() - start >= FRAME_MS || app.pendingChars > FRAME_OUTPUT) break;
-            }
-            flushOutput();
-            if (this.phase === 'run') presentScreen();
-            updateStats(this);
+            const st = vm.run(0, SLICE_MS);
+            if (app.pendingChars > FRAME_OUTPUT) flushOutput();
+            requestPresent();
             switch (st) {
             case STATUS.YIELD:
-                this.schedule(0);
+                this.schedule();
                 return;
             case STATUS.SLEEP: {
                 const ms = vm.sleepMs;
-                if (ms <= 0) { this.schedule(0); return; }
+                if (ms <= 0) { this.schedule(); return; }
                 this.sleepUntil = performance.now() + ms;
-                if (ms > 50) setState('sleeping', `Sleeping (sleep_ms ${ms})…`);
-                this.schedule(ms > 30 ? ms - 12 : 0);
+                if (ms > 50) setState('sleeping', `Sleeping (sleep_ms: ${fmtMs(ms)} left)…`);
+                this.sleepWait();
                 return;
             }
             case STATUS.WAIT_KEY:
-                if (vm.keys.length) { this.schedule(0); return; }
+                if (vm.keys.length) { this.schedule(); return; }
                 setState('waiting-key', finePointer()
                     ? 'Waiting for a key: click the screen (or the output) and press a key'
                     : 'Waiting for a key: use the keys under the screen');
@@ -765,15 +887,14 @@
             const s = document.body.dataset.state;
             if (s === 'waiting-key' || s === 'waiting-line') {
                 setState(this.phase === 'run' ? 'running' : 'compiling', this.phase === 'run' ? 'Running…' : 'Compiling with tilc…');
-                this.schedule(0);
+                this.schedule();
             }
         }
 
         cancelTimers() {
-            if (this.raf) cancelAnimationFrame(this.raf);
             if (this.timer) clearTimeout(this.timer);
-            this.raf = 0;
             this.timer = 0;
+            this.sleepUntil = 0;
         }
 
         stop() {
@@ -782,8 +903,8 @@
             this.cancelTimers();
             hideStdin();
             if (this.resolveCompile) { const r = this.resolveCompile; this.resolveCompile = null; r(null); }
-            flushOutput();
-            presentScreen();
+            this.showFinalScreen();
+            presentNow();
             updateStats(this);
         }
     }
@@ -864,8 +985,11 @@
         return true;
     }
 
+    /* Keys for the program while the screen (or the output) has the focus.
+     * Tab and Shift+Tab are not taken: they move the focus as usual, so a
+     * keyboard user can always leave the screen (and reach Stop). */
     function onProgramKey(e) {
-        if (e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.ctrlKey || e.metaKey || e.altKey || e.key === 'Tab') return;
         if (sendKey(keyCode(e.key))) e.preventDefault();
     }
 
@@ -889,11 +1013,19 @@
         run.resume();
     }
 
+    /* Ctrl+D: end of input, like a terminal - text already typed is delivered
+     * first (without a newline), then input() returns "" */
     function onStdinKey(e) {
         if (e.ctrlKey && (e.key === 'd' || e.key === 'D')) {
             e.preventDefault();
             const run = app.run;
             if (!run || run.done || run.stopped) return;
+            const text = ui.stdinText.value;
+            ui.stdinText.value = '';
+            if (text) {
+                appendOutput(text, 'o-echo');
+                run.vm.pushInput(encoder.encode(text));
+            }
             run.vm.closeInput();
             note('end of input');
             hideStdin();
@@ -905,7 +1037,17 @@
     }
 
     /* ───────────────────────────── start-up ────────────────────────────── */
-    async function detectCompiler() {
+    async function loadBuildInfo() {
+        try {
+            const resp = await fetch('build-info.json', { cache: 'no-cache' });
+            if (resp.ok) return await resp.json();
+        } catch (e) {
+            /* no build information: assume a complete build */
+        }
+        return null;
+    }
+
+    async function detectCompiler(infoP) {
         const custom = new URLSearchParams(location.search).get('compiler');
         if (custom) {
             const url = new URL(custom, location.href);
@@ -913,13 +1055,7 @@
             app.compiler = { kind: 'custom', bytes: await fetchBytes(url.href), url: url.pathname };
             return;
         }
-        let info = null;
-        try {
-            const resp = await fetch('build-info.json', { cache: 'no-cache' });
-            if (resp.ok) info = await resp.json();
-        } catch (e) {
-            info = null;
-        }
+        const info = await infoP;
         if (!info || info.compiler === 'tilc') {
             try {
                 app.compiler = { kind: 'tilc', bytes: await fetchBytes('tilc.tbc'), url: 'tilc.tbc' };
@@ -958,7 +1094,11 @@
         ui.share.addEventListener('click', () => { shareLink().catch((e) => toast(e.message)); });
         ui.theme.addEventListener('click', toggleTheme);
         ui.clear.addEventListener('click', () => { clearOutput(); });
-        ui.examples.addEventListener('change', () => { if (ui.examples.value) loadExample(ui.examples.value); });
+        ui.examples.addEventListener('change', () => {
+            const id = ui.examples.value;
+            if (id === PREVIOUS_ID) restorePrevious();
+            else if (id) loadExample(id);
+        });
         ui.screen.addEventListener('keydown', onProgramKey);
         ui.output.addEventListener('keydown', onProgramKey);
         ui.screen.addEventListener('focus', () => ui.screenWrap.classList.add('focused'));
@@ -971,15 +1111,28 @@
         window.addEventListener('hashchange', () => { loadFromHash(); });
 
         const runtimeP = Runtime.create('tilvm.wasm');
-        const compilerP = detectCompiler();
+        const infoP = loadBuildInfo();
+        const compilerP = detectCompiler(infoP);
         runtimeP.catch(() => {});
         compilerP.catch(() => {});
+        const info = await infoP;
+        if (info && info.graphics === false) app.features.graphics = false;
         await loadExampleIndex();
-        if (!(await loadFromHash())) {
-            let draft = null;
-            try { draft = localStorage.getItem(DRAFT_KEY); } catch (e) { draft = null; }
-            if (draft) setCode(draft);
-            else if (!(await loadExample('hello'))) setCode('print("Hello, World!")\n');
+        let draft = null, previous = null;
+        try {
+            draft = localStorage.getItem(DRAFT_KEY);
+            previous = localStorage.getItem(PREVIOUS_KEY);
+        } catch (e) {
+            draft = null;
+        }
+        if (previous) { app.previous = previous; updatePreviousOption(); }
+        if (await loadFromHash()) {
+            /* a link or example: the user's saved draft stays available */
+            if (draft && draft.trim() && draft !== ui.code.value) rememberPrevious(draft);
+        } else if (draft) {
+            setCode(draft);
+        } else if (!(await loadExample('hello'))) {
+            setCode('print("Hello, World!")\n');
         }
         try {
             app.runtime = await runtimeP;

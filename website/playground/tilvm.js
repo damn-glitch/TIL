@@ -6,7 +6,8 @@
  *   vm.onOutput = (text, stream) => ...;      // stream 1 = output, 2 = errors
  *   vm.load(bytecode);                        // Uint8Array of a .tbc file
  *   vm.setArgs(['a', 'b']);                   // args()
- *   let st = vm.run(20000);                   // at most 20000 steps, never blocks
+ *   let st = vm.run(0, 8);                    // about 8 ms (no step limit), never blocks
+ *   st = vm.run(20000);                       // exactly 20000 steps (or fewer if it ends)
  *   // st: DONE, ERROR, EXIT (vm.exitCode), YIELD (call run again),
  *   //     WAIT_KEY (vm.pushKey(code), then run), WAIT_LINE (vm.pushLine(text)),
  *   //     SLEEP (run again after vm.sleepMs ms), HOST_ERROR
@@ -54,18 +55,30 @@
         return 0;
     }
 
-    /* "UP,UP,ENTER,a" (the --keys syntax of the desktop VMs) -> key codes */
-    const KEY_WORDS = { UP: 1, DOWN: 2, LEFT: 3, RIGHT: 4, ENTER: 13, ESC: 27, ESCAPE: 27, SPACE: 32,
-        TAB: 9, BACKSPACE: 8 };
+    /* "UP,UP,ENTER,a" -> key codes, exactly like the desktop VM's --keys
+     * (vm/main.c): comma-separated names in any case or single characters,
+     * blanks around entries ignored, NONE = 0 (key_pressed() returns 0 once;
+     * wait_key() skips it), "" = no keys. Throws on any other entry. */
+    const KEY_WORDS = { UP: 1, DOWN: 2, LEFT: 3, RIGHT: 4, ENTER: 13, ESC: 27, SPACE: 32,
+        TAB: 9, BACKSPACE: 8, COMMA: 44, NONE: 0 };
 
     function parseKeys(text) {
+        const spec = String(text);
         const out = [];
-        for (const word of String(text).split(',')) {
-            if (word === '') continue;
-            const up = word.toUpperCase();
-            if (Object.prototype.hasOwnProperty.call(KEY_WORDS, up) && word.length > 1) out.push(KEY_WORDS[up]);
-            else if (/^\d+$/.test(word) && word.length > 1) out.push(parseInt(word, 10));
-            else out.push(word.codePointAt(0));
+        if (/^[ \t]*$/.test(spec)) return out;
+        for (const raw of spec.split(',')) {
+            const word = raw.replace(/^[ \t]+|[ \t]+$/g, '');
+            const chars = Array.from(word);
+            if (chars.length === 1 && !(word.length === 1 && word.charCodeAt(0) >= 0xD800 &&
+                    word.charCodeAt(0) <= 0xDFFF)) {
+                out.push(word.codePointAt(0));
+            } else if (word && Object.prototype.hasOwnProperty.call(KEY_WORDS, word.toUpperCase()) &&
+                    /^[A-Za-z]+$/.test(word)) {
+                out.push(KEY_WORDS[word.toUpperCase()]);
+            } else {
+                throw new Error(`bad --keys entry '${word}' (use UP, DOWN, LEFT, RIGHT, ENTER, ESC, SPACE, ` +
+                    'TAB, BACKSPACE, COMMA, NONE or one character)');
+            }
         }
         return out;
     }
@@ -179,10 +192,14 @@
                         const vm = vmOf(id);
                         return vm ? vm._readLine(buf, cap) : -1;
                     },
-                    key(id) {
+                    key(id, wait) {
                         const vm = vmOf(id);
                         if (!vm) return 0;
                         vm.keyPolls++;
+                        if (wait) {
+                            while (vm.keys.length && vm.keys[0] === 0) vm.keys.shift();   /* NONE */
+                            if (!vm.keys.length) return vm.keyScriptEnded ? 27 : 0;
+                        }
                         return vm.keys.length ? vm.keys.shift() : 0;
                     },
                     file_read(id, pathPtr, pathLen, buf, cap) {
@@ -219,6 +236,7 @@
         _reset() {
             this.keys = [];
             this.keyPolls = 0;
+            this.keyScriptEnded = false;     /* runners: wait_key() returns 27 (Esc) when no key is left */
             this.input = new Uint8Array(0);  /* unread input bytes (lines end with \n) */
             this.inputClosed = false;
             this.decoders = { 1: new TextDecoder(), 2: new TextDecoder() };
@@ -252,14 +270,17 @@
             if (e.wh_set_args(this.id, total) < 0) throw new Error('too many program arguments');
         }
 
-        /* Run at most `budget` steps; returns a STATUS code. Never blocks. */
-        run(budget) {
+        /* Run at most `budget` steps (0 = no step limit) and, with maxMs > 0, for
+         * about maxMs milliseconds (checked every few steps; see wh_run in
+         * wasm_host.c); returns a STATUS code. Never blocks: without maxMs, give
+         * a budget. */
+        run(budget, maxMs) {
             const rt = this.rt, e = rt.exports;
             if (rt.broken) return (this.status = STATUS.HOST_ERROR);
             const sp = e.__stack_pointer.value;
             let st;
             try {
-                st = e.wh_run(this.id, budget >>> 0);
+                st = e.wh_run(this.id, budget >>> 0, maxMs > 0 ? maxMs : 0);
             } catch (err) {
                 e.__stack_pointer.value = sp;           /* the C stack was unwound by the exception */
                 if (err !== SUSPEND) {
@@ -290,6 +311,17 @@
             if (this.keys.length >= 256) this.keys.shift();
             this.keys.push(code);
         }
+
+        /* a whole key script (parseKeys): 0 entries are kept (NONE), and once it
+         * is used up wait_key() returns 27 (Esc), as with the desktop VM's --keys */
+        setKeyScript(codes) {
+            this.keys = codes.slice();
+            this.keyScriptEnded = true;
+        }
+
+        /* the program has ended or was stopped: show its framebuffer as it is
+         * (also without a final screen_show()); true when the picture changed */
+        showFinalScreen() { return this.rt.exports.wh_screen_final(this.id) === 1; }
 
         /* queue one line of input (without the newline) */
         pushLine(text) { this.pushInput(encoder.encode(String(text) + '\n')); }

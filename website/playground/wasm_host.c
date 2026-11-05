@@ -18,9 +18,14 @@
  *     bytes, in memory grown on demand) that the page copies to a <canvas>.
  *
  * Never blocking the browser
- *   JavaScript calls wh_run(id, budget) for a few milliseconds per animation
- *   frame; each call runs at most `budget` steps (loop iterations + calls) and
- *   returns a status. Three natives would block a desktop VM; here they pause:
+ *   JavaScript calls wh_run(id, budget, max_ms) for a few milliseconds at a
+ *   time. It runs the program in small sub-slices (`chunk` steps: loop
+ *   iterations + calls, adapted to the measured time per step, at most
+ *   WH_CHUNK_MAX) and returns once max_ms have passed, so the time of one call
+ *   stays bounded even when single steps are costly (a sort, a long string)
+ *   or suddenly become costly. Only one step that takes long by itself (one
+ *   native working on a huge value) can exceed it. Three natives would block a
+ *   desktop VM; here they pause:
  *
  *   wait_key(), input(), sleep_ms()  When the program would have to wait (no
  *       key / line queued yet; the busy-wait of sleep_ms), the hook moves the
@@ -39,7 +44,8 @@
  *   Pausing checks the bytecode at the saved pc (NATIVE or NATIVE_POP with
  *   the expected native id), so a VM build that does not save the pc before
  *   natives is detected: wait_key() and input() then stop the program with an
- *   explicit error, and sleep_ms() busy-waits as on a desktop.
+ *   explicit error, and sleep_ms() busy-waits as on a desktop. The idle hook
+ *   (energy saving) never pauses: see h_idle.
  *
  * Exports (all ids are instance numbers 0..WH_MAX_VMS-1) - see tilvm.js.
  */
@@ -58,6 +64,11 @@
 #define WH_ARGS_MAX 8192                    /* bytes of program arguments */
 #define WH_ARGC_MAX 64
 #define WH_ERR_MAX 4096                     /* captured error report */
+#ifndef WH_CHUNK_MAX
+#define WH_CHUNK_MAX 32                     /* steps per sub-slice of wh_run (see wh_run) */
+#endif
+#define WH_SUB_MS 0.5                       /* target duration of one sub-slice */
+#define WH_SLICE_OUTPUT (256L * 1024L)      /* wh_run returns early after this much output */
 
 /* status codes of wh_run (0-3 are the TILVM_* codes) */
 #define WH_DONE 0
@@ -83,13 +94,15 @@
 /* ─── JavaScript imports (tilvm.js) ─────────────────────────────────────── */
 /* stream 1 = program output, 2 = error reports */
 JS_IMPORT("write") void js_write(int vm, int stream, const char *data, unsigned long len);
-/* milliseconds (performance.now()) */
+/* milliseconds (performance.now(), fractional) */
 JS_IMPORT("now") double js_now(void);
 /* copy the next input line (at most cap-1 bytes, no newline) into buf:
  * length, -1 at end of input, -2 when no line is queued yet */
 JS_IMPORT("read_line") int js_read_line(int vm, char *buf, int cap);
-/* next queued key code, 0 when none */
-JS_IMPORT("key") int js_key(int vm);
+/* next queued key code, 0 when none. wait = 1 (wait_key): entries 0 (a
+ * scripted "no key") are skipped; a runner whose key script has ended may
+ * return 27 (Esc), as the desktop VM does */
+JS_IMPORT("key") int js_key(int vm, int wait);
 /* virtual file system: size or -1 (copies at most cap bytes when buf != 0); 0 or -1 */
 JS_IMPORT("file_read") long js_file_read(int vm, const char *path, int path_len, char *buf, unsigned long cap);
 JS_IMPORT("file_write") int js_file_write(int vm, const char *path, int path_len, const char *data,
@@ -115,13 +128,15 @@ typedef struct wh_vm {
     int status;             /* status of the last wh_run */
     int host_failed;        /* WH_HOST_ERROR: never resume */
     int swallow;            /* drop program output until input() reads again */
+    uint32_t chunk;         /* steps per sub-slice of wh_run (adapted) */
+    unsigned long out_bytes;    /* output written during the current wh_run */
     double t0;              /* js_now() when the program was loaded */
     uint32_t last_ms;       /* the clock never goes back */
     /* sleep_ms() (see h_clock): 0 = none, 1 = first clock read inside a sleep_ms
      * native, 2 = that sleep was paused and its native runs again */
     int sleep_state;
     wh_spot sleep_spot;     /* where the native reads the clock */
-    uint32_t sleep_until;   /* its deadline */
+    uint32_t sleep_until;   /* its deadline (program clock) */
     uint32_t sleep_len;     /* its argument (ms) */
     uint32_t sleep_reads;   /* clock reads since it runs again */
     /* program arguments */
@@ -162,6 +177,7 @@ static wh_vm *get_vm(int id) {
 static void h_write(void *ctx, const char *data, size_t len) {
     wh_vm *w = (wh_vm *)ctx;
     if (w->swallow || !len) return;
+    w->out_bytes += (unsigned long)len;
     js_write(w->id, 1, data, (unsigned long)len);
 }
 
@@ -230,12 +246,12 @@ static int h_read_line(void *ctx, char *buf, size_t cap) {
 }
 
 static int h_key_pressed(void *ctx) {
-    return js_key(((wh_vm *)ctx)->id);
+    return js_key(((wh_vm *)ctx)->id, 0);
 }
 
 static int h_wait_key(void *ctx) {
     wh_vm *w = (wh_vm *)ctx;
-    int k = js_key(w->id);
+    int k = js_key(w->id, 1);
     if (k > 0) return k;
     pause_native(w, WH_N_WAIT_KEY, WH_WAIT_KEY, "wait_key");
 }
@@ -270,17 +286,21 @@ static int same_spot(const wh_spot *a, const wh_spot *b) {
            a->tries == b->tries && a->deadlines == b->deadlines;
 }
 
-/* the int argument of the sleep_ms native being executed, or -1 */
-static long sleep_arg(wh_vm *w) {
+/* The wait of the sleep_ms native being executed, as the VM computes it
+ * (until = now + (uint32_t)ms), or 0. The frame's saved pc is only fresh inside
+ * a native: elsewhere (timeout() set-up and deadline checks also read the
+ * clock) it may still point after an earlier sleep_ms of the same frame, so
+ * this is a candidate only - see h_clock. */
+static uint32_t sleep_arg(wh_vm *w) {
     tv_frame *fr = top_frame(w);
     uint8_t argc;
     const tv_val *a;
-    if (!in_native(w, WH_N_SLEEP_MS)) return -1;
+    if (!in_native(w, WH_N_SLEEP_MS)) return 0;
     argc = w->vm.bc[fr->pc - 1];
-    if (!argc || w->vm.st.sp < argc) return -1;
+    if (!argc || w->vm.st.sp < argc) return 0;
     a = &w->vm.st.stack[w->vm.st.sp - argc];
-    if (a->t != TV_INT || a->u.i <= 0) return -1;
-    return (long)(uint32_t)a->u.i;             /* the VM computes until = now + (uint32_t)ms */
+    if (a->t != TV_INT || a->u.i <= 0) return 0;
+    return (uint32_t)a->u.i;
 }
 
 static uint32_t sleep_end(wh_vm *w) {
@@ -300,52 +320,50 @@ static __attribute__((noreturn)) void pause_sleep(wh_vm *w) {
  * read at the very same spot is the busy-wait: the program pauses (WH_SLEEP)
  * and the page waits. When the instruction runs again, its first read returns
  * the original start (so `until` is the same deadline) and later reads return
- * at least the deadline, so the wait ends at once. Reads elsewhere (timeouts)
- * are never taken for a sleep: they happen at another spot. */
+ * at least the deadline, so the wait ends at once.
+ *
+ * Why a pause never rewinds a stale pc: outside natives the frame's pc may be
+ * stale (sleep_arg), so a clock read of a timeout() set-up or deadline check
+ * can be recorded as a candidate. But those read the clock once per spot: a
+ * set-up then changes the recovery points, a deadline check happens at a
+ * back-edge, i.e. after `steps` changed. Two reads at one spot (same pc, steps,
+ * stack pointer, frames, recovery points) happen only inside one native call,
+ * where the pc is fresh. */
 static uint32_t h_clock(void *ctx) {
     wh_vm *w = (wh_vm *)ctx;
     wh_spot here;
-    uint32_t now;
-    long ms;
+    uint32_t now, ms;
     get_spot(w, &here);
     if (w->sleep_state && same_spot(&here, &w->sleep_spot)) {
         if (w->sleep_state == 2) {
             if (!w->sleep_reads++) return w->sleep_until - w->sleep_len;
             return sleep_end(w);
         }
-        if ((int32_t)(w->sleep_until - real_ms(w)) > 0) pause_sleep(w);
+        if ((int32_t)(real_ms(w) - w->sleep_until) < 0) pause_sleep(w);   /* the VM's own test */
         w->sleep_state = 0;
         return wall_ms(w);
     }
     w->sleep_state = 0;
     now = wall_ms(w);
     ms = sleep_arg(w);
-    if (ms > 0) {
+    if (ms) {
         w->sleep_state = 1;
         w->sleep_spot = here;
-        w->sleep_until = now + (uint32_t)ms;
-        w->sleep_len = (uint32_t)ms;
+        w->sleep_until = now + ms;
+        w->sleep_len = ms;
     }
     return now;
 }
 
-/* Idling inside sleep_ms() (a VM that sleeps through the idle hook) is the
- * same pause. Energy saving elsewhere is a no-op: a browser tab gains
- * nothing from idling inside a time slice. */
+/* Energy saving (design section 11: idle 1 ms every few thousand steps, at
+ * loop back-edges) saves nothing inside a browser time slice, and pausing
+ * there is impossible: the frame's saved pc is stale at a back-edge, so the
+ * program could not resume at the right instruction. The idle hook therefore
+ * never pauses; sleep_ms() pauses through its clock reads (h_clock), which
+ * the VM keeps reading while it waits, whether or not it idles in between. */
 static void h_idle(void *ctx, unsigned long ms) {
-    wh_vm *w = (wh_vm *)ctx;
-    wh_spot here;
-    if (!ms) return;
-    get_spot(w, &here);
-    if (w->sleep_state && same_spot(&here, &w->sleep_spot)) {
-        if (w->sleep_state == 1 && (int32_t)(w->sleep_until - real_ms(w)) > 0) pause_sleep(w);
-        return;                                 /* paused before: the wait is over */
-    }
-    if (sleep_arg(w) != (long)ms) return;      /* only an idle(ms) that is the sleep itself */
-    w->sleep_spot = here;
-    w->sleep_until = wall_ms(w) + (uint32_t)ms;
-    w->sleep_len = (uint32_t)ms;
-    pause_sleep(w);
+    (void)ctx;
+    (void)ms;
 }
 
 /* ─── files: the virtual file system lives in JavaScript ───────────────── */
@@ -423,6 +441,19 @@ static void h_gfx_show(void *ctx) {
     memcpy(screen.front, screen.back, (size_t)screen.w * (size_t)screen.h * sizeof(uint32_t));
     screen.frame++;
     js_screen(w->id, 1, (int)screen.frame, 0);
+}
+
+/* The program has ended (or was stopped): show the framebuffer as it is,
+ * whether or not screen_show() was called after the last drawing - like the
+ * desktop VM's --screen FILE.ppm. Returns 1 when the shown frame changed. */
+WASM_EXPORT("wh_screen_final") int wh_screen_final(int id) {
+    size_t bytes;
+    if (!screen.open || screen.owner != id) return 0;
+    bytes = (size_t)screen.w * (size_t)screen.h * sizeof(uint32_t);
+    if (!memcmp(screen.front, screen.back, bytes)) return 0;
+    memcpy(screen.front, screen.back, bytes);
+    screen.frame++;
+    return 1;
 }
 
 /* ─── exported API ──────────────────────────────────────────────────────── */
@@ -512,6 +543,7 @@ WASM_EXPORT("wh_load") int wh_load(int id, uint32_t size) {
     w->status = WH_YIELD;
     w->host_failed = 0;
     w->swallow = 0;
+    w->chunk = 1;
     w->sleep_state = 0;
     w->t0 = js_now();
     w->last_ms = 0;
@@ -520,15 +552,46 @@ WASM_EXPORT("wh_load") int wh_load(int id, uint32_t size) {
     return 0;
 }
 
-/* Run at most `budget` steps (0 = no limit). Returns a WH_* status. */
-WASM_EXPORT("wh_run") int wh_run(int id, uint32_t budget) {
+/* Adapt the sub-slice length to the time its last run took. It grows by
+ * doubling, at most to WH_CHUNK_MAX steps (so a sudden change from cheap to
+ * costly steps costs at most WH_CHUNK_MAX costly steps), and shrinks at once
+ * in proportion to the measured time per step (down to a single step). */
+static void adapt_chunk(wh_vm *w, double ms) {
+    if (ms > WH_SUB_MS) {
+        double n = (double)w->chunk * (WH_SUB_MS / ms);
+        w->chunk = n < 1 ? 1u : (uint32_t)n;
+    } else if (ms < WH_SUB_MS / 4 && w->chunk < WH_CHUNK_MAX) {
+        w->chunk *= 2;
+        if (w->chunk > WH_CHUNK_MAX) w->chunk = WH_CHUNK_MAX;
+    }
+}
+
+/* Run the program: at most `budget` steps (0 = no step limit) and, when
+ * max_ms > 0, until about max_ms milliseconds have passed (checked between
+ * sub-slices of w->chunk steps) or after WH_SLICE_OUTPUT bytes of output.
+ * max_ms <= 0 runs the budget in one go. Returns a WH_* status. */
+WASM_EXPORT("wh_run") int wh_run(int id, uint32_t budget, double max_ms) {
     wh_vm *w = get_vm(id);
+    double start, t, now;
+    uint32_t n;
     int rc;
     if (!w || !w->loaded) return WH_HOST_ERROR;
     if (w->host_failed) return w->status = WH_HOST_ERROR;
     w->status = WH_YIELD;
+    w->out_bytes = 0;
     if (w->sleep_state == 1) w->sleep_state = 0;    /* a paused sleep (2) is resumed now */
-    rc = tilvm_run_steps(&w->vm, budget);
+    if (!(max_ms > 0)) return w->status = tilvm_run_steps(&w->vm, budget);
+    start = t = js_now();
+    for (;;) {
+        n = budget && budget < w->chunk ? budget : w->chunk;
+        rc = tilvm_run_steps(&w->vm, n);
+        if (rc != TILVM_YIELD) break;              /* YIELD: exactly n steps ran */
+        if (budget && !(budget -= n)) break;
+        now = js_now();
+        adapt_chunk(w, now - t);
+        t = now;
+        if (now - start >= max_ms || w->out_bytes >= (unsigned long)WH_SLICE_OUTPUT) break;
+    }
     return w->status = rc;
 }
 
@@ -544,13 +607,14 @@ WASM_EXPORT("wh_exit_code") int wh_exit_code(int id) {
     return w->status == WH_DONE ? 0 : 1;
 }
 
-/* WH_SLEEP: milliseconds left until the program wakes up (0 = now) */
-WASM_EXPORT("wh_sleep_ms") int wh_sleep_ms(int id) {
+/* WH_SLEEP: milliseconds (fractional) left until the program wakes up, 0 =
+ * now: until the real clock reaches the deadline of the program's clock */
+WASM_EXPORT("wh_sleep_ms") double wh_sleep_ms(int id) {
     wh_vm *w = get_vm(id);
-    int32_t left;
-    if (!w) return 0;
-    left = (int32_t)(w->sleep_until - real_ms(w));
-    return left > 0 ? (int)left : 0;
+    double left;
+    if (!w || w->status != WH_SLEEP) return 0;
+    left = w->t0 + (double)w->sleep_until - js_now();
+    return left > 0 ? left : 0;
 }
 
 WASM_EXPORT("wh_steps") uint32_t wh_steps(int id) {
@@ -603,6 +667,7 @@ WASM_EXPORT("wh_info") long wh_info(int key) {
     case 11: return TILVM_MAX_CONSTS;
     case 12: return WH_ARGS_MAX;
     case 13: return WH_ARGC_MAX;
+    case 14: return WH_CHUNK_MAX;
     default: return -1;
     }
 }

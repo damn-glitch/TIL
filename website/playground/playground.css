@@ -392,6 +392,18 @@ body[data-state="no-compiler"] .state::before { background: var(--err); }
 
 .footer a { color: var(--accent); margin-left: auto; }
 
+.toast-action {
+    margin-left: 10px;
+    padding: 2px 10px;
+    border: 1px solid currentColor;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-weight: 600;
+    cursor: pointer;
+}
+
 .toast {
     position: fixed;
     left: 50%;

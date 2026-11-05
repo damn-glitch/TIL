@@ -92,5 +92,62 @@
       "state": "done",
       "graphics": true
     }
+  },
+  {
+    "name": "costly_steps",
+    "source": "var a = []\nfor i in 0..500\n    a.push((i * 7919) % 500)\nprint(\"sorting\")\nvar n = 0\nloop\n    var b = a.copy()\n    b.sort()\n    n += 1\n",
+    "expect": {
+      "state": "running",
+      "output_contains": [
+        "sorting"
+      ]
+    }
+  },
+  {
+    "name": "sleep_many",
+    "source": "let t0 = clock_ms()\nfor i in 0..100\n    sleep_ms(2)\nlet t = clock_ms() - t0\nprint(t >= 200, t < 1000)\n",
+    "expect": {
+      "state": "done",
+      "output": "true\ntrue\n"
+    }
+  },
+  {
+    "name": "no_show",
+    "source": "screen_init(40, 30)\nfill_rect(0, 0, 40, 30, 0xFF0000)\nprint(get_pixel(5, 5))\n",
+    "expect": {
+      "state": "done",
+      "output": "16711680\n",
+      "graphics": true
+    }
+  },
+  {
+    "name": "input_eof",
+    "source": "let a = input(\"first? \")\nlet b = input(\"second? \")\nlet c = input(\"third? \")\nprint(f\"[{a}] [{b}] [{c}]\")\n",
+    "expect": {
+      "state": "done"
+    }
+  },
+  {
+    "name": "tilc_unsupported",
+    "source": "import math_utils\nprint(math_utils.square(3))\n",
+    "tilc_says": "tilc: /main.til:1: unsupported: import of 'math_utils' (module not found)\n",
+    "expect": {
+      "state": "compile-error",
+      "error_line": 1,
+      "status_contains": "Compile error (line 1)"
+    }
+  },
+  {
+    "name": "tilc_crash",
+    "source": "print(1)\nlet y = ((((((1))))))\n",
+    "tilc_crashes": true,
+    "expect": {
+      "state": "compile-error",
+      "no_error_line": true,
+      "status_contains": "Compiler failed",
+      "output_contains": [
+        "stack overflow"
+      ]
+    }
   }
 ]

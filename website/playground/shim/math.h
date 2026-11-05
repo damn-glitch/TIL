@@ -4,8 +4,9 @@
  * sqrt/floor/ceil/trunc/fabs are single WebAssembly instructions; fmod is the
  * JavaScript `%` operator (exact, same sign rule as C); the transcendental
  * functions are imported from the browser's Math object (Math.pow, Math.sin,
- * ...), so their last digit can differ from the desktop C library in rare
- * cases (see website/playground/README.md).
+ * ...). Their special cases (inf, nan, zeros) follow C99 Annex F - pow() fixes
+ * the two where JavaScript differs - but the last bit of ordinary results
+ * often differs from the desktop C library (see website/playground/README.md).
  */
 #ifndef TILWASM_MATH_H
 #define TILWASM_MATH_H
@@ -45,7 +46,14 @@ static inline double fmax(double x, double y) { return (x > y || y != y) ? x : y
 double fmod(double x, double y) TILWASM_JS_ENV("fmod");
 
 /* JavaScript Math.* */
-double pow(double x, double y) TILWASM_JS_MATH("pow");
+double tilwasm_math_pow(double x, double y) TILWASM_JS_MATH("pow");
+
+/* C99 (Annex F) and the reference VM: pow(+1, y) is 1 for every y, NaN too,
+ * and pow(-1, +-inf) is 1; JavaScript's Math.pow returns NaN for these. */
+static inline double pow(double x, double y) {
+    if (x == 1.0 || (x == -1.0 && __builtin_isinf(y))) return 1.0;
+    return tilwasm_math_pow(x, y);
+}
 double exp(double x) TILWASM_JS_MATH("exp");
 double expm1(double x) TILWASM_JS_MATH("expm1");
 double log(double x) TILWASM_JS_MATH("log");

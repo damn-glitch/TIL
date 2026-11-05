@@ -460,11 +460,230 @@ def test_float_formatting_matches_printf(builds, tmp_path):
     src = '''
 print(123456.5, 999999.5, 65081.35, -0.0)
 print(f"{0.005:.2f} {-0.015:.2f} {1e100:.3f}")
+print(2877580 / 8.0, 7158252 / 8.0, 65023 / 8.0)
+print(f"{72465 / 100.0:.3e} {1.0 / 3.0:.17f}")
 '''
     tbc = compile_file(src, str(tmp_path), 'floats')
     wasm = node_run(builds['wasm'], tbc)[:3]
     desktop = desktop_run(tbc)[:3]
     assert wasm == desktop
+
+
+# float(str) / str.to_float(): the C VM (vm/tilvm.c, every build) follows the
+# reference VM (Python's float() of the bytes) exactly, also without stdio
+# (the playground, calculators): same syntax, correctly rounded values.
+
+FLOAT_SYNTAX_CASES = [
+    '1e3', '2.5e3', '2.5E-3', '1.5e+3', 'inf', '-inf', '+Infinity', 'iNfInItY', 'nan', '-NaN', ' 2.5\t', '\t7.25',
+    ' \t\n\x0b\x0c\r2.5\r\n\x0b\x0c', '0.3', '123.456', '1_000.5', '1_000_000e-3', '1e1_0', '.5', '5.', '+.5', '-.5e-3',
+    '00001.5', '-0', '0e0', '1e999999999999999999999', '1e-99999999999999999', '1.7976931348623157e308',
+    '1.7976931348623159e308', '4.9406564584124654e-324', '2.4703282292062327e-324', '2.4703282292062328e-324',
+    '2.2250738585072011e-308', '9007199254740993', '1.00000000000000011102230246251565404236316680908203125',
+    '1.00000000000000011102230246251565404236316680908203125000000000000000000001', '0.' + '0' * 400 + '1',
+    '1' + '0' * 400, '1' * 900 + 'e-800',
+    # not numbers
+    '', ' ', '.', 'e5', '1e', '1e+', '1__0', '_1', '1_', '1_.5', '1._5', '1e_5', '1_e5', 'infinit', 'nan(1)',
+    '0x10', '0x1p3', '1.5f', '--1', '+-1', '1 2', '\x1c5', '5\x1c', 'in f', '1e5_', '1\x00', '\x002',
+]
+
+
+def float_cases(n_random=400, seed=31):
+    import random
+    import struct
+    rnd = random.Random(seed)
+    cases = list(FLOAT_SYNTAX_CASES)
+    for _ in range(n_random):
+        k = rnd.random()
+        if k < 0.35:
+            cases.append(f"{rnd.randint(0, 10 ** rnd.randint(1, 9))}.{rnd.randint(0, 10 ** rnd.randint(1, 9))}")
+        elif k < 0.6:
+            x = struct.unpack('<d', struct.pack('<Q', rnd.getrandbits(64)))[0]
+            if x == x and abs(x) != float('inf'):
+                cases.append(repr(x))
+        elif k < 0.8:
+            digits = ''.join(rnd.choice('0123456789') for _ in range(rnd.randint(1, 40)))
+            cases.append(f"{digits[0]}.{digits[1:]}e{rnd.randint(-330, 320)}")
+        else:
+            cases.append(f"{rnd.uniform(-1e6, 1e6) * 10 ** rnd.randint(-30, 30):.{rnd.randint(0, 25)}g}")
+    return cases
+
+
+def halfway_cases(n, seed=7):
+    """exact decimal expansions of points halfway between two floats (up to
+    767 significant digits), and their neighbours"""
+    import decimal
+    import random
+    from fractions import Fraction
+    rnd = random.Random(seed)
+    ctx = decimal.Context(prec=2000)
+    out = []
+    for _ in range(n):
+        if rnd.random() < 0.3:
+            m, e = rnd.getrandbits(52) | 1, -1074            # subnormal range
+        else:
+            m, e = rnd.getrandbits(52) | (1 << 52), rnd.randint(-1074, 971)
+        h = Fraction(2 * m + 1) * Fraction(2) ** (e - 1)
+        text = format(ctx.divide(decimal.Decimal(h.numerator), decimal.Decimal(h.denominator)), 'f')
+        out += [text, text + '0001']
+        if '.' in text and text[-1] != '0':
+            out.append(text[:-1] + str(int(text[-1]) - 1))
+    return out
+
+
+def python_float_bits(text: str, single: bool = False) -> str:
+    """what the reference VM's float() gives, as hex bits (single: the float32
+    nearest to the decimal, ties to even), or 'ERR'"""
+    import struct
+    from fractions import Fraction
+    try:
+        v = float(text.encode('latin-1').strip())
+    except ValueError:
+        return 'ERR'
+    if v != v:
+        return 'NAN'
+    if not single:
+        return struct.pack('>d', v).hex()
+    neg = text.strip(' \t\n\r\x0b\x0c').startswith('-')
+    body = text.strip(' \t\n\r\x0b\x0c').lstrip('+-').replace('_', '').lower()
+    mant, _, exp = body.partition('e')
+    if body.startswith('inf') or (exp and abs(int(exp)) > 1000) and v in (0.0, float('inf'), float('-inf')):
+        bits = 0 if v == 0 else 0x7f800000
+    else:
+        a = abs(Fraction(body))
+        bits = 0
+        if a:
+            e = a.numerator.bit_length() - a.denominator.bit_length()
+            while Fraction(2) ** e > a:
+                e -= 1
+            while Fraction(2) ** (e + 1) <= a:
+                e += 1
+            lsb = max(e - 23, -149)
+            q = a / Fraction(2) ** lsb
+            m = q.numerator // q.denominator
+            r = q - m
+            if r > Fraction(1, 2) or (r == Fraction(1, 2) and m & 1):
+                m += 1
+            val = m * Fraction(2) ** lsb
+            bits = 0x7f800000 if val >= Fraction(2) ** 128 else struct.unpack('<I', struct.pack('<f', float(val)))[0]
+    return '%08x' % (bits | (0x80000000 if neg else 0))
+
+
+FLOAT_HARNESS = r"""
+#include <stdio.h>
+#include <string.h>
+#include "tilvm.c"
+int main(void) {                    /* one string per line (bytes), prints the bits or ERR */
+    static char line[1 << 16];
+    while (fgets(line, sizeof line, stdin)) {
+        size_t n = strlen(line);
+        tv_float f;
+        if (n && line[n - 1] == '\n') line[--n] = 0;
+        if (!parse_float(line, (uint32_t)n, &f)) { puts("ERR"); continue; }
+        if (f != f) { puts("NAN"); continue; }
+#if TILVM_FLOAT == 1
+        { uint32_t u; memcpy(&u, &f, 4); printf("%08lx\n", (unsigned long)u); }
+#else
+        { uint64_t u; memcpy(&u, &f, 8); printf("%016llx\n", (unsigned long long)u); }
+#endif
+    }
+    return 0;
+}
+"""
+
+
+@pytest.mark.skipif(CC is None, reason="no C compiler")
+@pytest.mark.parametrize("defs", [[], ['-DTILVM_NO_STDIO'],
+                                  ['-DTILVM_NO_STDIO', '-DTILVM_NO_MATH', '-DTILVM_FLOAT=1', '-DTILVM_INT_BITS=32']],
+                         ids=['stdio', 'nostdio', 'float32'])
+def test_float_parsing_is_exact_in_every_c_build(tmp_path, defs):
+    """parse_float of vm/tilvm.c == Python's float() bit for bit (float32: the
+    correctly rounded float), with and without stdio, including halfway points
+    with hundreds of digits"""
+    single = '-DTILVM_FLOAT=1' in defs
+    harness = tmp_path / 'harness.c'
+    harness.write_text(FLOAT_HARNESS)
+    exe = str(tmp_path / 'harness')
+    r = subprocess.run([CC, '-std=c99', '-O1', '-I', os.path.join(ROOT, 'vm'), *defs, '-o', exe, str(harness), '-lm'],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    cases = [c for c in float_cases(1500) + halfway_cases(150 if single else 300) if '\n' not in c and '\0' not in c]
+    if single:     # float32 halfway points are a different set
+        import decimal
+        import random
+        from fractions import Fraction
+        rnd, ctx = random.Random(5), decimal.Context(prec=400)
+        for _ in range(300):
+            m, e = rnd.getrandbits(23) | (1 << 23), rnd.randint(-149, 104)
+            h = Fraction(2 * m + 1) * Fraction(2) ** (e - 1)
+            cases.append(format(ctx.divide(decimal.Decimal(h.numerator), decimal.Decimal(h.denominator)), 'f'))
+    out = subprocess.run([exe], input='\n'.join(cases).encode('latin-1') + b'\n', capture_output=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    got = out.stdout.decode().split('\n')[:-1]
+    assert len(got) == len(cases)
+    bad = [(c[:80], python_float_bits(c, single), g) for c, g in zip(cases, got) if python_float_bits(c, single) != g]
+    assert not bad, f"{len(bad)} of {len(cases)} differ, e.g. {bad[:5]}"
+
+
+def float_program(cases):
+    """a TIL program: for each string, 'ok' if float(s) is the reference
+    value, 'error' if it is rejected (with nan and inf checked by value)"""
+    lines = ['check(s: str, want: float, kind: int) -> str',
+             '    let x = float(s)',
+             '    if kind == 1',
+             '        return str(x != x)',
+             '    if kind == 2',
+             '        return str(x > 1e308 and x == x * 2.0)',
+             '    if kind == 3',
+             '        return str(x < -1e308 and x == x * 2.0)',
+             '    return str(x == want)',
+             'var cases = []', 'var wants = []', 'var kinds = []']
+    expect = []
+    for c in cases:
+        try:
+            v = float(c.encode('latin-1').strip())
+        except ValueError:
+            v = None
+        kind = 0 if v is None or (v == v and abs(v) != float('inf')) else 1 if v != v else 2 if v > 0 else 3
+        lines.append(f'cases.push({til_bytes(c.encode("latin-1"))})')
+        lines.append(f'wants.push({repr(v) if kind == 0 and v is not None else "0.0"})')
+        lines.append(f'kinds.push({kind})')
+        expect.append('error' if v is None else 'true')
+    lines += ['for i in 0..len(cases)',
+              '    let r = retry(1)',
+              '        check(cases[i], wants[i], kinds[i])',
+              '    else',
+              '        "error"',
+              '    print(r)',
+              'print("2.5e3".to_float() * 2.0, " -1.5E-1 ".to_float() == -0.15)']
+    return '\n'.join(lines) + '\n', '\n'.join(expect) + '\n5000\ntrue\n'
+
+
+@needs_node
+@pytest.mark.skipif(CC is None, reason="no C compiler for the desktop VM")
+def test_float_parsing_same_in_all_three_vms(builds, tmp_path):
+    """the playground (TILVM_NO_STDIO), the desktop C VM and the reference VM
+    accept the same strings and give the same values"""
+    src, expect = float_program(float_cases(300))
+    tbc = compile_file(src, str(tmp_path), 'floats')
+    from tilhelpers import run_vm
+    ref = run_vm(src)
+    assert ref == (0, expect), ref[1][:2000]
+    assert desktop_run(tbc)[:3] == (0, expect, '')
+    assert node_run(builds['wasm'], tbc)[:3] == (0, expect, '')
+
+
+@needs_node
+@pytest.mark.skipif(CC is None, reason="no C compiler for the desktop VM")
+def test_math_special_cases_match_the_desktop_vm(builds, tmp_path):
+    """pow() follows C99 where JavaScript's Math.pow does not (1 ** inf, ...)"""
+    src = ('let inf = 1e308 * 10.0\nlet nan = inf - inf\n'
+           'print(1.0 ** inf, pow(1.0, nan), pow(-1.0, inf), pow(-1.0, -inf), (-1.0) ** inf, pow(1.0, -inf))\n'
+           'print(pow(nan, 0.0), pow(2.0, 0.5), pow(0.0, -1.0), pow(-0.0, -1.0), pow(-8.0, 1.0 / 3.0))\n'
+           'print(exp(710.0), log(0.0), sqrt(-1.0), floor(-0.5))\n')
+    tbc = compile_file(src, str(tmp_path), 'math')
+    wasm, desktop = node_run(builds['wasm'], tbc)[:3], desktop_run(tbc)[:3]
+    assert wasm == desktop
+    assert wasm[1].startswith('1\n1\n1\n1\n1\n1\n1\n')
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -555,6 +774,157 @@ def test_wait_key_pauses(builds, tmp_path):
     assert log[0]['ms'] < 1000
 
 
+@needs_node
+def test_a_sleep_of_2_31_ms_pauses_too(builds, tmp_path):
+    """sleep_ms(1 << 31): the VM waits 2^31 ms (like the desktop); the page
+    must still get control back at once (it used to busy-wait in wh_run)"""
+    log = drive(builds['wasm'], 'print("before")\nsleep_ms(1 << 31)\nprint("after")\n', [{}], tmp_path)
+    assert log[0]['st'] == 'sleep' and log[0]['out'] == 'before\n'
+    assert log[0]['ms'] < 1000
+    assert log[0]['sleep'] > 2 ** 31 - 10000
+
+
+SLICE_DRIVER = r"""
+const fs = require('fs');
+const T = require(process.argv[2]);
+(async () => {
+    const rt = await T.Runtime.create(fs.readFileSync(process.argv[3]));
+    const vm = rt.createVM();
+    let out = '';
+    vm.onOutput = (t) => { out += t; };
+    vm.load(fs.readFileSync(process.argv[4]));
+    vm.setArgs([]);
+    const calls = [];
+    const t00 = performance.now();
+    while (performance.now() - t00 < parseFloat(process.argv[5])) {
+        const t0 = performance.now();
+        const st = vm.run(0, 8);
+        calls.push(performance.now() - t0);
+        if (st !== T.STATUS.YIELD) break;
+    }
+    console.log(JSON.stringify({ calls, steps: vm.steps, out }));
+})().catch((e) => { console.error(e); process.exit(1); });
+"""
+
+COSTLY_PROGRAMS = {
+    # every iteration copies and sorts 500 numbers (one vm.run(20000) took 9 s)
+    'sort_copies': 'var a = []\nfor i in 0..500\n    a.push((i * 7919) % 500)\nprint("sorting")\n'
+                   'loop\n    var b = a.copy()\n    b.sort()\n',
+    # a cheap phase first (the sub-slices grow), then O(n) steps
+    'cheap_then_costly': 'var t = 0\nfor i in 0..300000\n    t += i % 7\nprint(t)\nvar seen = []\n'
+                         'for i in 0..40000\n    let v = (i * 7919) % 20000\n    if not seen.contains(v)\n'
+                         '        seen.push(v)\n',
+}
+
+
+@needs_node
+@pytest.mark.parametrize("name", sorted(COSTLY_PROGRAMS))
+def test_time_slices_stay_short_with_costly_steps(builds, tmp_path, name):
+    """vm.run(0, 8 ms) returns after about 8 ms even when every loop iteration
+    is costly, so the page answers and Stop works (the time is checked every
+    few steps, adapted to the measured time per step)"""
+    tbc = compile_file(COSTLY_PROGRAMS[name], str(tmp_path), name)
+    driver = tmp_path / 'slices.js'
+    driver.write_text(SLICE_DRIVER)
+    r = subprocess.run([NODE, str(driver), TILVM_JS, builds['wasm'], tbc, '2500'],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    res = json.loads(r.stdout)
+    assert len(res['calls']) > 20 and res['steps'] > 100, res
+    slow = sorted(res['calls'])[-3:]
+    assert slow[-1] < 250, f"the longest vm.run(0, 8) took {slow[-1]:.0f} ms (longest three: {slow})"
+
+
+def patch_energy_vm(src: str) -> str:
+    """TEST ONLY: a VM that idles like design section 11 (energy saving) at
+    loop back-edges, and whose sleep_ms idles while it waits"""
+    edge = re.search(r'\n[ \t]*backedge:[^\n]*\n(?:[^\n]*\n){0,3}?([ \t]*)st->steps\+\+;\n', src)
+    sleep = 'if (vm->clock_ms) while ((int32_t)(now_ms(vm) - until) < 0) { }'
+    if not edge or sleep not in src:
+        return None
+    idle = (f'{edge.group(1)}if (vm->host.idle && (st->steps & 63u) == 0) vm->host.idle(vm->ctx, 1);'
+            f'    /* TEST: energy */\n')
+    src = src[:edge.end()] + idle + src[edge.end():]
+    return src.replace(sleep, 'if (vm->clock_ms) while ((int32_t)(now_ms(vm) - until) < 0) '
+                              '{ if (vm->host.idle) vm->host.idle(vm->ctx, 1); }', 1)
+
+
+@needs_node
+@pytest.mark.skipif(CC is None, reason="no C compiler for the desktop VM")
+def test_energy_idles_never_pause_or_corrupt(builds, tmp_path):
+    """An idle at a loop back-edge (energy saving, design section 11) right
+    after a sleep_ms in the same function must not be taken for that sleep: the
+    frame's saved pc is stale there, and resuming from it re-ran old code. And
+    sleep_ms still pauses when it idles while it waits."""
+    if not builds['fresh']:
+        pytest.skip("no wasm toolchain")
+    with open(VM_C, encoding='utf-8') as f:
+        patched = patch_energy_vm(f.read())
+    if patched is None:
+        pytest.skip("the back-edge or sleep_ms code changed shape; nothing to simulate")
+    vm_c = tmp_path / 'tilvm.c'
+    vm_c.write_text(patched, encoding='utf-8')
+    out = str(tmp_path / 'out')
+    run_build(out, tilvm_c=str(vm_c), examples=False)
+    wasm = os.path.join(out, 'tilvm.wasm')
+    src = ('f() -> int\n    print("start")\n    sleep_ms(5)\n    var n = 0\n    var one = 1\n'
+           '    while n < 10000\n        n += one\n    return n\n'
+           'print(f"n = {f()}")\nvar m = 0\nlet one = 1\nsleep_ms(3)\nfor i in 0..5000\n    m += one\nprint(m)\n')
+    tbc = compile_file(src, str(tmp_path), 'energy')
+    rc, wout, werr, wsteps = node_run(wasm, tbc)
+    drc, dout, derr, dsteps = desktop_run(tbc)
+    assert (rc, wout, werr) == (drc, dout, derr) == (0, 'start\nn = 10000\n5000\n', '')
+    assert wsteps == dsteps
+    log = drive(wasm, 'print("a")\nsleep_ms(400)\nprint("b")\n', [{}, {'wait': 420}], tmp_path)
+    assert [e['st'] for e in log] == ['sleep', 'done'] and log[0]['ms'] < 300
+
+
+KEYS_PROGRAM = 'screen_init(4, 4)\nprint(key_pressed())\nprint(key_pressed())\nprint(key_pressed())\nprint(wait_key())\n'
+
+
+@needs_node
+def test_key_scripts_use_the_desktop_syntax(builds, tmp_path):
+    """tilvm_node.js --keys accepts exactly what the desktop VM's --keys does:
+    names in any case (COMMA, NONE = no key), one character; NONE is a poll
+    that returns 0; once the script is used up, wait_key() returns 27"""
+    probe = (f"const T = require({json.dumps(TILVM_JS)});"
+             "const bad = [];"
+             "for (const k of ['13', 'ESCAPE', 'a,,b', 'ab']) { try { T.parseKeys(k); bad.push(k); } catch (e) {} }"
+             "console.log(JSON.stringify([T.parseKeys('COMMA,NONE,a,ENTER, esc ,Up,ä,TAB,backspace,space'),"
+             " T.parseKeys(' '), bad]));")
+    r = subprocess.run([NODE, '-e', probe], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert json.loads(r.stdout) == [[44, 0, 97, 13, 27, 1, 228, 9, 8, 32], [], []]
+    if not builds.get('graphics') or not builds.get('site_wasm'):
+        pytest.skip("no screen/key natives in this VM build")
+    tbc = compile_file(KEYS_PROGRAM, str(tmp_path), 'keys')
+    rc, out, err, _ = node_run(builds['site_wasm'], tbc, keys='COMMA,NONE,a')
+    assert (rc, out, err) == (0, '44\n0\n97\n27\n', '')
+    with open(os.path.join(ROOT, 'vm', 'main.c'), encoding='utf-8') as f:
+        desktop_keys = '"--keys"' in f.read()
+    if desktop_keys and CC and builds.get('graphics') == 'real':
+        r = subprocess.run([cvm_binary(), '--keys', 'COMMA,NONE,a', tbc], capture_output=True, text=True, timeout=60)
+        assert (r.returncode, r.stdout) == (0, out), "the desktop VM reads the same key script"
+    rc, out, err, _ = node_run(builds['site_wasm'], tbc, keys='13')
+    assert rc == 2 and "bad --keys entry '13'" in err
+
+
+@needs_node
+def test_the_final_framebuffer_is_shown(builds, tmp_path):
+    """like the desktop VM's --screen: the picture at the end, also when the
+    program never called screen_show()"""
+    if not builds.get('graphics') or not builds.get('site_wasm'):
+        pytest.skip("no screen natives in this VM build")
+    tbc = compile_file('screen_init(8, 6)\nfill_rect(0, 0, 8, 6, 0xFF0000)\nprint(get_pixel(1, 1))\n',
+                       str(tmp_path), 'noshow')
+    ppm = tmp_path / 'out.ppm'
+    rc, out, _, _ = subprocess.run([NODE, NODE_RUNNER, '--wasm', builds['site_wasm'], '--screen', str(ppm), tbc],
+                                   capture_output=True, text=True, timeout=60).returncode, None, None, None
+    assert rc == 0
+    data = ppm.read_bytes()
+    assert data.startswith(b'P6\n8 6\n255\n') and data[len(b'P6\n8 6\n255\n'):][:3] == b'\xff\x00\x00'
+
+
 @slow
 @needs_node
 def test_a_vm_that_cannot_pause_is_reported(builds, tmp_path):
@@ -567,16 +937,24 @@ def test_a_vm_that_cannot_pause_is_reported(builds, tmp_path):
     m = re.search(r'(case OP_NATIVE: \{\n\s*uint8_t id = READ8\(\), argc = READ8\(\);\n)(\s*fr->pc = pc;\n)', src)
     if not m:
         pytest.skip("OP_NATIVE changed shape; nothing to simulate")
+    src = src.replace(m.group(0), m.group(1), 1)
+    if not has_real_graphics(src):
+        src = add_mock_graphics(src) or src           # wait_key() needs the key natives
     broken = tmp_path / 'tilvm.c'
-    broken.write_text(src.replace(m.group(0), m.group(1), 1), encoding='utf-8')
+    broken.write_text(src, encoding='utf-8')
     out = str(tmp_path / 'out')
     env = dict(os.environ, OUT=out, TILVM_C=str(broken), PYTHON=sys.executable, WERROR='0', EXAMPLES='0')
     r = subprocess.run([BASH, BUILD_SH], capture_output=True, text=True, env=env, timeout=600)
     assert r.returncode == 0, r.stderr
+    wasm = os.path.join(out, 'tilvm.wasm')
     tbc = compile_file('print("x")\nprint(input("? "))\n', str(tmp_path), 'p')
-    rc, wout, werr, _ = node_run(os.path.join(out, 'tilvm.wasm'), tbc, stdin='')
+    rc, wout, werr, _ = node_run(wasm, tbc, stdin='')
     assert rc == 1 and wout == 'x\n? '
     assert 'input() cannot pause in this VM build' in werr
+    if has_real_graphics(src):
+        log = drive(wasm, 'screen_init(4, 4)\nprint("y")\nprint(wait_key())\n', [{}], tmp_path)
+        assert log[0]['st'] == 'host-error' and log[0]['out'].startswith('y\n'), log
+        assert 'wait_key() cannot pause in this VM build' in log[0]['out']
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -590,15 +968,23 @@ def til_bytes(data: bytes) -> str:
 def mock_tilc_source(programs) -> str:
     """TEST ONLY: a TIL program with tilc's interface (args: input.til output.tbc)
     that 'compiles' the fixed programs of mock_programs.json by writing the
-    bytecode src/til.py produced for them (or printing its compile error)."""
+    bytecode src/til.py produced for them (or printing its compile error, or
+    the entry's "tilc_says" text; "tilc_crashes": the compiler itself fails
+    with a runtime error whose trace names lines of the compiler)."""
     lines = ['# TEST ONLY: stands in for selfhost/tilc.til (knows a fixed set of programs)',
+             'crash(n: int) -> int', '    return crash(n + 1) + 1',
              'let a = args()', 'let src = read_file(a[0])']
     for i, prog in enumerate(programs):
-        try:
-            data = til.compile_to_bytecode(prog['source'], '/main.til').serialize()
-            body = [f'    write_file(a[1], {til_bytes(data)})']
-        except (til.CompileError, SyntaxError) as e:
-            body = [f'    print({til_bytes(str(e).encode("utf-8"))})', '    exit(1)']
+        if prog.get('tilc_crashes'):
+            body = ['    print(crash(0))']
+        elif prog.get('tilc_says'):
+            body = [f'    print({til_bytes(prog["tilc_says"].rstrip(chr(10)).encode("utf-8"))})', '    exit(1)']
+        else:
+            try:
+                data = til.compile_to_bytecode(prog['source'], '/main.til').serialize()
+                body = [f'    write_file(a[1], {til_bytes(data)})']
+            except (til.CompileError, SyntaxError) as e:
+                body = [f'    print({til_bytes(str(e).encode("utf-8"))})', '    exit(1)']
         lines.append(('if' if i == 0 else 'elif') + f' src == {til_bytes(prog["source"].encode("utf-8"))}')
         lines += body
     lines += ['else', '    print("mock compiler: unknown program")', '    exit(1)']

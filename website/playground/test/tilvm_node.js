@@ -6,14 +6,17 @@
  *
  *   node tilvm_node.js [options] program.tbc [args...]
  *     --wasm FILE      tilvm.wasm to use (default: ../tilvm.wasm)
- *     --keys LIST      keys for key_pressed()/wait_key(): "UP,DOWN,ENTER,a"
+ *     --keys LIST      keys for key_pressed()/wait_key(), the desktop VM's syntax:
+ *                      "UP,DOWN,ENTER,a,COMMA,NONE" (wait_key() returns 27 = Esc
+ *                      once the list is used up, as on the desktop)
  *     --budget N       steps per wh_run call (default 20000)
- *     --screen FILE    write the last shown frame as a binary PPM (P6)
+ *     --screen FILE    write the framebuffer as it is at the end as a binary PPM
+ *                      (P6), whether or not screen_show() was called (desktop VM)
  *     --stats          print status/steps/slices to stderr at the end
  *
  * stdin feeds input(); files are the real file system (like the desktop VM);
  * sleep_ms() really waits. The exit code is the program's (0, 1 on errors,
- * n after exit(n)); a wait_key() with no keys left stops with exit code 1.
+ * n after exit(n)); without --keys, a wait_key() stops with exit code 1.
  */
 'use strict';
 const fs = require('fs');
@@ -29,11 +32,18 @@ function usage() {
 async function main() {
     const argv = process.argv.slice(2);
     let wasm = path.join(__dirname, '..', 'tilvm.wasm');
-    let keys = [], budget = 20000, screenOut = null, stats = false, prog = null, progArgs = [];
+    let keys = null, budget = 20000, screenOut = null, stats = false, prog = null, progArgs = [];
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--wasm' && i + 1 < argv.length) wasm = argv[++i];
-        else if (a === '--keys' && i + 1 < argv.length) keys = TILWasm.parseKeys(argv[++i]);
+        else if (a === '--keys' && i + 1 < argv.length) {
+            try {
+                keys = TILWasm.parseKeys(argv[++i]);
+            } catch (e) {
+                process.stderr.write(`tilvm_node: ${e.message}\n`);
+                process.exit(2);
+            }
+        }
         else if (a === '--budget' && i + 1 < argv.length) budget = parseInt(argv[++i], 10);
         else if (a === '--screen' && i + 1 < argv.length) screenOut = argv[++i];
         else if (a === '--stats') stats = true;
@@ -62,7 +72,7 @@ async function main() {
     }
     vm.setArgs(progArgs);
     let stdinData = null;
-    for (const k of keys) vm.pushKey(k);
+    if (keys) vm.setKeyScript(keys);
 
     let slices = 0, st;
     for (;;) {
@@ -93,6 +103,7 @@ async function main() {
     }
     flush();
     if (screenOut) {
+        vm.showFinalScreen();
         const s = rt.screen();
         if (s) {
             const rgb = Buffer.alloc(s.width * s.height * 3);

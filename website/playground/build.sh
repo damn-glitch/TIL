@@ -11,7 +11,8 @@
 #   examples/*.tbc    the bundled examples, precompiled by src/til.py - only
 #                     while there is no tilc.tbc (development fallback); they
 #                     are removed once tilc.tbc is built
-#   build-info.json   inputs (sha256), toolchain and configuration of the build
+#   build-info.json   inputs (sha256), toolchain and configuration of the build,
+#                     and whether the VM has the screen/key natives ("graphics")
 #
 # Needs: clang with the wasm32 target and wasm-ld (lld), python3.
 # Settings (environment): CLANG, PYTHON, TILVM_WASM_HEAP (bytes per VM,
@@ -177,6 +178,7 @@ fi
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -202,6 +204,8 @@ outputs = {"tilvm.wasm": sha(os.path.join(out, "tilvm.wasm"))}
 if os.path.exists(os.path.join(out, "tilc.tbc")):
     outputs["tilc.tbc"] = sha(os.path.join(out, "tilc.tbc"))
 version = subprocess.run([clang, "--version"], capture_output=True, text=True).stdout.splitlines()[0]
+with open(vm_c, encoding="utf-8") as f:
+    graphics = re.search(r"case\s+N_SCREEN_INIT\s*:", f.read()) is not None   # natives 40-53 implemented
 info = {
     "inputs": inputs,
     "outputs": outputs,
@@ -209,6 +213,7 @@ info = {
     "heap_bytes_per_vm": int(heap),
     "vms": int(nvms),
     "compiler": "tilc" if "tilc.tbc" in outputs else "precompiled-examples",
+    "graphics": graphics,
 }
 if os.path.realpath(vm_c) != os.path.realpath(os.path.join(root, "vm", "tilvm.c")):
     info["vm_source"] = vm_c
