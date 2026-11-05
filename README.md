@@ -119,7 +119,7 @@ running program and resume it later, even after a power cycle).
 |---|---|---|
 | ARM Cortex-M3, 64 KB RAM (NumWorks / STM32 class, QEMU) | 44.7 KB flash, 24 KB RAM | all examples identical |
 | 8-bit AVR ATmega1284P, 16 KB RAM (Arduino class, simavr) | 53.8 KB flash, 10.5 KB RAM | all examples identical |
-| Z80 (TI-83/84 class, ucsim) — TIL 3.1 | 16-bit lean build: code ends at 0xBE38 (below 0xC000), 5.7 KB RAM — [results](vm/ports/z80/RESULTS.md) | all examples without floats or values beyond 16 bits identical |
+| Z80 (TI-83/84 class, ucsim) — TIL 3.1 | 16-bit lean build: code ends at 0xBF31 (below 0xC000), 5.7 KB RAM — [results](vm/ports/z80/RESULTS.md) | all examples without floats or values beyond 16 bits identical |
 
 Every program in the test-suite runs on three engines — native C, the Python
 VM and the C VM — and must produce byte-identical output. Details:
@@ -179,8 +179,9 @@ Measured (details in each document):
   natively (TIL 3.0: 88.7%), with output identical to the VM for every one.
 * **Self-hosting**: `tilc.til` (~8,100 lines of TIL) compiles itself to the same
   bytes as the Python compiler (stage 1 = stage 2 = stage 3) — 0.4 s on the C VM.
-* **Devices** (emulated): Cortex-M3 55 KB flash / 30 KB RAM, AVR ATmega1284P
-  76 KB flash / 14 KB RAM, Z80 16-bit lean build below 0xC000 / 5.7 KB RAM.
+* **Devices** (emulated, VM + program): Cortex-M3 57 KB flash / 30 KB RAM,
+  AVR ATmega1284P 80 KB flash / 14.5 KB RAM, Z80 16-bit lean build below
+  0xC000 / 5.7 KB RAM (the 3.0 table above shows the smaller 3.0 VM).
   The TI-84 Plus CE port is written but has not been built with the CE
   toolchain or run on a calculator yet.
 

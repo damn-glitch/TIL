@@ -48,7 +48,7 @@ output of every example is compared with the reference VM.
 |---|---|---|---|---|---|---|
 | ARM Cortex-M (NumWorks/STM32 class) | Cortex-M3, 64 KB RAM | QEMU `lm3s6965evb` | int32, float32, 16 KB heap | 48.4 KB² | 24 KB | 17/17 programs identical¹ |
 | 8-bit AVR (Arduino Mega class) | ATmega1284P, 16 KB RAM | simavr | int32, float32, 5 KB heap | 60.2 KB² | 11.2 KB | 17/17 programs identical |
-| Z80 (TI-83/84 class) | Z80, 64 KB address space | ucsim `sz80` | int16, lean, 16-bit offsets, 4 KB heap, no effects / screen / energy saving³ | 46.9 KB (SDCC 4.2), ends at 0xBE38 (below 0xC000) | 5.7 KB + ≤1.4 KB C stack | 10/10 int16-compatible examples + test corpus identical³ — see `ports/z80/RESULTS.md` |
+| Z80 (TI-83/84 class) | Z80, 64 KB address space | ucsim `sz80` | int16, lean, 16-bit offsets, 4 KB heap, no effects / screen / energy saving³ | 47.1 KB (SDCC 4.2), ends at 0xBF31 (below 0xC000) | 5.7 KB + ≤1.4 KB C stack | 10/10 int16-compatible examples + test corpus identical³ — see `ports/z80/RESULTS.md` |
 | Desktop | x86-64 | native | int64, double, 256 KB heap | 80 KB | ~400 KB | all 255 + 81 tests |
 
 ¹ Single-precision builds print the last digit of some floats differently
