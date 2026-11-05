@@ -535,10 +535,13 @@ int main(int argc, char **argv) {
     if (!code) { fprintf(stderr, "tilvm: cannot read %s\n", path); return 2; }
     rc = tilvm_load(&vm, code, (uint32_t)size);
     if (rc != 0) {
-        fprintf(stderr, "tilvm: cannot load %s (error %d%s)\n", path, rc,
-                rc == -3 ? ": program uses floats, VM built without them" :
-                rc == -6 ? ": integer constant too large for this VM" :
-                rc == -10 ? ": too many functions for this VM build (TILVM_MAX_FUNCS)" : "");
+        const char *why = rc == -3 ? ": program uses floats, VM built without them" :
+                          rc == -6 ? ": integer constant too large for this VM" :
+                          rc == -10 ? ": too many functions for this VM build (TILVM_MAX_FUNCS)" : "";
+#ifdef TILVM_ADDR16
+        if (rc == -10 && size > 0xFFFFL) why = ": program larger than 64 KB (TILVM_ADDR16 build)";
+#endif
+        fprintf(stderr, "tilvm: cannot load %s (error %d%s)\n", path, rc, why);
         return 2;
     }
     vm.max_steps = (uint32_t)max_steps;

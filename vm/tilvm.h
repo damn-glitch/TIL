@@ -15,7 +15,7 @@
  * Targets: desktop (gcc/clang/MSVC), calculator-class CPUs (ARM: NumWorks,
  * TI-Nspire; eZ80: TI-84 Plus CE toolchain; SH4: Casio via gint) and
  * microcontrollers (AVR, ARM Cortex-M, ESP32, RP2040). Verified in emulators:
- * ARM Cortex-M3 and 8-bit AVR. Classic Z80: see ports/z80/RESULTS.md.
+ * ARM Cortex-M3, 8-bit AVR and the Z80 (16-bit lean build, ports/z80/RESULTS.md).
  *
  * Configuration (define before including, or with -D):
  *   TILVM_INT_BITS     16 | 32 | 64           (default 64)
@@ -39,9 +39,11 @@
  *   TILVM_NO_STDIO     no <stdio.h>: the host must set vm->write
  *   TILVM_NO_TIME      no <time.h>: timeouts count steps (1 ms = 1000 steps)
  *   TILVM_NO_MATH      no <math.h>: sqrt/sin/... use built-in approximations
+ *   TILVM_ADDR16       16-bit address space (Z80): 16-bit bytecode offsets and object
+ *                      lengths (programs and heap below 64 KB) - much smaller code
  *   TILVM_LEAN         smallest code for 8-bit CPUs: the whole language core, but
  *                      without format specs, snapshots, input/chr/ord/type_of/clock/
- *                      random/sleep, and str split/replace/trim/repeat/to_float,
+ *                      random/sleep, and str split/replace/trim/repeat/count/to_float,
  *                      array insert/remove/sort/reverse/slice/copy/join/sum/min/max,
  *                      map values/copy/clear (they report "not available" / "no
  *                      method"), array + array ("unsupported operand types"), and
@@ -159,6 +161,19 @@ typedef uint32_t tv_ref;
 typedef uint32_t tv_size;
 #endif
 
+/* Offsets into the bytecode (pc). TILVM_ADDR16 (CPUs with a 16-bit address
+ * space, e.g. the Z80): programs and the heap are smaller than 64 KB, so offsets
+ * and object lengths are 16-bit - much less code on 8-bit CPUs. tilvm_load
+ * rejects larger programs (error -10). */
+#ifdef TILVM_ADDR16
+#if TILVM_HEAP_SIZE > 65535L
+#error "TILVM_ADDR16 needs TILVM_HEAP_SIZE <= 65535"
+#endif
+typedef uint16_t tv_off;
+#else
+typedef uint32_t tv_off;
+#endif
+
 /* value tags */
 enum {
     TV_NIL = 0, TV_BOOL, TV_INT, TV_FLOAT, TV_STRK, TV_STR, TV_ARRAY, TV_MAP,
@@ -184,8 +199,8 @@ typedef struct TV_PACK tv_val {
 } tv_val;
 
 typedef struct tv_frame {
-    uint32_t ret_pc;    /* where the caller continues */
-    uint32_t pc;        /* saved pc of this frame while it calls others */
+    tv_off ret_pc;      /* where the caller continues */
+    tv_off pc;          /* saved pc of this frame while it calls others */
     uint16_t func;
     uint16_t base;      /* first local slot on the value stack */
     tv_ref closure;     /* closure being executed (0 = plain function) */
@@ -193,7 +208,7 @@ typedef struct tv_frame {
 } tv_frame;
 
 typedef struct tv_try {
-    uint32_t handler;
+    tv_off handler;
     uint32_t deadline;  /* ms (0 = no deadline) */
     uint16_t n_frames;
     uint16_t sp;
@@ -207,7 +222,7 @@ typedef struct tv_try {
  * kind 1 - a running clause of handler #n (the owner): it masks the owner and
  *          every entry above it; n_frames / n_try are the values at the perform. */
 typedef struct tv_handler {
-    uint32_t abort_pc;  /* kind 0: absolute pc after END_HANDLE; kind 1: 0 */
+    tv_off abort_pc;    /* kind 0: absolute pc after END_HANDLE; kind 1: 0 */
     uint16_t n_frames;  /* frames when installed (kind 1: at the perform) */
     uint16_t sp;        /* kind 0: stack index of the first pair; kind 1: 0 */
     uint16_t n_try;     /* recovery points when installed */
@@ -240,7 +255,7 @@ typedef struct tilvm_state {
 
 /* A function record decoded once at load (TILVM_MAX_FUNCS > 0). */
 typedef struct tv_func {
-    uint32_t code;      /* absolute offset of the first instruction in the bytecode */
+    tv_off code;        /* absolute offset of the first instruction in the bytecode */
     uint8_t nparams, nreq, nlocals, flags;
 } tv_func;
 
@@ -311,14 +326,14 @@ typedef struct tilvm {
     /* ---- program (read-only, may live in ROM) ---- */
     const uint8_t *bc;
     uint32_t bc_size;
-    uint32_t code_off, code_size;
-    uint32_t funcs_off, methods_off, prelude_off, lines_off;
+    tv_off code_off, code_size;
+    tv_off funcs_off, methods_off, prelude_off, lines_off;
     uint16_t n_consts, n_funcs, n_types, n_methods, n_globals, entry;
     uint16_t n_lines;
     uint8_t n_prelude, flags;
-    uint32_t const_off[TILVM_MAX_CONSTS];
-    uint32_t type_off[TILVM_MAX_TYPES];
-    uint32_t bc_hash;
+    tv_off const_off[TILVM_MAX_CONSTS];
+    tv_off type_off[TILVM_MAX_TYPES];
+    uint32_t bc_hash;                 /* FNV-1a of the bytecode, for snapshots (0 in TILVM_LEAN) */
 #if TILVM_MAX_FUNCS > 0
     tv_func funcs[TILVM_MAX_FUNCS];   /* decoded function records (TIL 3.1) */
 #endif

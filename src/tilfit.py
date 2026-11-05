@@ -462,7 +462,7 @@ METHOD_RECEIVERS = {
                       'error', 'to_string'),
 }
 LEAN_MISSING_METHODS = {
-    'str': ('trim', 'repeat', 'replace', 'split', 'to_float'),
+    'str': ('count', 'trim', 'repeat', 'replace', 'split', 'to_float'),
     'array': ('remove', 'insert', 'reverse', 'sort', 'sum', 'min', 'max', 'copy', 'slice', 'join'),
     'map': ('values', 'copy', 'clear'),
 }
