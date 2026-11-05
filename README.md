@@ -10,7 +10,7 @@
 
 [![CI](https://github.com/damn-glitch/TIL/actions/workflows/ci.yml/badge.svg)](https://github.com/damn-glitch/TIL/actions/workflows/ci.yml)
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-orange.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-3.0.0-green.svg)](https://github.com/damn-glitch/TIL/releases)
+[![Version](https://img.shields.io/badge/version-3.1.0-green.svg)](https://github.com/damn-glitch/TIL/releases)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20calculators%20%7C%20MCUs-lightgrey.svg)](vm/README.md)
 [![Tests](https://img.shields.io/badge/tests-336%20passing-brightgreen.svg)](tests/)
 

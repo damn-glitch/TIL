@@ -31,7 +31,7 @@ from typing import Dict, List, Optional, Set, Tuple, Any, Union
 from enum import Enum, auto
 from abc import ABC, abstractmethod
 
-TIL_VERSION = "3.0.0"
+TIL_VERSION = "3.1.0"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              ERROR REPORTING

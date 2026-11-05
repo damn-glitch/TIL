@@ -115,7 +115,7 @@ echo -e "${GREEN}╔════════════════════
 echo -e "${GREEN}║         TIL INSTALLED SUCCESSFULLY!        ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "Version: ${CYAN}$(til --version 2>/dev/null | head -1 || echo '3.0.0')${NC}"
+echo -e "Version: ${CYAN}$(til --version 2>/dev/null | head -1 || echo '3.1.0')${NC}"
 echo ""
 echo -e "${YELLOW}To start using TIL:${NC}"
 echo "  1. Restart your terminal or run: source $RC_FILE"

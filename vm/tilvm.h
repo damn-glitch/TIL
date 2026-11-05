@@ -79,7 +79,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define TILVM_VERSION "3.0.0"
+#define TILVM_VERSION "3.1.0"
 #define TILVM_BYTECODE_VERSION 2        /* newest .tbc version this VM loads */
 #define TILVM_BYTECODE_MIN_VERSION 1    /* oldest (TIL 3.0) */
 

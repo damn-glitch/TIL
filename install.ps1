@@ -106,7 +106,7 @@ try {
     $version = python "$TIL_BIN\til.py" --version 2>&1
     Write-Host "Version: $version" -ForegroundColor Cyan
 } catch {
-    Write-Host "Version: 3.0.0" -ForegroundColor Cyan
+    Write-Host "Version: 3.1.0" -ForegroundColor Cyan
 }
 
 Write-Host ""
