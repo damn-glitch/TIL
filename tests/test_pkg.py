@@ -1872,3 +1872,422 @@ class TestNamesAndLimits:
         monkeypatch.setattr(tilpkg, 'MAX_DOWNLOAD_BYTES', 1000)
         with pytest.raises(tilpkg.PkgError, match="download larger than 1000 bytes"):
             tilpkg.download(_uri(tmp_path / 'f.tar.gz'), str(tmp_path / 'out'))
+
+
+# ═══════════════════════════════════════════════════════════════
+# REVIEW ROUND 3: one namespace, integrity pins, stdlib order, ...
+# ═══════════════════════════════════════════════════════════════
+
+def _clash_body(prefix, scale, count, factor, size):
+    return (f'const SCALE = {scale}\nvar count = {count}\n\nstruct Config\n    size: int\n\n'
+            f'impl Config\n    describe(self) -> int\n        return self.size * {factor}\n\n'
+            f'{prefix}_val() -> int\n    return SCALE * {2 if prefix == "a" else 3}\n\n'
+            f'{prefix}_tick() -> int\n    count = count + 1\n    return count\n\n'
+            f'{prefix}_make() -> int\n    let c = Config {{ size: {size} }}\n    return c.describe()\n')
+
+
+@pytest.fixture
+def clashing(tmp_path):
+    """app/ with the packages a and b, which both define SCALE, count, Config
+    and Config.describe (with different values)."""
+    libs = tmp_path / 'libs'
+    make_pkg(libs / 'a', 'a', '1.0.0', body=_clash_body('a', 10, 0, 1, 5))
+    make_pkg(libs / 'b', 'b', '1.0.0', body=_clash_body('b', 1000, 100, 100, 7))
+    proj = make_project(tmp_path / 'app', {"a": "../libs/a", "b": "../libs/b"})
+    assert tilpkg.main(['-C', str(proj), 'install']) == 0
+    return proj
+
+
+def compile_error(main):
+    with pytest.raises(til.CompileError) as info:
+        til.compile_to_bytecode(read(main), str(main))
+    return str(info.value)
+
+
+class TestOneNamespace:
+    """critical: two packages (or a package and the program) that defined the
+    same top-level const, var or struct/impl silently shared one definition:
+    wrong results on every backend, and `til check` said OK."""
+
+    def test_two_packages_defining_the_same_names(self, clashing):
+        main = clashing / 'main.til'
+        write(main, 'import a\nimport b\n\nmain()\n    print(a.a_val())\n    print(b.b_make())\n')
+        text = compile_error(main)
+        a_til = str(clashing / 'til_modules' / 'a' / 'a.til')
+        b_til = str(clashing / 'til_modules' / 'b' / 'b.til')
+        for what, line in (("const 'SCALE'", 1), ("var 'count'", 2), ("struct 'Config'", 4),
+                           ("method 'Config.describe'", 8)):
+            assert f"error[E-IMPORT]: {what} is defined in two files: {a_til}:{line} and {b_til}:{line}" in text
+        assert "share one namespace" in text
+        rel_a, rel_b = os.path.join('til_modules', 'a', 'a.til'), os.path.join('til_modules', 'b', 'b.til')
+        for args in (('check', 'main.til'), ('run', '--vm', 'main.til'), ('run', '--cvm', 'main.til')):
+            r = cli(*args, cwd=str(clashing))
+            assert r.returncode == 1 and r.stdout == "", (args, r.stdout)
+            assert f"const 'SCALE' is defined in two files: {rel_a}:1 and {rel_b}:1" in r.stderr, args
+
+    def test_the_program_and_a_package(self, clashing):
+        write(clashing / 'own.til', 'import a\n\nconst SCALE = 5\n\nmain()\n    print(a.a_val())\n')
+        r = cli('run', '--vm', 'own.til', cwd=str(clashing))
+        assert r.returncode == 1 and r.stdout == ""
+        rel_a = os.path.join('til_modules', 'a', 'a.til')
+        assert f"const 'SCALE' is defined in two files: {rel_a}:1 and own.til:3" in r.stderr
+        assert " --> own.til:3:1" in r.stderr                         # points at the program's own definition
+        write(clashing / 'own.til', 'import a\n\nSCALE() -> int\n    return 5\n\nmain()\n    print(a.a_val())\n')
+        r = cli('check', 'own.til', cwd=str(clashing))
+        assert r.returncode == 1 and f"'SCALE' is defined in two files: const at {rel_a}:1, function at own.til:3" \
+            in r.stderr
+
+    def test_from_import_brings_what_the_names_use(self, clashing):
+        main = clashing / 'main.til'
+        # a_tick uses a's count, a_val a's SCALE, b_make b's Config and its method: each gets its own
+        write(main, 'from a import a_tick, a_val\nfrom b import b_make\n\nmain()\n    print(a_tick())\n'
+                    '    print(a_tick())\n    print(a_val())\n    print(b_make())\n')
+        assert run_file_both(read(main), str(main)) == "1\n2\n20\n700\n"
+        # names used by what `from` imports clash like everything else
+        write(main, 'from a import a_val\nfrom b import b_val\n\nmain()\n    print(a_val() + b_val())\n')
+        assert "const 'SCALE' is defined in two files" in compile_error(main)
+        write(main, 'from a import a_val\n\nconst SCALE = 5\n\nmain()\n    print(a_val())\n')
+        assert "const 'SCALE' is defined in two files" in compile_error(main)
+
+    def test_from_import_of_a_function_that_uses_helpers(self, tmp_path):
+        # used to fail with "unknown function 'helper'"
+        write(tmp_path / 'm.til', 'const FACTOR = 10\n\nhelper(x: int) -> int\n    return x * FACTOR\n\n'
+                                  'f(x: int) -> int\n    return helper(x) + 1\n')
+        main = tmp_path / 'main.til'
+        write(main, 'from m import f\n\nmain()\n    print(f(2))\n')
+        assert run_file_both(read(main), str(main)) == "21\n"
+
+    def test_names_a_from_import_does_not_bring_never_clash(self, tmp_path):
+        # TIL 3.0 programs keep working: `from math import gcd` next to the program's own factorial()
+        main = tmp_path / 'main.til'
+        write(main, 'from math import gcd\n\nfactorial(n: int) -> int\n    return 42\n\n'
+                    'main()\n    print(gcd(12, 18))\n    print(factorial(3))\n')
+        assert run_file_both(read(main), str(main)) == "6\n42\n"
+        write(main, 'import math\n\nfactorial(n: int) -> int\n    return 42\n\nmain()\n    print(factorial(3))\n')
+        text = compile_error(main)
+        assert "function 'factorial' is defined in two files" in text
+        assert os.path.join('stdlib', 'math.til') in text
+
+    @needs_symlinks
+    def test_one_file_reached_through_two_paths_is_one_module(self, tmp_path):
+        write(tmp_path / 'lib' / 'shared.til', 'const LIMIT = 3\n\nlimit() -> int\n    return LIMIT\n')
+        os.symlink(str(tmp_path / 'lib'), str(tmp_path / 'alias'))
+        main = tmp_path / 'main.til'
+        write(main, 'import lib.shared\nimport alias.shared\n\nmain()\n    print(limit())\n')
+        assert run_file_both(read(main), str(main)) == "3\n"
+
+
+def _tree_of_archive(archive, tmp_path):
+    out = tmp_path / 'unpacked'
+    os.makedirs(out)
+    tilpkg.extract_archive(str(archive), 'tar', str(out), 'test')
+    return tilpkg.tree_hash(tilpkg.single_top_dir(str(out)))
+
+
+def _tree_of_commit(repo, sha, tmp_path):
+    out = tmp_path / ('export-' + sha[:8])
+    os.makedirs(out)
+    tilpkg.git_export(repo.path, sha, str(out), 'test')
+    return tilpkg.tree_hash(str(out))
+
+
+def _edit_lock(proj, name, resolved, sha256):
+    """What an attacker can do in a pull request: change only til.lock."""
+    lock = lock_of(proj)
+    lock['packages'][name]['resolved'] = resolved
+    lock['packages'][name]['sha256'] = sha256
+    write(proj / 'til.lock', json.dumps(lock, indent=2) + "\n")
+    shutil.rmtree(proj / 'til_modules')
+
+
+class TestLockNeverOverridesIntegrityPins:
+    """major: a til.lock entry whose "spec" matched til.json was used even when
+    its "resolved" contradicted the archive #sha256= or full commit SHA that
+    til.json pins: install, install --frozen and verify all accepted other code."""
+
+    def _check(self, proj, tilpkg_run, name, requirer, expected, good_resolved):
+        main = proj / 'main.til'
+        rc, _out, err = tilpkg_run(proj, 'install', '--frozen')
+        assert rc == 1 and "--frozen: til.lock contradicts til.json" in err and f"{requirer} pins" in err, err
+        assert not (proj / 'til_modules').exists()
+        rc, out, _err = tilpkg_run(proj, 'verify')
+        assert rc == 1 and f"MISMATCH {name}: {requirer} requires {name} = " in out
+        rc, _out, err = tilpkg_run(proj, 'install')        # resolved from til.json again, never from the lock
+        assert rc == 0 and f"the til.lock entry for '{name}' is not used" in err, err
+        assert lock_of(proj)['packages'][name]['resolved'] == good_resolved
+        assert run_file_both(read(main), str(main)) == expected
+        assert tilpkg_run(proj, 'verify')[0] == 0 and tilpkg_run(proj, 'install', '--frozen')[0] == 0
+
+    def test_archive_hash(self, tmp_path, tilpkg_run):
+        meta = ('geo/til.json', 'file', json.dumps({"name": "geo", "version": "1.0.0"}))
+        good = make_tar(str(tmp_path / 'geo-good.tar.gz'), [meta, ('geo/geo.til', 'file', 'area() -> int\n    return 6\n')])
+        evil = make_tar(str(tmp_path / 'geo-evil.tar.gz'), [meta, ('geo/geo.til', 'file', 'area() -> int\n    return 666\n')])
+        proj = make_project(tmp_path / 'app', {"geo": archive_spec(good)})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        write(proj / 'main.til', 'import geo\nprint(area())\n')
+        _edit_lock(proj, 'geo', archive_spec(evil), _tree_of_archive(evil, tmp_path))
+        self._check(proj, tilpkg_run, 'geo', 'app', "6\n", archive_spec(good))
+
+    @needs_git
+    def test_full_commit_sha(self, tmp_path, colors_repo, tilpkg_run):
+        proj = make_project(tmp_path / 'app', {"colors": colors_repo.spec(colors_repo.v1)})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        write(proj / 'main.til', 'import colors\nprint(red())\n')
+        good = lock_of(proj)['packages']['colors']['resolved']
+        _edit_lock(proj, 'colors', good.replace(colors_repo.v1, colors_repo.v2),
+                   _tree_of_commit(colors_repo, colors_repo.v2, tmp_path))
+        self._check(proj, tilpkg_run, 'colors', 'app', "1\n", good)
+
+    @needs_git
+    def test_pin_in_a_dependency(self, tmp_path, colors_repo, tilpkg_run):
+        make_pkg(tmp_path / 'libs' / 'a', 'a', deps={'colors': colors_repo.spec(colors_repo.v1)},
+                 body='import colors\na_red() -> int\n    return red()\n')
+        proj = make_project(tmp_path / 'app', {"a": "../libs/a"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        write(proj / 'main.til', 'import a\nprint(a_red())\n')
+        good = lock_of(proj)['packages']['colors']['resolved']
+        _edit_lock(proj, 'colors', good.replace(colors_repo.v1, colors_repo.v2),
+                   _tree_of_commit(colors_repo, colors_repo.v2, tmp_path))
+        self._check(proj, tilpkg_run, 'colors', 'a', "1\n", good)
+
+    @needs_git
+    def test_annotated_tag_object_sha(self, tmp_path, colors_repo, tilpkg_run):
+        # `git rev-parse v2.0.0` prints the tag object's SHA, which names the commit the tag points to
+        tag_object = colors_repo.git('rev-parse', 'v2.0.0')
+        assert tag_object != colors_repo.v2
+        proj = make_project(tmp_path / 'app', {"colors": colors_repo.spec(tag_object)})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0 and "annotated tag" in err, err
+        assert lock_of(proj)['packages']['colors']['resolved'].endswith('#' + colors_repo.v2)
+        for args in (('install',), ('install', '--frozen'), ('verify',)):
+            rc, _out, err = tilpkg_run(proj, *args)
+            assert rc == 0, (args, err)
+
+
+@needs_git
+class TestAnnotatedTagAsASecondRequirement:
+    """minor (round-2 regression): a tag object's SHA next to the tag itself was
+    reported as a conflict, although both name the same commit."""
+
+    def test_tag_and_its_object_sha_agree(self, tmp_path, colors_repo, tilpkg_run):
+        tag_object = colors_repo.git('rev-parse', 'v2.0.0')
+        make_pkg(tmp_path / 'libs' / 'a', 'a', deps={'colors': colors_repo.spec(tag_object)})
+        proj = make_project(tmp_path / 'app', {"a": "../libs/a", "colors": colors_repo.spec('v2.0.0')})
+        for args in (('install',), ('install',), ('install', '--frozen'), ('verify',)):
+            rc, _out, err = tilpkg_run(proj, *args)
+            assert rc == 0, (args, err)
+        assert lock_of(proj)['packages']['colors']['resolved'].endswith('#' + colors_repo.v2)
+        # another commit is still a conflict
+        make_pkg(tmp_path / 'libs' / 'b', 'b', deps={'colors': colors_repo.spec(colors_repo.v1)})
+        rc, _out, err = tilpkg_run(proj, 'add', 'b', '../libs/b')
+        assert rc == 1 and "conflicting requirements for package 'colors'" in err
+
+
+class TestStandardLibraryAndPackages:
+    """minor: standard-library directories came before til_modules/: a package
+    named like a stdlib module could never be imported, and $TIL_HOME/stdlib or
+    ~/.til/stdlib replaced a package's locked dependency."""
+
+    def test_a_declared_package_comes_before_the_standard_library(self, tmp_path, tilpkg_run):
+        make_pkg(tmp_path / 'libs' / 'math', 'math', '1.0.0', body='triple(x: int) -> int\n    return x * 3\n')
+        make_pkg(tmp_path / 'libs' / 'calc', 'calc', '1.0.0',
+                 body='import math\ncalc_gcd(a: int, b: int) -> int\n    return gcd(a, b)\n')
+        proj = make_project(tmp_path / 'app')
+        for name in ('math', 'calc'):
+            rc, _out, err = tilpkg_run(proj, 'add', name, f'../libs/{name}')
+            assert rc == 0, err
+        main = proj / 'main.til'
+        write(main, 'import math\nprint(math.triple(4))\n')
+        assert run_file_both(read(main), str(main)) == "12\n"
+        # calc does not declare `math`: it still gets the standard library's
+        write(main, 'import math\nimport calc\nprint(math.triple(4) + calc_gcd(12, 18))\n')
+        assert run_file_both(read(main), str(main)) == "18\n"
+
+    def test_a_declared_package_that_is_not_installed_is_not_replaced(self, tmp_path):
+        proj = make_project(tmp_path / 'app', {"math": "../libs/math"})
+        main = proj / 'main.til'
+        write(main, 'import math\nprint(gcd(4, 6))\n')
+        assert til.ModuleResolver().resolve('math', str(main)) is None
+        r = cli('run', '--vm', str(main))
+        assert r.returncode == 1 and "hint: 'math' is a dependency in" in r.stderr
+
+    def test_user_stdlib_directories_cannot_replace_locked_dependencies(self, tmp_path, libs, tilpkg_run,
+                                                                       monkeypatch):
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        main = proj / 'main.til'
+        write(main, 'import geo\nprint(area(2, 3))\n')
+        decoy = 'const SCALE = 1000\nscaled(x: int) -> int\n    return x * 1000\n'
+        write(tmp_path / 'tilhome' / 'stdlib' / 'units.til', decoy)
+        write(tmp_path / 'home' / '.til' / 'stdlib' / 'units.til', decoy)
+        env = {'TIL_HOME': str(tmp_path / 'tilhome'), 'HOME': str(tmp_path / 'home'),
+               'USERPROFILE': str(tmp_path / 'home')}
+        for key, value in env.items():
+            monkeypatch.setenv(key, value)
+        assert run_file_both(read(main), str(main)) == "60\n"
+        r = cli('run', '--vm', str(main), env=env)
+        assert (r.returncode, r.stdout) == (0, "60\n"), r.stderr
+        assert tilpkg_run(proj, 'verify')[0] == 0
+
+
+def _deep_tree(base, depth=1100):
+    """A directory tree deeper than Python's recursion limit (a path of ~2 KB);
+    returns the relative path of the file at the bottom."""
+    if depth <= sys.getrecursionlimit():
+        depth = sys.getrecursionlimit() + 100
+    path = os.fspath(base)
+    try:
+        for _ in range(depth):
+            path = os.path.join(path, 'd')
+            os.mkdir(path)
+        write(os.path.join(path, 'x.til'), 'x() -> int\n    return 1\n')
+    except OSError as e:
+        pytest.skip(f"this file system does not allow such deep paths: {e}")
+    return os.path.join(*(['d'] * depth + ['x.til']))
+
+
+@pytest.fixture
+def deep_cleanup(tmp_path):
+    yield
+    for entry in os.listdir(tmp_path):        # shutil.rmtree may recurse too deeply (older Pythons)
+        tilpkg.rmtree(str(tmp_path / entry))
+
+
+class TestDeepTrees:
+    """minor: a very deep directory tree crashed install with a RecursionError
+    traceback (path and git packages, junk inside an installed copy)."""
+
+    def test_path_package_and_repair(self, tmp_path, tilpkg_run, deep_cleanup):
+        libs = tmp_path / 'libs'
+        make_pkg(libs / 'geo', 'geo', '1.0.0', body='area() -> int\n    return 6\n')
+        rel = _deep_tree(libs / 'geo')
+        make_pkg(libs / 'plain', 'plain', manifest=False)
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo", "plain": "../libs/plain"})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0, err
+        assert os.path.isfile(os.path.join(proj, 'til_modules', 'geo', rel))
+        assert tilpkg_run(proj, 'verify')[0] == 0
+        _deep_tree(proj / 'til_modules' / 'plain')                  # junk inside an installed copy
+        rc, out, _err = tilpkg_run(proj, 'verify')
+        assert rc == 1 and "MODIFIED plain" in out
+        rc, out, err = tilpkg_run(proj, 'install')
+        assert rc == 0 and "~ plain" in out, err
+        assert not (proj / 'til_modules' / 'plain' / 'd').exists()
+
+    @needs_git
+    def test_git_package(self, tmp_path, tilpkg_run, deep_cleanup):
+        repo = GitRepo(str(tmp_path / 'repo'))
+        rel = _deep_tree(repo.path)
+        repo.commit({'colors.til': 'red() -> int\n    return 1\n'})
+        proj = make_project(tmp_path / 'app', {"colors": repo.spec()})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0, err
+        assert os.path.isfile(os.path.join(proj, 'til_modules', 'colors', rel))
+
+    def test_deeply_nested_json(self, tmp_path, tilpkg_run):
+        nested = '[' * 100000 + ']' * 100000
+        make_pkg(tmp_path / 'libs' / 'odd', 'odd')
+        write(tmp_path / 'libs' / 'odd' / 'til.json', nested)
+        proj = make_project(tmp_path / 'app', {"odd": "../libs/odd"})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 1 and "nested too deeply" in err and "Traceback" not in err
+        assert til._package_manifest(str(tmp_path / 'libs' / 'odd')) == {}
+
+
+class TestBrokenLockFile:
+    """minor: `install --update`, the documented remedy for a broken til.lock,
+    crashed with a UnicodeDecodeError when til.lock was not UTF-8."""
+
+    def test_update_replaces_a_lock_that_is_not_utf8(self, tmp_path, libs, tilpkg_run):
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        good = read(proj / 'til.lock')
+        for broken in (b'{"lockVersion": 1, "packages": {\xff\xfe', good.encode('utf-16')):
+            with open(proj / 'til.lock', 'wb') as f:
+                f.write(broken)
+            rc, _out, err = tilpkg_run(proj, 'install')
+            assert rc == 1 and "invalid til.lock" in err
+            rc, out, err = tilpkg_run(proj, 'install', '--update')
+            assert rc == 0 and "til.lock written" in out, err
+            assert read(proj / 'til.lock') == good
+
+
+class TestFrozenChecksBeforeFetching:
+    """minor: `install --frozen` with a stale til.lock fetched the new sources
+    first and reported a network error instead of the stale lock."""
+
+    def test_nothing_is_fetched(self, tmp_path, libs, tilpkg_run, monkeypatch):
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+
+        def no_fetch(*args):
+            raise AssertionError(f"fetched {args}")
+        monkeypatch.setattr(tilpkg.Fetcher, 'fetch', no_fetch)
+        for spec in ("git+https://git.invalid.example/colors.git#v1",
+                     "https://pkgs.invalid.example/colors.tar.gz#sha256=" + "0" * 64, "^1.0", "../libs/extra"):
+            make_project(proj, {"geo": "../libs/geo", "colors": spec})
+            rc, _out, err = tilpkg_run(proj, 'install', '--frozen')
+            assert rc == 1 and "--frozen: til.lock is out of date with til.json" in err, (spec, err)
+            assert f"app requires colors = {spec}, which is not in til.lock" in err
+        make_project(proj, {"geo": "./../libs/geo"})
+        rc, _out, err = tilpkg_run(proj, 'install', '--frozen')
+        assert rc == 1 and "til.lock has geo = ../libs/geo" in err
+        make_project(proj, {})
+        rc, _out, err = tilpkg_run(proj, 'install', '--frozen')
+        assert rc == 1 and "geo, units are in til.lock, but nothing in til.json requires them" in err
+        make_project(proj, {"geo": "../libs/geo"})
+        assert tilpkg_run(proj, 'install', '--frozen')[0] == 0          # the installed copies are reused
+
+
+class TestInsideAnInstalledPackage:
+    """minor: inside PROJECT/til_modules/NAME/ of a package without its own
+    til.json, til pkg changed the enclosing project."""
+
+    def test_a_package_without_til_json(self, tmp_path, libs, tilpkg_run):
+        make_pkg(libs / 'plain', 'plain', manifest=False)
+        proj = make_project(tmp_path / 'app', {"geo": "../libs/geo", "plain": "../libs/plain"})
+        assert tilpkg_run(proj, 'install')[0] == 0
+        before = read(proj / 'til.json')
+        plain = proj / 'til_modules' / 'plain'
+        for args in (('remove', 'plain'), ('install',), ('add', 'extra', '../../../libs/extra'), ('list',),
+                     ('verify',)):
+            rc, _out, err = tilpkg_run(plain, *args)
+            assert rc == 1 and "inside an installed package" in err, (args, err)
+        assert read(proj / 'til.json') == before and plain.is_dir()
+        assert tilpkg_run(proj, 'verify')[0] == 0
+
+
+class TestLockRecordsPathsAsWritten:
+    """minor: til.lock recorded symlink-resolved real paths, so it was not
+    portable (and leaked the developer's directory layout)."""
+
+    @needs_symlinks
+    def test_links_on_the_way_are_kept(self, tmp_path, tilpkg_run, monkeypatch):
+        shared = tmp_path / 'shared' / 'libs'
+        make_pkg(shared / 'geo', 'geo', '1.0.0', deps={'units': '../units'},
+                 body='import units\narea() -> int\n    return scaled(6)\n')
+        make_pkg(shared / 'units', 'units', '0.3.0', body='scaled(x: int) -> int\n    return x * 10\n')
+        make_pkg(shared / 'geo2', 'geo2', body='g2() -> int\n    return 2\n')
+        home1 = tmp_path / 'home1' / 'me'
+        os.makedirs(home1)
+        os.symlink(str(shared), str(home1 / 'libs'))
+        monkeypatch.setenv('HOME', str(home1))
+        monkeypatch.setenv('USERPROFILE', str(home1))
+        proj = make_project(home1 / 'app', {"geo": "~/libs/geo", "geo2": "../libs/geo2"})
+        rc, _out, err = tilpkg_run(proj, 'install')
+        assert rc == 0, err
+        resolved = {name: e['resolved'] for name, e in lock_of(proj)['packages'].items()}
+        assert resolved == {"geo": "~/libs/geo", "units": "~/libs/units", "geo2": "../libs/geo2"}
+        # a teammate whose ~/libs and ../libs are real directories
+        home2 = tmp_path / 'home2' / 'me'
+        shutil.copytree(str(shared), str(home2 / 'libs'))
+        os.makedirs(home2 / 'app')
+        for name in ('til.json', 'til.lock'):
+            shutil.copy(proj / name, home2 / 'app' / name)
+        monkeypatch.setenv('HOME', str(home2))
+        monkeypatch.setenv('USERPROFILE', str(home2))
+        rc, _out, err = tilpkg_run(home2 / 'app', 'install', '--frozen')
+        assert rc == 0, err
+        main = home2 / 'app' / 'main.til'
+        write(main, 'import geo\nimport geo2\nprint(area() + g2())\n')
+        assert run_file_both(read(main), str(main)) == "62\n"

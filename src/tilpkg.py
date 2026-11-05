@@ -27,6 +27,7 @@ User guide: docs/TIL_PACKAGES.md. til.py dispatches `til pkg ...` here
 """
 
 import argparse
+import contextlib
 import gzip
 import hashlib
 import json
@@ -263,10 +264,14 @@ class Spec:
 
     def __init__(self, kind: str, raw: str, path: Optional[str] = None, url: Optional[str] = None,
                  rev: Optional[str] = None, sha256: Optional[str] = None, fmt: Optional[str] = None,
-                 req: Optional[Requirement] = None, anchor: str = 'project'):
+                 req: Optional[Requirement] = None, anchor: str = 'project', written: Optional[str] = None):
         self.kind = kind
         self.raw = raw              # as written in til.json / til.lock
-        self.path = path            # path: absolute directory; git: absolute path of a local repository
+        # path: absolute directory; git: absolute path of a local repository. The real path (symbolic
+        # links resolved): it identifies the directory. `written`: the same directory as it was written
+        # (absolute, normalized, links kept): what til.lock records and relative paths start from.
+        self.path = path
+        self.written = written or path
         self.url = url              # git: URL (or the absolute local path); archive: URL without '#...'
         self.rev = rev              # git: tag / branch / commit (None = the remote HEAD)
         self.sha256 = sha256        # archive: expected sha256 of the archive file
@@ -318,8 +323,9 @@ def parse_spec(raw: Any, base_dir: Optional[str], name: str, where: str, anchor:
         if base_dir is None:
             raise PkgError(f"{where}: dependency '{name}' = '{text}' is a local path; only your project and "
                            f"packages that are local directories may have path dependencies")
-        path = os.path.realpath(os.path.join(base_dir, os.path.expanduser(text)))
-        return Spec('path', raw, path=path, anchor=_path_anchor(text, anchor))
+        written = os.path.abspath(os.path.join(base_dir, os.path.expanduser(text)))
+        return Spec('path', raw, path=os.path.realpath(written), anchor=_path_anchor(text, anchor),
+                    written=written)
     req_text = text
     if '@' in text:
         alias, _, req_text = text.partition('@')
@@ -351,7 +357,7 @@ def _parse_git(raw: str, rest: str, base_dir: Optional[str], name: str, where: s
         raise PkgError(f"{bad}: invalid git URL")
     if sep and (not _GIT_REV_RE.match(rev) or '..' in rev or rev.endswith(('.', '/', '.lock'))):
         raise PkgError(f"{bad}: invalid git revision '{rev}'")
-    path = None
+    path = written = None
     if '://' in url:
         scheme = url.split('://', 1)[0].lower()
         if scheme not in ('https', 'http', 'ssh', 'git', 'file'):
@@ -361,10 +367,11 @@ def _parse_git(raw: str, rest: str, base_dir: Optional[str], name: str, where: s
             raise PkgError(f"{bad}: a git repository given as a local path is only allowed in your project "
                            f"and in packages that are local directories (use git+file:///...)")
         anchor = _path_anchor(url, anchor)
-        path = os.path.realpath(os.path.join(base_dir, os.path.expanduser(url)))
+        written = os.path.abspath(os.path.join(base_dir, os.path.expanduser(url)))
+        path = os.path.realpath(written)
         url = path
     # else: scp-like [user@]host:path (ssh)
-    return Spec('git', raw, url=url, rev=rev or None, path=path, anchor=anchor)
+    return Spec('git', raw, url=url, rev=rev or None, path=path, anchor=anchor, written=written)
 
 
 def _parse_archive(raw: str, text: str, name: str, where: str) -> Spec:
@@ -407,9 +414,11 @@ def display_path(path: str, root: str) -> str:
 def lock_source_path(path: str, root: str, anchor: str) -> str:
     """A local directory as til.lock records it ("resolved"), in the form it was
     declared in, so the lock means the same directory wherever the project is
-    checked out: relative to the project root, an absolute path, or ~/..."""
+    checked out: relative to the project root, an absolute path, or ~/...
+    `path` is the directory as written (Spec.written): symbolic links on the
+    way (~/libs -> /data/libs) are kept, never replaced by their targets."""
     if anchor == 'home':
-        home = os.path.realpath(os.path.expanduser('~'))
+        home = os.path.abspath(os.path.expanduser('~'))
         try:
             rel = os.path.relpath(path, home)
         except ValueError:
@@ -434,6 +443,8 @@ def read_json(path: str, what: str) -> Any:
             return json.load(f)
     except ValueError as e:
         raise PkgError(f"{path}: invalid {what} (not valid JSON: {e})") from None
+    except RecursionError:              # json nests a Python call per [ or {
+        raise PkgError(f"{path}: invalid {what} (JSON nested too deeply)") from None
     except OSError as e:
         raise PkgError(f"cannot read {path}: {e.strerror or e}") from None
 
@@ -591,35 +602,64 @@ def package_files(root: str, installed: bool = False) -> List[str]:
     to the hash, and a nested til_modules/ could shadow packages)."""
     out: List[str] = []
 
-    def walk(d: str, prefix: str):
+    def listing(d: str) -> List[os.DirEntry]:
         try:
-            entries = sorted(os.scandir(d), key=lambda e: e.name)
+            with os.scandir(d) as it:
+                return sorted(it, key=lambda e: e.name)
         except OSError as e:
             raise PkgError(f"cannot read {d}: {e.strerror or e}") from None
-        for entry in entries:
-            rel = prefix + entry.name
-            if entry.name in SKIPPED_NAMES:
-                if installed:
-                    raise PkgError(f"{root}: '{rel}' was added after installation "
-                                   f"(til pkg never installs {entry.name} directories)")
-                continue
-            if '\n' in entry.name or '\r' in entry.name:
-                raise PkgError(f"{root}: file name with a line break: {rel!r}")
-            if entry.is_symlink() or (os.name == 'nt' and _is_link(entry.path)):
-                raise PkgError(f"{root}: '{rel}' is a symbolic link (packages may only contain "
-                               f"plain files and directories)")
-            if entry.is_dir(follow_symlinks=False):
-                walk(entry.path, rel + '/')
-            elif entry.is_file(follow_symlinks=False):
-                out.append(rel)
-                if len(out) > MAX_PACKAGE_FILES:
-                    raise PkgError(f"{root}: more than {MAX_PACKAGE_FILES} files in one package")
-            else:
-                raise PkgError(f"{root}: '{rel}' is not a regular file or directory")
 
-    walk(root, '')
+    # depth first in name order, with an explicit stack instead of recursion: no
+    # directory depth (the OS allows thousands of levels) can exhaust Python's stack
+    stack: List[Tuple[str, List[os.DirEntry], int]] = [('', listing(root), 0)]
+    while stack:
+        prefix, entries, i = stack[-1]
+        if i == len(entries):
+            stack.pop()
+            continue
+        stack[-1] = (prefix, entries, i + 1)
+        entry = entries[i]
+        rel = prefix + entry.name
+        if entry.name in SKIPPED_NAMES:
+            if installed:
+                raise PkgError(f"{root}: '{rel}' was added after installation "
+                               f"(til pkg never installs {entry.name} directories)")
+            continue
+        if '\n' in entry.name or '\r' in entry.name:
+            raise PkgError(f"{root}: file name with a line break: {rel!r}")
+        if entry.is_symlink() or (os.name == 'nt' and _is_link(entry.path)):
+            raise PkgError(f"{root}: '{rel}' is a symbolic link (packages may only contain "
+                           f"plain files and directories)")
+        if entry.is_dir(follow_symlinks=False):
+            stack.append((rel + '/', listing(entry.path), 0))
+        elif entry.is_file(follow_symlinks=False):
+            out.append(rel)
+            if len(out) > MAX_PACKAGE_FILES:
+                raise PkgError(f"{root}: more than {MAX_PACKAGE_FILES} files in one package")
+        else:
+            raise PkgError(f"{root}: '{rel}' is not a regular file or directory")
     out.sort(key=_path_key)
     return out
+
+
+def make_dirs(path: str):
+    """os.makedirs(path, exist_ok=True) without recursion: os.makedirs calls
+    itself once per missing parent, so a tree ~1000 levels deep (valid on
+    Linux and macOS) exhausted Python's recursion limit."""
+    missing: List[str] = []
+    p = path
+    while not os.path.isdir(p):
+        missing.append(p)
+        parent = os.path.dirname(p)
+        if parent == p:
+            break
+        p = parent
+    for d in reversed(missing):
+        try:
+            os.mkdir(d)
+        except FileExistsError:
+            if not os.path.isdir(d):
+                raise
 
 
 def _hash_line(file_hex: str, rel: str) -> bytes:
@@ -650,7 +690,7 @@ def copy_package(src: str, dest: str) -> str:
     total = 0
     for rel in package_files(src):
         target = os.path.join(dest, *rel.split('/'))
-        os.makedirs(os.path.dirname(target), exist_ok=True)
+        make_dirs(os.path.dirname(target))
         fh = hashlib.sha256()
         try:
             with open(os.path.join(src, *rel.split('/')), 'rb') as fi, open(target, 'xb') as fo:
@@ -731,6 +771,22 @@ def rmtree(path: str):
                 stack.append((entry.path, False))
             else:
                 _unlink_file(entry.path)
+
+
+@contextlib.contextmanager
+def work_directory():
+    """A private temporary directory for one command, like
+    tempfile.TemporaryDirectory - but removed with rmtree(): shutil.rmtree
+    recurses once per directory level before Python 3.13, so a deep
+    package tree fetched into it raised RecursionError when it was cleaned up."""
+    d = tempfile.mkdtemp(prefix='tilpkg-')
+    try:
+        yield d
+    finally:
+        try:
+            rmtree(d)
+        except OSError:
+            pass                        # only scratch files are left behind; never hide the real outcome
 
 
 def modules_dir(root: str) -> str:
@@ -868,7 +924,7 @@ class _Extractor:
             path = self.target(rel)
             if os.path.isfile(path):
                 raise PkgError(f"{self.archive}: '{rel}' is both a file and a directory")
-            os.makedirs(path, exist_ok=True)
+            make_dirs(path)
 
     def file(self, rel: str, src):
         if not rel:
@@ -883,7 +939,7 @@ class _Extractor:
         parent = os.path.dirname(path)
         if os.path.isfile(parent):
             raise PkgError(f"{self.archive}: '{rel}' is inside a file")
-        os.makedirs(parent, exist_ok=True)
+        make_dirs(parent)
         try:
             with open(path, 'xb') as out:
                 for chunk in iter(lambda: src.read(1 << 20), b''):
@@ -1136,7 +1192,7 @@ class Registry:
         else:
             path = file_url_path(location) if low.startswith('file://') else \
                 os.path.join(relative_to, os.path.expanduser(location))
-            path = os.path.realpath(path)
+            path = os.path.abspath(path)            # links kept: til.lock records sources as written
             if os.path.isdir(path):
                 path = os.path.join(path, 'index.json')
             if not os.path.isfile(path):
@@ -1243,7 +1299,7 @@ class Fetcher:
             dest = self.new_dir('path-')
             self._paths[p] = (dest, copy_package(p, dest))
         dest, h = self._paths[p]
-        return dest, h, lock_source_path(p, self.root, source.anchor)
+        return dest, h, lock_source_path(source.written or p, self.root, source.anchor)
 
     # -- git ----------------------------------------------------------------
     def _clone(self, url: str) -> str:
@@ -1277,6 +1333,12 @@ class Fetcher:
     def _git(self, source: Spec, name: str) -> Tuple[str, str, str]:
         url = source.url or ''
         sha = self.git_commit(source)
+        if source.rev and _SHA_RE.match(source.rev) and sha != source.rev:
+            warning = (f"package '{name}': {source.rev} ({source.raw}) is the SHA of an annotated tag, not of a "
+                       f"commit; it names the commit {sha}, and since til.lock records commits, every install "
+                       f"checks it in the repository - pin the commit SHA to install without the network")
+            if warning not in self.warnings:
+                self.warnings.append(warning)
         if (url, sha) not in self._checkouts:
             work = self.new_dir('git-')
             submodules = git_export(self._clone(url), sha, work, f"git {url} ({sha[:12]})")
@@ -1285,7 +1347,7 @@ class Fetcher:
                                      f"{', '.join(submodules)})")
             self._checkouts[(url, sha)] = (work, tree_hash(work))
         work, h = self._checkouts[(url, sha)]
-        where = lock_source_path(source.path, self.root, source.anchor) if source.path else url
+        where = lock_source_path(source.written or source.path, self.root, source.anchor) if source.path else url
         return work, h, f"git+{where}#{sha}"
 
     # -- archives -----------------------------------------------------------
@@ -1321,10 +1383,17 @@ class Resolver:
       the resolution with both as constraints (highest version satisfying all).
     * Cycles are an error.
     * Packages in til.lock whose spec is unchanged are reproduced exactly
-      (same resolved source, same tree hash) unless they are being updated."""
+      (same resolved source, same tree hash) unless they are being updated -
+      but til.lock never overrides an integrity pin of a til.json (an
+      archive's #sha256=, a full commit SHA): an entry that contradicts one
+      is not used (a warning; with --frozen an error).
+    * frozen (--frozen): every package must be reproduced from til.lock; one
+      that is not in it (or not as required) is an error before anything is
+      fetched for it."""
 
     def __init__(self, root: str, manifest: Dict[str, Any], lock: Optional[Dict[str, Any]],
-                 unlocked: Optional[Set[str]], fetcher: Fetcher, cwd: Optional[str] = None):
+                 unlocked: Optional[Set[str]], fetcher: Fetcher, cwd: Optional[str] = None,
+                 frozen: bool = False):
         self.root = root
         self.manifest = manifest
         self.root_name: Optional[str] = manifest.get('name')     # None: nothing can depend on the project
@@ -1333,11 +1402,14 @@ class Resolver:
         self.unlocked = unlocked                 # None: ignore the whole lock
         self.fetcher = fetcher
         self.cwd = cwd or os.getcwd()            # a relative TIL_REGISTRY is relative to this (-C DIR)
+        self.frozen = frozen
         self.constraints: Dict[str, List[Tuple[Spec, str]]] = {}
         self._registry: Optional[Registry] = None
         self._installed: Dict[str, Optional[str]] = {}
 
     def resolve(self) -> Dict[str, Package]:
+        if self.frozen:
+            self._check_frozen()
         for _ in range(MAX_RESOLVE_PASSES):
             try:
                 return self._pass()
@@ -1380,26 +1452,67 @@ class Resolver:
         return packages
 
     def _check_cycles(self, edges: Dict[str, List[str]], root_key: str):
-        state: Dict[str, int] = {}
-        stack: List[str] = []
+        """Depth-first search for a cycle; iterative, so a very long dependency
+        chain cannot exhaust Python's recursion limit."""
+        state: Dict[str, int] = {root_key: 1}
+        path: List[str] = [root_key]
+        todo: List[Tuple[str, int]] = [(root_key, 0)]          # (node, index of its next edge)
+        while todo:
+            n, i = todo[-1]
+            out = edges.get(n, [])
+            if i == len(out):
+                todo.pop()
+                path.pop()
+                state[n] = 2
+                continue
+            todo[-1] = (n, i + 1)
+            m = out[i]
+            if state.get(m) == 1:
+                cycle = path[path.index(m):] + [m]
+                raise PkgError("dependency cycle: " + " -> ".join(cycle))
+            if m not in state:
+                state[m] = 1
+                path.append(m)
+                todo.append((m, 0))
 
-        def visit(n: str):
-            state[n] = 1
-            stack.append(n)
-            for m in edges.get(n, []):
-                if state.get(m) == 1:
-                    cycle = stack[stack.index(m):] + [m]
-                    raise PkgError("dependency cycle: " + " -> ".join(cycle))
-                if m not in state:
-                    visit(m)
-            stack.pop()
-            state[n] = 2
+    # -- --frozen -------------------------------------------------------------
+    def _frozen_error(self, problem: str, suspicious: bool = False) -> PkgError:
+        if suspicious:
+            return PkgError(f"--frozen: {LOCKFILE} contradicts {MANIFEST}: {problem}\n(til pkg never writes such "
+                            f"an entry - was {LOCKFILE} edited? `til pkg install` resolves the package from "
+                            f"{MANIFEST} and rewrites {LOCKFILE}; --frozen never does)")
+        return PkgError(f"--frozen: {LOCKFILE} is out of date with {MANIFEST}: {problem}\n"
+                        f"(`til pkg install` resolves it again and writes {LOCKFILE}; --frozen never does)")
 
-        visit(root_key)
+    def _check_frozen(self):
+        """--frozen, before anything is fetched: til.lock must have every direct
+        dependency of til.json, as til.json requires it, and nothing that is no
+        longer required. (Indirect dependencies are checked as the resolution
+        reaches them, also before they are fetched - _usable_lock_entry.)"""
+        deps = self.manifest.get('dependencies') or {}
+        for name in sorted(deps):
+            if name == self.root_name:
+                continue
+            spec = parse_spec(deps[name], self.root, name, os.path.join(self.root, MANIFEST), 'project')
+            _found, problem = self._lock_entry(name, spec, self.root_label, ask_git=False)
+            if problem is not None:
+                raise self._frozen_error(*problem)
+        needed: Set[str] = set()
+        todo = [n for n in deps if n in self.lock]
+        while todo:
+            n = todo.pop()
+            if n not in needed:
+                needed.add(n)
+                todo.extend(d for d in self.lock[n].get('dependencies', {}) if d in self.lock)
+        extra = sorted(set(self.lock) - needed)
+        if extra:
+            raise self._frozen_error(f"{', '.join(extra)} {'is' if len(extra) == 1 else 'are'} in {LOCKFILE}, "
+                                     f"but nothing in {MANIFEST} requires {'it' if len(extra) == 1 else 'them'} "
+                                     f"any more")
 
     # -- obtaining a package --------------------------------------------------
     def _obtain(self, name: str, spec: Spec, requirer: str) -> Package:
-        locked = self._usable_lock_entry(name, spec)
+        locked = self._usable_lock_entry(name, spec, requirer)
         pkg = Package(name, spec, requirer)
         if locked is not None:
             entry, source = locked
@@ -1431,33 +1544,81 @@ class Resolver:
         elif pkg.source.kind == 'archive':
             pkg.archive_sha = pkg.resolved.rsplit('#sha256=', 1)[1]
         if pkg.source.kind == 'path' and spec.kind == 'path':
-            pkg.base_dir, pkg.anchor = pkg.source.path, spec.anchor
+            # relative dependencies start from the directory as til.json wrote it (Spec.written)
+            pkg.base_dir, pkg.anchor = spec.written or pkg.source.path, spec.anchor
         self._read_package_manifest(pkg, requirer)
         return pkg
 
-    def _usable_lock_entry(self, name: str, spec: Spec) -> Optional[Tuple[Dict[str, Any], Spec]]:
+    def _usable_lock_entry(self, name: str, spec: Spec, requirer: str) -> Optional[Tuple[Dict[str, Any], Spec]]:
+        """The til.lock entry (and its resolved source) that reproduces the
+        requirement `spec`, or None: then the package is resolved from `spec`
+        (--frozen: an error instead). An entry that contradicts an integrity
+        pin of `spec` is reported with a warning - til.lock was edited."""
         if self.unlocked is None or name in self.unlocked:
             return None
+        found, problem = self._lock_entry(name, spec, requirer)
+        if found is not None:
+            return found
+        assert problem is not None
+        message, suspicious = problem
+        if self.frozen:
+            raise self._frozen_error(message, suspicious)
+        if suspicious:
+            self.fetcher.warnings.append(f"the {LOCKFILE} entry for '{name}' is not used: {message} (til pkg "
+                                         f"never writes such an entry - was {LOCKFILE} edited?); '{name}' is "
+                                         f"resolved again")
+        return None
+
+    def _lock_entry(self, name: str, spec: Spec, requirer: str, ask_git: bool = True) \
+            -> Tuple[Optional[Tuple[Dict[str, Any], Spec]], Optional[Tuple[str, bool]]]:
+        """-> ((entry, resolved source), None) when til.lock's entry for `name`
+        reproduces the requirement `spec`, else (None, (why, suspicious)).
+        suspicious: til pkg never writes such an entry (til.lock was edited).
+        Integrity pins win over til.lock: an archive spec's #sha256= (and URL)
+        and a full commit SHA must be exactly what the entry resolves to.
+        ask_git=False: never contact a repository (a full SHA that differs from
+        the locked commit then counts as reproducible - it may be an annotated
+        tag object pointing to that commit; the resolution checks it)."""
         entry = self.lock.get(name)
-        if entry is None or entry.get('spec') != spec.raw:
-            return None
+        if entry is None:
+            return None, (f"{requirer} requires {name} = {spec.raw}, which is not in {LOCKFILE}", False)
+        if entry.get('spec') != spec.raw:
+            return None, (f"{requirer} requires {name} = {spec.raw}, {LOCKFILE} has {name} = {entry.get('spec')}",
+                          False)
         source = parse_spec(entry['resolved'], self.root, name, os.path.join(self.root, LOCKFILE))
         if source.kind == 'registry':
             raise PkgError(f"{os.path.join(self.root, LOCKFILE)}: package '{name}': \"resolved\" must be a "
                            f"path, git+URL or archive URL")
+        here = f"{LOCKFILE} resolves {name} to {entry['resolved']}"
+        if spec.kind != 'registry' and source.kind != spec.kind:
+            return None, (f"{here}, which is not the source {spec.raw}", True)
+        if source.kind == 'git' and not (source.rev and _SHA_RE.match(source.rev)):
+            return None, (f"{here}, which does not name a commit by its full SHA", True)
         if spec.kind == 'path' and source.path != spec.path:
-            return None                         # the same text now names another directory
-        if spec.kind == 'git' and (source.kind != 'git' or source.url != spec.url):
-            return None
+            return None, (f"{here}, but {spec.raw} now names {display_path(spec.written or '', self.root)}",
+                          False)                # the same text now names another directory
+        if spec.kind == 'git':
+            if source.url != spec.url:
+                return None, (f"{here}, which is not the repository of {spec.raw}", spec.path is None)
+            if spec.rev and _SHA_RE.match(spec.rev) and source.rev != spec.rev and ask_git:
+                # a full commit SHA in til.json is an integrity pin; the only other commit it can name is
+                # the one an annotated tag object points to (`git rev-parse v1.0` prints the tag's SHA)
+                if self.fetcher.git_commit(spec) != source.rev:
+                    return None, (f"{here}, but {requirer} pins the commit {spec.rev}", True)
+        if spec.kind == 'archive':
+            if spec.sha256 is None:
+                return None, (f"{spec.raw} does not pin the archive's sha256", False)
+            if source.url != spec.url or source.sha256 != spec.sha256:
+                return None, (f"{here}, but {requirer} pins {spec.raw}", True)
         if spec.kind == 'registry':
             try:
                 version = Version.parse(entry.get('version'))
             except PkgError:
-                return None
-            if not spec.req.matches(version) or not all(s.req.matches(version)
-                                                        for s, _who in self.constraints.get(name, [])):
-                return None
-        return entry, source
+                return None, (f"{LOCKFILE} has no valid version for {name}", True)
+            for s, who in [(spec, requirer)] + self.constraints.get(name, []):
+                if not s.req.matches(version):
+                    return None, (f"{who} requires {name} {s.req}, {LOCKFILE} has {name} {version}", False)
+        return (entry, source), None
 
     def _installed_copy(self, name: str, sha256: str) -> Optional[str]:
         """til_modules/NAME when it already holds exactly the locked files."""
@@ -1554,7 +1715,10 @@ class Resolver:
     def _same_commit(self, pkg: Package, spec: Spec, requirer: str) -> bool:
         """Does the git requirement `spec` (same repository) name the commit
         chosen for `pkg`? Answered without the network when possible:
-        * a full commit SHA is compared directly;
+        * a full commit SHA equal to that commit (otherwise it is resolved in
+          the repository: it may be an annotated tag object's SHA - what `git
+          rev-parse v1.0` prints - which names the commit the tag points to;
+          an integrity pin is never taken on til.lock's word);
         * when `pkg` was reproduced from til.lock and til.lock records this very
           requirement (`requirer` depends on it with the same text), it was
           checked when the lock was written: like the package itself, a
@@ -1563,7 +1727,7 @@ class Resolver:
           repeated install works offline.
         Otherwise the revision is resolved in the repository."""
         if spec.rev and _SHA_RE.match(spec.rev):
-            return spec.rev == pkg.git_sha
+            return spec.rev == pkg.git_sha or self.fetcher.git_commit(spec) == pkg.git_sha
         if pkg.from_lock:
             recorded = (self.lock.get(requirer) or {}).get('dependencies', {}).get(pkg.name)
             if recorded == spec.raw:
@@ -1572,8 +1736,8 @@ class Resolver:
 
     def _conflict(self, pkg: Package, spec: Spec, requirer: str) -> str:
         def show(s: Spec) -> str:
-            if s.kind == 'path' and s.path is not None and display_path(s.path, self.root) != s.raw:
-                return f"{s.raw} (= {display_path(s.path, self.root)})"
+            if s.kind == 'path' and s.written is not None and display_path(s.written, self.root) != s.raw:
+                return f"{s.raw} (= {display_path(s.written, self.root)})"
             return s.raw
         lines = [f"conflicting requirements for package '{pkg.name}':"]
         lines += [f"  {who} requires {pkg.name} = {show(s)}" for who, s in pkg.requirers]
@@ -1661,9 +1825,10 @@ def install_project(root: str, manifest: Dict[str, Any], unlocked: Optional[Set[
                 raise
     if frozen and old_lock is None:
         raise PkgError(f"--frozen: {lock_path} does not exist (run `til pkg install` first)")
-    with tempfile.TemporaryDirectory(prefix='tilpkg-') as workdir:
+    with work_directory() as workdir:
         fetcher = Fetcher(root, workdir)
-        resolver = Resolver(root, manifest, old_lock if unlocked is not None else None, unlocked, fetcher, cwd)
+        resolver = Resolver(root, manifest, old_lock if unlocked is not None else None, unlocked, fetcher, cwd,
+                            frozen=frozen)
         packages = resolver.resolve()
         unknown = sorted((unlocked or set()) - set(packages))
         if unknown:
@@ -1677,11 +1842,13 @@ def install_project(root: str, manifest: Dict[str, Any], unlocked: Optional[Set[
             before_apply()
         changes = apply_packages(root, packages)
     text = json_text(new_lock)
-    old_text = None
-    if os.path.exists(lock_path):
-        with open(lock_path, encoding='utf-8') as f:
-            old_text = f.read()
-    lock_written = text != old_text and not frozen      # --frozen never writes til.lock
+    old_bytes = None
+    try:
+        with open(lock_path, 'rb') as f:        # bytes: the old til.lock may be anything (UTF-16, garbage)
+            old_bytes = f.read()
+    except FileNotFoundError:
+        pass
+    lock_written = text.encode('utf-8') != old_bytes and not frozen      # --frozen never writes til.lock
     if lock_written:
         write_text_atomic(lock_path, text)
     _report(packages, changes, (old_lock or {}).get('packages', {}), lock_written)
@@ -1745,6 +1912,9 @@ def _refuse_installed_copy(directory: str):
 
 
 def _project(start: str) -> Tuple[str, Dict[str, Any]]:
+    # the directory the command runs in first: inside PROJECT/til_modules/NAME/ without a til.json of
+    # its own, find_root() would climb to PROJECT and the command would change the project from there
+    _refuse_installed_copy(start)
     root = find_root(start)
     _refuse_installed_copy(root)
     return root, load_manifest(root) or {}
@@ -1762,13 +1932,13 @@ def _spec_from_cwd(raw: str, start: str, root: str) -> str:
     if text.startswith('git+'):
         url, sep, rev = text[4:].partition('#')
         if url and _is_local_git_path(url) and _path_anchor(url, 'project') == 'project':
-            return 'git+' + display_path(os.path.realpath(os.path.join(here, url)), root) + sep + rev
+            return 'git+' + display_path(os.path.abspath(os.path.join(here, url)), root) + sep + rev
         return raw
     if text.lower().startswith(('https://', 'http://', 'file://')) or not _looks_like_path(text):
         return raw
     if _path_anchor(text, 'project') != 'project':
         return raw
-    return display_path(os.path.realpath(os.path.join(here, text)), root)
+    return display_path(os.path.abspath(os.path.join(here, text)), root)
 
 
 def _write_manifest(root: str, manifest: Dict[str, Any]):
@@ -1817,7 +1987,7 @@ def cmd_add(args, start: str) -> int:
         if not location:
             raise PkgError(f"`til pkg add {name}` without a SPEC needs a registry: set TIL_REGISTRY or "
                            f"\"registry\" in {MANIFEST}, or give a path, git+URL or archive URL")
-        with tempfile.TemporaryDirectory(prefix='tilpkg-') as workdir:
+        with work_directory() as workdir:
             registry = Registry.load(location, os.path.abspath(start) if env else root, workdir)
             raw = f"^{latest_version(registry.versions(name))}"
     raw = _spec_from_cwd(raw, start, root)
@@ -1888,8 +2058,11 @@ def cmd_list(args, start: str) -> int:
         print("(no dependencies)")
         return 0
     expanded: Set[str] = set()
-
-    def node(name: str, spec: str, prefix: str, last: bool, direct: bool):
+    names = sorted(deps)
+    # (name, spec, prefix, last, direct), printed depth first with an explicit stack (no recursion limit)
+    todo = [(name, deps[name], '', i == len(names) - 1, True) for i, name in enumerate(names)][::-1]
+    while todo:
+        name, spec, prefix, last, direct = todo.pop()
         entry = entries.get(name)
         line = prefix + ('`-- ' if last else '|-- ') + name
         if entry is not None and entry.get('version'):
@@ -1911,13 +2084,62 @@ def cmd_list(args, start: str) -> int:
         print(line)
         expanded.add(name)
         sub = prefix + ('    ' if last else '|   ')
-        for i, child in enumerate(children):
-            node(child, entry['dependencies'][child], sub, i == len(children) - 1, False)
-
-    names = sorted(deps)
-    for i, name in enumerate(names):
-        node(name, deps[name], '', i == len(names) - 1, True)
+        todo.extend([(child, entry['dependencies'][child], sub, i == len(children) - 1, False)
+                     for i, child in enumerate(children)][::-1])
     return 0
+
+
+def pin_mismatches(root: str, manifest: Dict[str, Any], entries: Dict[str, Any]) -> List[str]:
+    """Requirements - in til.json and, for every locked package, in its own
+    til.json as til.lock records it - whose integrity pin til.lock does not
+    honour: an archive's #sha256= (for the package's own spec also its URL),
+    a full commit SHA (also the repository, for the package's own spec).
+    til pkg never writes such a til.lock; it was edited. A full SHA that
+    differs from the locked commit is resolved in the repository (it may be
+    an annotated tag object's SHA); only that needs the network."""
+    label = manifest.get('name') or os.path.basename(root) or 'project'
+    requirements = [(label, n, s) for n, s in sorted((manifest.get('dependencies') or {}).items())]
+    for requirer in sorted(entries):
+        requirements += [(requirer, n, s) for n, s in sorted(entries[requirer].get('dependencies', {}).items())]
+    lock_path = os.path.join(root, LOCKFILE)
+    out: List[str] = []
+    with work_directory() as workdir:
+        fetcher = Fetcher(root, workdir)
+        for requirer, name, text in requirements:
+            entry = entries.get(name)
+            if entry is None:
+                continue                                # reported as OUTDATED
+            try:
+                spec = parse_spec(text, root, name, MANIFEST)
+            except PkgError:
+                continue                                # `til pkg install` reports it
+            own = text == entry['spec']
+            pinned_sha = spec.kind == 'git' and spec.rev is not None and _SHA_RE.match(spec.rev) is not None
+            if not ((spec.kind == 'archive' and spec.sha256) or pinned_sha):
+                continue
+            bad = f"MISMATCH {name}: {requirer} requires {name} = {text}, but {LOCKFILE} resolves it to " \
+                  f"{entry['resolved']}"
+            try:
+                source = parse_spec(entry['resolved'], root, name, lock_path)
+            except PkgError as e:
+                out.append(f"{bad} ({e})")
+                continue
+            if spec.kind == 'archive':
+                if source.kind != 'archive' or source.sha256 != spec.sha256 or (own and source.url != spec.url):
+                    out.append(bad)
+                continue
+            if source.kind != 'git' or (own and spec.path is None and source.url != spec.url):
+                out.append(bad)
+            elif source.rev != spec.rev:
+                try:
+                    commit = fetcher.git_commit(Spec('git', text, url=source.url, rev=spec.rev))
+                except PkgError as e:
+                    out.append(f"{bad} (and {spec.rev} could not be resolved in the repository to check "
+                               f"whether it is an annotated tag pointing to that commit: {e})")
+                    continue
+                if commit != source.rev:
+                    out.append(bad)
+    return out
 
 
 def cmd_verify(args, start: str) -> int:
@@ -1938,6 +2160,9 @@ def cmd_verify(args, start: str) -> int:
             locked = f"has {entry['spec']}" if entry else "does not have it"
             print(f"OUTDATED {name}: {MANIFEST} requires {deps[name]}, {LOCKFILE} {locked}")
             problems += 1
+    for line in pin_mismatches(root, manifest, entries):
+        print(line)
+        problems += 1
     needed: Set[str] = set()                    # what til.json requires, directly or through til.lock
     todo = [n for n in deps if n in entries]
     while todo:
@@ -2056,6 +2281,9 @@ def main(argv: List[str]) -> int:
         return 1
     except OSError as e:
         print(f"til pkg: error: {e}", file=sys.stderr)
+        return 1
+    except RecursionError:                      # last resort: walks are iterative, JSON depth is caught
+        print("til pkg: error: input nested too deeply to process (Python recursion limit)", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print("til pkg: interrupted", file=sys.stderr)

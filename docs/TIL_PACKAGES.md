@@ -32,12 +32,12 @@ only files.
 | `til pkg init [NAME]` | Create `til.json` in the current directory: `{"name", "version": "0.1.0", "dependencies": {}}`. `NAME` defaults to the directory name (made an identifier: `my-app` → `my_app`). Refuses to overwrite an existing `til.json`. |
 | `til pkg add NAME SPEC` | Record `NAME: SPEC` in `til.json` and install it (re-resolving that package; the rest stays as locked). Replaces an existing spec for `NAME`. A relative path is relative to the directory the command runs in, as in any shell command, and is stored relative to the project root: `til pkg add geo ../vendor/geo` in `proj/src/` records `"./vendor/geo"`. |
 | `til pkg add NAME@REQ` / `til pkg add NAME` | Registry forms: `add geo@^1.2`; without a spec the newest release in the registry is recorded as `^X.Y.Z`. |
-| `til pkg install` | Install everything in `til.json` (recursively). Packages already in `til.lock` with an unchanged spec are reproduced exactly; new or changed ones are resolved. Writes `til.lock`. |
+| `til pkg install` | Install everything in `til.json` (recursively). Packages already in `til.lock` with an unchanged spec are reproduced exactly; new or changed ones are resolved (and so is an entry that contradicts an integrity pin of `til.json`, §4). Writes `til.lock`. |
 | `til pkg install --update [NAME...]` | Ignore `til.lock` and resolve again (everything, or only the named packages). |
-| `til pkg install --frozen` | For CI: install exactly `til.lock`; fail if it is missing or does not match `til.json`. Never writes `til.lock`. |
+| `til pkg install --frozen` | For CI: install exactly `til.lock`; fail if it is missing or does not match `til.json` — checked before anything is fetched for a package. Never writes `til.lock`. |
 | `til pkg remove NAME` (`rm`) | Drop `NAME` from `til.json`, remove packages nothing needs any more. |
 | `til pkg list` (`ls`) | Dependency tree from `til.lock` (see below). |
-| `til pkg verify` | Re-hash every directory in `til_modules/` and compare with `til.lock`; also check that `til.lock` matches `til.json`. Exit code 1 on any difference. |
+| `til pkg verify` | Re-hash every directory in `til_modules/` and compare with `til.lock`; also check that `til.lock` matches `til.json`, including its integrity pins (§4). Exit code 1 on any difference. |
 | `til pkg help` | Usage (also `til pkg --help`, `til pkg COMMAND -h`). |
 
 All commands except `init` find the project by looking for `til.json` in the
@@ -47,8 +47,9 @@ searched from `DIR`, and relative paths on the command line and a relative
 `TIL_REGISTRY` are relative to `DIR`.
 
 `til pkg` refuses to run inside an installed package (`PROJECT/til_modules/NAME/`
-or below): installed copies are only ever replaced as a whole, and their own
-dependencies live in `PROJECT/til_modules/`.
+or below, whether or not the package has a `til.json` of its own): installed
+copies are only ever replaced as a whole, and their own dependencies live in
+`PROJECT/til_modules/`.
 
 Exit codes: `0` success, `1` error (message on stderr, prefixed `til pkg:
 error:`), `2` command-line usage error (unknown command or option,
@@ -82,11 +83,15 @@ MISSING  colors: til_modules/colors does not exist
 EXTRA    til_modules/intruder is not in til.lock
 OUTDATED extra: til.json requires ../libs/extra, til.lock does not have it
 OUTDATED old: in til.lock, but nothing in til.json requires it any more
+MISMATCH mathx: app requires mathx = https://example.com/mathx-1.0.tar.gz#sha256=9f86..., but til.lock resolves it to https://example.org/x.tar.gz#sha256=0be2...
 ```
 
 `til pkg install` repairs all of these: it restores every package from the
 locked source and removes extra directories. (`OUTDATED` means `til.lock`
-must be rewritten, which `install --frozen` refuses to do.)
+must be rewritten, which `install --frozen` refuses to do.) `MISMATCH` means
+that `til.lock` contradicts an integrity pin of a `til.json` (§4) — `til pkg`
+never writes such a lock, so it was edited; `install` resolves that package
+from `til.json` again, `install --frozen` refuses.
 
 ---
 
@@ -129,9 +134,9 @@ dependencies sorted by name; other fields are kept as they are.
 
 | Spec | Kind |
 |---|---|
-| `./libs/geo`, `../geo`, `/abs/geo`, `~/geo` | **Local directory.** Relative to the directory of the `til.json` that declares it. Use `/` (also on Windows) so projects stay portable. `til.lock` records the directory in the form it was written — relative to the project root, absolute, or `~/...` (a relative path declared by such a package inherits its form) — so the lock stays valid wherever the project is checked out. |
-| `git+URL` / `git+URL#REV` | **Git repository.** `URL` is any git URL: `https://`, `ssh://`, `git://`, `file://`, `user@host:path`, or a local repository path (relative paths as for directories). `REV` is a tag, a branch (also non-default branches) or a full or abbreviated commit SHA; without `#REV` the remote's default branch (`HEAD`). The resolved **commit SHA** is recorded in `til.lock`. The package is the files of that commit **exactly as committed** (see "Git packages" below). |
-| `https://host/p.tar.gz#sha256=HEX` | **Archive**: `.tar.gz`, `.tgz` or `.zip`, also `file:///path/p.zip#sha256=...`. The sha256 of the archive file is **required** and is checked *before* anything is extracted. Leave it out and the error message prints the current hash for you to paste. Plain `http://` is refused. If the archive holds exactly one top-level directory (as GitHub release archives do), that directory is the package. |
+| `./libs/geo`, `../geo`, `/abs/geo`, `~/geo` | **Local directory.** Relative to the directory of the `til.json` that declares it — for a package that is itself a local directory, that directory as it was written: `..` goes back up the written path, not up from the target of a symbolic link. Use `/` (also on Windows) so projects stay portable. `til.lock` records the directory in the form it was written — relative to the project root, absolute, or `~/...` (a relative path declared by such a package inherits its form), with symbolic links on the way kept (`~/libs/geo` stays `~/libs/geo` when `~/libs` is a link) — so the lock stays valid wherever the project is checked out. |
+| `git+URL` / `git+URL#REV` | **Git repository.** `URL` is any git URL: `https://`, `ssh://`, `git://`, `file://`, `user@host:path`, or a local repository path (relative paths as for directories). `REV` is a tag, a branch (also non-default branches) or a full or abbreviated commit SHA; without `#REV` the remote's default branch (`HEAD`). The resolved **commit SHA** is recorded in `til.lock`. A full SHA is an integrity pin (§4); it may also be an annotated tag object's SHA (what `git rev-parse v1.0` prints), which names the commit the tag points to — since `til.lock` records that commit, every install then checks the tag in the repository (a warning says so; pin the commit SHA to install offline). The package is the files of that commit **exactly as committed** (see "Git packages" below). |
+| `https://host/p.tar.gz#sha256=HEX` | **Archive**: `.tar.gz`, `.tgz` or `.zip`, also `file:///path/p.zip#sha256=...`. The sha256 of the archive file is **required** and is checked *before* anything is extracted — also when `til.lock` names the archive (§4). Leave it out and the error message prints the current hash for you to paste. Plain `http://` is refused. If the archive holds exactly one top-level directory (as GitHub release archives do), that directory is the package. |
 | `^1.2`, `~1.2.3`, `1.x`, `1.2`, `*`, `1.2.3`, `>=1.2 <2`, `^1 \|\| ^3`, `NAME@^1.2` | **Version requirement**, resolved through the registry (§5). |
 
 Version requirements follow npm:
@@ -202,7 +207,9 @@ in name order, so **your project's own declarations are seen first**.
   directory in your project also satisfies a dependency's `geo: ^1.2` when
   the directory's version is in range.
 * A second git requirement is checked without the network when it can be: a
-  full commit SHA is compared directly, and a requirement that `til.lock`
+  full commit SHA equal to the chosen commit is accepted directly (another
+  full SHA is resolved in the repository — it may be an annotated tag object
+  pointing to that commit), and a requirement that `til.lock`
   already records for that package (the requiring package's `dependencies`)
   is pinned by the lock like the package itself — a branch or `HEAD`
   requirement does not follow upstream pushes until `til pkg install
@@ -275,6 +282,16 @@ replaced at the same URL — the install stops with a hash error that names the
 package and the remedy (`til pkg install --update NAME`). Local directories
 are *copied*: after editing one, run `til pkg install --update NAME`.
 
+**Integrity pins win over `til.lock`.** An archive's `#sha256=` and a full
+commit SHA — in your `til.json` or in a package's — are never taken on
+`til.lock`'s word: a lock entry that resolves such a requirement to another
+archive (URL or hash), repository or commit is not used. `til pkg` never
+writes such an entry, so it means `til.lock` was edited (lock diffs are rarely
+reviewed): `install` warns and resolves the package from `til.json` again,
+`install --frozen` fails, and `verify` reports `MISMATCH`. Tags, branches,
+abbreviated SHAs and version requirements are not pins — for them, `til.lock`
+is the pin.
+
 ### Tree hash
 
 `sha256` is the sha256 of the text made of one line per file
@@ -344,11 +361,15 @@ import geo.shapes.square        # til_modules/geo/shapes/square.til (or .../squa
 
 **In your program** (any file that is not inside `til_modules/`):
 
-* `import NAME` first searches everything it searched before TIL 3.1 — the
-  importing file's directory, the current directory, `$TIL_PATH`, the
-  standard library — and only then installed packages. A local `geo.til` next
-  to your program therefore shadows the package `geo`, and a package cannot
-  replace a standard-library module (`math`, `strings`).
+* `import NAME` first searches the importing file's directory, the current
+  directory and `$TIL_PATH`. Then, if `NAME` is a dependency in your project's
+  `til.json`, it is taken from the installed package — only from there: if it
+  is not installed, the import fails with a hint. Any other `NAME` is looked
+  up in the standard library and then in installed packages. So a local
+  `geo.til` next to your program shadows the package `geo`, and a package you
+  declare comes before the standard library: `til pkg add math ../my-math`
+  replaces the standard `math` module in your program (not in packages that do
+  not declare `math` themselves; they keep the standard one).
 * Packages are looked up in `til_modules/` of the importing file's directory,
   then of its parent, grandparent, ... (nearest first), **up to the nearest
   project root** — the first directory with a `til.json` (or `til.lock`) —
@@ -362,13 +383,15 @@ import geo.shapes.square        # til_modules/geo/shapes/square.til (or .../squa
 `til.json` or `til.lock`):
 
 * `import NAME` searches the importing file's directory (the package's own
-  modules: `import helper` finds its `helper.til`), the standard library, and
-  then **only `PROJECT/til_modules/`** — the flat directory that `til.lock`
-  describes. The current directory and `$TIL_PATH` are not searched, and a
-  `til_modules/` inside an installed package is never used. So a package
-  always gets exactly the dependencies `til.lock` pins, wherever `til` runs
-  and whatever modules your project has: a `units.til` of your own does not
-  replace the package `units` that `geo` depends on.
+  modules: `import helper` finds its `helper.til`); then a dependency declared
+  in the package's `til.json` comes from **`PROJECT/til_modules/` only** — the
+  flat directory that `til.lock` describes; any other `NAME` from the standard
+  library, then `PROJECT/til_modules/`. The current directory and `$TIL_PATH`
+  are not searched, and a `til_modules/` inside an installed package is never
+  used. So a package always gets exactly the dependencies `til.lock` pins,
+  wherever `til` runs and whatever modules your project (or `$TIL_HOME/stdlib`,
+  `~/.til/stdlib`) has: a `units.til` of your own does not replace the package
+  `units` that `geo` depends on.
 
 **Both:**
 
@@ -389,13 +412,28 @@ that uses packages builds and runs the same way natively (`til run`,
 --cvm`, `til build --target vm` / `c-vm` — the `.tbc` file contains the
 package code, the device needs no `til_modules/`).
 
-**One namespace.** TIL has no module-private names yet: the top-level
-definitions of your program, of its modules and of every package it imports
-(directly or through other packages) share one namespace. Two packages that
-both define the same top-level name — even an internal `helper()` — cannot be
-used in one program; the compiler reports `function 'helper' is defined twice`
-(at the first `import`, without naming the packages). Package authors should
-prefix internal names with the package name (`geo_helper`).
+**One namespace.** TIL has no module-private names yet: everything a
+program brings in — its own definitions, its modules, every package, directly
+or through other packages — shares one namespace, and merged code sees all of
+it. `import NAME` brings in every top-level definition of `NAME`; `from NAME
+import a, b` brings in `a`, `b` and every definition of `NAME` (and of what
+it imports) that they use, transitively — helper functions, constants,
+structs and their methods. A top-level name (function, `const`/`let`/`var`,
+struct, enum, trait, type alias, capability) or a method of a type that two
+different files bring in is a compile error that names both files, on every
+backend and in `til check`:
+
+```
+error[E-IMPORT]: const 'SCALE' is defined in two files: til_modules/a/a.til:1 and til_modules/b/b.til:1
+ --> til_modules/b/b.til:1:1
+```
+
+So code of one file never silently uses another file's definition. Two
+packages that both define the same name — even an internal `helper()` —
+cannot both be imported with `import NAME`; package authors should prefix
+internal names with the package name (`geo_helper`). Names that a `from`
+import does not bring in never clash: `from math import gcd` next to your own
+`factorial()` is fine.
 
 ---
 
