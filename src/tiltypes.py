@@ -4820,31 +4820,53 @@ class TypedCGen(til.CCodeGenerator):
         self.unsupported(f"assignment to unknown name '{target.name}'", target)
 
     def g_Assignment(self, n):
+        """Step by step in the VMs' order (BytecodeCompiler.compile_assignment),
+        every step a C statement (C leaves the order of operands unspecified):
+        `x op= v` reads x, then evaluates v; `a[i] (op)= v` evaluates a, i, [reads
+        the element], v, [computes], then stores (the store checks the index);
+        `p.f (op)= v` evaluates p, [reads the field], v, [computes], then stores
+        (a None p fails at the field). The value never sees a pointer into an
+        array that it could reallocate."""
         target, op = n.target, n.op
         vt = self.T(n.value)
+        compound = op != '='
+        k = self.fresh_id()
+
+        def combine(old_code, t):
+            """old (already read), then the value, then old op value -> type t."""
+            self.emit(f"{self.ct(vt, n)} _v{k} = {self.x(n.value)};")
+            res = self.arith(op[:-1], old_code, t, f"_v{k}", vt, None, n)
+            self.emit(f"{self.ct(t, n)} _n{k} = {self.coerce(res[0], res[1], t, n)};")
+            return f"_n{k}"
+
         if isinstance(target, til.Identifier):
             lv, t = self.place(target)
-            if op == '=':
+            if not compound:
                 self.emit(f"{lv} = {self.coerce(self.x(n.value), vt, t, n)};")
-            else:
-                res = self.arith(op[:-1], lv, t, self.x(n.value), vt, self.T(target) if False else None, n)
-                self.emit(f"{lv} = {self.coerce(res[0], res[1], t, n)};")
+                return
+            self.emit("{")
+            self.indent += 1
+            self.emit(f"{self.ct(t, n)} _old{k} = {lv};")
+            self.emit(f"{lv} = {combine(f'_old{k}', t)};")
+            self.indent -= 1
+            self.emit("}")
             return
         if isinstance(target, til.Index):
             ot = self.T(target.obj)
-            k = self.fresh_id()
             if ot.name == 'array':
                 e = ot.args[0]
                 self.check_slot_type(e, n)
                 self.emit("{")
                 self.indent += 1
-                self.emit(f"TIL_Slot* _p{k} = til_arr_at({self.x(target.obj)}, {self.int_code(target.index)});")
-                if op == '=':
-                    val = self.coerce(self.x(n.value), vt, e, n)
+                self.emit(f"TIL_Arr* _a{k} = {self.x(target.obj)};")
+                self.emit(f"int64_t _i{k} = {self.int_code(target.index)};")
+                if compound:
+                    self.emit(f"{self.ct(e, n)} _old{k} = {self.slot_get(e, f'*til_arr_at(_a{k}, _i{k})')};")
+                    val = combine(f"_old{k}", e)
                 else:
-                    res = self.arith(op[:-1], self.slot_get(e, f"*_p{k}"), e, self.x(n.value), vt, None, n)
-                    val = self.coerce(res[0], res[1], e, n)
-                self.emit(f"*_p{k} = {self.slot_make(e, val)};")
+                    self.emit(f"{self.ct(e, n)} _n{k} = {self.coerce(self.x(n.value), vt, e, n)};")
+                    val = f"_n{k}"
+                self.emit(f"*til_arr_at(_a{k}, _i{k}) = {self.slot_make(e, val)};")
                 self.indent -= 1
                 self.emit("}")
             elif ot.name == 'map':
@@ -4856,12 +4878,13 @@ class TypedCGen(til.CCodeGenerator):
                 self.indent += 1
                 self.emit(f"TIL_Map* _m{k} = {self.x(target.obj)};")
                 self.emit(f"TIL_Slot _k{k} = {self.slot_make(kt, self.coerce(self.x(target.index), self.T(target.index), kt, n))};")
-                if op == '=':
-                    val = self.coerce(self.x(n.value), vt, v, n)
-                else:
+                if compound:
                     cur = self.slot_get(v, f"til_map_get(_m{k}, _k{k}, {kind})")
-                    res = self.arith(op[:-1], cur, v, self.x(n.value), vt, None, n)
-                    val = self.coerce(res[0], res[1], v, n)
+                    self.emit(f"{self.ct(v, n)} _old{k} = {cur};")
+                    val = combine(f"_old{k}", v)
+                else:
+                    self.emit(f"{self.ct(v, n)} _n{k} = {self.coerce(self.x(n.value), vt, v, n)};")
+                    val = f"_n{k}"
                 self.emit(f"til_map_set(_m{k}, _k{k}, {self.slot_make(v, val)}, {kind});")
                 self.indent -= 1
                 self.emit("}")
@@ -4879,18 +4902,18 @@ class TypedCGen(til.CCodeGenerator):
             if ft is None:
                 self.unsupported(f"unknown field '{target.attr}'", n)
             self.ct(ft, n, f"field '{target.attr}'")
-            k = self.fresh_id()
             sc = self.mangle_name(nominal_name(ot))
-            obj = self.x(target.obj)
+            field = til.c_string_literal(target.attr)
             self.emit("{")
             self.indent += 1
-            self.emit(f"{sc}* _o{k} = ({sc}*)til_nn({obj}, {til.c_string_literal(target.attr)});")
-            if op == '=':
-                val = self.coerce(self.x(n.value), vt, ft, n)
+            self.emit(f"{sc}* _o{k} = ({sc}*)({self.x(target.obj)});")
+            if compound:
+                self.emit(f"{self.ct(ft, n)} _old{k} = (({sc}*)til_nn(_o{k}, {field}))->{target.attr};")
+                val = combine(f"_old{k}", ft)
             else:
-                res = self.arith(op[:-1], f"_o{k}->{target.attr}", ft, self.x(n.value), vt, None, n)
-                val = self.coerce(res[0], res[1], ft, n)
-            self.emit(f"_o{k}->{target.attr} = {val};")
+                self.emit(f"{self.ct(ft, n)} _n{k} = {self.coerce(self.x(n.value), vt, ft, n)};")
+                val = f"_n{k}"
+            self.emit(f"(({sc}*)til_nn(_o{k}, {field}))->{target.attr} = {val};")
             self.indent -= 1
             self.emit("}")
             return
@@ -5115,13 +5138,27 @@ class TypedCGen(til.CCodeGenerator):
                 return True
         return False
 
+    def may_fail(self, node) -> bool:
+        """Can evaluating node stop with a run-time error (so that its order
+        relative to other operands is observable, e.g. through `error` in a
+        retry)? Calls, indexing, struct fields (None), integer / and %, casts."""
+        for n in walk(node):
+            if isinstance(n, (til.Call, til.Index, til.Cast, til.MatchExpr)):
+                return True
+            if isinstance(n, til.Attribute) and is_struct(self.T(n.obj)):
+                return True
+            if isinstance(n, til.BinaryOp) and n.op in ('/', '%') and \
+                    self.T(n.left) is not FLOAT and self.T(n.right) is not FLOAT:
+                return True
+        return False
+
     def seq(self, nodes, gen):
         """Generate operands left to right like the VM: operands up to the last
-        one with side effects are evaluated into temporaries first (C leaves the
-        order of operand evaluation unspecified)."""
+        one with side effects (or that can fail) are evaluated into temporaries
+        first (C leaves the order of operand evaluation unspecified)."""
         last = -1
         for i, nd in enumerate(nodes):
-            if nd is not None and self.effectful(nd):
+            if nd is not None and (self.effectful(nd) or self.may_fail(nd)):
                 last = i
         prelude, codes = [], []
         for i, nd in enumerate(nodes):
@@ -5733,7 +5770,8 @@ class TypedCGen(til.CCodeGenerator):
         rc = "void" if ret is NIL else self.ct(ret, n)
         sig = ", ".join(["TIL_Clo*"] + [self.ct(p, n) for p in ptypes])
         call = f"(({rc} (*)({sig}))_k{k}->fn)({', '.join([f'_k{k}'] + codes)})"
-        lines = prelude + [f"TIL_Clo* _k{k} = til_clo_chk({code});"]
+        # the VMs evaluate the function value first, then the arguments, then call
+        lines = [f"TIL_Clo* _k{k} = (TIL_Clo*)({code});"] + prelude + [f"_k{k} = til_clo_chk(_k{k});"]
         if ret is NIL:
             return self.sx(lines + [f"{call};"], "NULL")
         return self.sx(lines, call)
@@ -6624,15 +6662,19 @@ class TypedCGen(til.CCodeGenerator):
             callee = self.insts.get(ikey)
             if callee is None:
                 self.unsupported(f"no instance of '{key}' for these types", n)
+            sc = self.mangle_name(nominal_name(rt))
             if isinstance(obj, til.Identifier) and obj.name == 'self' and self.lookup_var('self') == ('self', rt):
                 recv = "self"
-            else:
-                sc = self.mangle_name(nominal_name(rt))
-                recv = f"(({sc}*)til_nm({self.x(obj)}, {til.c_string_literal(meth)}))"
-            if self.effectful(obj) and any(self.effectful(a) for a in args):
+            elif any(self.effectful(a) or self.may_fail(a) for a in args):
+                # the VMs evaluate the receiver before the arguments (which may
+                # reassign it) and look the method up after them (None fails then)
                 k = self.fresh_id()
-                return self.sx([f"{self.ct(rt)} _r{k} = {recv};"],
-                               self.call_instance(callee, self.inst_names[ikey], obj, f"_r{k}", args, n))
+                return self.sx([f"{sc}* _r{k} = ({sc}*)({self.x(obj)});"],
+                               self.call_instance(callee, self.inst_names[ikey], obj,
+                                                  f"(({sc}*)til_nm(_r{k}, {til.c_string_literal(meth)}))",
+                                                  args, n))
+            else:
+                recv = f"(({sc}*)til_nm({self.x(obj)}, {til.c_string_literal(meth)}))"
             return self.call_instance(callee, self.inst_names[ikey], obj, recv, args, n)
         nodes = [obj] + list(args)
         if meth in ('map', 'filter', 'reduce', 'each', 'any', 'all') and rt.name == 'array':

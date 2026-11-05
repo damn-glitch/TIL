@@ -1142,6 +1142,14 @@ COMPILER_MESSAGES: List[Tuple[str, str, str]] = [
     ("line {line:int}: the native backend does not support effect handlers (handle ... with); use the TIL VM",
      "строка {line}: нативный бэкенд не поддерживает обработчики эффектов (handle ... with); используйте TIL VM",
      "{line}-жол: нативті бэкенд әсер өңдеушілерін қолдамайды (handle ... with); TIL VM қолданыңыз"),
+    ("line {line:int}: the classic C backend cannot keep the VMs' left-to-right order of evaluation here "
+     "(an operand with side effects next to one it could change); run it on the TIL VM, or without --no-types",
+     "строка {line}: классический C-бэкенд не может сохранить порядок вычисления слева направо, как в VM "
+     "(операнд с побочными эффектами рядом с тем, что он может изменить); запустите программу на TIL VM "
+     "или без --no-types",
+     "{line}-жол: классикалық C бэкенді VM-дегідей солдан оңға қарай есептеу ретін сақтай алмайды "
+     "(жанама әсері бар операнд өзі өзгерте алатын операндтың қасында); бағдарламаны TIL VM-де немесе "
+     "--no-types-сіз іске қосыңыз"),
     ("'{func}' can end without returning a value (None), which a native {type:type} cannot hold",
      "'{func}' может завершиться, не вернув значения (None), а нативный тип {type} не может хранить None",
      "'{func}' мән қайтармай аяқталуы мүмкін (None), ал нативті {type} типі None сақтай алмайды"),

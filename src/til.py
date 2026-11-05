@@ -12325,6 +12325,149 @@ def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
     return program
 
 
+# ── classic C backend: operand order (TIL 3.1 review) ─────────────────────────
+_CLASSIC_PURE_CALLS = frozenset({
+    'len', 'str', 'int', 'float', 'bool', 'abs', 'sqrt', 'pow', 'sin', 'cos', 'tan', 'log',
+    'exp', 'floor', 'ceil', 'round', 'min', 'max', 'chr', 'ord', 'range', 'type_of', 'format',
+    'sum', 'str_bytes', 'args', 'file_exists', 'Some', 'Ok', 'Err'})
+_CLASSIC_PURE_METHODS = frozenset({
+    'len', 'contains', 'starts_with', 'ends_with', 'trim', 'to_upper', 'to_lower', 'replace',
+    'slice', 'find', 'index_of', 'count', 'eq', 'split', 'repeat', 'is_empty', 'get', 'join',
+    'first', 'last', 'has', 'keys', 'values', 'get_or', 'is_some', 'is_none', 'is_ok', 'is_err',
+    'unwrap_or', 'to_string', 'copy', 'unwrap', 'error'})
+
+
+def classic_order_hazard(program: 'Program') -> Optional[ASTNode]:
+    """The classic C backend (`--no-types`, or no src/tiltypes.py) writes
+    operands as one C expression, and C does not define the order in which they
+    are evaluated, while the VMs evaluate left to right (`G += f()` reads G
+    before the call). Returns a node where that order is observable -- the
+    program then runs on the VM -- or None:
+
+    * an operand list (operator, call arguments and receiver, literal
+      elements, struct fields, f-string parts, index) with an operand that has
+      side effects (calls a function that prints, assigns a global, a field or
+      an element, calls a mutating method, ...) and another operand that reads
+      something such a call could change (a global, a field, an element, any
+      call);
+    * an assignment whose value has side effects and whose target is a field
+      or an element, or a compound assignment (`+=` ...) to a global.
+    """
+    funcs: Dict[str, List[FuncDef]] = {}
+    globals_: Set[str] = set()
+    consts: Set[str] = set()
+    types: Set[str] = set()
+    literal = (IntLit, FloatLit, StringLit, BoolLit, CharLit)
+    for st in program.statements:
+        if isinstance(st, FuncDef):
+            funcs.setdefault(st.name, []).append(st)
+        elif isinstance(st, ImplBlock):
+            for m in st.methods:
+                funcs.setdefault(m.name, []).append(m)
+        elif isinstance(st, VarDecl):
+            globals_.add(st.name)
+            if not st.mutable and isinstance(st.value, literal):
+                consts.add(st.name)
+        elif isinstance(st, (StructDef, EnumDef)):
+            types.add(st.name)
+    mutable_globals = globals_ - consts
+
+    def direct_impure(body) -> Tuple[bool, Set[str]]:
+        """(impure by itself, names of the user functions / methods it calls)."""
+        calls: Set[str] = set()
+        for n in walk(body):
+            if isinstance(n, Assignment):
+                t = n.target
+                if not isinstance(t, Identifier) or t.name in mutable_globals:
+                    return True, calls
+            elif isinstance(n, (PerformEffect, RetryExpr, TimeoutExpr, IntentBlock, EffectHandler)):
+                return True, calls
+            elif isinstance(n, Call):
+                f = n.func
+                if isinstance(f, Identifier):
+                    if f.name in funcs:
+                        calls.add(f.name)
+                    elif f.name not in _CLASSIC_PURE_CALLS and f.name not in types:
+                        return True, calls      # print, input, a closure value, ...
+                elif isinstance(f, Attribute):
+                    if f.attr in funcs:
+                        calls.add(f.attr)
+                    elif f.attr not in _CLASSIC_PURE_METHODS:
+                        return True, calls      # push, pop, sort, ...
+                else:
+                    return True, calls
+        return False, calls
+
+    summary = {name: direct_impure(fd) for name, defs in funcs.items() for fd in defs[:1]}
+    for name, defs in funcs.items():
+        for fd in defs[1:]:
+            imp, calls = direct_impure(fd)
+            summary[name] = (summary[name][0] or imp, summary[name][1] | calls)
+    impure = {name for name, (imp, _c) in summary.items() if imp}
+    changed = True
+    while changed:
+        changed = False
+        for name, (_imp, calls) in summary.items():
+            if name not in impure and calls & impure:
+                impure.add(name)
+                changed = True
+
+    def effectful(node) -> bool:
+        imp, calls = direct_impure(node)
+        return imp or bool(calls & impure)
+
+    def stable(node) -> bool:
+        """Nothing a call could change: literals, locals, constants, operators."""
+        for n in walk(node):
+            if isinstance(n, (Call, Index, Lambda, Assignment)):
+                return False
+            if isinstance(n, Attribute) and not (isinstance(n.obj, Identifier) and n.obj.name in types):
+                return False
+            if isinstance(n, Identifier) and n.name in mutable_globals:
+                return False
+        return True
+
+    def operand_lists(n):
+        if isinstance(n, BinaryOp) and n.op not in ('and', 'or'):
+            yield [n.left, n.right]
+        elif isinstance(n, Call):
+            ops = list(n.args)
+            if isinstance(n.func, Attribute):
+                ops = [n.func.obj] + ops
+            elif not isinstance(n.func, Identifier):
+                ops = [n.func] + ops
+            yield ops
+        elif isinstance(n, (ArrayLit, TupleLit)):
+            yield list(n.elements)
+        elif isinstance(n, DictLit):
+            yield [x for pair in n.pairs for x in pair]
+        elif isinstance(n, StructInit):
+            yield list(n.fields.values())
+        elif isinstance(n, FStringLit):
+            yield [x for part in n.parts if isinstance(part, (list, tuple)) and part and part[0] == 'expr'
+                   for x in part[1:] if isinstance(x, ASTNode)]
+        elif isinstance(n, Index):
+            yield [n.obj, n.index]
+        elif isinstance(n, Range):
+            yield [n.start, n.end]
+
+    for st in program.statements:
+        for n in walk(st):
+            if isinstance(n, Assignment) and effectful(n.value):
+                t = n.target
+                if isinstance(t, (Attribute, Index)) or (n.op != '=' and isinstance(t, Identifier)
+                                                         and t.name in mutable_globals):
+                    return n
+            for ops in operand_lists(n):
+                ops = [o for o in ops if o is not None]
+                if len(ops) < 2:
+                    continue
+                for i, o in enumerate(ops):
+                    if effectful(o) and any(not stable(p) for j, p in enumerate(ops) if j != i):
+                        return n
+    return None
+
+
 class TILCompiler:
     def __init__(self):
         self.verbose = False
@@ -12395,6 +12538,13 @@ class TILCompiler:
         if self.verbose:
             print(f"[TIL] Generating C code...")
         
+        hazard = classic_order_hazard(ast)
+        if hazard is not None:
+            raise NativeUnsupported(
+                f"native backend: line {getattr(hazard, 'line', 0)}: the classic C backend cannot keep "
+                "the VMs' left-to-right order of evaluation here (an operand with side effects next "
+                "to one it could change); run it on the TIL VM, or without --no-types")
+
         codegen = CCodeGenerator()
         c_code = codegen.generate(ast)
         
