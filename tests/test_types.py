@@ -145,6 +145,36 @@ class TestInference:
                             '    let k = i + 1\n')
         assert types == {'i': 'int', 'mixed': '[dynamic]', 'j': 'dynamic', 'k': 'int'}
 
+    def test_infinite_types_are_dynamic(self, tmp_path):
+        # polymorphic recursion (nest([v])) and an array that contains itself:
+        # the type would be infinite, so it is dynamic (no crash, no E-TYPE)
+        src = ('nest(v, n: int)\n    if n == 0\n        return str(v)\n    return nest([v], n - 1)\n'
+               'grow(xs)\n    xs.push(xs)\n    return len(xs)\n'
+               'main()\n    print(nest(1, 3))\n    var a = []\n    print(grow(a))\n')
+        assert etype_errors(src) == []
+        with pytest.raises(til.NativeUnsupported) as info:
+            c_code(src)
+        assert "dynamically typed" in str(info.value)
+        prog = tmp_path / 'nest.til'
+        prog.write_text(src)
+        r = cli('check', str(prog))
+        assert r.returncode == 0 and "internal error" not in r.stderr, r.stderr
+        r = cli('run', '--vm', str(prog))
+        assert r.stdout == "[[[1]]]\n1\n" and "internal error" not in r.stderr, r.stderr
+
+    def test_private_constraints_do_not_grow_schemes(self):
+        # f0's open constraint (g applied to an element of unknown type) only
+        # concerns f0's own variables: callers do not copy it (it used to double
+        # at every level: 12288 constraints in f12's scheme)
+        lines = ['g(x)', '    return x + 1', 'f0()', '    var v = []', '    return len(str(g(v[0])))']
+        for i in range(1, 13):
+            lines += [f'f{i}()', f'    return f{i - 1}() + f{i - 1}()']
+        src = '\n'.join(lines + ['main()', '    print(f12() * 0)']) + '\n'
+        ti = infer(src)
+        assert ti.errors == []
+        assert len(ti.funcs['f12'].scheme.templates) == 0
+        assert ti.funcs['g'].scheme.templates                    # x + 1 decides g's result
+
     def test_retry_with_a_string_fallback(self):
         types = main_locals('main()\n    let r = retry(2)\n        6 * 7\n    else\n        "failed: " + error\n'
                             '    let s = retry(1)\n        panic("x")\n    else\n        error\n')
@@ -203,6 +233,9 @@ class TestEType:
         'need(x: int) -> int\n    return x\nmain()\n    print(need("nope"))\n',
         # None fits references
         'struct P\n    x: int\nmain()\n    let s: str = None\n    var p: P = None\n    print(s, p)\n',
+        # a number given to `bool` stays a number on the VMs (no conversion, no error)
+        'h(b: bool, n: int) -> bool\n    if n <= 0\n        return b\n    return h(n, n - 1)\n'
+        'f(b: bool = 5) -> bool\n    let k: bool = 0\n    return b\nmain()\n    print(h(true, 1), f())\n',
         # dynamic code
         'main()\n    var v = 1\n    v = "x"\n    print(v * 2)\n',
         'main()\n    let m = {"a": 1}\n    print(m.get_or(5, 0), m.has(true))\n',
@@ -385,6 +418,54 @@ class TestNativeEqualsVM:
         assert rc == 0 and vm_out.startswith("false\ntrue\n10000000000000000159")
         assert run_native(src) == (0, vm_out)
 
+    def test_nul_bytes_are_explicit_errors(self):
+        """Native strings are C strings: a NUL byte from chr(0) or input() stops
+        the program with an explicit error instead of truncating the string."""
+        assert run_vm('main()\n    let z = 0\n    print(len(chr(z)))\n') == (0, "1\n")
+        src = 'main()\n    let z = 0\n    print(len(chr(z)))\n'
+        compiler = til.TILCompiler()
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, 'nul')
+            assert compiler.compile_to_executable(src, exe, "<test>", quiet=True)
+            r = subprocess.run([exe], capture_output=True, timeout=60)
+            assert r.returncode == 1 and r.stdout == b"" and b"NUL" in r.stderr
+            assert compiler.compile_to_executable('main()\n    let s = input()\n    print(len(s))\n', exe,
+                                                  "<test>", quiet=True)
+            r = subprocess.run([exe], input=b"ab\x00c\n", capture_output=True, timeout=60)
+            assert r.returncode == 1 and r.stdout == b"" and b"NUL" in r.stderr
+            r = subprocess.run([exe], input=b"abc\n", capture_output=True, timeout=60)
+            assert r.returncode == 0 and r.stdout == b"3\n"
+
+    def test_sorting_nan_is_an_explicit_error(self):
+        # where nan ends up depends on the sort algorithm (host Python's on the reference VM)
+        src = 'main()\n    let z = 0.0\n    var xs = [3.0, z / z, 1.0]\n    xs.sort()\n    print(len(xs))\n'
+        assert run_vm(src) == (0, "3\n")
+        rc, out = run_native(src)
+        assert rc == 1 and out == ""
+        assert native_matches_vm('main()\n    var xs = [3.0, 0.0, -0.0, -1.5]\n    xs.sort()\n    print(xs)\n') == \
+            "[-1.5, 0, -0, 3]\n"
+
+    def test_integer_literals_beyond_64_bits_fold_like_the_bytecode_compiler(self):
+        # const_eval folds with the exact value; at run time the literal is wrapped
+        src = ('const BIG = 18446744073709551616\nmain()\n    print(BIG / 2, BIG > 0, BIG % 10, BIG)\n'
+               '    let big = 18446744073709551616\n    print(big > 0, 18446744073709551616 > 0, 0 < BIG < 10)\n')
+        assert native_matches_vm(src) == "-9223372036854775808\ntrue\n6\n0\nfalse\ntrue\nfalse\n"
+
+    def test_floor_ceil_and_integer_formats_of_big_floats(self):
+        # floor/ceil are float(math.floor(x)) on the reference VM (never -0);
+        # {x:d} of a float beyond int64 is the exact integer (Python's int(x)).
+        # Compared with the reference VM only: the C VM differs here
+        # (docs/TIL_TYPES.md, "Known differences of the C VM").
+        src = ('main()\n    let a = 0.0 - 0.00001\n    let z = 0.0 - 0.0\n'
+               '    print(ceil(a), floor(z), ceil(-0.5), floor(-0.5), round(a))\n'
+               '    let big = 1e100\n    let neg = 0.0 - 9223372036854775808.0\n'
+               '    print(f"{big:d}", f"{neg:x}", f"{2.0 ** 70:b}")\n'
+               '    print(f"{123.9:d}", f"{-0.5:d}", f"{1e19:X}")\n')
+        rc, out = run_vm(src)
+        assert rc == 0 and run_native(src) == (0, out)
+        assert out.startswith("0\n0\n0\n-1\n-0\n1000000000000000015902891109759918046836080856394528138978132755"
+                              "7747838772170381060813469985856815104\n-8000000000000000\n1" + "0" * 70 + "\n123\n0\n")
+
     def test_kazakh_program(self):
         native_matches_vm('қосу(а: int, б: int) -> int\n    return а + б\nнегізгі()\n'
                           '    тұрақты нәтиже = қосу(2, 3)\n    басып_шығару(нәтиже)\n')
@@ -421,6 +502,63 @@ class TestFallback:
             c_code('make()\n    var total = 0\n    let f = |x: int| x + total\n    total = 10\n    return f\n'
                    'main()\n    print(make()(1))\n')
         assert "changes later" in str(info.value)
+
+    @pytest.mark.parametrize("src, vm_out", [
+        ('let A = B == NULL\nlet B = 5 + 0\nmain()\n    print(A)\n', "true\n"),
+        ('let A = f()\nlet B = 5 + 0\nf()\n    return B\nmain()\n    print(A, B)\n', "None\n5\n"),
+        ('let A = B\nlet B = C + 1\nlet C = 2\nmain()\n    print(A, B, C)\n', "None\n3\n2\n"),
+        # through a struct field default
+        ('struct S\n    v: int = L\nlet A = S {}\nlet L = 3 + 0\nmain()\n    print(A.v)\n', "None\n"),
+        # a `var` with a literal value is set in order too (only `let` literals are inlined)
+        ('let A = f()\nvar B = 5\nf()\n    return B\nmain()\n    print(A, B)\n', "None\n5\n"),
+        ('#[requires: x < LIMIT]\nf(x: int) -> int\n    return x\nlet A = retry(1)\n        f(1)\n'
+         '    else\n        0 - 1\nlet LIMIT = 10 + 0\nmain()\n    print(A)\n', "-1\n"),
+        # script mode: a top-level statement before the line that sets X
+        ('show()\n    print(X)\nshow()\nlet X = 5 + 0\nshow()\n', "None\n5\n"),
+    ])
+    def test_a_global_read_before_it_is_set(self, src, vm_out):
+        """Literal globals are set before anything runs (in the VMs and as C
+        initialisers); a computed one is None until its line has run, which a
+        native int cannot hold."""
+        assert run_both(src) == vm_out
+        with pytest.raises(til.NativeUnsupported) as info:
+            c_code(src)
+        assert "is read before its value is set" in str(info.value)
+
+    @needs_cc
+    def test_globals_read_after_they_are_set_stay_native(self):
+        src = ('let B = 5 + 0\nlet A = f() + C\nlet C = 2\nf() -> int\n    return B\n'
+               'main()\n    print(A, B, f())\n')
+        assert native_matches_vm(src) == "7\n5\n5\n"
+        assert native_matches_vm('print("start")\nlet X = 5 + 0\nf() -> int\n    return X\nprint(f())\n') == \
+            "start\n5\n"
+        # a string (any reference) read before its line has run is None natively too
+        assert native_matches_vm('let A = g()\nvar S = "s"\nlet T = "t"\ng()\n    return [S, T]\n'
+                                 'main()\n    print(A, S)\n') == '[None, "t"]\ns\n'
+
+    def test_a_number_given_to_a_bool_parameter_runs_on_the_vm(self):
+        src = 'show(b: bool)\n    print(b, b == true)\nmain()\n    show(5)\n    show(true)\n'
+        assert run_both(src) == "5\nfalse\ntrue\ntrue\n"
+        with pytest.raises(til.NativeUnsupported):
+            c_code(src)
+
+    @needs_cc
+    def test_lambda_called_where_its_captured_variable_is_shadowed(self):
+        # the VMs use the variable the lambda captured, not the one that shadows it
+        src = ('run(f, v: int) -> int\n    return f(v)\n'
+               'main()\n    let base = 1\n    let f = |x: int| x + base\n    print(f(1))\n'
+               '    if true\n        let base = 50\n        print(f(1), base)\n    print(f(2))\n')
+        assert run_both(src) == "2\n2\n50\n3\n"
+        with pytest.raises(til.NativeUnsupported) as info:
+            c_code(src)
+        assert "captured variable 'base' is not visible" in str(info.value)
+        # used as a value (passed on) where the captured variable is shadowed
+        with pytest.raises(til.NativeUnsupported) as info:
+            c_code(src.replace('print(f(1), base)', 'print(run(f, 1), base)'))
+        assert "captured variable 'base' is not visible" in str(info.value)
+        # not shadowed: native
+        assert native_matches_vm(src.replace('let base = 50', 'let other = 50')
+                                    .replace('print(f(1), base)', 'print(run(f, 1), other)')) == "2\n2\n50\n3\n"
 
     @needs_cc
     def test_run_falls_back_and_explains(self, tmp_path):

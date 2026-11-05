@@ -36,6 +36,7 @@ Part 2 (TYPED NATIVE BACKEND) turns the per-instance types into C.
 """
 
 import os
+import re
 import sys
 
 if 'til' in sys.modules:            # til.py loaded us (also as __main__): use that module
@@ -212,6 +213,24 @@ def canon(t) -> str:
     return f"{short}_{inner}"
 
 
+def occurs(r: TVar, t) -> bool:
+    """Does the class of root `r` occur inside the term t (an infinite type)?"""
+    stack = list(t.args) if isinstance(t, TCon) else [t]
+    seen = set()
+    while stack:
+        x = stack.pop()
+        if isinstance(x, TVar):
+            x = root(x)
+            if x is r:
+                return True
+            if id(x) in seen or x.value is None:
+                continue
+            seen.add(id(x))
+            x = x.value
+        stack.extend(x.args)
+    return False
+
+
 def contains(t, names) -> bool:
     """Does a (resolved) type mention one of these constructor names?"""
     t = resolve(t)
@@ -239,6 +258,8 @@ class Solver:
         return TVar()
 
     def bind(self, r: TVar, value: TCon):
+        if value.args and occurs(r, value):
+            value = DYN                   # an infinite type (`nest([v])` recursion): dynamic
         r.value = value
         self.wake(r)
 
@@ -247,6 +268,8 @@ class Solver:
         a.parent = b
         if a.waiters:
             self.wake(a)
+        if b.value is not None and b.value.args and occurs(b, b.value):
+            self.bind(b, DYN)             # a = [a]: infinite, so dynamic
 
     def wake(self, r: TVar):
         if r.waiters:
@@ -1045,7 +1068,10 @@ def parses_as(text: str, t) -> bool:
 
 def kind_mismatch(d, v) -> bool:
     """Can a value of (resolved) type v never satisfy the declared type d?
-    Numbers convert into each other (the VMs cast), None fits references."""
+    Numbers convert into each other (the VMs cast), None fits references. A
+    number given to a `bool` annotation is not reported: the VMs keep the number
+    as it is (no conversion, no error) and programs rely on that (an int passed
+    to `b: bool` is how the prover's soundness tests make a non-bool `b`)."""
     if not (isinstance(d, TCon) and isinstance(v, TCon)):
         return False
     if d in (DYN, UNK) or v in (DYN, UNK) or v.name == 'strish':
@@ -1054,7 +1080,9 @@ def kind_mismatch(d, v) -> bool:
         return v.name not in ('int', 'float', 'bool', 'nil')
     if v is NIL:
         return not nullable(d) and d is not BOOL
-    if d is STR or d is BOOL:
+    if d is BOOL:
+        return v.name not in ('bool', 'int', 'float')
+    if d is STR:
         return v is not d
     if is_struct(d) or is_adt(d):
         return v.name != d.name
@@ -2568,14 +2596,39 @@ class TypeInfer:
             for t in c.terms():
                 _free(t, cand)
         q = cand - env
-        templates = []
+        templated = []
         for c in pending:
             fv: Set[TVar] = set()
             for t in c.terms():
                 _free(t, fv)
             if fv & q:
-                templates.append(c)
-                c.done = True           # lives on in the scheme only
+                templated.append((c, fv))
+                c.done = True           # lives on in the scheme only (or nowhere, below)
+        # A caller only needs the open constraints connected to the signature; the
+        # others constrain variables private to the body. Copying those at every
+        # call made schemes grow with the size of the call graph (hundreds of
+        # thousands of constraints for a large program).
+        parent: Dict[int, int] = {}
+
+        def find(i):
+            while parent.get(i, i) != i:
+                parent[i] = parent.get(parent[i], parent[i])
+                i = parent[i]
+            return i
+
+        for _c, fv in templated:
+            ids = [id(v) for v in fv]
+            r0 = find(ids[0])
+            for i in ids[1:]:
+                ri = find(i)
+                if ri != r0:
+                    parent[ri] = r0
+        sig_vars: Set[TVar] = set()
+        for info in infos:
+            for t in list(info.mono.params) + [info.mono.ret]:
+                _free(t, sig_vars)
+        live = {find(id(v)) for v in sig_vars}
+        templates = [c for c, fv in templated if find(id(next(iter(fv)))) in live]
         for info in infos:
             info.scheme = Scheme(q, info.mono, templates)
 
@@ -3102,6 +3155,11 @@ static void til_arr_sort(TIL_Arr* a, til_cmp_fn cmp) {
     int64_t n = til_arr_chk(a)->len, w, i;
     TIL_Slot* tmp;
     if (n < 2) return;
+    if (cmp == til_cmp_f)
+        for (i = 0; i < n; i++)
+            if (a->data[i].f != a->data[i].f)       /* where nan ends up depends on the sort algorithm */
+                til_panic("sort(): the array contains nan, whose place in the order the native "
+                          "backend cannot reproduce (run the program on the TIL VM)");
     tmp = (TIL_Slot*)til_alloc_obj(sizeof(TIL_Slot) * (size_t)n);
     for (w = 1; w < n; w *= 2) {
         for (i = 0; i < n; i += 2 * w) {
@@ -3377,6 +3435,39 @@ static int64_t til_ord(const char* s) {
     return c;
 }
 
+/* digits of the integer value of a finite double with |x| >= 2^63, exact like
+   Python's int(x) (f"{x:d}" on the reference VM): x = mant * 2^e, written into
+   32-bit limbs, then divided by the base repeatedly */
+static char* til_big_digits(double x, int base, const char* set) {
+    uint32_t limb[34];
+    char tmp[1100];
+    int e, j, n, d = 0, i;
+    uint64_t mant = (uint64_t)ldexp(frexp(fabs(x), &e), 53);
+    char* out;
+    e -= 53;                                    /* |x| = mant * 2^e, e >= 11 here */
+    memset(limb, 0, sizeof limb);
+    for (j = 0; j < 53; j++)
+        if ((mant >> j) & 1) limb[(e + j) / 32] |= (uint32_t)1 << ((e + j) % 32);
+    n = (e + 53) / 32 + 1;
+    while (n > 0 && limb[n - 1] == 0) n--;
+    while (n > 0) {
+        uint64_t rem = 0;
+        for (i = n - 1; i >= 0; i--) {
+            uint64_t cur = (rem << 32) | limb[i];
+            limb[i] = (uint32_t)(cur / (uint64_t)base);
+            rem = cur % (uint64_t)base;
+        }
+        tmp[d++] = set[rem];
+        while (n > 0 && limb[n - 1] == 0) n--;
+    }
+    out = (char*)til_alloc_obj((size_t)d + 2);
+    i = 0;
+    if (x < 0) out[i++] = '-';
+    while (d) out[i++] = tmp[--d];
+    out[i] = '\0';
+    return out;
+}
+
 /* f-string format specs: [<>^][0][width][.prec][f|e|%|d|x|X|o|b] (same rules as the VMs) */
 static const char* til_fmt_spec(int kind, int64_t iv, double fv, const char* body, const char* spec) {
     const char* p = spec;
@@ -3416,6 +3507,10 @@ static const char* til_fmt_spec(int kind, int64_t iv, double fv, const char* bod
             if (conv == '%') strcat(num, "%");
             body = num;
         }
+    } else if (conv && strchr("dxXob", conv) && kind == 1 && !isinf(fv) &&
+               (fv >= 9223372036854775808.0 || fv < -9223372036854775808.0)) {
+        int base = conv == 'd' ? 10 : conv == 'o' ? 8 : conv == 'b' ? 2 : 16;
+        body = til_big_digits(fv, base, conv == 'X' ? "0123456789ABCDEF" : "0123456789abcdef");
     } else if (conv && strchr("dxXob", conv) && is_num) {
         int64_t n = kind == 0 ? iv : til_f2i(fv);
         uint64_t u = n < 0 ? 0 - (uint64_t)n : (uint64_t)n;
@@ -3467,7 +3562,11 @@ static const char* til_input(const char* prompt) {
     int c;
     if (prompt) { fputs(prompt, stdout); }
     fflush(stdout);
-    while ((c = getchar()) != EOF && c != '\n') { char ch = (char)c; til_buf_put(&b, &ch, 1); }
+    while ((c = getchar()) != EOF && c != '\n') {
+        char ch = (char)c;
+        if (c == 0) til_panic("input(): the line contains NUL bytes, which the native backend cannot represent");
+        til_buf_put(&b, &ch, 1);
+    }
     return til_buf_done(&b);
 }
 static uint64_t til_rng = 0x9E3779B97F4A7C15ULL;
@@ -3555,6 +3654,9 @@ static bool til_truthy_map(TIL_Map* m) { return m && m->len; }
 static void* til_nn(void* p, const char* field) { if (!p) til_panic_str("no field '", field, "' on nil"); return p; }
 static void* til_nm(void* p, const char* method) { if (!p) til_panic_str("no method '", method, "' on nil"); return p; }
 static double til_round_vm(double x) { return x != x ? x : copysign(floor(fabs(x) + 0.5), x); }
+/* the reference VM computes float(math.floor(x)): an integral result, never -0.0 */
+static double til_floor_vm(double x) { double r = floor(x); return r == 0 ? 0.0 : r; }
+static double til_ceil_vm(double x) { double r = ceil(x); return r == 0 ? 0.0 : r; }
 static int64_t til_min_i(int64_t a, int64_t b) { return b < a ? b : a; }
 static int64_t til_max_i(int64_t a, int64_t b) { return b > a ? b : a; }
 static double til_min_f(double a, double b) { return b < a ? b : a; }
@@ -3637,6 +3739,15 @@ def c_string_opaque(text: str) -> str:
 def is_ptr(t) -> bool:
     """Values represented by a C pointer (NULL = None)."""
     return t.name in PTR_KINDS or t.name == 'fn' or is_struct(t) or is_adt(t)
+
+
+def preset_global(decl) -> bool:
+    """A global the VMs set before any code runs: an immutable one with a literal
+    value (inlined as a constant). Every other global is set in order at start-up
+    (a `var` with a literal value too) and is None until then; here they are C
+    statics (NULL / 0) assigned in the same order."""
+    return (decl.value is not None and not decl.deferred and not decl.mutable and
+            isinstance(decl.value, (til.IntLit, til.FloatLit, til.StringLit, til.BoolLit, til.CharLit)))
 
 
 def literal_default(node) -> bool:
@@ -4188,6 +4299,7 @@ class TypedCGen(til.CCodeGenerator):
                     self._capabilities = {}
                 self._capabilities[st.name] = st
         self.build_instances()
+        self.check_global_init_order(program)
 
         # function bodies first: they decide which helper types are needed
         functions = []
@@ -4343,6 +4455,96 @@ class TypedCGen(til.CCodeGenerator):
                     base += "_"
             self.inst_names[ikey] = base
 
+    def check_global_init_order(self, program):
+        """The VMs set the globals one after the other at start-up (`let`/`const`
+        literals before anything runs, like the static C initialisers here); a global read
+        before its initialiser has run is None there -- directly, through a
+        function the initialiser calls, or (script mode) by a top-level statement
+        before the line that sets it. A native int/float/bool (or Result) cannot
+        hold that None, so such a program runs on the VM."""
+        ti = self.ti
+
+        def scalar(name):
+            g = ti.globals.get(name)
+            t = g.frozen if g is not None else None
+            return t is not None and not (t.name == 'option' or is_ptr(t))
+
+        computed = [d for d in self._globals if d.value is not None and not preset_global(d) and scalar(d.name)]
+        if not computed:
+            return
+        watched = {d.name for d in computed}
+        by_name: Dict[str, list] = {}
+        for info in ti.funcs.values():
+            by_name.setdefault(info.name, []).append(info.fdef)
+        summaries: Dict[int, Tuple[Set[str], list]] = {}
+
+        def summary(node):
+            """(watched globals named in node, functions / struct definitions it may run)."""
+            key = id(node)
+            if key not in summaries:
+                names: Set[str] = set()
+                runs = []
+                texts, roots = [], [node]
+                if isinstance(node, til.FuncDef):
+                    texts = list(node.attributes or [])
+                    roots += [p.default for p in node.params if p.default is not None]   # not ASTNodes
+                for x in (y for r in roots for y in walk(r)):
+                    nm = None
+                    if isinstance(x, til.Identifier):
+                        nm = x.name
+                    elif isinstance(x, til.Attribute):
+                        nm = x.attr
+                    elif isinstance(x, til.StructInit) and x.name in self.structs:
+                        runs.extend(f.default for f in self.structs[x.name].fields     # field defaults
+                                    if f.default is not None)
+                    if nm is None:
+                        continue
+                    if nm in watched and isinstance(x, til.Identifier):
+                        names.add(nm)
+                    runs.extend(by_name.get(nm, ()))
+                for text in texts:                              # contracts: #[requires: x < LIMIT]
+                    names.update(w for w in re.findall(r'\w+', text) if w in watched)
+                summaries[key] = (names, runs)
+            return summaries[key]
+
+        def reads(nodes) -> Set[str]:
+            out: Set[str] = set()
+            seen: Set[int] = set()
+            stack = list(nodes)
+            while stack:
+                nd = stack.pop()
+                if id(nd) in seen:
+                    continue
+                seen.add(id(nd))
+                names, runs = summary(nd)
+                out |= names
+                stack.extend(runs)
+            return out
+
+        def refuse(name, node):
+            self.inst = self.ginst
+            self.unsupported(f"global '{name}' is read before its value is set (the VMs see None "
+                             f"there, which a native {show(ti.globals[name].frozen)} cannot hold)", node)
+
+        # globals initialised before main(), in order; script-mode ones (deferred) later
+        unset = {d.name for d in computed}
+        for decl in self._globals:
+            if decl.value is None or decl.deferred or preset_global(decl):
+                continue
+            early = reads([decl.value]) & unset
+            if early:
+                refuse(sorted(early)[0], decl)
+            unset.discard(decl.name)
+        deferred = {d.name for d in computed if d.deferred}
+        if not deferred:
+            return
+        main = next((st for st in program.statements if isinstance(st, til.FuncDef) and st.name == 'main'), None)
+        stmts = main.body.statements if main is not None and isinstance(main.body, til.Block) else []
+        for k, st in enumerate(stmts):
+            if isinstance(st, til.GlobalInit) and st.decl is not None and st.decl.name in deferred:
+                if st.decl.name in reads(stmts[:k] + [st.decl.value]):
+                    refuse(st.decl.name, st)
+
     def global_decls(self) -> List[str]:
         lines = []
         if not self._globals:
@@ -4359,8 +4561,7 @@ class TypedCGen(til.CCodeGenerator):
                 # the VMs start a global without a value as None (whatever its annotation)
                 self.unsupported(f"global '{decl.name}' starts as None, which a native {show(t)} "
                                  "cannot hold", decl)
-            if decl.value is not None and not decl.deferred and \
-                    isinstance(decl.value, (til.IntLit, til.FloatLit, til.StringLit, til.BoolLit, til.CharLit)):
+            if preset_global(decl):
                 lines.append(f"static {c} {cname} = {self.x(decl.value)};")
             else:
                 lines.append(f"static {c} {cname};")
@@ -4479,9 +4680,7 @@ class TypedCGen(til.CCodeGenerator):
         saved = self.inst
         self.inst = self.ginst
         for decl in self._globals:
-            if decl.value is None or decl.deferred:
-                continue
-            if isinstance(decl.value, (til.IntLit, til.FloatLit, til.StringLit, til.BoolLit, til.CharLit)):
+            if decl.value is None or decl.deferred or preset_global(decl):
                 continue
             g = self.ti.globals[decl.name]
             code = self.coerce(self.x(decl.value), self.T(decl.value), g.frozen, decl)
@@ -4988,7 +5187,12 @@ class TypedCGen(til.CCodeGenerator):
         found = self.lookup_var(name)
         if found is not None:
             if isinstance(found[0], dict):
-                return self.closure_value(found[0]['lam'])
+                info = found[0]
+                for (til_name, _c, _t), entry in zip(info['caps'], info['entries']):
+                    if self.lookup_var(til_name) is not entry:      # out of scope, or shadowed
+                        self.unsupported(f"the lambda '{info['name']}' is used where its captured "
+                                         f"variable '{til_name}' is not visible", n)
+                return self.closure_value(info['lam'])
             return found[0]
         if name in self.ti.globals:
             return c_global(name)
@@ -5037,6 +5241,12 @@ class TypedCGen(til.CCodeGenerator):
         env = self._inline_consts
         for x in walk(n):
             if isinstance(x, til.Identifier) and x.name in env and self.lookup_var(x.name) is not None:
+                return True
+            # an integer literal beyond 64 bits: const_eval computes with the exact
+            # value (`18446744073709551616 > 0` is true), run time with the wrapped one
+            big = x.value if isinstance(x, til.IntLit) else \
+                env.get(x.name) if isinstance(x, til.Identifier) and self.lookup_var(x.name) is None else None
+            if isinstance(big, int) and not isinstance(big, bool) and not -(1 << 63) <= big < (1 << 63):
                 return True
             if isinstance(x, til.BinaryOp) and x.op in ('==', '!='):
                 try:
@@ -5957,7 +6167,10 @@ class TypedCGen(til.CCodeGenerator):
         prelude, codes = self.seq(nodes, gen)
         if recv_code is not None:
             codes = [recv_code] + codes
-        return self.wrap(prelude, f"{cname}({', '.join(codes)})")
+        call = f"{cname}({', '.join(codes)})"
+        if callee.ret is NIL:
+            call = f"({call}, NULL)"        # a C void function: its value (None) is NULL
+        return self.wrap(prelude, call)
 
     # ── lambdas bound to names: static C functions, captures passed at the call ──
     def bind_lambda(self, name: str, lam):
@@ -5969,6 +6182,7 @@ class TypedCGen(til.CCodeGenerator):
         cname = f"_til_lambda_{k}"
         pnames = [p for p, _t in lam.params]
         caps = []
+        entries = []        # the captured declarations themselves (a shadowing one has the same C name)
         for node in walk(lam.body):
             if isinstance(node, til.Identifier) and node.name not in pnames and node.name not in [c[0] for c in caps]:
                 found = self.lookup_var(node.name)
@@ -5976,6 +6190,7 @@ class TypedCGen(til.CCodeGenerator):
                     if isinstance(found[0], dict):
                         self.unsupported(f"the lambda '{name}' calls another lambda", lam)
                     caps.append((node.name, found[0], found[1]))
+                    entries.append(found)
         saved = (self.output, self.indent, self.scopes, self.cnames_used, self._recover_stack, self._loop_depth)
         self.output, self.indent, self.scopes, self.cnames_used = [], 1, [], []
         self._recover_stack, self._loop_depth = [], 0
@@ -6006,15 +6221,14 @@ class TypedCGen(til.CCodeGenerator):
         finally:
             self.output, self.indent, self.scopes, self.cnames_used, self._recover_stack, self._loop_depth = saved
         self.lambda_defs.append(text)
-        self.scopes[-1][name] = ({'cname': cname, 'caps': caps, 'ptypes': ptypes, 'ret': ret,
-                                  'name': name, 'lam': lam}, ft)
+        self.scopes[-1][name] = ({'cname': cname, 'caps': caps, 'entries': entries, 'ptypes': ptypes,
+                                  'ret': ret, 'name': name, 'lam': lam}, ft)
 
     def call_lambda(self, info, args, n):
         if len(args) != len(info['ptypes']):
             self.unsupported(f"calling the lambda '{info['name']}' with {len(args)} argument(s)", n)
-        for til_name, c_name, _t in info['caps']:
-            found = self.lookup_var(til_name)
-            if found is None or found[0] != c_name:
+        for (til_name, _c, _t), entry in zip(info['caps'], info['entries']):
+            if self.lookup_var(til_name) is not entry:      # out of scope, or shadowed
                 self.unsupported(f"the lambda '{info['name']}' is called where its captured "
                                  f"variable '{til_name}' is not visible", n)
         prelude, codes = self.seq(args, lambda i, nd: (
@@ -6095,9 +6309,8 @@ class TypedCGen(til.CCodeGenerator):
         return self.sx(lines, call)
 
     def call_lambda_codes(self, info, codes, n):
-        for til_name, c_name, _t in info['caps']:
-            found = self.lookup_var(til_name)
-            if found is None or found[0] != c_name:
+        for (til_name, _c, _t), entry in zip(info['caps'], info['entries']):
+            if self.lookup_var(til_name) is not entry:      # out of scope, or shadowed
                 self.unsupported(f"the lambda '{info['name']}' is used where its captured variable "
                                  f"'{til_name}' is not visible", n)
         args = [self.coerce(c, pt, pt, n) for c, pt in zip(codes, info['ptypes'])]
@@ -6177,7 +6390,7 @@ class TypedCGen(til.CCodeGenerator):
         if name in ('sqrt', 'sin', 'cos', 'tan', 'log', 'exp', 'floor', 'ceil', 'round'):
             if t0 not in (INT, FLOAT, UNK):
                 self.unsupported(f"{name}() of {show(t0)}", n)
-            fn = {'round': 'til_round_vm', 'sqrt': 'sqrt', 'log': 'log'}.get(name, name)
+            fn = {'round': 'til_round_vm', 'floor': 'til_floor_vm', 'ceil': 'til_ceil_vm'}.get(name, name)
             return w(f"{fn}((double)({a0}))")
         if name == 'pow':
             if any(t not in (INT, FLOAT, UNK) for t in types):

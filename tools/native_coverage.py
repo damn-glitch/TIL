@@ -193,7 +193,8 @@ class _OutputCap(Exception):
 
 
 def run_reference(prog):
-    """(exit code, stdout bytes) on the Python VM, or None if the step budget ran out."""
+    """(exit code, stdout bytes) on the Python VM, or None when the VM hit a limit
+    (step budget, output cap, or a fatal error such as its recursion limit)."""
     module = til.TBCModule.from_bytes(til.compile_to_bytecode(prog.source, prog.filename).serialize())
     out = []
     size = [0]
@@ -262,7 +263,8 @@ def measure_one(prog, workdir, opt=0):
         result.update(status='vm-error', reason=f"{type(e).__name__}: {e}")
         return result
     if ref is None:
-        result.update(status='vm-limit', reason=f"VM step budget ({VM_STEPS}) or output cap exceeded")
+        result.update(status='vm-limit', reason=f"VM limit: step budget ({VM_STEPS}), output cap or a fatal "
+                                                f"error such as the recursion limit")
         return result
     native = run_native(prog, workdir, opt)
     if native[0] == 'fallback':
@@ -365,7 +367,8 @@ def main(argv=None):
     ap.add_argument('--jobs', type=int, default=0)
     ap.add_argument('-O', '--opt', type=int, default=0, help="C optimisation level (default 0)")
     ap.add_argument('--json', help="write per-program results to this file")
-    ap.add_argument('--compare', help="baseline JSON: report programs that regressed")
+    ap.add_argument('--compare', help="baseline JSON: report programs that regressed; exit status 1 "
+                                      "on a regression or on any native output that differs from the VM")
     ap.add_argument('--details', action='store_true', help="one line per program")
     ap.add_argument('--reasons', action='store_true', help="most common fallback / mismatch reasons")
     ap.add_argument('--filter', help="only programs whose label contains this text")
@@ -396,7 +399,12 @@ def main(argv=None):
         print(f"\ncompared with {args.compare}: {len(worse)} regression(s)")
         for r, old in worse:
             print(f"  {r['id']} {r['label']}: {old} -> {r['status']} {r.get('reason', '')}")
-        rc = 1 if worse else 0
+        # native output that differs from the VM fails the check too, also for a
+        # program that was not native in the baseline (never a silent wrong result)
+        wrong = [r for r in results if r['status'] == 'native-mismatch']
+        for r in wrong:
+            print(f"  native output differs from the VM: {r['id']} {r['label']} {r.get('reason', '')}")
+        rc = 1 if worse or wrong else 0
     return rc
 
 

@@ -1,12 +1,12 @@
 {
  "summary": {
   "programs": 233,
-  "compared": 232,
-  "native": 206,
+  "compared": 231,
+  "native": 205,
   "native_ok": 203,
-  "native_mismatch": 3,
+  "native_mismatch": 2,
   "fallback": 26,
-  "vm_limit": 1,
+  "vm_limit": 2,
   "vm_error": 0
  },
  "programs": [
@@ -810,14 +810,14 @@
   {
    "id": "395319f6a475",
    "label": "tests/test_v3.py:323",
-   "status": "native-mismatch",
-   "reason": "exit -11 vs VM 1"
+   "status": "vm-limit",
+   "reason": "VM limit: step budget (5000000), output cap or a fatal error such as the recursion limit"
   },
   {
    "id": "ca438b890dc6",
    "label": "tests/test_v3.py:328",
    "status": "native-mismatch",
-   "reason": "stdout b'94383813624072\\n' vs VM b'contract violation: fact requires n >= 0\\n'"
+   "reason": "stdout b'93830587191560\\n' vs VM b'contract violation: fact requires n >= 0\\n'"
   },
   {
    "id": "10f58a6c61c4",
@@ -863,7 +863,7 @@
    "id": "3b2544c05f9e",
    "label": "tests/test_v3.py:422",
    "status": "native-mismatch",
-   "reason": "stdout b'94334796955906\\n' vs VM b\"intent 'parse config' failed: bad token\\n\""
+   "reason": "stdout b'94783913046274\\n' vs VM b\"intent 'parse config' failed: bad token\\n\""
   },
   {
    "id": "6b2915c3b2b9",
@@ -961,7 +961,7 @@
    "id": "005a88d94732",
    "label": "tests/test_v3.py:468",
    "status": "vm-limit",
-   "reason": "VM step budget (5000000) or output cap exceeded"
+   "reason": "VM limit: step budget (5000000), output cap or a fatal error such as the recursion limit"
   },
   {
    "id": "635230b99eb6",
