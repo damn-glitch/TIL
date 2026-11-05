@@ -3069,8 +3069,8 @@ def check_program(program, source: str, filename: str, explicit: bool) -> List[s
         if explicit:
             return [f"error[{ERROR_CODE}]: til check --prove needs the Z3 SMT solver, which is not installed\n"
                     f"  = hint: {INSTALL_HINT}"]
-        print(f"warning: {len(keys)} #[level: 4] function(s) in {filename} were not proved: "
-              f"the Z3 SMT solver is not installed ({INSTALL_HINT})", file=sys.stderr)
+        print(til.localize(f"warning: {len(keys)} #[level: 4] function(s) in {filename} were not proved: "
+                           f"the Z3 SMT solver is not installed ({INSTALL_HINT})"), file=sys.stderr)
         return []
     prover = Prover(program, source, filename)
     errors: List[str] = []
@@ -3120,7 +3120,16 @@ Exit code 0 when everything in scope is proved. Needs Z3: {INSTALL_HINT}
 _VALUE_OPTIONS = ('--timeout', '--memory', '--function')
 
 
+def _(text: str) -> str:
+    """A diagnostic in the language of TIL's messages (src/tilmsg.py)."""
+    return til.localize(text)
+
+
+@til.scoped_message_language          # a program's #[lang: ...] pragma lasts for this call only
 def main(argv: List[str]) -> int:
+    """`til prove`. Diagnostics (standard error) are in the language of TIL's
+    messages (--lang / TIL_LANG / the program's pragma, docs/TIL_I18N.md); the
+    report on standard output and the usage text stay English."""
     path = None
     timeout = DEFAULT_TIMEOUT_MS
     memory = None
@@ -3138,7 +3147,7 @@ def main(argv: List[str]) -> int:
             return 0
         if a in _VALUE_OPTIONS:
             if i + 1 >= len(argv):
-                print(f"til prove: {a} needs a value\n\n{USAGE}", end="", file=sys.stderr)
+                print(_(f"til prove: {a} needs a value") + f"\n\n{USAGE}", end="", file=sys.stderr)
                 return 2
             value = argv[i + 1]
             i += 2
@@ -3158,7 +3167,7 @@ def main(argv: List[str]) -> int:
             i += 1
             continue
         else:
-            print(f"til prove: unknown option {a}\n\n{USAGE}", end="", file=sys.stderr)
+            print(_(f"til prove: unknown option {a}") + f"\n\n{USAGE}", end="", file=sys.stderr)
             return 2
         if a in ('--timeout', '--memory'):
             what = "milliseconds" if a == '--timeout' else f"megabytes (at least {MIN_MEMORY_MB})"
@@ -3168,7 +3177,7 @@ def main(argv: List[str]) -> int:
                 if number < least:
                     raise ValueError
             except ValueError:
-                print(f"til prove: {a} needs a number of {what}, got {value!r}", file=sys.stderr)
+                print(_(f"til prove: {a} needs a number of {what}, got {value!r}"), file=sys.stderr)
                 return 2
             if a == '--timeout':
                 timeout = number
@@ -3180,34 +3189,35 @@ def main(argv: List[str]) -> int:
         print(USAGE, end="", file=sys.stderr)
         return 2
     if not os.path.exists(path):
-        print(f"Error: File not found: {path}", file=sys.stderr)
+        print(_(f"Error: File not found: {path}"), file=sys.stderr)
         return 1
     if not load_z3():
-        print(f"til prove needs the Z3 SMT solver, which is not installed.\n"
-              f"Install it with:  {INSTALL_HINT}", file=sys.stderr)
+        print(_(f"til prove needs the Z3 SMT solver, which is not installed.\n"
+                f"Install it with:  {INSTALL_HINT}"), file=sys.stderr)
         return 1
     try:
         with open(path, 'r', encoding='utf-8') as f:
             source = f.read()
+        til.use_program_message_language(source)      # #[lang: ru] -> Russian messages
         program = til.resolve_imports(til.parse_source(source, path), path)
         errors = til.SemanticChecker(source, path).check(program)
         if errors:
             for err in errors:
-                print(err, file=sys.stderr)
+                print(_(err), file=sys.stderr)
             return 1
         til.BytecodeCompiler(source, path).compile_program(program)
     except SyntaxError as e:
-        print(f"Syntax Error: {e}", file=sys.stderr)
+        print(_(f"Syntax Error: {e}"), file=sys.stderr)
         return 1
     except til.CompileError as e:
-        print(str(e), file=sys.stderr)
+        print(_(str(e)), file=sys.stderr)
         return 1
     except (ValueError, OSError) as e:      # a directory, a file that is not UTF-8, ...
-        print(f"Error: {e}", file=sys.stderr)
+        print(_(f"Error: {e}"), file=sys.stderr)
         return 1
     prover = Prover(program, source, path, timeout, memory_mb=memory)
     if only is not None and not prover.targets(False, only):
-        print(f"til prove: no function named '{only}' in {path}", file=sys.stderr)
+        print(_(f"til prove: no function named '{only}' in {path}"), file=sys.stderr)
         return 1
     keys = prover.targets(True, only)
     print(f"Proving {path} with Z3 {z3_version()} (64-bit integers, {timeout} ms per query)")
@@ -3228,7 +3238,7 @@ def main(argv: List[str]) -> int:
                 print(f"      ({rep.seconds:.2f} s)")
         sys.stdout.flush()
         for err in format_errors(rep, prover.reporter, prover.timeout):
-            print(err, file=sys.stderr)
+            print(_(err), file=sys.stderr)
     counts: Dict[str, int] = {}
     for rep in reports:
         counts[rep.status] = counts.get(rep.status, 0) + 1

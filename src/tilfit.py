@@ -2835,7 +2835,7 @@ def build_device_vm(dev: Device, verbose: bool = False) -> Tuple[Optional[str], 
         tmp = f"{exe}.{os.getpid()}.tmp"
         cmd = [cc, '-std=c99', VM_OPT] + flags + ['-o', tmp, sources[0], sources[2], '-lm']
         if verbose:
-            print("[til fit] building the device VM: " + " ".join(cmd), file=sys.stderr)
+            print(_("[til fit] building the device VM: " + " ".join(cmd)), file=sys.stderr)
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
             return None, "building the device VM failed:\n" + res.stderr
@@ -3081,6 +3081,11 @@ def format_devices() -> str:
 #                                  ENTRY POINTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _(text: str) -> str:
+    """A diagnostic in the language of TIL's messages (src/tilmsg.py)."""
+    return til.localize(text)
+
+
 USAGE = """\
 usage: til fit PROGRAM --device NAME [options] [-- ARGS...]
        til fit --list-devices [--json]
@@ -3133,15 +3138,15 @@ def check_build(data: bytes, device: str, filename: str) -> bool:
     try:
         dev = load_device(device)
     except KeyError:
-        print(f"Error: unknown device '{device}' (til fit --list-devices)", file=sys.stderr)
+        print(_(f"Error: unknown device '{device}' (til fit --list-devices)"), file=sys.stderr)
         return False
     except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(_(f"Error: {e}"), file=sys.stderr)
         return False
     try:
         an = Analysis(data, filename)
     except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(_(f"Error: {e}"), file=sys.stderr)
         return False
     r = check(an, dev)
     if not r.fits:
@@ -3158,7 +3163,11 @@ def check_build(data: bytes, device: str, filename: str) -> bool:
     return True
 
 
+@til.scoped_message_language          # a program's #[lang: ...] pragma lasts for this call only
 def main(argv: List[str]) -> int:
+    """`til fit`. Diagnostics (standard error) are in the language of TIL's
+    messages (--lang / TIL_LANG / the program's pragma, docs/TIL_I18N.md); the
+    report, --json and the usage text stay English."""
     device, program = None, None
     want_run = want_json = strip = functions = show_output = verbose = list_devices = False
     max_steps, timeout, stdin_path = 0, None, None
@@ -3214,7 +3223,7 @@ def main(argv: List[str]) -> int:
                 prog_args.append(a)
             i += 1
     except ValueError as e:
-        print(f"til fit: {e}\n\n{USAGE}", file=sys.stderr)
+        print(_(f"til fit: {e}") + f"\n\n{USAGE}", file=sys.stderr)
         return 2
 
     if list_devices:
@@ -3225,28 +3234,31 @@ def main(argv: List[str]) -> int:
             print(format_devices())
         return 0
     if program is None or device is None:
-        print("til fit: " + ("no program given" if program is None else "--device NAME is required "
-                             "(til fit --list-devices)") + "\n\n" + USAGE, file=sys.stderr)
+        print(_("til fit: " + ("no program given" if program is None else "--device NAME is required "
+                               "(til fit --list-devices)")) + "\n\n" + USAGE, file=sys.stderr)
         return 2
     try:
         dev = load_device(device)
     except KeyError:
-        print(f"til fit: unknown device '{device}'; known: {', '.join(DEVICES)}", file=sys.stderr)
+        print(_(f"til fit: unknown device '{device}'; known: {', '.join(DEVICES)}"), file=sys.stderr)
         return 2
     except ValueError as e:
-        print(f"til fit: {e}", file=sys.stderr)
+        print(_(f"til fit: {e}"), file=sys.stderr)
         return 2
     if not os.path.exists(program):
-        print(f"til fit: file not found: {program}", file=sys.stderr)
+        print(_(f"til fit: file not found: {program}"), file=sys.stderr)
         return 2
     try:
+        if not program.endswith('.tbc'):
+            with open(program, encoding='utf-8', errors='replace') as f:
+                til.use_program_message_language(f.read())     # #[lang: ru] -> Russian messages
         data, saving = load_program(program, strip)
         an = Analysis(data, program, n_args=len(prog_args) if want_run else 0)
     except (til.CompileError, SyntaxError) as e:
-        print(str(e), file=sys.stderr)
+        print(_(str(e)), file=sys.stderr)
         return 2
     except (OSError, ValueError, UnicodeDecodeError) as e:
-        print(f"til fit: {e}", file=sys.stderr)
+        print(_(f"til fit: {e}"), file=sys.stderr)
         return 2
     report = check(an, dev, saving)
     if want_run:
@@ -3256,7 +3268,7 @@ def main(argv: List[str]) -> int:
                 with open(stdin_path, 'rb') as f:
                     stdin_data = f.read()
             except OSError as e:
-                print(f"til fit: {e}", file=sys.stderr)
+                print(_(f"til fit: {e}"), file=sys.stderr)
                 return 2
         used = {name for ff in an.reachable_facts() for _pc, name, _a in ff.natives}
         why_not = ""
@@ -3269,7 +3281,7 @@ def main(argv: List[str]) -> int:
             run = run_on_device(dev, data, prog_args, max_steps, timeout, stdin_data, compare=True,
                                 verbose=verbose)
         except RuntimeError as e:
-            print(f"til fit --run: {e}", file=sys.stderr)
+            print(_(f"til fit --run: {e}"), file=sys.stderr)
             return 2
         apply_run(report, run, compared=not why_not, why_not=why_not)
         if show_output and not want_json:

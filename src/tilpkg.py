@@ -69,6 +69,12 @@ _WINDOWS_RESERVED = frozenset(['con', 'prn', 'aux', 'nul'] + [f'com{i}' for i in
                               [f'lpt{i}' for i in range(1, 10)])
 
 
+def _(text: str) -> str:
+    """A diagnostic in the language of TIL's messages (--lang / TIL_LANG,
+    docs/TIL_I18N.md); what `til pkg` prints on standard output stays English."""
+    return til.localize(text)
+
+
 class PkgError(Exception):
     """A user-facing error: printed as `til pkg: error: ...`, exit code 1."""
 
@@ -1505,10 +1511,10 @@ class Resolver:
                 needed.add(n)
                 todo.extend(d for d in self.lock[n].get('dependencies', {}) if d in self.lock)
         extra = sorted(set(self.lock) - needed)
-        if extra:
-            raise self._frozen_error(f"{', '.join(extra)} {'is' if len(extra) == 1 else 'are'} in {LOCKFILE}, "
-                                     f"but nothing in {MANIFEST} requires {'it' if len(extra) == 1 else 'them'} "
-                                     f"any more")
+        if extra:       # (one sentence per number: the messages are translated, docs/TIL_I18N.md)
+            raise self._frozen_error(
+                f"{extra[0]} is in {LOCKFILE}, but nothing in {MANIFEST} requires it any more" if len(extra) == 1
+                else f"{', '.join(extra)} are in {LOCKFILE}, but nothing in {MANIFEST} requires them any more")
 
     # -- obtaining a package --------------------------------------------------
     def _obtain(self, name: str, spec: Spec, requirer: str) -> Package:
@@ -1837,7 +1843,7 @@ def install_project(root: str, manifest: Dict[str, Any], unlocked: Optional[Set[
         if frozen and new_lock != old_lock:
             raise PkgError(f"--frozen: {LOCKFILE} is out of date with {MANIFEST} (run `til pkg install`)")
         for warning in fetcher.warnings:
-            print(f"til pkg: warning: {warning}", file=sys.stderr)
+            print(_(f"til pkg: warning: {warning}"), file=sys.stderr)
         if before_apply is not None:
             before_apply()
         changes = apply_packages(root, packages)
@@ -2207,8 +2213,8 @@ def cmd_verify(args, start: str) -> int:
                 print(f"EXTRA    {MODULES}/{entry_name} is not in {LOCKFILE}")
                 problems += 1
     if problems:
-        print(f"til pkg verify: {problems} problem{'s' if problems != 1 else ''} "
-              f"(`til pkg install` restores {MODULES}/ from {LOCKFILE})", file=sys.stderr)
+        print(_(f"til pkg verify: {problems} problem{'s' if problems != 1 else ''} "
+                f"(`til pkg install` restores {MODULES}/ from {LOCKFILE})"), file=sys.stderr)
         return 1
     print(f"verified {len(entries)} package{'s' if len(entries) != 1 else ''}: {MODULES}/ matches {LOCKFILE}")
     return 0
@@ -2269,24 +2275,24 @@ def main(argv: List[str]) -> int:
         return 0
     start = args.directory or os.getcwd()
     if not os.path.isdir(start):
-        print(f"til pkg: error: no such directory: {start}", file=sys.stderr)
+        print(_(f"til pkg: error: no such directory: {start}"), file=sys.stderr)
         return 1
     try:
         return COMMANDS[args.command](args, start)
     except UsageError as e:
-        print(f"til pkg: error: {e}", file=sys.stderr)
+        print(_(f"til pkg: error: {e}"), file=sys.stderr)
         return 2
     except PkgError as e:
-        print(f"til pkg: error: {e}", file=sys.stderr)
+        print(_(f"til pkg: error: {e}"), file=sys.stderr)
         return 1
-    except OSError as e:
-        print(f"til pkg: error: {e}", file=sys.stderr)
+    except OSError as e:                        # (the system's own text: English)
+        print(_(f"til pkg: error: {e}"), file=sys.stderr)
         return 1
     except RecursionError:                      # last resort: walks are iterative, JSON depth is caught
-        print("til pkg: error: input nested too deeply to process (Python recursion limit)", file=sys.stderr)
+        print(_("til pkg: error: input nested too deeply to process (Python recursion limit)"), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("til pkg: interrupted", file=sys.stderr)
+        print(_("til pkg: interrupted"), file=sys.stderr)
         return 130
 
 

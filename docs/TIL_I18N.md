@@ -2,9 +2,11 @@
 
 TIL 3.1 prints its diagnostics in **English**, **Russian** or **Kazakh**:
 syntax errors, the verifier's `E-EFFECT` / `E-CAP` / `E-CONTRACT` / `E-ARITY`
-errors, `E-VM` (bytecode compiler) errors, hints, warnings, and the uncaught
-runtime-error reports of both VMs (the reference VM and the C VM) when a
-program runs through `til`.
+/ `E-IMPORT` errors, `E-VM` (bytecode compiler) errors, the typed backend's
+`E-TYPE` errors and `native backend: ...` refusals, the prover's `E-PROVE`
+errors, hints, warnings, the uncaught runtime-error reports of both VMs (the
+reference VM and the C VM) when a program runs through `til`, and the
+diagnostics of `til prove`, `til pkg`, `til fit` and `til debug`.
 
 ```
 $ til run --vm --lang kk prog.til
@@ -28,7 +30,8 @@ start
 The first of these that is set wins:
 
 1. `--lang en|ru|kk` on the command line (`til run`, `build`, `check`, `exec`,
-   `dis`, `translate`, `repl`, also `--lang=ru`). An unknown value is an error.
+   `dis`, `translate`, `repl`, `prove`, `pkg`, `fit`, `debug`, also
+   `--lang=ru`). An unknown value is an error.
 2. The `TIL_LANG` environment variable. Locale-style values work too
    (`ru_RU.UTF-8`, `kk_KZ`, `kk-latn`, `kz`); an empty value means "not set";
    an unknown value prints a warning and is ignored.
@@ -53,8 +56,15 @@ Translated:
   (`runtime error:` / `fatal error:`), known messages and the traceback lines
   (`  at f (line 3)` becomes `  в f (строка 3)` / `  f ішінде (3-жол)`);
 * the C VM runner's own messages (`tilvm: bad --keys entry ...`) and the
-  graphics messages of `til` (`til: --screen: ...`): the program name stays,
-  the message after it is translated.
+  graphics and snapshot messages of `til` (`til: --screen: ...`, `til: cannot
+  resume x.tilp: the snapshot is damaged or incomplete (truncated)`): the
+  program name stays, the message after it is translated;
+* the tools: `til prove` (its `E-PROVE` errors with the obligation, the
+  reason a function is unsupported and the outcome of a counterexample run,
+  its option errors), `til pkg` (`til pkg: error: ...`, `til pkg: warning:
+  ...`), `til fit` (`til fit: ...`, device files, `til build --device`) and
+  `til debug` (every message of the debugger). `til prove` and `til fit`
+  also follow the program's `#[lang: ...]` pragma, as `til check` does.
 
 Kept as they are:
 
@@ -66,7 +76,7 @@ Kept as they are:
   identifiers, numbers, quoted code and everything inside a placeholder;
 * error codes (`E-VM`, `E-EFFECT`, ...), so they stay searchable;
 * messages that are not in the catalog yet: they stay English inside a
-  translated frame (`ошибка[E-TYPE]: some new message`);
+  translated frame (`ошибка[E-VM]: some new message`);
 * **a program's own message** in its error report (`panic(...)`, `expect(...)`,
   an `Err` value): it is translated only when it is, as a whole, one of the
   messages the VMs report (`panic("division by zero")`). Free text never is:
@@ -80,7 +90,19 @@ Kept as they are:
 * a message longer than 10,000 characters (`tilmsg.MAX_LOOKUP`) is not looked
   up and stays English (its frame is translated), and `intent` failures nested
   more than 32 deep (`MAX_NESTING`) keep their inner messages English;
-* standard output (`OK: prog.til`, `Built: ...`) and `til --help`;
+* standard output (`OK: prog.til`, `Built: ...`) and `til --help`; so are
+  the reports the tools print there (`til prove`'s `f: proved` lines and
+  `Result:`, `til pkg`'s `+ name 1.0.0` and `verify` lines, `til fit`'s
+  report and `--json`; also the fit report `til build --device` prints when
+  a program does not fit), their usage texts and the messages of `til pkg`'s
+  argument parser (argparse);
+* text that is not TIL's: operating-system errors (`[Errno 2] No such file
+  or directory`), a compiler's or git's own output, Z3's reasons;
+* locations inside a message: file names, URLs, `til.json`, `git URL (sha)`,
+  `til pkg add NAME`; code such as `str.upper()` in `native backend:
+  str.upper() (line 3)`;
+* the descriptions of the unknowns a failed proof relies on (`... it relies
+  on 'i' at the start of an iteration of the loop at line 5; ...`);
 * runtime errors printed by **native executables** (`til run` with a C
   compiler, `til build`): they come from the generated C runtime, whose
   messages are not catalogued yet. Their compile errors are translated.
@@ -135,7 +157,7 @@ catalog:
 | syntax error | `Syntax Error: error: msg` (becomes `Синтаксическая ошибка: msg`) |
 | hint | `  = hint: msg`, `hint: msg`, `  = note: msg` |
 | runtime report | `runtime error: msg`, `fatal error: msg` (msg: run-time messages only) |
-| program name | `til: msg`, `tilvm: msg` (the name is kept) |
+| program name | `til: msg`, `tilvm: msg`, `til pkg: error: msg`, `til fit --run: msg` (the name and up to three words after `til` are kept; the rest is framed again) |
 | traceback | `  at main (line 7)` |
 | location, source | ` --> file:3:5`, `  3 | code`, `    |   ^` (never changed) |
 | anything else | the whole line is looked up as a message |
@@ -177,7 +199,7 @@ template only):
 | `'{name}'` (between matching `'`, `"` or `` ` ``) | any text on one line (`'load the class list'`) |
 | `{name:text}` | any text: a condition, a path, a key, a user's message |
 | `{name:int}` | an integer |
-| `{name:type}` | a type as the VMs name it: `nil`, `bool`, `int`, `float`, `str`, `array`, `map`, `fn`, `struct`, or a capitalized name (`Point`, `Shape.Circle`, `Нүкте`) |
+| `{name:type}` | a type as the VMs name it: `nil`, `bool`, `int`, `float`, `str`, `array`, `map`, `fn`, `struct`, or a capitalized name (`Point`, `Shape.Circle`, `Нүкте`); also as the typed backend writes it (`E-TYPE`): `[int]`, `{str: int}`, `Option<int>`, `Result<int, str>`, `fn(int) -> str`, `str or int`, `?3`, `None`, `dynamic` (checked by a small parser, in linear time) |
 | `{name:builtin}` | the name of a builtin function (`[a-z_][a-z0-9_]*`) |
 | `{name:msg}` | a nested message, translated too (`intent '{intent}' failed: {error:msg}`) |
 
@@ -189,9 +211,14 @@ value: that is what keeps a program's own sentences out (`cannot compare
 `cannot compare apples and oranges`). Two placeholders must not touch. A
 run-time template must not start with a `text` or `msg` placeholder (it would
 take a program's own sentence with that ending); a compiler or command-line
-template may, when distinctive text follows it, e.g. the parser's
-`{message:msg} ('{word}' is a reserved word and cannot be used as a name)`,
-which translates any "Expected ..." message with that note appended.
+template may, when distinctive text follows it (at least 30 characters of
+literal text in a compiler template, 12 in a command-line one), e.g. the
+parser's `{message:msg} ('{word}' is a reserved word and cannot be used as a
+name)`, which translates any "Expected ..." message with that note appended,
+or `til pkg`'s `{where:msg}: dependency '{name}' = '{spec}': invalid git URL`
+(the location is looked up too: `registry URL (name 1.0.0)` is translated, a
+path stays as it is). Such a template must not end with text that a longer
+message of another entry also ends with: give that message its own entry.
 
 Lookup:
 
@@ -204,9 +231,12 @@ Lookup:
   value that contains that text does not match, and the message stays
   English. This keeps every lookup linear.
 
-`UNTRANSLATED` lists the few messages that are English on purpose (the
-default `panic` message is the builtin's name; the notes about a missing
-catalog). `FRAME` holds the frame words of each language.
+`UNTRANSLATED` lists the messages that are English on purpose, each with
+its reason: the default `panic` message is the builtin's name; code, file
+names and keywords that appear as a nested part of a translated message
+(`str.{method}()`, `til.json`, `let`, `#[ensures: ...]`, `git URL`); the notes
+about a missing catalog; two internal consistency errors of `til debug`.
+`FRAME` holds the frame words of each language.
 `tilmsg.check_catalog()` reports malformed templates, placeholder mismatches,
 bad kinds, duplicates and untranslated entries (a test runs it).
 
@@ -224,15 +254,22 @@ bad kinds, duplicates and untranslated entries (a test runs it).
    ```
 
    It extracts message templates statically from `src/til.py`, the feature
-   modules next to it (`src/til*.py`) and `vm/tilvm.c` (see its docstring for
-   the exact rules) and checks each one against the catalog with the same
-   lookup `til` uses (run-time messages against `RUNTIME_MESSAGES` only).
-   `tests/test_i18n.py` fails while a message of the enforced categories has
-   no entry; plain `print(..., file=sys.stderr)` messages are reported but
-   not enforced. Entries may exist ahead of the code (the messages of the
-   effects, graphics, typed, prove and vmcore branches were written against
-   those branches before they were merged); `--unused` lists them, they do
-   no harm.
+   modules next to it (`src/til*.py`), `vm/tilvm.c` and the C VM's runner
+   `vm/main.c` (see its docstring for the exact rules) and checks each one
+   against the catalog with the same lookup `til` uses (run-time messages
+   against `RUNTIME_MESSAGES` only). It follows messages through helper
+   functions (`_(text)`, `self.say(text)`, `self.unsupported(what)`), through
+   the exception classes of the tools (`PkgError`, `Unsupported`, the
+   `ValueError` that `til fit` prints) and through `localize()` /
+   `til.localize()`. `tests/test_i18n.py` fails while a message of the
+   enforced categories has no entry (everything but `cli`, plain
+   `print(..., file=sys.stderr)` without `localize()`, and `internal`, an
+   exception text nothing prints). Some entries cover text the tool cannot
+   follow (a message built with `"\n".join(lines)`, a reason returned in a
+   tuple, the help lines of `til debug`); `--unused` lists them with the
+   entries written for one wording of a message that the tool sees as a
+   placeholder (`function 'f' is defined in two files: ...`): they are used
+   at run time.
 3. Add the entry to the list that `--skeleton` names (`COMPILER_MESSAGES`,
    `RUNTIME_MESSAGES` or `COMMAND_LINE_MESSAGES`), in the section of its
    subsystem, with the Russian and Kazakh text, following the conventions
@@ -247,7 +284,14 @@ A message whose wording depends on a variable holding English words needs one
 entry per wording. The tool expands local variables and literal-only
 parameters (`what="name"` / `"function"`) by itself; for other cases
 (`f"Invalid {name} literal"` with `name` from a loop) add the specific entries
-by hand and keep a generic fallback.
+by hand and keep a generic fallback. Prefer one sentence per case in the code
+(`f"{x} is in ..." if n == 1 else f"{xs} are in ..."`) to several independent
+`{'is' if n == 1 else 'are'}` choices: the tool expands every combination.
+
+A message that quotes another one (`cannot prove 'f': unsupported:
+{reason}`, `native backend: {reason} (line 3)`, `til pkg`'s `{where}: ...`)
+takes it as a `{x:msg}` placeholder, and the quoted messages get entries of
+their own; code, file names and keywords among them go to `UNTRANSLATED`.
 
 ## Adding a language
 
@@ -327,16 +371,42 @@ by hand and keep a generic fallback.
 | not available | недоступна | қолжетімсіз |
 | VM build | сборка VM | VM құрастырмасы |
 | compile time | этап компиляции | компиляция кезі |
+| native backend | нативный бэкенд | нативті бэкенд |
+| type inference | вывод типов | типтерді шығару |
+| closure / lambda | замыкание / лямбда | тұйықтама / лямбда |
+| captured variable | захваченная переменная | сыртқы аймақтан алынған айнымалы |
+| prover / solver | модуль доказательства / решатель | дәлелдеу модулі / шешуші |
+| global initializers | инициализаторы глобальных переменных | ғаламдық айнымалылардың бастапқы мәндері |
+| snapshot (`.tilp`) | снимок | күй көшірмесі |
+| device | устройство | құрылғы |
+| breakpoint | точка останова | тоқтау нүктесі |
+| package / dependency | пакет / зависимость | пакет / тәуелділік |
+| registry | реестр | тізілім |
+| version requirement | требование к версии | нұсқаға талап |
+| archive | архив | архив |
+| symbolic link | символическая ссылка | символдық сілтеме |
 
 ## For feature modules
 
-Tools that run under `til` (`til prove`, `til fit`, `til debug`, ...) can
-localize their own diagnostics:
+Tools that run under `til` (`til prove`, `til pkg`, `til fit`, `til debug`)
+localize their own diagnostics (standard error) with a small helper, and the
+coverage tool follows it:
 
 ```python
 import til                                   # the running compiler
-print(til.localize(f"error[E-FIT]: {msg}"), file=sys.stderr)
+
+def _(text: str) -> str:
+    return til.localize(text)
+
+print(_(f"til fit: unknown device '{device}'; known: {names}"), file=sys.stderr)
 ```
+
+The first words of such a line are the tool's name (`til pkg: error: ...`):
+the catalog keeps them and translates the rest. A tool that reads a program
+calls `til.use_program_message_language(source)` (the program's `#[lang:
+...]` pragma, unless `--lang` or `TIL_LANG` chose a language) inside a
+`main()` decorated with `@til.scoped_message_language`, so the choice does
+not outlive the call.
 
 `main()` sets `til.MESSAGE_LANG` from `--lang` / `TIL_LANG` before it
 dispatches to a tool and removes `--lang X` / `--lang=X` (before any `--`)
