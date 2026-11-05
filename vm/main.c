@@ -607,11 +607,13 @@ int main(int argc, char **argv) {
         {   /* high-water marks (til fit --run reads this line) */
             tilvm_stats s;
             tilvm_get_stats(&vm, &s);
-            fprintf(stderr, "[tilvm] peak stack=%lu/%lu frames=%lu/%lu try=%lu/%lu heap=%lu/%ld live=%lu\n",
+            fprintf(stderr, "[tilvm] peak stack=%lu/%lu frames=%lu/%lu try=%lu/%lu heap=%lu/%ld live=%lu "
+                    "handlers=%lu/%lu\n",
                     (unsigned long)s.peak_stack, (unsigned long)TILVM_STACK_SIZE,
                     (unsigned long)s.peak_frames, (unsigned long)TILVM_MAX_FRAMES,
                     (unsigned long)s.peak_try, (unsigned long)TILVM_MAX_TRY,
-                    (unsigned long)s.peak_heap, (long)TILVM_HEAP_SIZE, (unsigned long)s.peak_live);
+                    (unsigned long)s.peak_heap, (long)TILVM_HEAP_SIZE, (unsigned long)s.peak_live,
+                    (unsigned long)s.peak_handlers, (unsigned long)TILVM_MAX_HANDLERS);
         }
 #endif
     }

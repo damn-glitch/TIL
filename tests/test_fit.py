@@ -91,10 +91,12 @@ class TestDevices:
         flags = d.c_flags()
         assert f"-DTILVM_STACK_SIZE={d.stack}" in flags and f"-DTILVM_HEAP_SIZE={d.heap}" in flags
         assert ('-DTILVM_LEAN' in flags) == d.lean
-        # the VM itself must fit the device's RAM with room for a program
+        # the VM itself must fit the device's RAM, with room for a program where the port
+        # copies it into that RAM (z80-16 keeps the program in a region of its own)
         layout = fit.vm_struct_layout(d)
         if d.ram is not None:
-            assert layout['tilvm'] + d.vm_static_ram + d.c_stack + 400 <= d.ram, layout
+            room = 400 if d.bytecode_in_ram else 0
+            assert layout['tilvm'] + d.vm_static_ram + d.c_stack + room <= d.ram, layout
         # a tiny program fits every device
         r = report('print("hi")', name)
         assert r.fits, r.verdict()
@@ -441,7 +443,9 @@ class TestStaticVersusMeasured:
     @pytest.mark.parametrize("n", [1, 10, 57])
     def test_recursion_levels_formula(self, n, tmp_path):
         """k levels of a recursion need at most base + (k - 1) * per_level + top slots
-        (the deepest level takes the base case, so one slot less here)."""
+        (the deepest level takes the base case, so two slots less here: `n == 0` compares
+        without pushing (JUMP_IF_NOT_LI), then `return 0` pushes one value, where the top
+        level's worst case is n, 1, n and the immediate of SUB_I)."""
         src = ('count(n: int) -> int\n    if n == 0\n        return 0\n    return 1 + count(n - 1)\n'
                f'main()\n    print(count({n}))\n')
         data = compile_vm(src).serialize()
@@ -450,7 +454,7 @@ class TestStaticVersusMeasured:
         _r, peak = measure(data, tmp_path)
         k = n + 1
         assert peak['frames'] == rec.frames_below - 1 + k
-        assert peak['stack'] == rec.base + (k - 1) * rec.slots_per_level + rec.top_occ - 1
+        assert peak['stack'] == rec.base + (k - 1) * rec.slots_per_level + rec.top_occ - 2
 
     def test_levels_prediction_is_exact_on_the_device(self, tmp_path, capsys):
         """The predicted number of levels is the number the device's VM runs."""
@@ -501,9 +505,10 @@ class TestVerdicts:
         assert report(src, 'cortex-m3-64k').fits
 
     def test_range_with_a_constant_size(self):
+        """TIL 3.1 VMs build range()'s array in the heap (TIL 3.0 pushed every element)."""
         src = 'main()\n    var t = 0\n    for i in range(1000)\n        t += i\n    print(t)\n'
         r = report(src, 'cortex-m3-64k')
-        assert not r.fits and "value stack" in r.verdict()
+        assert r.fits and r.get_row('stack')['need_value'] < 16, r.verdict()
         assert report(src, 'desktop').fits
         assert report(src.replace('range(1000)', '0..1000'), 'cortex-m3-64k').fits
 
@@ -613,8 +618,11 @@ class TestVerdicts:
         assert any("temporary objects" in n for n in r.notes)
 
     def test_data_dependent_stack(self):
-        r = report('main()\n    let parts = "a b c".split(" ")\n    print(parts)\n', 'desktop')
-        assert any("grows with the data" in w.text and ".split()" in w.text for w in r.warnings)
+        # TIL 3.1 VMs build split()/keys()/range()/... results in the heap: constant stack
+        r = report('main()\n    let parts = "a b c".split(" ")\n    print(parts, range(0, 50))\n', 'desktop')
+        assert not any("grows with the data" in w.text for w in r.warnings)
+        r = report('print(len(args()))\n', 'desktop')       # args() still pushes every argument
+        assert any("args() puts every program argument" in w.text for w in r.warnings)
 
     def test_json_output(self, tmp_path, capsys):
         prog = write(tmp_path, 'fib(n: int) -> int\n    if n < 2\n        return n\n'
@@ -652,8 +660,9 @@ class TestVerdicts:
 # ═══════════════════════════════════════════════════════════════
 
 def patched_tbc(new_op: int) -> bytes:
-    """`x = x + 2` in main with the ADD replaced by another opcode."""
-    m = compile_vm('main()\n    var x = 1\n    x = x + 2\n    print(x)\n')
+    """`x = x + 2` in main with the ADD replaced by another opcode (compiled without
+    superinstructions, which would turn the sequence into INC_LOCAL)."""
+    m = til.compile_to_bytecode('main()\n    var x = 1\n    x = x + 2\n    print(x)\n', "<test>", fuse=False)
     data = bytearray(m.serialize())
     mod = til.TBCModule.from_bytes(bytes(data))
     main = next(f for f in mod.funcs if f.name == 'main')
@@ -663,8 +672,12 @@ def patched_tbc(new_op: int) -> bytes:
     return bytes(data)
 
 
+# opcode numbers no instruction uses (docs/TIL_BYTECODE_V2.md: 0x8B-0x8F, 0x95-0x9F, 0xC0-0xFF)
+UNASSIGNED = [0x8B, 0x95, 0x9F, 0xC0, 0x7E, 0xFF]
+
+
 class TestRobustness:
-    @pytest.mark.parametrize("op", [0x80, 0xB0, 0xBF, 0x7E, 0xFF])
+    @pytest.mark.parametrize("op", UNASSIGNED)
     def test_unknown_opcode_is_incomplete_not_a_crash(self, op, tmp_path, capsys):
         path = tmp_path / "p.tbc"
         path.write_bytes(patched_tbc(op))
@@ -676,8 +689,9 @@ class TestRobustness:
         data = json.loads(out)
         assert data['static']['complete'] is False and data['static']['stack_slots'] is None
 
-    def test_known_layout_without_stack_effect(self, tmp_path, capsys):
-        """HANDLE has an operand layout but (in this branch) no stack-effect entry."""
+    def test_known_layout_without_stack_effect(self, tmp_path, capsys, monkeypatch):
+        """An opcode the compiler knows (operand layout) without a stack-effect entry."""
+        monkeypatch.delitem(fit.STACK_EFFECTS, til.Op.HANDLE)
         path = tmp_path / "p.tbc"
         path.write_bytes(patched_tbc(til.Op.HANDLE))
         rc, out, _ = fit_main(capsys, str(path), '--device', 'desktop')
@@ -686,7 +700,7 @@ class TestRobustness:
     def test_new_opcode_is_a_one_line_addition(self, monkeypatch):
         """A superinstruction registered in til (Op/OP_NAMES/OP_OPERANDS) + one line in
         STACK_EFFECTS makes the analysis complete again."""
-        op = 0x80
+        op = 0x8B
         monkeypatch.setitem(til.OP_NAMES, op, 'ADD_I8')          # ADD_I8 n: TOS += n
         monkeypatch.setitem(til.OP_OPERANDS, op, 'c')
         data = bytearray(patched_tbc(op))
@@ -1086,7 +1100,7 @@ class TestValueKinds:
         assert "array" in a and b == "any" and "array" in r
 
     def test_unknown_opcode_disables_kinds(self):
-        an = fit.Analysis(patched_tbc(0xB0), "<p>")
+        an = fit.Analysis(patched_tbc(0xC0), "<p>")
         assert not an.complete and an.kinds is None
 
 
@@ -1486,7 +1500,8 @@ class TestPackedBigHeap:
             assert res.returncode == 0 and "runtime error" not in res.stderr, (name, res.stderr)
 
     def test_custom_ez80_device_runs(self, tmp_path, capsys):
-        dev = custom_device(tmp_path, "ce-big", base="ti84ce", heap=100000, ram=262144)
+        # (the CE port uses 16-bit offsets, TILVM_ADDR16, which limits the heap to 64 KB)
+        dev = custom_device(tmp_path, "ce-big", base="ti84ce", heap=100000, ram=262144, addr16=False)
         prog = write(tmp_path, CORPUS['structs'])
         rc, out, _ = fit_main(capsys, prog, '--device', dev, '--run')
         assert rc == 0 and "verdict: fits" in out, out
@@ -1532,3 +1547,427 @@ class TestCacheDirectory:
         data = json.loads(r.stdout)
         assert "PLANTED" not in data['run']['errors'] and data['run']['stdout'] == "hi\n"
         assert os.path.isdir(shared / f"til-cache-{os.getuid()}")      # built in the private directory
+
+
+# ═══════════════════════════════════════════════════════════════
+# TIL 3.1 INTEGRATION: superinstructions, effects, screen natives,
+# the new build switches and VM tables, the debug-info section
+# ═══════════════════════════════════════════════════════════════
+
+def measure_all(data: bytes, tmp_path, exe=None):
+    """(run, {stack, frames, try, handlers}) on a device VM (TILVM_STATS)."""
+    path = tmp_path / "m.tbc"
+    path.write_bytes(data)
+    r = subprocess.run([exe or stats_vm(), '--stats', str(path)], capture_output=True, text=True, timeout=60)
+    m = re.search(r'peak stack=(\d+)/\d+ frames=(\d+)/\d+ try=(\d+)/\d+ .* handlers=(\d+)/\d+', r.stderr)
+    assert m, r.stderr
+    return r, dict(zip(('stack', 'frames', 'try', 'handlers'), (int(x) for x in m.groups())))
+
+
+def static_peaks(an):
+    return dict(stack=an.slots_occ, frames=an.frames, **{'try': an.tries, 'handlers': an.hands})
+
+
+def sample_operands(op):
+    """Operands for a superinstruction: small slots, a comparison, immediates, offsets."""
+    out = []
+    for i, kind in enumerate(til.OP_OPERANDS.get(op, '')):
+        if op in (til.Op.JUMP_IF_NOT, til.Op.JUMP_IF_NOT_L, til.Op.JUMP_IF_NOT_I, til.Op.JUMP_IF_NOT_LL,
+                  til.Op.JUMP_IF_NOT_LI) and i == 0:
+            out.append(til.Op.LT)
+        else:
+            out.append({'b': 3 + i, 'c': -2, 'h': 1, 's': 7}[kind])
+    return tuple(out)
+
+
+def til_net_effect(op, args):
+    """The compiler's net stack effect of an instruction (til._STACK_EFFECT / _OPERAND_EFFECT)."""
+    if op in til._STACK_EFFECT:
+        return til._STACK_EFFECT[op]
+    i, factor, const = til._OPERAND_EFFECT[op]
+    return const - factor * args[i]
+
+
+def fit_landing(op, args):
+    """Where the analysis lets a jump land, relative to the depth before the instruction."""
+    eff = fit.STACK_EFFECTS[op]
+    net = eff.pushes(args) - eff.pops(args) if callable(eff.pops) else fit._value(eff.pushes, args) - fit._value(eff.pops, args)
+    if eff.land is not None:
+        return eff.land
+    return {fit.JUMP: net, fit.BRANCH: net, fit.DEFAULT: net, fit.ITER: 0, fit.TRY: net + 1,
+            fit.HANDLE: 1 - 2 * args[0]}.get(eff.flow)
+
+
+class TestOpcodeTables:
+    """Every opcode of the compiler has a stack effect, and the analysis agrees with the
+    compiler's own tables (net effect, jump landing, end of flow): adding an opcode to
+    til without updating til fit fails here."""
+
+    def test_every_opcode_has_an_entry(self):
+        assert sorted(set(til.OP_NAMES) - set(fit.STACK_EFFECTS)) == []
+
+    @pytest.mark.parametrize("op", sorted(til.OP_NAMES), ids=[til.OP_NAMES[o] for o in sorted(til.OP_NAMES)])
+    def test_agrees_with_the_compiler(self, op):
+        args = sample_operands(op)
+        eff = fit.STACK_EFFECTS[op]
+        if op != til.Op.END_HANDLE and op not in til._ENDS_FLOW:   # the compiler follows reachable code only
+            net = fit._value(eff.pushes, args) - fit._value(eff.pops, args)
+            assert net == til_net_effect(op, args)
+        assert (op in til._JUMP_LANDING) == eff.jumps()
+        if op in til._JUMP_LANDING:
+            want = til._JUMP_LANDING[op] - (2 * args[0] if op == til.Op.HANDLE else 0)
+            assert fit_landing(op, args) == want
+        assert (op in til._ENDS_FLOW) == (eff.flow in (fit.JUMP, fit.STOP))
+
+    @pytest.mark.parametrize("op", sorted(fit.SUPERINSTRUCTIONS), ids=[til.OP_NAMES[o] for o in sorted(fit.SUPERINSTRUCTIONS)])
+    def test_superinstruction_sequences(self, op):
+        """The sequence a superinstruction stands for is what the peephole pass replaces:
+        compiling the sequence alone and fusing it gives the superinstruction back."""
+        args = sample_operands(op)
+        seq = fit.expand(op, args)
+        assert seq and all(m in fit.STACK_EFFECTS and m not in fit.SUPERINSTRUCTIONS for m, _a in seq)
+        # the sequence's own jump lands where til._JUMP_LANDING says
+        if op in til._JUMP_LANDING:
+            d = 0
+            for mop, margs in seq:
+                e = fit.STACK_EFFECTS[mop]
+                before = d
+                d += fit._value(e.pushes, margs) - fit._value(e.pops, margs)
+                if e.jumps():
+                    landing = before if e.flow == fit.ITER else d
+            assert landing == til._JUMP_LANDING[op]
+
+    def test_bad_comparison_operand(self):
+        data = bytearray(tbc_bytes('main()\n    var i = 0\n    while i < 3\n        i += 1\n    print(i)\n'))
+        mod = til.TBCModule.from_bytes(bytes(data))
+        code_start = len(data) - 2 - 6 * len(mod.lines) - len(mod.code)
+        fused = [til.Op.JUMP_IF_NOT, til.Op.JUMP_IF_NOT_L, til.Op.JUMP_IF_NOT_I, til.Op.JUMP_IF_NOT_LL,
+                 til.Op.JUMP_IF_NOT_LI]
+        at = next(i for i, b in enumerate(mod.code) if b in fused)
+        assert fit.Analysis(bytes(data), "<p>").complete
+        data[code_start + at + 1] = til.Op.ADD           # not a comparison: the VMs say "bad opcode"
+        an = fit.Analysis(bytes(data), "<p>")
+        assert not an.complete and any("malformed operand" in p for p in an.problems())
+
+
+@needs_cc
+class TestSuperinstructions:
+    @pytest.mark.parametrize("fuse", [True, False], ids=["fused", "unfused"])
+    @pytest.mark.parametrize("name", ['closures', 'structs', 'strings', 'retry', 'higher_order', 'defaults'])
+    def test_fused_and_unfused_code_are_exact(self, name, fuse, tmp_path):
+        """--run builds have no integer fast paths, so a superinstruction writes the stack
+        slots of its sequence (or none: compare-and-branch, RETURN_LOCAL, FOR_ITER_STORE)."""
+        data = til.compile_to_bytecode(CORPUS[name], name, fuse=fuse).serialize()
+        an = fit.Analysis(data, name)
+        r, peak = measure_all(data, tmp_path)
+        assert r.returncode == 0 and an.complete and not an.recursions, r.stderr
+        assert static_peaks(an) == peak
+
+    def test_device_builds_run_the_slow_paths(self):
+        for name in NAMES:
+            flags = fit.device_vm_flags(fit.DEVICES[name])
+            assert '-DTILVM_FAST_PATHS=0' in flags and '-DTILVM_STATS' in flags
+            assert not any(f.startswith('-DTILVM_ROM') for f in flags)       # __flash is avr-gcc only
+
+    def test_compare_and_branch_writes_no_operands(self):
+        an = analyze('count(n)\n    var i = 0\n    var t = 0\n    while i < n\n        t += i\n'
+                     '        i += 1\n    return t\nprint(count(5))\n')
+        f = next(an.facts(g) for g in an.reachable if an.module.funcs[g].name == 'count')
+        ops = {til.OP_NAMES[op] for op, _a, _n in f.code.values()}
+        assert {'JUMP_IF_NOT_LL', 'LOAD_LOCAL2', 'ADD_STORE_LOCAL', 'INC_LOCAL', 'RETURN_LOCAL'} <= ops, ops
+        assert f.max_occ == 2          # LOAD_LOCAL2 t i, INC_LOCAL's slow path; i < n pushes nothing
+
+
+EFFECTS = {
+    'nested': 'main()\n    let r = handle\n        handle\n            perform Log("a")\n            "body"\n'
+              '        with\n            Log(m) =>\n                perform Log("inner: " + m)\n                resume()\n'
+              '    with\n        Log(m) =>\n            print(m)\n            resume()\n    print(r)\n',
+    'abort_in_call': 'find(xs) -> int\n    for x in xs\n        if x > 2\n            perform Stop(x)\n    return -1\n'
+                     'main()\n    let v = handle\n        let a = 1\n        let b = find([1, 2, 3, 4])\n        a + b\n'
+                     '    with\n        Stop(x) => x * 100\n    print(v)\n',
+    'retry_in_clause': 'var calls = 0\nmain()\n    let reading = handle\n        retry(3)\n            perform Sensor()\n'
+                       '        else\n            -1\n    with\n        Sensor() =>\n            calls += 1\n'
+                       '            if calls < 3\n                panic("busy")\n            resume(42)\n    print(reading)\n',
+    'generator': 'countdown(n: int)\n    var i = n\n    while i > 0\n        perform Yield(i)\n        i -= 1\n'
+                 'main()\n    var squares = []\n    handle\n        countdown(4)\n    with\n        Yield(v) =>\n'
+                 '            squares.push(v * v)\n            resume()\n    print(squares)\n',
+    'default_function': 'Log(msg: str)\n    print("[log] " + msg)\nwork() -> int\n    perform Log("working")\n'
+                        '    return 7\nmain()\n    print(work())\n',
+}
+WALK = ('walk(n: int) -> int\n    if n == 0\n        return perform Leaf(n)\n    return handle\n        walk(n - 1) + 1\n'
+        '    with\n        Note(x) => resume(x)\nmain()\n    let v = handle\n        walk(DEPTH)\n    with\n'
+        '        Leaf(x) => resume(x + 10)\n    print(v)\n')
+
+
+class TestEffects:
+    """HANDLE/END_HANDLE/PERFORM/RESUME: the clause pairs on the stack, clauses called by
+    PERFORM in the call graph (only clauses of handle blocks that may be active), the
+    default function, handler entries (TILVM_MAX_HANDLERS), TILVM_NO_EFFECTS."""
+
+    @needs_cc
+    @pytest.mark.parametrize("name", sorted(EFFECTS))
+    def test_exact(self, name, tmp_path):
+        data = compile_vm(EFFECTS[name]).serialize()
+        an = fit.Analysis(data, name)
+        r, peak = measure_all(data, tmp_path)
+        assert r.returncode == 0, r.stderr
+        assert an.complete and not an.recursions, an.problems()
+        assert static_peaks(an) == peak
+
+    @needs_cc
+    def test_example_is_exact(self, tmp_path):
+        src = open(os.path.join(ROOT, 'examples', '12_effects.til'), encoding='utf-8').read()
+        data = til.compile_to_bytecode(src, '12_effects.til').serialize()
+        an = fit.Analysis(data, '12_effects.til')
+        r, peak = measure_all(data, tmp_path)
+        assert r.returncode == 0 and an.complete and not an.recursions
+        assert static_peaks(an) == peak and an.hands >= 3
+
+    def test_clauses_are_called_by_perform(self):
+        an = analyze(EFFECTS['nested'])
+        names = {an.module.funcs[f].name for f in an.reachable}
+        clauses = sorted(n for n in names if n.startswith('<clause Log'))
+        assert len(clauses) == 2 and not an.recursions      # the inner clause's perform goes outward
+        main = next(an.facts(f) for f in an.reachable if an.module.funcs[f].name == 'main')
+        site = next(s for s in main.calls if s.op == til.Op.PERFORM)
+        assert {an.module.funcs[e.callee].name for e in site.edges} == {clauses[1]}     # the innermost handle
+        assert all(e.hands == 3 for e in site.edges)        # 2 open handles + the running clause
+
+    def test_only_active_handlers(self):
+        """greet() performs Log; it runs only inside a handle without a Log clause: the
+        perform reaches the default function, not the Log clauses elsewhere in main."""
+        src = ('Log(m: str)\n    print(m)\ngreet()\n    perform Log("hi")\nmain()\n    handle\n        greet()\n'
+               '    with\n        Ask() => resume(1)\n    handle\n        print(1)\n    with\n'
+               '        Log(m) => resume()\n')
+        an = analyze(src)
+        greet = next(an.facts(f) for f in an.reachable if an.module.funcs[f].name == 'greet')
+        assert {an.module.funcs[e.callee].name for s in greet.calls for e in s.edges} == {'Log'}
+
+    @needs_cc
+    def test_handler_entries_limit_recursion(self, tmp_path):
+        values = fit.DEVICES['desktop'].as_dict()
+        del values['name']
+        values.update(max_handlers=8, title="8 handler entries")
+        dev = fit.Device('h8', **values)
+        r = fit.check(analyze(WALK.replace('DEPTH', '1')), dev)
+        rec = r.recursion[0]
+        assert (rec['handlers_per_level'], rec['limited_by']) == (1, "effect handlers"), rec
+        assert any("1 effect handler entry" in w.text for w in r.warnings)
+        exe, err = fit.build_device_vm(dev)
+        assert exe, err
+        levels = rec['levels']                 # walk(n) runs n + 1 levels
+        ok, _ = measure_all(compile_vm(WALK.replace('DEPTH', str(levels - 1))).serialize(), tmp_path, exe)
+        bad, _ = measure_all(compile_vm(WALK.replace('DEPTH', str(levels))).serialize(), tmp_path, exe)
+        assert ok.returncode == 0, ok.stderr
+        assert bad.returncode == 1 and "too many nested handlers" in bad.stderr
+
+    def test_too_many_handlers(self, tmp_path):
+        src = ('main()\n    let v = handle\n        handle\n            handle\n                perform A()\n'
+               '            with\n                B() => resume(1)\n        with\n            C() => resume(2)\n'
+               '    with\n        A() => resume(3)\n    print(v)\n')
+        dev = fit.load_device(custom_device(tmp_path, "h2", base="cortex-m3-64k", max_handlers=3))
+        r = fit.check(analyze(src), dev)
+        assert not r.fits and "effect handlers 4 > 3" in r.verdict()      # 3 handles + the running clause
+        assert r.get_row('handlers')['needs'] == "4"
+        assert fit.check(analyze(src), fit.DEVICES['cortex-m3-64k']).fits
+
+    def test_no_effects_build(self):
+        r = report(EFFECTS['generator'], 'z80-16')
+        assert not r.fits and "effect handlers not available (TILVM_NO_EFFECTS)" in r.verdict()
+        assert r.get_row('builtins')['status'] == "FAIL" and "effect handlers" in r.get_row('builtins')['note']
+        # a perform without a handle calls the default function: fine without handlers
+        assert report(EFFECTS['default_function'], 'z80-16').fits
+        assert report(EFFECTS['generator'], 'arduino-mega').fits            # lean builds have handlers
+
+    @needs_cc
+    def test_no_effects_run(self, tmp_path, capsys):
+        prog = write(tmp_path, EFFECTS['generator'])
+        rc, out, _ = fit_main(capsys, prog, '--device', 'z80-16', '--run')
+        assert rc == 1 and "effect handlers are not available in this VM build" in flat(out)
+
+    @needs_cc
+    def test_measured_handlers_row(self, tmp_path, capsys):
+        prog = write(tmp_path, EFFECTS['nested'])
+        rc, out, _ = fit_main(capsys, prog, '--device', 'cortex-m3-64k', '--run', '--json')
+        data = json.loads(out)
+        # 2 handle blocks + the inner clause + the outer clause its perform runs
+        assert rc == 0 and data['static']['effect_handlers'] == data['run']['stats']['peak_handlers'] == 4
+        assert next(r for r in data['resources'] if r['key'] == 'handlers')['measured'] == "4"
+
+
+GFX = 'screen_init(W, H)\nfill_rect(0, 0, 10, 10, 0xFF0000)\nscreen_show()\nprint(screen_width())\n'
+
+
+class TestScreen:
+    """The screen/keys natives: TILVM_NO_GFX builds and the device's largest screen."""
+
+    @pytest.mark.parametrize("device", ['z80-16', 'arduino-mega'])
+    def test_no_gfx_build(self, device):
+        r = report(GFX.replace('W', '64').replace('H', '32'), device)
+        assert not r.fits and "screen natives not available (TILVM_NO_GFX)" in r.verdict()
+        assert "not in this build: screen/keys natives" in r.get_row('builtins')['note']
+
+    def test_screen_size(self):
+        r = report(GFX.replace('W', '400').replace('H', '300'), 'ti84ce')
+        assert not r.fits and "screen_init(400, 300) > 320x240 screen" in r.verdict()
+        assert report(GFX.replace('W', '320').replace('H', '240'), 'ti84ce').fits
+        assert report(GFX.replace('W', '400').replace('H', '300'), 'desktop').fits
+        r = report('let w = 100 + len(args())\n' + GFX.replace('W', 'w').replace('H', '50'), 'ti84ce')
+        assert r.fits and any("computed size: at most 320x240" in n for n in r.notes)
+
+    def test_device_without_a_display(self):
+        r = report(GFX.replace('W', '64').replace('H', '32'), 'esp32')
+        assert r.fits and any("need a screen" in w.text for w in r.warnings)
+
+    @needs_cc
+    def test_screen_size_run(self, tmp_path, capsys):
+        prog = write(tmp_path, 'let w = 300 + len(args())\n' + GFX.replace('W', 'w + 100').replace('H', '50'))
+        rc, out, _ = fit_main(capsys, prog, '--device', 'ti84ce', '--run')
+        assert rc == 1 and "screen_init() argument 1 must be 1..320" in flat(out)
+
+
+def header_defaults():
+    text = open(os.path.join(VM_DIR, 'tilvm.h'), encoding='utf-8').read()
+    return dict(re.findall(r'#ifndef (TILVM_\w+)\n#define \1 (\S+)', text))
+
+
+class TestBuildSwitches:
+    """TILVM_ADDR16 / NO_EFFECTS / NO_GFX / MAX_HANDLERS / MAX_FUNCS / FIELD_CACHE / GFX_MAX
+    / ROM in the profiles and the layout model."""
+
+    @pytest.mark.parametrize("port, makefile, name", [('z80', 'Makefile', 'z80-16'), ('avr', 'Makefile', 'atmega1284'),
+                                                      ('cortex-m', 'Makefile', 'cortex-m3-64k'),
+                                                      ('ti84ce', 'makefile', 'ti84ce')])
+    def test_profiles_are_the_port_builds(self, port, makefile, name):
+        """Every -D flag of the port's build, switches included; the profile adds only
+        the header's defaults."""
+        text = open(os.path.join(VM_DIR, 'ports', port, makefile), encoding='utf-8').read()
+        port_flags = set(re.findall(r'-D(TILVM_\w+(?:=\S+)?)', text))
+        dev_flags = {f[2:] for f in fit.DEVICES[name].c_flags()}
+        assert port_flags <= dev_flags, port_flags - dev_flags
+        defaults = header_defaults()
+        for flag in dev_flags - port_flags:
+            macro, _eq, value = flag.partition('=')
+            assert defaults.get(macro) == value, flag
+
+    def test_z80_does_not_fit_what_the_port_leaves_out(self, tmp_path):
+        dev = fit.DEVICES['z80-16']
+        assert dev.addr16 and dev.no_effects and dev.no_gfx and dev.lean and dev.funcs_table == 0
+        assert fit.vm_struct_layout(dev)['tilvm'] == 5836          # vm/ports/z80/RESULTS.md (SDCC)
+
+    def test_function_table(self, tmp_path):
+        src = "".join(f"f{i}() -> int\n    return {i}\n" for i in range(12)) + \
+            "main()\n" + "".join(f"    print(f{i}())\n" for i in range(12))
+        r = fit.check(analyze(src), fit.load_device(custom_device(tmp_path, "f8", base="cortex-m3-64k", max_funcs=8)))
+        assert not r.fits and re.search(r'\d+ functions > 8', r.verdict()) and "error -10" in r.errors[0].text
+        r = fit.check(analyze(src), fit.load_device(custom_device(tmp_path, "f0", base="cortex-m3-64k", max_funcs=0)))
+        assert r.fits and r.get_row('funcs')['limit'] == "no table"
+
+    @needs_cc
+    def test_function_table_run(self, tmp_path, capsys):
+        src = "".join(f"f{i}() -> int\n    return {i}\n" for i in range(12)) + "print(f3())\n"
+        dev = custom_device(tmp_path, "f8", base="cortex-m3-64k", max_funcs=8)
+        rc, out, _ = fit_main(capsys, write(tmp_path, src), '--device', dev, '--run')
+        assert rc == 1 and "(error -10)" in out
+
+    def test_addr16_program_size(self, tmp_path):
+        src = "main()\n" + "".join(f'    print("{i:05d} {"x" * 90}")\n' for i in range(720))
+        an = fit.Analysis(compile_vm(src).serialize(strip=True), "<big>")
+        assert an.size > 0xFFFF
+        dev = fit.load_device(custom_device(tmp_path, "a16", base="desktop", addr16=True, heap=65535))
+        assert "bytecode larger than 64 KB (TILVM_ADDR16)" in fit.check(an, dev).verdict()
+        with pytest.raises(ValueError, match="addr16 needs a heap"):
+            fit.load_device(custom_device(tmp_path, "bad", base="desktop", addr16=True))
+
+    @pytest.mark.parametrize("values, message", [
+        ({"max_handlers": 0}, "max_handlers must be 1..65535"),
+        ({"field_cache": 3}, "field_cache must be 0 or a power of two"),
+        ({"max_funcs": -1}, "max_funcs must be 0..65535"),
+        ({"gfx_max_w": 5000}, "gfx_max_w must be 1..4096"),
+        ({"rom": "__flash const"}, "rom must be a C identifier"),
+        ({"no_gfx": 1}, "no_gfx must be true or false"),
+    ])
+    def test_new_fields_are_validated(self, tmp_path, values, message):
+        with pytest.raises(ValueError, match=re.escape(message)):
+            fit.load_device(custom_device(tmp_path, "x", base="cortex-m3-64k", **values))
+
+    @needs_cc
+    def test_layout_model_with_every_switch(self, tmp_path):
+        """sizeof(tilvm) of the model == the host compiler for builds with the new switches."""
+        variants = {
+            'no_effects': dict(base='cortex-m3-64k', no_effects=True),
+            'handlers5': dict(base='cortex-m3-64k', max_handlers=5),
+            'funcs0_cache0': dict(base='cortex-m3-64k', max_funcs=0, field_cache=0),
+            'funcs7_cache8': dict(base='atmega1284', max_funcs=7, field_cache=8),
+            'lean_table': dict(base='arduino-mega', max_funcs=40, field_cache=16, no_gfx=False),
+            'addr16': dict(base='cortex-m3-64k', addr16=True),
+            'addr16_big': dict(base='z80-16', no_effects=False, no_gfx=False, int_bits=32, float=1),
+            'gfx': dict(base='ti84ce', gfx_max_w=128, gfx_max_h=64),
+        }
+        devs, configs = {}, {}
+        for key, v in variants.items():
+            v = dict(v)
+            base = v.pop('base')
+            values = dict(fit.DEVICES[base].as_dict(), abi=host_abi(), **v)
+            del values['name']
+            devs[key] = fit.Device(key, **values)
+            configs[key] = [f for f in devs[key].c_flags() if not f.startswith('-DTILVM_ROM')]
+        got = host_sizes(configs, tmp_path)
+        for key, dev in devs.items():
+            want = fit.vm_struct_layout(dev)
+            assert got[key] == (want['tilvm'], want['tv_val']), key
+
+    def test_struct_parts(self):
+        parts = fit.vm_struct_layout(fit.DEVICES['atmega1284'])['parts']
+        assert parts['heap'] == 5120 and parts['value stack'] == 160 * 5 and parts['effect handlers'] == 32 * 16
+        assert parts['function table'] == 160 * 8 and parts['lookup caches'] == 2 * 64 * 6
+        assert 'effect handlers' not in fit.vm_struct_layout(fit.DEVICES['z80-16'])['parts']
+
+    def test_ram_error_names_the_big_tables(self):
+        src = "main()\n" + "".join(f'    print("line number {i} of a long program")\n' for i in range(150))
+        r = fit.check(analyze(src, strip=True), fit.DEVICES['atmega1284'])
+        text = next(e.text for e in r.errors if "of RAM" in e.text)
+        assert "function table 1.2 KB" in text and "heap 5 KB" in text
+
+    @pytest.mark.parametrize("compiler", ["gcc", "clang"])
+    @pytest.mark.parametrize("device", ['z80-16', 'ti84ce', 'arduino-mega'])
+    def test_strict_device_emulation_builds(self, compiler, device):
+        if not shutil.which(compiler):
+            pytest.skip(f"{compiler} not installed")
+        flags = fit.device_vm_flags(fit.DEVICES[device])
+        for src in ('tilvm.c', 'main.c'):
+            r = subprocess.run([compiler] + STRICT + flags + ['-fsyntax-only', os.path.join(VM_DIR, src)],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, (src, r.stderr)
+
+
+class TestDebugInfo:
+    """The optional debug-info section after the line table (til build --debug-info)."""
+
+    def test_accepted_and_reported(self, tmp_path, capsys):
+        src = 'main()\n    let greeting = "hi"\n    var n = 3\n    print(greeting, n)\n'
+        data = til.compile_to_bytecode(src, "p.til", debug_info=True).serialize()
+        plain = compile_vm(src).serialize()
+        assert len(data) > len(plain)
+        an = fit.Analysis(data, "p.tbc")
+        assert an.complete and an.has_debug_info
+        assert (an.slots_occ, an.frames) == (fit.Analysis(plain, "p").slots_occ, fit.Analysis(plain, "p").frames)
+        path = tmp_path / "p.tbc"
+        path.write_bytes(data)
+        rc, out, _ = fit_main(capsys, str(path), '--device', 'esp32', '--json')
+        report_data = json.loads(out)
+        assert rc == 0 and report_data['static']['debug_info'] is True
+        assert any("debug-info section" in n for n in report_data['notes'])
+        rc, out, _ = fit_main(capsys, str(path), '--device', 'esp32', '--strip', '--json')
+        report_data = json.loads(out)
+        assert report_data['static']['bytecode_bytes'] < len(plain) and report_data['static']['debug_info'] is False
+
+    def test_strip_hint_for_bytecode_files(self, tmp_path, capsys):
+        src = "main()\n" + "".join(f"    print({i} + {i})\n" for i in range(300))
+        data = til.compile_to_bytecode(src, "p.til", debug_info=True).serialize()
+        stripped = len(compile_vm(src).serialize(strip=True))
+        path = tmp_path / "p.tbc"
+        path.write_bytes(data)
+        dev = custom_device(tmp_path, "small", base="cortex-m3-64k", storage=(len(data) + stripped) // 2)
+        rc, out, _ = fit_main(capsys, str(path), '--device', dev)
+        assert rc == 1 and f"--strip would save {len(data) - stripped} bytes" in flat(out)
