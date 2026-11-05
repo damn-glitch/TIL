@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-TIL 3.1 contract proofs (src/tilprove.py): regression tests for the first
-adversarial review of `til prove`.
+TIL 3.1 contract proofs (src/tilprove.py): regression tests for the
+adversarial reviews of `til prove`.
 
 Each class is one finding.  The pattern is always the same: a program that the
 prover used to call `proved` while it fails on both VMs (or a false
@@ -631,3 +631,119 @@ def test_the_probe_does_not_pass_its_inputs_as_program_arguments():
     rep = prove(src)['f']
     assert rep.status == 'not proved' and rep.failures[0].confirmed is False
     assert run_both(src + 'main()\n    print(f(0))\n') == "0\n"
+
+
+# ═══════════════════════════════════════════════════════════════
+# review round 2 (own adversarial pass)
+# ═══════════════════════════════════════════════════════════════
+
+class TestCallsThroughParameters:
+    def test_a_bool_result_from_a_parameter_called_as_a_function(self):
+        # `g` in h is the parameter (a function value returning 5), not the
+        # function g; the result of h(k) is 5
+        src = ('k() -> int\n    return 5\n'
+               'g() -> bool\n    return true\n'
+               'h(g) -> bool\n    print("h")\n    return g()\n'
+               '#[ensures: result == 0]\nf(x: int) -> int\n    let r = h(k)\n'
+               '    assert r == true or r == false\n    return 0\n'
+               'main()\n    print(f(0))\n')
+        assert prove(src)['f'].status != 'proved'
+        fails_on_both_vms(src, "Assertion failed")
+
+
+def test_a_global_named_range_is_not_the_builtin():
+    src = ('mk(a: int, b: int) -> [int]\n    return [100]\n'
+           'let range = mk\n'
+           '#[ensures: result == 0]\nf(n: int) -> int\n    var s = 0\n    for i in range(0, 0)\n'
+           '        invariant s == 0\n        s = s + 1\n    return s\n'
+           'main()\n    print(f(0))\n')
+    assert prove(src)['f'].status != 'proved'
+    fails_on_both_vms(src, "contract violation: f ensures result == 0")
+
+
+@pytest.mark.parametrize("func", [
+    "f() -> int\n    let N = 3\n    return N + 1\n",
+    "f(N: int) -> int\n    return N + 1\n",
+    "f() -> int\n    var r = 0\n    for N in 0..1\n        r = N * 1\n    return r\n",
+])
+def test_a_local_shadowing_a_folded_constant(func):
+    # the bytecode compiler folds `N + 1` with the constant N = 5 although the
+    # local N shadows it (both VMs return 6); native code uses the local
+    src = "const N = 5\n#[ensures: result == 6]\n" + func
+    rep = prove(src)['f']
+    assert rep.status == 'unsupported' and "shadows the constant 'N'" in rep.reason
+    # without the shadowing the same expression is proved
+    assert statuses("const N = 5\n#[ensures: result == 6]\nf() -> int\n    return N + 1\n") == {'f': 'proved'}
+
+
+class TestParameterDefaults:
+    HELPER = '#[requires: x >= 0]\nh(x: int) -> int\n    return x\n'
+
+    def test_a_call_in_a_default_is_checked_in_the_function(self):
+        src = self.HELPER + '#[ensures: result >= 0]\ng(y: int = h(-1)) -> int\n    return 0\n' \
+                            'main()\n    print(g())\n'
+        rep = prove(src)['g']
+        assert rep.status == 'counterexample'
+        fail = failure(rep)
+        assert fail.confirmed and fail.inputs == [] and "default value of parameter 'y'" in fail.ob.what
+        fails_on_both_vms(src, "contract violation: h requires x >= 0")
+
+    def test_the_run_leaves_out_the_arguments_from_the_default_on(self):
+        src = self.HELPER + ('#[ensures: result >= 0]\n'
+                             'g(a: int, y: int = h(a - 1), z: int = 100 / a) -> int\n    return 0\n')
+        rep = prove(src)['g']
+        by_kind = {f.ob.kind: f for f in rep.failures}
+        assert by_kind['call'].status == 'counterexample' and by_kind['call'].confirmed
+        assert [n for n, _v in by_kind['call'].inputs] == ['a'] and by_kind['call'].values['a'] < 1
+        assert by_kind['div'].status == 'counterexample' and by_kind['div'].confirmed
+        assert by_kind['div'].values['a'] == 0 and [n for n, _v in by_kind['div'].inputs] == ['a', 'y']
+        fails_on_both_vms(src + 'main()\n    print(g(0))\n', "contract violation: h requires x >= 0")
+        fails_on_both_vms(src + 'main()\n    print(g(0, 1))\n', "division by zero")
+
+    def test_a_function_whose_only_contract_call_is_in_a_default_is_proved(self):
+        src = self.HELPER + 'g(y: int = h(-1)) -> int\n    return y\nlet A = g()\nmain()\n    print(A)\n'
+        assert prove(src)['g'].status != 'proved'
+        fails_on_both_vms(src, "contract violation: h requires x >= 0")
+        ok = self.HELPER + 'g(y: int = h(1)) -> int\n    return y\n'
+        assert statuses(ok) == {'h': 'proved', 'g': 'proved'}
+
+    def test_defaults_without_checks_do_not_make_a_function_unsupported(self):
+        src = ('#[ensures: result == x]\nf(x: int, cb = |v| v * 2, name: str = "n") -> int\n'
+               '    print(name)\n    return x\n')
+        assert statuses(src) == {'f': 'proved'}
+
+    def test_a_bool_parameter_whose_default_is_not_a_bool(self):
+        src = ('#[ensures: result == true or result == false]\nf(b: bool = 5) -> bool\n    return b\n'
+               'main()\n    print(f())\n')
+        assert prove(src)['f'].status != 'proved'
+        fails_on_both_vms(src, "contract violation: f ensures")
+        good = '#[ensures: result == true or result == false]\nf(b: bool = false) -> bool\n    return b\n'
+        assert statuses(good) == {'f': 'proved'}
+
+
+def test_a_function_with_requires_stored_in_a_global(tmp_path):
+    # calls through a function value are not checked: the code that makes
+    # the value (here the global initializers) is unsupported, not silent
+    src = ('#[requires: x >= 0]\ng(x: int) -> int\n    return x\n'
+           'let H = g\n'
+           '#[ensures: result == 0]\nf() -> int\n    print(H(-1))\n    return 0\n'
+           'main()\n    print(f())\n')
+    reps = prove(src)
+    assert reps[tilprove.START].status == 'unsupported' and "used as a value" in reps[tilprove.START].reason
+    fails_on_both_vms(src, "contract violation: g requires x >= 0")
+    r = cli('prove', write(tmp_path, 'fv.til', src))
+    assert r.returncode == 1 and "unsupported" in r.stdout
+
+
+def test_an_int_passed_to_a_bool_parameter_of_a_proved_function():
+    # to_int is proved for bools; f passes an int, which the VM does not convert
+    src = ('#[ensures: result == 0 or result == 1]\nto_int(b: bool) -> int\n    if b == true\n        return 1\n'
+           '    if b == false\n        return 0\n    return 2\n'
+           '#[ensures: result >= 0]\nf(x: int) -> int\n    return to_int(x & 1)\n'
+           '#[ensures: result >= 0]\ng(x: int) -> int\n    return to_int(x > 0)\n')
+    reps = prove(src)
+    assert reps['to_int'].status == 'proved' and reps['g'].status == 'proved'
+    f = reps['f']
+    assert f.status != 'proved' and f.failures[0].ob.kind == 'bool-arg'
+    assert "does not convert" in f.failures[0].outcome
+    fails_on_both_vms(src + 'main()\n    print(f(3))\n', "contract violation: to_int ensures")

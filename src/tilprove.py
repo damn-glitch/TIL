@@ -151,10 +151,11 @@ class _LoopCtx:
 
 class Obligation:
     """One condition to prove: `pc => goal`."""
-    __slots__ = ('kind', 'what', 'line', 'col', 'pc', 'goal', 'expect', 'show', 'unmodeled', 'loop', 'prefer')
+    __slots__ = ('kind', 'what', 'line', 'col', 'pc', 'goal', 'expect', 'show', 'unmodeled', 'loop', 'prefer',
+                 'omit')
 
-    def __init__(self, kind, what, line, col, pc, goal, expect, show, unmodeled, loop, prefer=None):
-        # ensures | call | div | assert | invariant | loop-entry | loop-step | range | overflow
+    def __init__(self, kind, what, line, col, pc, goal, expect, show, unmodeled, loop, prefer=None, omit=None):
+        # ensures | call | div | assert | invariant | loop-entry | loop-step | range | overflow | bool-arg
         self.kind = kind
         self.what = what            # human readable: "#[ensures: result > x]"
         self.line = line            # where to report it (in the file being proved)
@@ -166,6 +167,7 @@ class Obligation:
         self.unmodeled = unmodeled  # number of unmodeled operations before it (exactness)
         self.loop = loop            # inside / after a loop abstraction
         self.prefer = prefer        # a counterexample satisfying this is preferred (it can be run)
+        self.omit = omit            # a run that reaches it leaves out the arguments from this index on
 
 
 def _and(conjuncts):
@@ -523,6 +525,7 @@ class _Encoder:
         self.attr: Optional[Tuple[str, int]] = None
         self.suffix = ""
         self.note = ""                # where a call is, when not in the body itself (a struct default)
+        self.omit: Optional[int] = None  # in the default of parameter i: a run leaves out arguments i...
         self.frames: Optional[list] = None
         self.unmodeled = 0
         self.loop_depth = 0          # > 0: obligations depend on a loop abstraction
@@ -589,7 +592,7 @@ class _Encoder:
                 line, col = self.location(node)
                 self.obligations.append(Obligation(
                     kind, what, line, col, st.pc, goal, expect, list(show), self.unmodeled,
-                    self.loop_depth > 0 or self.after_loop, prefer))
+                    self.loop_depth > 0 or self.after_loop, prefer, self.omit))
         st.pc = st.pc + (goal,)
 
     def overflow(self, st: _State, term, node):
@@ -716,6 +719,7 @@ class _Encoder:
             if p.name == 'self':
                 raise Unsupported("methods with 'self' are not supported (the receiver is a struct)", fdef)
             st.declare(p.name, self.param_value(p, st))
+        self.check_defaults(st)
         for k, cond in enumerate(fdef.requires):
             text = _text(fdef.requires_text, k)
             # assumed (the VM checks it at entry); its own divisions must not fail
@@ -738,6 +742,35 @@ class _Encoder:
             with self.context(ovf='collect', collected=bucket):
                 t = self.truth(self.ev(part, st), part)
             st.pc = st.pc + ((z3.Implies(_and(bucket), t) if bucket else t),)
+
+    def check_defaults(self, st: _State):
+        """A call that leaves out parameter i makes the function evaluate its
+        default value at entry (ARG_DEFAULT, before the casts and the
+        #[requires]), with the earlier parameters set and the later ones not:
+        the calls and divisions in it are conditions of this function.  A
+        `bool` parameter whose default is not a bool may hold a non-bool."""
+        params = self.fdef.params
+        for i, p in enumerate(params):
+            if p.default is None:
+                continue
+            scope = {q.name: st.lookup(q.name) for q in params[:i]}
+            for q in params[i:]:
+                scope[q.name] = _opaque(f"parameter '{q.name}' before it is set")
+            sub = _State(st.pc, [scope])
+            note = f" (in the default value of parameter '{p.name}')"
+            saved = (len(self.obligations), self.unmodeled)
+            try:
+                with self.context(note=self.note + note, suffix=self.suffix or note, omit=i):
+                    v = self.ev(p.default, sub)
+            except Unsupported:
+                if self.p.default_needs_checks(p.default):
+                    raise
+                del self.obligations[saved[0]:]      # nothing in it can fail that the proof claims
+                self.unmodeled = saved[1]
+                v = _opaque("a default value")
+            if _type_kind(p.type) == 'bool' and v.sort != BOOL:
+                st.assign(p.name, _opaque(f"parameter '{p.name}' (when it is left out it holds its default "
+                                          f"value, which is not a bool)"))
 
     def param_value(self, p, st: _State) -> _V:
         kind = _type_kind(p.type)
@@ -1050,8 +1083,8 @@ class _Encoder:
         if not (isinstance(it, til.Call) and isinstance(it.func, til.Identifier)
                 and it.func.name == 'range' and 1 <= len(it.args) <= 2):
             return None
-        if st.lookup('range') is not None or 'range' in self.p.funcs:
-            return None
+        if st.lookup('range') is not None or 'range' in self.p.funcs or self.p.is_global('range'):
+            return None                  # not the builtin: a call of a value or of a user function
         args = [self.ev(a, st) for a in it.args]
         return (self.int_const(0), args[0]) if len(args) == 1 else (args[0], args[1])
 
@@ -1211,6 +1244,7 @@ class _Encoder:
         if t is T.BinaryOp or t is T.UnaryOp:
             folded = self.p.fold(node)
             if folded is not _NO_FOLD:
+                self.check_fold(node, st)
                 return self.const_value(folded)
             return self.ev_binary(node, st) if t is T.BinaryOp else self.ev_unary(node, st)
         if t is T.IntLit:
@@ -1270,6 +1304,18 @@ class _Encoder:
         }
         raise Unsupported(f"{names.get(t.__name__, t.__name__)} are not supported"
                           if t.__name__ in names else f"{t.__name__} is not supported", node)
+
+    def check_fold(self, node, st: _State):
+        """The bytecode compiler folds a constant expression with the literal
+        constants even where a local (or a parameter) shadows one of them;
+        native code uses the local.  The two disagree there: nothing is
+        claimed about such code."""
+        for name in _names_in(node):
+            if name in self.p.inline_consts and (st.lookup(name) is not None or
+                                                 (name == 'result' and self.result is not None)):
+                raise Unsupported(f"'{name}' here is a local that shadows the constant '{name}': the "
+                                  f"bytecode compiler computes this expression with the constant, native "
+                                  f"code with the local (rename the local)", node)
 
     def ev_struct_init(self, node, st: _State) -> _V:
         """Like compile_struct_init: the fields in the order of the struct
@@ -1517,6 +1563,7 @@ class _Encoder:
         p = self.p
         callee = p.funcs[key]
         args = self.ev_args(node, st)
+        self.check_bool_args(key, callee, args, node, st)
         if callee.requires or callee.ensures:
             return self.call_with_contract(key, callee, args, node, st)
         if p.inlinable(key) and key not in [k for k, _ in self.inline_stack] and key != self.key:
@@ -1529,6 +1576,22 @@ class _Encoder:
                 self.unmodeled = saved_um
         self.unmodeled += 1
         return self.call_result(key, callee, st, args)
+
+    def check_bool_args(self, key: str, callee, args: List[_V], node, st: _State):
+        """The VM does not convert `bool` parameters, and the proof of a
+        function assumes they hold bools: passing an int (or nil) to one of a
+        function that is proved is a failure of the caller.  It is not a
+        run-time error, so it is not assumed afterwards."""
+        if self.mode != 'check' or self.dead(st) or not self.p.has_contract_work(key):
+            return
+        for i, prm in enumerate(callee.params):
+            if i < len(args) and _type_kind(prm.type) == 'bool' and args[i].sort in (INT, NIL):
+                with self.context(sites=self.sites + [node]):
+                    line, col = self.location(node)
+                what = f"argument '{prm.name}' of '{key}' is a bool (the proof of '{key}' assumes it){self.note}"
+                self.obligations.append(Obligation('bool-arg', what, line, col, st.pc, z3.BoolVal(False), None, [],
+                                                   self.unmodeled, self.loop_depth > 0 or self.after_loop,
+                                                   None, self.omit))
 
     def call_result(self, key: str, callee, st: _State, args: List[_V]) -> _V:
         """An unconstrained result of the callee's declared return type -
@@ -2194,6 +2257,8 @@ class Prover:
         shadow = _bound_names(f)
         bool_params = {p.name: i for i, p in enumerate(f.params)
                        if _type_kind(p.type) == 'bool' and p.name not in shadow}
+        # a call of a parameter, a local or a global calls a value (CALL_VALUE), not a function
+        values = shadow | {p.name for p in f.params} | set(self.globals)
         need: Set[int] = set()
         self_calls: list = []
 
@@ -2215,8 +2280,8 @@ class Prover:
                 return isinstance(e.target_type, til.PrimitiveType) and e.target_type.name == 'bool'
             if isinstance(e, til.Call) and isinstance(e.func, til.Identifier):
                 name = e.func.name
-                if name in shadow:
-                    return False                     # a local function value
+                if name in values:
+                    return False                     # a function value (parameter, local, global)
                 if name == key:
                     self_calls.append(e)             # decided below, once `need` is known
                     return True
@@ -2341,19 +2406,43 @@ class Prover:
         return [k for k in keys if k in self.funcs]
 
     def has_contract_work(self, key: str) -> bool:
-        f = self.fdef_of(key)
-        if f.requires or f.ensures:
-            return True
-        return self._contract_work_in(f.body, set())
+        cache = self.__dict__.setdefault('_work', {})
+        if key not in cache:
+            f = self.fdef_of(key)
+            # the default values of parameters run in the function (when an argument is left out)
+            cache[key] = bool(f.requires or f.ensures) or any(
+                self._contract_work_in(part, set())
+                for part in [f.body] + [p.default for p in f.params if p.default is not None])
+        return cache[key]
+
+    def default_needs_checks(self, expr) -> bool:
+        """Can evaluating a parameter's default value fail in a way the proof
+        claims (a call that must satisfy a #[requires], a division)?"""
+        return self._contract_work_in(expr, set()) or any(
+            isinstance(n, til.BinaryOp) and n.op in ('/', '%') for n in til.walk(expr))
 
     def _contract_work_in(self, node, seen_structs: Set[str]) -> bool:
         """An assert/invariant, or a call of a function with #[requires] (also
-        in the default values of the fields a struct initializer leaves out)."""
-        for n in til.walk(node):
+        in the default values of the fields a struct initializer leaves out),
+        or such a function used as a value (calls through it are not checked:
+        the proof of the code that makes the value says so)."""
+        nodes = list(til.walk(node))
+        called = {id(n.func) for n in nodes if isinstance(n, til.Call)}
+        for n in nodes:
             if isinstance(n, (til.AssertStmt, til.InvariantStmt)):
                 return True
             if isinstance(n, til.Call) and self._calls_contract(n):
                 return True
+            if id(n) not in called:
+                if isinstance(n, til.Identifier):
+                    g = self.funcs.get(n.name) if '.' not in n.name else None
+                elif isinstance(n, til.Attribute) and isinstance(n.obj, til.Identifier) and \
+                        n.obj.name in self.module_names:
+                    g = self.funcs.get(n.attr)
+                else:
+                    g = None
+                if g is not None and g.requires:
+                    return True
             if isinstance(n, til.StructInit) and n.name in self.struct_defs and n.name not in seen_structs:
                 seen_structs.add(n.name)
                 for fld in self.struct_defs[n.name].fields:
@@ -2526,7 +2615,9 @@ class Prover:
         fail = Failure(ob, 'counterexample')
         fail.domain = dom
         runnable = True
-        for name, sort, z, t in enc.inputs:
+        # a condition in the default value of parameter i: the run leaves out arguments i...
+        given = enc.inputs if ob.omit is None else enc.inputs[:ob.omit]
+        for name, sort, z, t in given:
             fail.order.append(name)
             if sort in (INT, BOOL):
                 fail.inputs.append((name, value(_V(sort, z))))
@@ -2558,6 +2649,8 @@ class Prover:
                     fail.confirmed = True
                     fail.outcome = f"running it fails with: {ob.expect[0]} (found by running edge values; " \
                                    f"the solver's candidate relied on an abstraction)"
+        elif ob.kind == 'bool-arg':
+            fail.outcome = "the call passes an int or nil, which the VM does not convert (not a run-time error)"
         elif not runnable:
             fail.outcome = ("it cannot be run: the prover has no value for the parameter"
                             + ("s " if sum(v is None for _n, v in fail.others) > 1 else " ")
@@ -2667,7 +2760,7 @@ class Prover:
                 args = [_literal(v) for v in literal_args]
             else:
                 args = []
-                for i, kind in enumerate(self._probe_kinds(key)):
+                for i, kind in enumerate(self._probe_kinds(key)[:n_args]):
                     item = T.Index(obj=T.Call(func=T.Identifier(name='args'), args=[]), index=T.IntLit(value=i))
                     if kind == 'bool':
                         args.append(T.BinaryOp(op='==', left=item, right=T.StringLit(value="true")))

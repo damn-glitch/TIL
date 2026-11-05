@@ -38,7 +38,7 @@ Add `#[requires: x < 9223372036854775807]` and `inc` is proved.
 
 | command | proves | without Z3 |
 |---|---|---|
-| `til prove prog.til` | every function with `#[requires]`, `#[ensures]`, `assert` or `invariant`, every function that calls a function with `#[requires]`, and the global initializers (`__start__`) when they call one | explains `pip install z3-solver`, exit 1 |
+| `til prove prog.til` | every function with `#[requires]`, `#[ensures]`, `assert` or `invariant`, every function that calls a function with `#[requires]` (also in the default values of its parameters) or uses one as a value, and the global initializers (`__start__`) when they do | explains `pip install z3-solver`, exit 1 |
 | `til check --prove prog.til` | the same, as part of the checks | error `E-PROVE`, exit 1 |
 | `til check prog.til` | only `#[level: 4]` functions (level 4 = "formal") | warning on stderr, does not fail |
 
@@ -104,8 +104,10 @@ parameter values that satisfies its `#[requires]`:
 2. each `assert` and `invariant` statement holds;
 3. each call satisfies the called function's `#[requires]` - also the calls in
    the default values of struct fields that an initializer `P { ... }` leaves
-   out (the VM evaluates them there), and, for `__start__`, the calls in the
-   global initializers;
+   out (the VM evaluates them there), the calls in the default values of the
+   function's own parameters (the function evaluates them when a call leaves
+   the argument out), and, for `__start__`, the calls in the global
+   initializers;
 4. no `/` or `%` divides by zero (also inside contracts);
 5. each loop invariant holds when the loop is reached and after every
    iteration.
@@ -140,7 +142,10 @@ Constant subexpressions are folded exactly like the compiler folds them
 (`BytecodeCompiler.try_fold`), because that is what the bytecode computes -
 with the compiler's rules, which are not always the run-time rules: the
 constant expression `1 == true` is folded to `true` (both VMs print `true`),
-and the prover agrees.
+and the prover agrees. The compiler also folds an expression like `N + 1`
+with the constant `N` where a local variable or parameter named `N` shadows
+the constant, while native code uses the local; such an expression makes the
+function unsupported (rename the local).
 
 `x ** e` is exact for constant exponents up to 64, for variable exponents up
 to 8, for negative exponents, for the bases 0, 1 and -1, and for even bases
@@ -167,6 +172,11 @@ their exact VM result there.
   function unsupported. Parameters without a type are treated the same way:
   annotate them. A `bool` parameter is not converted by the VM: the proof of a
   function assumes its `bool` parameters hold `true` or `false`.
+  Default values (`f(x: int, y: int = g(x))`) are evaluated by the function
+  itself when a call leaves the argument out, before its `#[requires]` is
+  checked: the calls and divisions in them are conditions of the function
+  (a counterexample run then leaves the argument out). A `bool` parameter
+  whose default value is not a bool is an unknown value.
 * **Locals**: `let`, `var`, `const`, assignments (`=`, `+=`, ...), shadowing,
   block scopes.
 * **Control flow**: `if`/`elif`/`else`, `x if c else y`, `and`/`or` (the right
@@ -303,15 +313,21 @@ it prints depend on the Z3 version):
   overflow and `MIN / -1` are undefined behaviour; a C compiler may then
   disagree with the VMs (for example fold `x + 1 > x` to true). Proved
   properties hold for native builds only when they are compiled with
-  wrap-around semantics (`-fwrapv`).
+  wrap-around semantics (`-fwrapv`). Native code also compares an int with a
+  bool numerically (`x == true` is true for `x = 1` natively, false on both
+  VMs); the prover follows the VMs.
 * `bool` parameters are not converted by the VM; the proof of a function
-  assumes its callers pass bools (a call that passes an int is not reported;
-  the caller's own proof does not rely on the callee's proof).
+  assumes its callers pass bools. A call in a proved function that passes an
+  int or nil to a `bool` parameter of a function with contracts is reported
+  there (`argument 'b' of 'f' is a bool`); a value the prover does not model
+  (an array element, ...) and calls from functions that are not proved are
+  not checked.
 * `#[ensures]` of a function without a return type is checked by the VM only at
   `return <value>`; the prover follows the VM.
 * Calls through function values (closures, functions passed as arguments) are
-  not checked; passing a function that has `#[requires]` as a value makes the
-  caller unsupported.
+  not checked; using a function that has `#[requires]` as a value makes the
+  code that does it unsupported (a function, or `__start__` for
+  `let h = f` at the top level).
 * Nonlinear bit-vector problems that do not fit the integer model (they need
   wrap-around) can time out; the result is then `unknown`.
 * Floats, strings, arrays, maps, structs and methods with `self` are not
