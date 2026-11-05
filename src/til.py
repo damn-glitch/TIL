@@ -10498,36 +10498,47 @@ class ModuleResolver:
         # Convert module.path to file path
         parts = module_name.replace(".", os.sep)
 
-        # Search: importing file's dir, base path, $TIL_PATH, then stdlib dirs
+        def find(dirs: List[str]) -> Optional[str]:
+            for d in dirs:
+                # Try module_name.til, then module_name/mod.til (package)
+                for candidate in (os.path.join(d, parts + ".til"), os.path.join(d, parts, "mod.til")):
+                    if os.path.exists(candidate):
+                        return candidate
+            return None
+
+        # Search: importing file's dir, base path, $TIL_PATH, (declared packages,) stdlib dirs
         search_dirs = []
         if from_file and not from_file.startswith("<"):
             search_dirs.append(os.path.dirname(os.path.abspath(from_file)))
-        search_dirs.append(self.base_path)
-        for extra in os.environ.get('TIL_PATH', '').split(os.pathsep):
-            if extra:
-                search_dirs.append(extra)
-        for home in til_home_dirs():
-            stdlib_dir = os.path.join(home, 'stdlib')
-            if os.path.isdir(stdlib_dir):
-                search_dirs.append(stdlib_dir)
-
-        for d in search_dirs:
-            # Try module_name.til
-            candidate = os.path.join(d, parts + ".til")
-            if os.path.exists(candidate):
-                return candidate
-            # Try module_name/mod.til (package)
-            candidate = os.path.join(d, parts, "mod.til")
-            if os.path.exists(candidate):
-                return candidate
-        return None
+        # a file of an installed package never searches the current directory or
+        # $TIL_PATH: its imports must not depend on where `til` runs (til.lock pins them)
+        if installed_package_dirs(from_file) is None:
+            search_dirs.append(self.base_path)
+            for extra in os.environ.get('TIL_PATH', '').split(os.pathsep):
+                if extra:
+                    search_dirs.append(extra)
+        found = find(search_dirs)
+        if found:
+            return found
+        # a dependency declared in the til.json that governs the importing file is
+        # pinned by til.lock: only til_modules/ provides it - never the standard
+        # library ($TIL_HOME/stdlib and ~/.til/stdlib differ between machines)
+        if module_name.split(".")[0] in declared_dependencies(from_file, self.base_path):
+            return find_package_module(module_name, from_file, self.base_path)
+        stdlib_dirs = [os.path.join(home, 'stdlib') for home in til_home_dirs()]
+        found = find([d for d in stdlib_dirs if os.path.isdir(d)])
+        # the other installed packages (til_modules/, `til pkg`) come after everything above
+        return found or find_package_module(module_name, from_file, self.base_path)
 
     def load_module(self, module_name: str, from_file: str = "") -> Optional[Program]:
         """Load and parse a module, returning its AST (cached per file)."""
         path = self.resolve(module_name, from_file)
         if not path:
+            hint = package_install_hint(module_name, from_file, self.base_path)
+            if hint:
+                print(hint, file=sys.stderr)
             return None
-        key = os.path.abspath(path)
+        key = module_file_key(path)         # one AST per file, whatever path reaches it
         if key in self.loaded:
             return self.loaded[key]
 
@@ -10539,6 +10550,169 @@ class ModuleResolver:
         return ast
 
 
+# ── packages: til_modules/ (installed by `til pkg`, see docs/TIL_PACKAGES.md) ──
+# `import NAME` / `from NAME import x` look for til_modules/NAME/ after the
+# search paths above - but a NAME declared in the "dependencies" of the
+# importing package's til.json (or, for a program, of its project's til.json)
+# comes from til_modules/ only, before the standard library is searched
+# (declared_dependencies):
+#   * from a program: in the importing file's directory, then each parent
+#     directory (nearest first), up to the nearest project root (the first
+#     directory with a til.json or til.lock) - never above it;
+#   * from a file of an installed package (PROJECT/til_modules/PKG/...): only
+#     in PROJECT/til_modules/ - the flat directory til.lock describes; never a
+#     til_modules/ nested inside an installed package.
+# Inside a package:
+#   import NAME      -> til.json "main", else NAME.til, lib.til, mod.til
+#   import NAME.a.b  -> a/b.til or a/b/mod.til (package root first, then the
+#                       directory of the entry file)
+PACKAGE_DIR = 'til_modules'
+
+
+def _package_manifest(directory: str) -> Dict[str, Any]:
+    """til.json of a directory as a dict ({} if missing or unreadable)."""
+    import json
+    try:
+        with open(os.path.join(directory, 'til.json'), encoding='utf-8-sig') as f:
+            data = json.load(f)
+    except (OSError, ValueError, RecursionError):      # RecursionError: JSON nested too deeply
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _package_start_dir(from_file: str, base_path: str) -> str:
+    if from_file and not from_file.startswith("<"):
+        return os.path.dirname(os.path.abspath(from_file))
+    return os.path.abspath(base_path)
+
+
+def package_entry_file(pkg_dir: str, name: str) -> Optional[str]:
+    """The file `import NAME` loads from a package directory: til.json "main"
+    (a relative path inside the package; '/' or '\\' separate directories on
+    every OS, as `til pkg` checks it), else NAME.til, lib.til, mod.til."""
+    main = _package_manifest(pkg_dir).get('main')
+    if isinstance(main, str) and main:
+        root = os.path.abspath(pkg_dir)
+        parts = main.replace('\\', '/').split('/')
+        path = os.path.abspath(os.path.join(root, *parts))
+        if (os.path.isabs(main) or main.startswith(('/', '\\')) or ':' in parts[0]
+                or not path.startswith(root + os.sep) or not os.path.isfile(path)):
+            return None             # `til pkg` rejects such packages; never look elsewhere
+        return path
+    for candidate in (name + ".til", "lib.til", "mod.til"):
+        path = os.path.join(pkg_dir, candidate)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _is_project_root(directory: str) -> bool:
+    return os.path.isfile(os.path.join(directory, 'til.json')) or \
+        os.path.isfile(os.path.join(directory, 'til.lock'))
+
+
+def installed_package_dirs(from_file: str) -> Optional[Tuple[str, str]]:
+    """(package directory, project til_modules/) when `from_file` belongs to an
+    installed package - it lies in PROJECT/til_modules/PKG/ and PROJECT has a
+    til.json or til.lock - else None."""
+    if not from_file or from_file.startswith("<"):
+        return None
+    d = os.path.dirname(os.path.abspath(from_file))
+    while True:
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        if os.path.basename(parent) == PACKAGE_DIR and _is_project_root(os.path.dirname(parent)):
+            return d, parent
+        d = parent
+
+
+def package_search_dirs(from_file: str = "", base_path: str = ".") -> List[str]:
+    """The til_modules/ directories `import NAME` looks in, nearest first."""
+    owner = installed_package_dirs(from_file)
+    if owner is not None:
+        return [owner[1]]           # a package's dependencies: the project's flat til_modules/ only
+    dirs = []
+    d = _package_start_dir(from_file, base_path)
+    while True:
+        dirs.append(os.path.join(d, PACKAGE_DIR))
+        parent = os.path.dirname(d)
+        if _is_project_root(d) or parent == d:
+            return dirs             # never above the nearest project root
+        d = parent
+
+
+def find_package_module(module_name: str, from_file: str = "", base_path: str = ".") -> Optional[str]:
+    """Resolve `import NAME[.sub...]` against installed packages: the first
+    til_modules/NAME/ directory of package_search_dirs()."""
+    parts = module_name.split(".")
+    for modules in package_search_dirs(from_file, base_path):
+        pkg_dir = os.path.join(modules, parts[0])
+        if os.path.isdir(pkg_dir):
+            entry = package_entry_file(pkg_dir, parts[0])
+            if len(parts) == 1:
+                return entry
+            roots = [pkg_dir]
+            if entry and os.path.dirname(entry) != os.path.abspath(pkg_dir):
+                roots.append(os.path.dirname(entry))
+            sub = os.path.join(*parts[1:])
+            for root in roots:
+                for candidate in (os.path.join(root, sub + ".til"), os.path.join(root, sub, "mod.til")):
+                    if os.path.isfile(candidate):
+                        return candidate
+            return None             # the nearest package of that name wins
+    return None
+
+
+def declared_dependencies(from_file: str = "", base_path: str = ".") -> Set[str]:
+    """The names in "dependencies" of the til.json that governs `from_file`:
+    that of the installed package it belongs to, else that of the nearest
+    project root (the first directory upwards with a til.json or til.lock)."""
+    owner = installed_package_dirs(from_file)
+    if owner is not None:
+        directory = owner[0]
+    else:
+        directory = _package_start_dir(from_file, base_path)
+        while not _is_project_root(directory):
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                return set()
+            directory = parent
+    deps = _package_manifest(directory).get('dependencies')
+    return set(deps) if isinstance(deps, dict) else set()
+
+
+def package_install_hint(module_name: str, from_file: str = "", base_path: str = ".") -> Optional[str]:
+    """A hint for a module that was not found: an installed package lacks that
+    (sub)module, or the nearest til.json declares it as a dependency that was
+    never installed (`til pkg install` was not run)."""
+    parts = module_name.split(".")
+    name = parts[0]
+    for modules in package_search_dirs(from_file, base_path):
+        pkg_dir = os.path.join(modules, name)
+        if os.path.isdir(pkg_dir):
+            if len(parts) > 1:
+                sub = "/".join(parts[1:])
+                return (f"hint: the package '{name}' ({pkg_dir}) has no module '{'.'.join(parts[1:])}' "
+                        f"({sub}.til or {sub}/mod.til)")
+            return (f"hint: the package '{name}' ({pkg_dir}) has no entry file: til.json \"main\" if it is "
+                    f"set, else {name}.til, lib.til or mod.til")
+    owner = installed_package_dirs(from_file)
+    d = owner[0] if owner is not None else _package_start_dir(from_file, base_path)
+    while True:
+        if _is_project_root(d):
+            deps = _package_manifest(d).get('dependencies')
+            if not (isinstance(deps, dict) and name in deps):
+                return None
+            project = os.path.dirname(owner[1]) if owner is not None else d
+            return (f"hint: '{name}' is a dependency in {os.path.join(d, 'til.json')} but is not "
+                    f"installed - run `til pkg install` in {project}")
+        parent = os.path.dirname(d)
+        if parent == d or owner is not None:
+            return None             # a package's own til.json is at its root
+        d = parent
+
+
 IMPORTABLE_NODES = (FuncDef, StructDef, EnumDef, ImplBlock, TraitDef, TypeAlias,
                     VarDecl, CapabilityType)
 
@@ -10548,12 +10722,154 @@ def _definition_name(node) -> Optional[str]:
     return getattr(node, 'name', None)
 
 
+def module_file_key(path: str) -> str:
+    """The identity of a source file: the same file reached through different
+    paths (symbolic links, '..', letter case on Windows) is one module."""
+    if not path or path.startswith("<"):
+        return path
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _definition_kind(node) -> str:
+    if isinstance(node, VarDecl):
+        return 'const' if node.is_const else ('var' if node.mutable else 'let')
+    for cls, kind in ((FuncDef, 'function'), (StructDef, 'struct'), (EnumDef, 'enum'), (TraitDef, 'trait'),
+                      (TypeAlias, 'type alias'), (CapabilityType, 'capability')):
+        if isinstance(node, cls):
+            return kind
+    return 'definition'
+
+
+MAX_NAMESPACE_ERRORS = 10
+
+
+def _shown_path(path: str) -> str:
+    """A source path in messages: relative to the current directory when the
+    file is below it, else as it is."""
+    if not os.path.isabs(path):
+        return path
+    try:
+        rel = os.path.relpath(path)
+    except ValueError:              # another drive (Windows)
+        return path
+    return path if rel == os.pardir or rel.startswith(os.pardir + os.sep) else rel
+
+
+def namespace_errors(definitions: List[Tuple[str, ASTNode]]) -> List[str]:
+    """TIL has ONE namespace for a program and everything it imports (its
+    modules and packages, directly or indirectly): there are no module-private
+    names, and merged definitions see each other. So a top-level name
+    (function, const/let/var, struct, enum, trait, type alias, capability) -
+    or a method of a type - that two different files bring into the program
+    would make code of one file silently use the other file's definition.
+    Each such clash is an error naming both files. `definitions`: (file,
+    definition) for everything merged into the program, each once, in merge
+    order. (Duplicates inside one file are left to the backends, as before.)"""
+    first: Dict[Tuple[str, str], Tuple[str, str, ASTNode, str]] = {}
+    errors: List[str] = []
+    more = 0
+    reporters: Dict[str, ErrorReporter] = {}
+    for path, stmt in definitions:
+        if isinstance(stmt, ImplBlock):
+            entries = [(('method', f"{stmt.type_name}.{meth.name}"), meth, 'method') for meth in stmt.methods]
+        elif isinstance(stmt, IMPORTABLE_NODES) and _definition_name(stmt):
+            entries = [(('name', _definition_name(stmt)), stmt, _definition_kind(stmt))]
+        else:
+            continue
+        key = module_file_key(path)
+        for ident, node, kind in entries:
+            prev = first.setdefault(ident, (path, key, node, kind))
+            if prev[1] == key:
+                continue
+            if len(errors) >= MAX_NAMESPACE_ERRORS:
+                more += 1
+                continue
+            name = ident[1]
+            there = f"{_shown_path(prev[0])}:{getattr(prev[2], 'line', 0) or '?'}"
+            here = f"{_shown_path(path)}:{getattr(node, 'line', 0) or '?'}"
+            if kind == prev[3]:
+                msg = f"{kind} '{name}' is defined in two files: {there} and {here}"
+            else:
+                msg = f"'{name}' is defined in two files: {prev[3]} at {there}, {kind} at {here}"
+            if key not in reporters:
+                try:
+                    with open(path, encoding='utf-8') as f:
+                        source = f.read()
+                except (OSError, ValueError):
+                    source = ""
+                reporters[key] = ErrorReporter(source, _shown_path(path))
+            hint = ("a program and everything it imports (modules, packages, also indirectly) share one "
+                    "namespace - TIL has no module-private names: rename one of the two (packages should "
+                    "prefix their internal names with the package name)" if not errors else "")
+            errors.append(reporters[key].format_error(getattr(node, 'line', 0) or 0, getattr(node, 'col', 0) or 1,
+                                                      msg, "E-IMPORT", hint))
+    if more:
+        errors.append(f"error[E-IMPORT]: ... and {more} more name{'s' if more != 1 else ''} defined in two files")
+    return errors
+
+
+def _names_used(definition: ASTNode) -> Set[str]:
+    """Every string inside a definition (identifiers, but also literals and
+    type names): an over-approximation of the top-level names it uses. Merging
+    a definition too many is harmless - a clash is never silent (namespace_errors)."""
+    from dataclasses import is_dataclass
+    names: Set[str] = set()
+    todo: List[Any] = [definition]
+    seen: Set[int] = set()
+    while todo:
+        n = todo.pop()
+        if isinstance(n, str):
+            names.add(n)
+        elif id(n) in seen or n is None or isinstance(n, (int, float, bool, bytes)):
+            continue
+        elif isinstance(n, (list, tuple, set, frozenset)):
+            seen.add(id(n))
+            todo.extend(n)
+        elif isinstance(n, dict):
+            seen.add(id(n))
+            todo.extend(n.keys())
+            todo.extend(n.values())
+        elif isinstance(n, Type) or (is_dataclass(n) and not isinstance(n, type)):
+            seen.add(id(n))             # AST nodes, types, FuncParam, StructField, EnumVariant, ...
+            todo.extend(getattr(n, '__dict__', {}).values())
+    return names
+
+
+def from_import_closure(definitions: List[ASTNode], items: List[str]) -> List[ASTNode]:
+    """`from m import a, b` merges a, b and every definition of m (and of what
+    m imports) that they use, transitively: a function imported this way still
+    finds its module's constants, helpers, structs and methods (it used to fail
+    with "unknown function", or - worse - silently use the program's own
+    definition of that name; namespace_errors now reports that clash)."""
+    wanted = set(items)
+    kept: Set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        for d in definitions:
+            if id(d) in kept:
+                continue
+            if isinstance(d, ImplBlock):
+                hit = d.type_name in wanted or any(meth.name in wanted for meth in d.methods)
+            elif isinstance(d, EnumDef):
+                hit = d.name in wanted or any(v.name in wanted for v in d.variants)
+            else:
+                hit = _definition_name(d) in wanted
+            if hit:
+                kept.add(id(d))
+                wanted |= _names_used(d)
+                changed = True
+    return [d for d in definitions if id(d) in kept]
+
+
 def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
     """Process import statements: load modules (recursively) and merge their
     definitions - functions, structs, enums, impls, traits, consts, aliases.
 
     `import m` / `import m as alias` also enable qualified calls `m.f()`;
-    the module names are recorded in `program.module_names`."""
+    the module names are recorded in `program.module_names`. Everything
+    merged shares one namespace: a name two files bring in is an error
+    (namespace_errors)."""
     resolver = ModuleResolver()
     seen_defs: Set[int] = set()
     module_names: Set[str] = set(getattr(program, 'module_names', set()) or ())
@@ -10572,27 +10888,29 @@ def resolve_imports(program: Program, filename: str = "<stdin>") -> Program:
             if stmt.alias:
                 module_names.add(stmt.alias)
             mod_path = getattr(mod_ast, 'filename', stmt.module)
-            if mod_path in stack:
+            mod_key = module_file_key(mod_path)
+            if mod_key in stack:
                 continue  # import cycle: definitions are already being merged
-            mod_stmts = merge(mod_ast, mod_path, stack + (mod_path,))
-            for mod_stmt in mod_stmts:
-                if not isinstance(mod_stmt, IMPORTABLE_NODES):
-                    continue
-                if isinstance(mod_stmt, FuncDef) and mod_stmt.name == "main":
-                    continue  # a module's own entry point / script code is not imported
-                if stmt.items is not None and _definition_name(mod_stmt) not in stmt.items:
-                    continue
-                out.append(mod_stmt)
+            mod_stmts = [s for s in merge(mod_ast, mod_path, stack + (mod_key,))
+                         if isinstance(s, IMPORTABLE_NODES)
+                         # a module's own entry point / script code is not imported
+                         and not (isinstance(s, FuncDef) and s.name == "main")]
+            if stmt.items is not None:
+                mod_stmts = from_import_closure(mod_stmts, stmt.items)
+            out.extend(mod_stmts)
         return out
 
-    merged = merge(program, filename, (os.path.abspath(filename)
-                                       if not filename.startswith("<") else filename,))
+    merged = merge(program, filename, (module_file_key(filename),))
     program.statements = []
     for stmt in merged:                 # a module imported several times is merged once
         if id(stmt) not in seen_defs:
             seen_defs.add(id(stmt))
             program.statements.append(stmt)
     program.module_names = module_names
+    origin = {id(s): mod.filename for mod in resolver.loaded.values() for s in mod.statements}
+    clashes = namespace_errors([(origin.get(id(s), filename), s) for s in program.statements])
+    if clashes:
+        raise CompileError("\n\n".join(clashes))
     return program
 
 
@@ -11048,6 +11366,9 @@ def run_repl():
 def main():
     args = sys.argv[1:]
 
+    if args and args[0] in EXTRA_COMMANDS:      # before -h/--help: `til pkg --help` is the tool's own help
+        return run_extra_command(args[0], args[1:])
+
     if not args or '-h' in args or '--help' in args:
         print_help()
         return 0
@@ -11057,9 +11378,6 @@ def main():
         print("Author: Alisher Beisembekov")
         print("Backends: native (C via gcc/clang), TIL VM (bytecode: Python, C99 / calculators)")
         return 0
-
-    if args[0] in EXTRA_COMMANDS:
-        return run_extra_command(args[0], args[1:])
 
     command = None
     if args and args[0] in ('run', 'build', 'check', 'repl', 'exec', 'dis', 'translate'):
