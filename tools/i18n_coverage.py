@@ -51,7 +51,7 @@ Message templates are extracted statically:
   interpolated expression becomes a placeholder.
 * vm/tilvm.c, with regular expressions: `fail(vm, "...")`, `failn(vm, ...)`,
   `failf(vm, ...)`, `type_error2(vm, "...", ...)`, `invalid_number(vm, ...,
-  "...")` and the few messages assembled by hand in `vm->errbuf` (C_HANDBUILT
+  "...")`, `fail_type(vm, ...)` / `fail_types(vm, ...)` (a value's type) and the few messages assembled by hand in `vm->errbuf` (C_HANDBUILT
   below; each is used only while its anchor literal is still in the source).
   A helper that passes one of its `const char *` parameters on to
   fail/failn/failf is expanded at each of its call sites, and a string
@@ -1114,7 +1114,7 @@ def _is_null(arg: str) -> bool:
     return arg.strip() in ('0', 'NULL', '(const char *)0')
 
 
-_C_FAIL_CALL = re.compile(r'\b(fail|failn|failf|type_error2|invalid_number)\s*\(')
+_C_FAIL_CALL = re.compile(r'\b(fail|failn|failf|type_error2|invalid_number|fail_type|fail_types)\s*\(')
 _C_STRING_CONST = re.compile(r'\bstatic\s+const\s+char\s+(?:\*\s*const\s+(\w+)|(\w+)\s*\[\s*\])\s*=\s*'
                              r'((?:"(?:[^"\\\n]|\\.)*"\s*)+);')
 _C_HELPER = re.compile(r'\bstatic\s+int\s+(\w+)\s*\(\s*tilvm\s*\*\s*vm\s*,([^)]*)\)\s*\{')
@@ -1167,6 +1167,15 @@ def c_message_parts(name: str, args: List[str]) -> List[List[Optional[str]]]:
         return [[c_literal(args[0]) or PH, PH, " and ", PH]]
     if name == 'invalid_number' and len(args) == 2:
         return [[c_literal(args[1]) or PH, '"', PH, '"']]
+    if name in ('fail_type', 'fail_types') and len(args) == (4 if name == 'fail_type' else 5):
+        # fail_type(vm, p0, p1, value, p3) / fail_types(vm, p0, p1, a, p3, b): the values'
+        # types are placeholders (any argument may be 0)
+        alts: List[List[Optional[str]]] = [[]]
+        for k, a in enumerate(args):
+            if _is_null(a):
+                continue
+            alts = _product(alts, [[PH]] if k in (2, 4) else c_alternatives(a))
+        return alts
     return []
 
 

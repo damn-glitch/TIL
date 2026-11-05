@@ -974,7 +974,50 @@ static const char *type_name(tilvm *vm, const tv_val *v) {
     }
 }
 
+#ifndef TILVM_LEAN
+/* Error messages that name a value's type: a struct (also Some/Ok/Err) is named by
+ * its type, like the reference VM (lean builds, less code: "struct"). */
+static size_t err_cat(tilvm *vm, size_t pos, const char *s) {
+    while (s && *s && pos < sizeof(vm->errbuf) - 1) vm->errbuf[pos++] = *s++;
+    return pos;
+}
+
+static size_t err_type(tilvm *vm, size_t pos, const tv_val *v) {
+    tv_len n;
+    const char *p;
+    if (!v) return pos;
+    if (v->t == TV_STRUCT) {
+        tv_val nv;
+        nv.t = TV_STRK;
+        nv.u.i = 0;
+        nv.u.k = type_name_const(vm, OBJ(vm, v->u.r)->aux);
+        p = str_data(vm, &nv, &n);
+    } else {
+        p = type_name(vm, v);
+        n = (tv_len)strlen(p);
+    }
+    while (n-- && pos < sizeof(vm->errbuf) - 1) vm->errbuf[pos++] = *p++;
+    return pos;
+}
+
+/* "<p0><p1><type of a><p3><type of b>" (any of them may be 0) */
+static int fail_types(tilvm *vm, const char *p0, const char *p1, const tv_val *a, const char *p3,
+                      const tv_val *b) {
+    size_t pos = err_cat(vm, err_cat(vm, 0, p0), p1);
+    pos = err_cat(vm, err_type(vm, pos, a), p3);
+    if (b) pos = err_type(vm, pos, b);
+    vm->errbuf[pos] = 0;
+    return fail(vm, vm->errbuf);
+}
+#define fail_type(vm, p0, p1, v, p3) fail_types(vm, p0, p1, v, p3, 0)
+#else
+#define fail_type(vm, p0, p1, v, p3) failn(vm, p0, p1, type_name(vm, v), p3, 0, 0)
+#endif
+
 static int type_error2(tilvm *vm, const char *what, const tv_val *a, const tv_val *b) {
+#ifndef TILVM_LEAN
+    return fail_types(vm, what, 0, a, " and ", b);
+#else
     size_t pos = 0, cap = sizeof(vm->errbuf) - 1;
     const char *parts[4];
     int k;
@@ -985,6 +1028,7 @@ static int type_error2(tilvm *vm, const char *what, const tv_val *a, const tv_va
     }
     vm->errbuf[pos] = 0;
     return fail(vm, vm->errbuf);
+#endif
 }
 
 /* a < b etc. Returns 1 ok (result in *res), 0 error */
@@ -1126,6 +1170,9 @@ static int arith(tilvm *vm, int op) {
         uint32_t k, times = b->u.i > 0 ? (uint32_t)b->u.i : 0;
         tv_ref r;
         str_data(vm, a, &la);
+#if TILVM_INT_BITS == 64
+        if (b->u.i > (tv_int)TV_STR_MAX) times = (uint32_t)TV_STR_MAX + 1;     /* no wrap-around */
+#endif
 #ifdef TILVM_ADDR16     /* 16-bit lengths: no 32-bit multiply / divide routines */
         if (times > TV_STR_MAX ? la != 0 : times && la > (tv_len)0xFFFFu / (tv_len)times)
             return fail(vm, E_STR_LONG);
@@ -1147,6 +1194,16 @@ static int arith(tilvm *vm, int op) {
 #ifndef TILVM_LEAN
     if (op == OP_ADD && a->t == TV_ARRAY && b->t == TV_ARRAY) return tv_array_concat(vm);
 #endif
+#ifndef TILVM_LEAN
+    {
+        static const char *const names[] = {"+", "-", "*", "/", "%", "**"};
+        size_t pos = err_cat(vm, err_cat(vm, 0, "unsupported operand types for "), names[op - OP_ADD]);
+        pos = err_type(vm, err_cat(vm, pos, ": "), a);
+        pos = err_type(vm, err_cat(vm, pos, " and "), b);
+        vm->errbuf[pos] = 0;
+        return fail(vm, vm->errbuf);
+    }
+#else
     {
         static const char *const names[] = {"+", "-", "*", "/", "%", "**"};
         size_t pos = 0, cap = sizeof(vm->errbuf) - 1;
@@ -1161,6 +1218,7 @@ static int arith(tilvm *vm, int op) {
         vm->errbuf[pos] = 0;
         return fail(vm, vm->errbuf);
     }
+#endif
 }
 
 /* ─── arrays and maps ───────────────────────────────────────────────────── */
@@ -1312,7 +1370,7 @@ static int check_map_key(tilvm *vm, const tv_val *k) {
 #if TILVM_FLOAT
     if (k->t == TV_FLOAT) return 1;
 #endif
-    return failn(vm, type_name(vm, k), " cannot be a map key", 0, 0, 0, 0);
+    return fail_type(vm, 0, 0, k, " cannot be a map key");
 }
 
 /* map[key] = value with map, key, value in slots (no stack change) */
@@ -1385,6 +1443,9 @@ static int get_index(tilvm *vm) {
     if (o->t == TV_MAP) {
         int i;
         map_key(ix);
+#ifndef TILVM_LEAN
+        if (!check_map_key(vm, ix)) return 0;
+#endif
         i = map_find(vm, o->u.r, ix);
         if (i < 0) return key_not_found(vm, (uint16_t)(SP - 1));
         *o = VALS(vm, ARROBJ(vm, o->u.r)->buf)[2 * i + 1];
@@ -1400,6 +1461,9 @@ static int get_index(tilvm *vm) {
             return 1;
         }
     }
+#ifndef TILVM_LEAN
+    return fail_type(vm, 0, 0, o, " cannot be indexed");
+#else
     {
         size_t pos = 0;
         const char *s1 = type_name(vm, o), *s2 = " cannot be indexed";
@@ -1408,6 +1472,7 @@ static int get_index(tilvm *vm) {
         vm->errbuf[pos] = 0;
         return fail(vm, vm->errbuf);
     }
+#endif
 }
 
 /* [.., obj, idx, val] -> [..] */
@@ -1427,7 +1492,7 @@ static int set_index(tilvm *vm) {
         return 1;
     }
     if (is_str(o)) return fail(vm, "strings are immutable");
-    return failn(vm, type_name(vm, o), " does not support item assignment", 0, 0, 0, 0);
+    return fail_type(vm, 0, 0, o, " does not support item assignment");
 }
 
 /* ─── structs ───────────────────────────────────────────────────────────── */
@@ -1799,7 +1864,11 @@ static int cast_slot(tilvm *vm, uint16_t slot, int kind) {
             set_int(&STK[slot], i);
             return 1;
         }
+#ifndef TILVM_LEAN
+        default: return fail_type(vm, "cannot convert ", 0, v, " to int");
+#else
         default: return fail(vm, "cannot convert value to int");
+#endif
         }
     }
 #if TILVM_FLOAT
@@ -1815,7 +1884,7 @@ static int cast_slot(tilvm *vm, uint16_t slot, int kind) {
         set_float(&STK[slot], f);
         return 1;
     }
-    default: return fail(vm, "cannot convert value to float");
+    default: return fail_type(vm, "cannot convert ", 0, v, " to float");
     }
 #else
     return fail(vm, "this TIL VM was built without floating point");
@@ -1836,10 +1905,12 @@ static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
     uint32_t k = 0;
     if (k < slen && (sp[k] == '<' || sp[k] == '>' || sp[k] == '^')) align = sp[k++];
     if (k < slen && sp[k] == '0') { zero = 1; k++; }
-    while (k < slen && sp[k] >= '0' && sp[k] <= '9') width = width * 10 + (uint32_t)(sp[k++] - '0');
+    for (; k < slen && sp[k] >= '0' && sp[k] <= '9'; k++)       /* saturates: capped below */
+        if (width < 1000) width = width * 10 + (uint32_t)(sp[k] - '0');
     if (k < slen && sp[k] == '.') {
         prec = 0; k++;
-        while (k < slen && sp[k] >= '0' && sp[k] <= '9') prec = prec * 10 + (sp[k++] - '0');
+        for (; k < slen && sp[k] >= '0' && sp[k] <= '9'; k++)
+            if (prec < 1000) prec = prec * 10 + (sp[k] - '0');
     }
     if (k < slen) kind = sp[k++];
     explicit_align = align != 0;
@@ -1870,10 +1941,9 @@ static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
         char tmp[80], *q = tmp + 79;
         unsigned base = kind == 'd' ? 10 : kind == 'o' ? 8 : kind == 'b' ? 2 : 16;
 #if TILVM_FLOAT
-        n = v->t == TV_INT ? v->u.i : (tv_int)v->u.f;
-#else
-        n = v->u.i;
+        if (v->t == TV_FLOAT && !cast_slot(vm, vslot, 0)) return 0;   /* like int(x) */
 #endif
+        n = v->u.i;
         u = n < 0 ? (tv_uint)0 - (tv_uint)n : (tv_uint)n;
         *q = 0;
         do {
@@ -1944,14 +2014,21 @@ static tv_float f_round(tv_float x) {
 #endif
 
 #ifndef TILVM_LEAN
-static uint32_t rng_next(tilvm *vm) {
+/* 64-bit builds: xorshift64*, the reference VM's generator (random() takes the top
+ * 53 bits of a draw, random(lo, hi) all 64); 16/32-bit builds: a 32-bit xorshift */
+#if TILVM_INT_BITS == 64
+typedef uint64_t tv_rnd;
+#else
+typedef uint32_t tv_rnd;
+#endif
+static tv_rnd rng_next(tilvm *vm) {
 #if TILVM_INT_BITS == 64
     uint64_t x = vm->st.rng;
     x ^= x >> 12;
     x ^= x << 25;
     x ^= x >> 27;
     vm->st.rng = x;
-    return (uint32_t)((x * 0x2545F4914F6CDD1DULL) >> 32);
+    return x * 0x2545F4914F6CDD1DULL;
 #else
     uint32_t x = vm->st.rng;
     x ^= x << 13;
@@ -1987,7 +2064,7 @@ typedef char tv_check_native_tables[(sizeof(NATIVE_MIN_ARGS) == N_NATIVES) ? 1 :
 static int c_path(tilvm *vm, const tv_val *v, char *buf, const char *who) {
     tv_len n;
     const char *p;
-    if (!is_str(v)) return failn(vm, who, "() expects a path string, got ", type_name(vm, v), 0, 0, 0);
+    if (!is_str(v)) return fail_type(vm, who, "() expects a path string, got ", v, 0);
     p = str_data(vm, v, &n);
     if (n == 0 || n >= TV_PATH_MAX || memchr(p, 0, n)) return failn(vm, who, "(): invalid path", 0, 0, 0, 0);
     memcpy(buf, p, n);
@@ -2381,14 +2458,18 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
             SP = (uint16_t)(base + 1);
             return 1;
         }
+#ifndef TILVM_LEAN
+        if (a->t != TV_ARRAY && !is_str(a)) return fail_type(vm, 0, 0, a, " is not iterable");
+#else
         if (a->t != TV_ARRAY && !is_str(a)) return fail(vm, "value is not iterable");
+#endif
         res = *a;
         break;
     case N_LEN: {
         tv_len n;
         if (is_str(a)) str_data(vm, a, &n);
         else if (a->t == TV_ARRAY || a->t == TV_MAP) n = ARROBJ(vm, a->u.r)->len;
-        else return failn(vm, "len() of ", type_name(vm, a), 0, 0, 0, 0);
+        else return fail_type(vm, "len() of ", 0, a, 0);
         set_int(&res, (tv_int)n);
         break;
     }
@@ -2401,13 +2482,13 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
 #if TILVM_FLOAT
         else if (a->t == TV_FLOAT) set_float(&res, a->u.f < 0 ? -a->u.f : a->u.f);
 #endif
-        else return failn(vm, "abs expects a number, got ", type_name(vm, a), 0, 0, 0, 0);
+        else return fail_type(vm, "abs expects a number, got ", 0, a, 0);
         break;
 #if TILVM_FLOAT
     case N_SQRT: case N_SIN: case N_COS: case N_TAN: case N_LOG: case N_EXP:
     case N_FLOOR: case N_CEIL: case N_ROUND: {
         tv_float x;
-        if (!is_num(a)) return failn(vm, NATIVE_NAMES[id], " expects a number, got ", type_name(vm, a), 0, 0, 0);
+        if (!is_num(a)) return fail_type(vm, NATIVE_NAMES[id], " expects a number, got ", a, 0);
         x = as_float(a);
         switch (id) {
         case N_SQRT: x = x < 0 ? (tv_float)0 / (tv_float)0 : F_SQRT(x); break;
@@ -2428,7 +2509,8 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         break;
     }
     case N_POW:
-        if (!is_num(a) || !is_num(a + 1)) return fail(vm, "pow expects numbers");
+        if (!is_num(a) || !is_num(a + 1))
+            return fail_type(vm, "pow expects a number, got ", 0, is_num(a) ? a + 1 : a, 0);
         set_float(&res, F_POW(as_float(a), as_float(a + 1)));
         break;
 #endif
@@ -2478,9 +2560,11 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     case N_CHR: {
         char buf[4];
         uint32_t c, n;
-        if (a->t != TV_INT || a->u.i < 0) return fail(vm, "chr() argument out of range");
+        if (a->t != TV_INT) return fail(vm, "chr() needs an integer");
+        if (a->u.i < 0) return fail(vm, "chr() argument out of range");
 #if TILVM_INT_BITS > 16
-        if (a->u.i > 0x10FFFF) return fail(vm, "chr() argument out of range");
+        if (a->u.i > 0x10FFFF || (a->u.i >= 0xD800 && a->u.i <= 0xDFFF))   /* surrogates: not UTF-8 */
+            return fail(vm, "chr() argument out of range");
 #endif
         c = (uint32_t)a->u.i;
         if (c < 0x80) { buf[0] = (char)c; n = 1; }
@@ -2508,6 +2592,27 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     }
 #endif
     case N_RANGE: {
+#ifndef TILVM_LEAN
+        tv_int lo, hi;
+        tv_uint d;
+        tv_len n = 0, i;
+        int incl = argc > 2 && truthy(vm, &a[2]);
+        if (a->t != TV_INT || a[1].t != TV_INT) return fail(vm, "range bounds must be integers");
+        lo = a->u.i;
+        hi = a[1].u.i;
+        if (hi > lo || (incl && hi == lo)) {
+            d = (tv_uint)hi - (tv_uint)lo;          /* hi - lo, exact (no overflow) */
+            if (d >= 0xFFFFu && (d != 0xFFFFu || incl)) return fail(vm, "range too large");
+            n = (tv_len)(d + (incl ? 1u : 0u));
+        }
+        SP = base;
+        if (!push_empty(vm, OBJ_ARRAY, n, n)) return 0;
+        {
+            tv_val *dst = VALS(vm, ARROBJ(vm, STK[SP - 1].u.r)->buf);
+            for (i = 0; i < n; i++) set_int(&dst[i], (tv_int)((tv_uint)lo + (tv_uint)i));
+        }
+        return 1;
+#else
         tv_int lo, hi, i;
         uint32_t n;
         if (a->t != TV_INT || a[1].t != TV_INT) return fail(vm, "range bounds must be integers");
@@ -2523,6 +2628,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
             for (i = 0; i < (tv_int)n; i++) set_int(&d[i], lo + i);
         }
         return 1;
+#endif
     }
 #ifndef TILVM_LEAN
     case N_TYPE_OF: {
@@ -2536,6 +2642,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
 #endif
     case N_FORMAT:
 #ifndef TILVM_LEAN
+        if (!is_str(a + 1)) return fail_type(vm, "format() expects a spec string, got ", 0, a + 1, 0);
         if (!format_slot(vm, base, (uint16_t)(base + 1))) return 0;
 #else
         if (!to_str_slot(vm, base)) return 0;       /* lean build: specs ignored */
@@ -2547,12 +2654,14 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     case N_RANDOM:
         if (argc >= 2) {
             tv_int lo = a->u.i, hi = a[1].u.i;
-            tv_uint span;
+            tv_uint span, r = (tv_uint)rng_next(vm);    /* drawn first, as in the reference VM */
             if (a->t != TV_INT || a[1].t != TV_INT || hi < lo) return fail(vm, "random(lo, hi) needs lo <= hi");
-            span = (tv_uint)(hi - lo) + 1;
-            set_int(&res, span ? (tv_int)((tv_uint)lo + (tv_uint)rng_next(vm) % span) : (tv_int)rng_next(vm));
+            span = (tv_uint)((tv_uint)hi - (tv_uint)lo + 1u);        /* 0: every int */
+            set_int(&res, (tv_int)((tv_uint)lo + (span ? r % span : r)));
         } else {
-#if TILVM_FLOAT
+#if TILVM_FLOAT && TILVM_INT_BITS == 64
+            set_float(&res, (tv_float)(rng_next(vm) >> 11) / (tv_float)9007199254740992.0);
+#elif TILVM_FLOAT
             set_float(&res, (tv_float)rng_next(vm) / (tv_float)4294967296.0);
 #else
             set_int(&res, (tv_int)(rng_next(vm) & 0x7FFF));
@@ -2561,12 +2670,19 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         break;
     case N_SEED:
         if (a->t != TV_INT) return fail(vm, "seed() needs an integer");
+#if TILVM_INT_BITS == 64
+        vm->st.rng = a->u.i ? (uint64_t)a->u.i : 0x9E3779B97F4A7C15ULL;
+#else
         vm->st.rng = a->u.i ? (uint32_t)a->u.i : 0x9E3779B9u;
+#endif
         break;
     case N_SLEEP_MS: {
         uint32_t ms, until, now;
         if (a->t != TV_INT) return fail(vm, "sleep_ms() needs an integer");
         ms = (uint32_t)(a->u.i > 0 ? a->u.i : 0);
+#if TILVM_INT_BITS == 64
+        if (a->u.i > 0x7FFFFFFF) ms = 0x7FFFFFFFu;     /* the clock arithmetic below: < 2^31 ms */
+#endif
         if (vm->clock_ms) {
             /* wait on the clock (re-read after every idle: hosts may watch the reads, see
              * website/playground/wasm_host.c); idle instead of spinning when the host can */
@@ -2625,7 +2741,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         tv_len n, i;
         const uint8_t *p;
         tv_ref buf;
-        if (!is_str(a)) return failn(vm, "str_bytes() expects a string, got ", type_name(vm, a), 0, 0, 0, 0);
+        if (!is_str(a)) return fail_type(vm, "str_bytes() expects a string, got ", 0, a, 0);
         str_data(vm, a, &n);
         if (!push_new_array(vm, n)) return 0;   /* GC may move the string: re-read it */
         p = (const uint8_t *)str_data(vm, &STK[base], &n);
@@ -2647,6 +2763,9 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         break;
 #endif
     case N_EXIT:
+#ifndef TILVM_LEAN
+        if (argc && a->t != TV_INT) return fail(vm, "exit() needs an integer");
+#endif
         vm->st.exit_code = (uint8_t)(argc && a->t == TV_INT ? a->u.i : 0);
         vm->st.halted = 2;
         break;
@@ -2739,8 +2858,14 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         } else
 #endif
         if (mid == M_SLICE) {
+#ifndef TILVM_LEAN
+            tv_int x = argc ? a1->u.i : 0;
+            tv_int y = argc > 1 ? STK[base + 2].u.i : (tv_int)n;
+            if ((argc && a1->t != TV_INT) || (argc > 1 && STK[base + 2].t != TV_INT)) return fail(vm, E_INDEX_INT);
+#else
             tv_int x = argc && a1->t == TV_INT ? a1->u.i : 0;
             tv_int y = argc > 1 && STK[base + 2].t == TV_INT ? STK[base + 2].u.i : (tv_int)n;
+#endif
             if (x < 0) x = 0;
             if (y > (tv_int)n) y = (tv_int)n;
             if (x > (tv_int)n) x = (tv_int)n;
@@ -2752,6 +2877,9 @@ static int str_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         else if (mid == M_REPEAT) {
             if (!argc || a1->t != TV_INT) return fail(vm, "repeat() needs an integer");
             times = a1->u.i > 0 ? (uint32_t)a1->u.i : 0;
+#if TILVM_INT_BITS == 64
+            if (a1->u.i > (tv_int)TV_STR_MAX) times = (uint32_t)TV_STR_MAX + 1;
+#endif
             if (times && n > TV_STR_MAX / times) return fail(vm, E_STR_LONG);
         }
         r = new_str(vm, (uint32_t)(hi - lo) * times);
@@ -2974,8 +3102,9 @@ static int array_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_
     case M_COPY: case M_SLICE: {
         tv_int lo = 0, hi = (tv_int)n;
         if (mid == M_SLICE) {
-            lo = argc && a1->t == TV_INT ? a1->u.i : 0;
-            hi = argc > 1 && STK[base + 2].t == TV_INT ? STK[base + 2].u.i : (tv_int)n;
+            if ((argc && a1->t != TV_INT) || (argc > 1 && STK[base + 2].t != TV_INT)) return fail(vm, E_INDEX_INT);
+            lo = argc ? a1->u.i : 0;
+            hi = argc > 1 ? STK[base + 2].u.i : (tv_int)n;
             if (lo < 0) lo = 0;
             if (hi > (tv_int)n) hi = (tv_int)n;
             if (lo > hi) lo = hi;
@@ -3030,8 +3159,12 @@ static int map_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, tv_va
         if (argc < 2) return fail(vm, "set() needs a key and a value");
         return map_set(vm, base, (uint16_t)(base + 1), (uint16_t)(base + 2));
     case M_GET: case M_GET_OR: case M_HAS: case M_CONTAINS: case M_DELETE: case M_REMOVE:
+        if (mid == M_GET_OR && argc < 2) return fail(vm, "get_or() needs a key and a default");
         if (!argc) return fail(vm, "map method needs a key");
         map_key(&STK[base + 1]);
+#ifndef TILVM_LEAN
+        if (!check_map_key(vm, &STK[base + 1])) return 0;
+#endif
         k = map_find(vm, m, &STK[base + 1]);
         if (mid == M_HAS || mid == M_CONTAINS) { set_bool(res, k >= 0); return 1; }
         if (mid == M_DELETE || mid == M_REMOVE) { if (k >= 0) map_delete(vm, m, k); return 1; }
@@ -3089,6 +3222,9 @@ static int variant_method(tilvm *vm, uint8_t mid, uint16_t base, uint8_t argc, t
         vm->err_msg = "";
         return 0;
     case M_UNWRAP_OR:
+#ifndef TILVM_LEAN
+        if (!argc) return fail(vm, "unwrap_or() needs a default");
+#endif
         if (ok) *res = STRUCTOBJ(vm, r->u.r)->v[0];
         else if (argc) *res = STK[base + 1];
         return 1;
@@ -3116,7 +3252,11 @@ static int call_method(tilvm *vm, uint8_t mid, uint8_t argc) {
     else if (r->t == TV_MAP) ok = map_method(vm, mid, base, argc, &res);
     else if (r->t == TV_NIL || (r->t == TV_STRUCT && OBJ(vm, r->u.r)->aux <= TYPE_ERR))
         ok = variant_method(vm, mid, base, argc, &res);
+#ifndef TILVM_LEAN
+    else ok = fail_types(vm, E_NO_METHOD, mid < N_METHODS ? METHOD_NAMES[mid] : "?", 0, "' on ", r);
+#else
     else ok = failn(vm, E_NO_METHOD, mid < N_METHODS ? METHOD_NAMES[mid] : "?", "' on ", type_name(vm, r), 0, 0);
+#endif
     if (!ok) return 0;
     STK[base] = res;
     SP = (uint16_t)(base + 1);
@@ -3624,6 +3764,9 @@ static int push_try(tilvm *vm, uint8_t op, tv_off handler) {
     if (op == OP_TRY_TIMEOUT) {
         tv_val *ms = &STK[--SP];
         tv_int v = ms->t == TV_INT ? ms->u.i : 0;
+#ifndef TILVM_LEAN
+        if (!is_num(ms)) return fail_type(vm, "timeout expects a number, got ", 0, ms, 0);
+#endif
 #if TILVM_FLOAT
         if (ms->t == TV_FLOAT) v = (tv_int)ms->u.f;
 #endif
@@ -4422,7 +4565,7 @@ dispatch_op:
 #if TILVM_FLOAT
         else if (sp[-1].t == TV_FLOAT) sp[-1].u.f = -sp[-1].u.f;
 #endif
-        else { fail(vm, "cannot negate a non-number"); goto panic; }
+        else { fail_type(vm, "cannot negate ", 0, &sp[-1], 0); goto panic; }
         NEXT;
     CASE(OP_NOT) set_bool(&sp[-1], !truthy(vm, &sp[-1])); NEXT;
     CASE(OP_BNOT)
@@ -4497,7 +4640,7 @@ dispatch_op:
         clos = 0;
         if (callee->t == TV_FUNC) fidx = callee->u.k;
         else if (callee->t == TV_CLOSURE) { clos = callee->u.r; fidx = CLOSOBJ(vm, clos)->func; }
-        else { failn(vm, type_name(vm, callee), " is not callable", 0, 0, 0, 0); goto panic; }
+        else { fail_type(vm, 0, 0, callee, " is not callable"); goto panic; }
         goto call_fn;
     }
     CASE(OP_INVOKE) {

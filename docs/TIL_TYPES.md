@@ -379,8 +379,6 @@ Not part of the native backend, found while testing it: the C VM compares an
 reference VM and natively), truncates very long fixed-point formats
 (`{1e100:.1f}`), gives `-0` for `ceil(-0.5)` and `floor(-0.0)` (the reference VM
 and the native code give `0`), and formats a float beyond the 64-bit range with
-`{x:d}`/`{x:x}`/`{x:o}`/`{x:b}` after wrapping it to an int64 (the reference VM
-prints the exact integer). The reference VM itself stops with an internal error
-(`cannot convert float infinity to integer`, not a TIL run-time error that
-`retry` could catch) for `{x:d}` of `inf`/`nan`; the C VM prints
-`-9223372036854775808`.
+`{x:d}`/`{x:x}`/`{x:o}`/`{x:b}` after wrapping it to an int64, like `int(x)` (the
+reference VM prints the exact integer). For `inf`/`nan` both VMs report
+`cannot convert nan/inf to int`, an error `retry` catches.
