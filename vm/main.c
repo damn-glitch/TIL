@@ -617,7 +617,11 @@ int main(int argc, char **argv) {
     rc = tilvm_load(&vm, code, (uint32_t)size);
     if (rc != 0) {
         const char *why = rc == -3 ? ": program uses floats, VM built without them" :
+                          rc == -4 ? ": too many constants for this VM build (TILVM_MAX_CONSTS)" :
+                          rc == -5 ? ": truncated or malformed file" :
                           rc == -6 ? ": integer constant too large for this VM" :
+                          rc == -7 ? ": too many types for this VM build (TILVM_MAX_TYPES)" :
+                          rc == -8 ? ": too many globals for the value stack (TILVM_STACK_SIZE)" :
                           rc == -10 ? ": too many functions for this VM build (TILVM_MAX_FUNCS)" : "";
 #ifdef TILVM_ADDR16
         if (rc == -10 && size > 0xFFFFL) why = ": program larger than 64 KB (TILVM_ADDR16 build)";

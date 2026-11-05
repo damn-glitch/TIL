@@ -213,9 +213,16 @@ typedef struct tv_frame {
     uint8_t extra;      /* callee slot below the arguments to drop on return */
 } tv_frame;
 
+#if TILVM_INT_BITS > 16 || TILVM_FLOAT || !(defined(TILVM_LEAN) || defined(TILVM_NO_PORTABLE))
+#define TV_FAR_TIMEOUTS 1   /* timeouts (or snapshots' times left) of 2^30 ms or more */
+#endif
+
 typedef struct tv_try {
     tv_off handler;
     uint32_t deadline;  /* ms (0 = no deadline) */
+#ifdef TV_FAR_TIMEOUTS
+    uint32_t far;       /* periods of 2^30 ms still to wait after the deadline */
+#endif
     uint16_t n_frames;
     uint16_t sp;
     uint16_t n_handlers; /* effect handler entries when the block started */

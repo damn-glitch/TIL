@@ -219,6 +219,9 @@ static const char E_STACK[] = "stack overflow";
 static const char E_STR_LONG[] = "string too long";
 static const char E_INDEX_INT[] = "index must be an integer";
 static const char E_NO_METHOD[] = "no method '";
+#if TILVM_FLOAT
+static const char E_NANINF[] = "cannot convert nan/inf to int";
+#endif
 
 static int fail(tilvm *vm, const char *msg) {
     vm->err_msg = msg;
@@ -613,144 +616,7 @@ static void sink_put(sink *s, const char *p, tv_len n) {
 static void sink_cstr(sink *s, const char *p) { sink_put(s, p, (tv_len)strlen(p)); }
 
 #if TILVM_FLOAT
-#if !defined(TILVM_NO_STDIO)
-static void fmt_g(char *buf, tv_float x) {
-    if (x != x) { strcpy(buf, "nan"); return; }
-    snprintf(buf, 40, "%g", (double)x);
-    if (buf[0] == '-' && buf[1] == 'n') strcpy(buf, "nan");
-}
-#else
-/* printf-free float formatting for freestanding builds (calculators, MCUs). */
-static int fmt_special(char *buf, tv_float x) {
-    if (x != x) { strcpy(buf, "nan"); return 1; }
-    if (x - x != x - x) { strcpy(buf, x < 0 ? "-inf" : "inf"); return 1; }
-    return 0;
-}
-
-/* normalize |x| to [1, 10): returns the decimal exponent */
-static int fnorm(tv_float *x) {
-    int e = 0;
-    if (*x == 0) return 0;
-    while (*x >= 10) { *x /= 10; e++; }
-    while (*x < 1) { *x *= 10; e--; }
-    return e;
-}
-
-/* %.{sig}g */
-static void fmt_gp(char *buf, tv_float x, int sig) {
-    char digits[24];
-    int e, i, nd, pos = 0;
-    tv_float m;
-    if (fmt_special(buf, x)) return;
-    if (sig < 1) sig = 1;
-    if (sig > 17) sig = 17;
-    if (x < 0) { buf[pos++] = '-'; x = -x; }
-    if (x == 0) { strcpy(buf + pos, "0"); return; }
-    e = fnorm(&x);
-    m = x;
-    for (i = 0; i < sig; i++) { int d = (int)m; if (d > 9) d = 9; digits[i] = (char)('0' + d); m = (m - (tv_float)d) * 10; }
-    if (m >= 5) {                                   /* round half up */
-        for (i = sig - 1; i >= 0; i--) {
-            if (digits[i] < '9') { digits[i]++; break; }
-            digits[i] = '0';
-        }
-        if (i < 0) { for (i = sig - 1; i > 0; i--) digits[i] = digits[i - 1]; digits[0] = '1'; e++; }
-    }
-    nd = sig;
-    while (nd > 1 && digits[nd - 1] == '0') nd--;
-    if (e < -4 || e >= sig) {
-        buf[pos++] = digits[0];
-        if (nd > 1) { buf[pos++] = '.'; for (i = 1; i < nd; i++) buf[pos++] = digits[i]; }
-        buf[pos++] = 'e';
-        buf[pos++] = e < 0 ? '-' : '+';
-        if (e < 0) e = -e;
-        if (e >= 100) buf[pos++] = (char)('0' + e / 100);
-        buf[pos++] = (char)('0' + (e / 10) % 10);
-        buf[pos++] = (char)('0' + e % 10);
-    } else if (e >= 0) {
-        for (i = 0; i <= e; i++) buf[pos++] = i < nd ? digits[i] : '0';
-        if (nd > e + 1) { buf[pos++] = '.'; for (i = e + 1; i < nd; i++) buf[pos++] = digits[i]; }
-    } else {
-        buf[pos++] = '0'; buf[pos++] = '.';
-        for (i = 0; i < -e - 1; i++) buf[pos++] = '0';
-        for (i = 0; i < nd; i++) buf[pos++] = digits[i];
-    }
-    buf[pos] = 0;
-}
-
-static void fmt_g(char *buf, tv_float x) { fmt_gp(buf, x, 6); }
-
-#ifndef TILVM_LEAN      /* format specs %.Nf / %.Ne (lean builds ignore specs) */
-/* %.{prec}f  (exact ties round to even, like printf) */
-static void fmt_fixed(char *buf, tv_float x, int prec) {
-    char dig[72];
-    int pos = 0, n = 0, i, intlen;
-    tv_float ipart, frac, p10 = 1;
-    if (fmt_special(buf, x)) return;
-    if (prec > 20) prec = 20;
-    if (x < 0) { buf[pos++] = '-'; x = -x; }
-    ipart = x;
-    dig[n++] = '0';                       /* spare leading digit for carries */
-    {
-        int k = 0;
-        while (p10 * 10 <= ipart && k < 40) { p10 *= 10; k++; }
-        for (; k >= 0; k--) {
-            int d = 0;
-            while (ipart >= p10 && d < 9) { ipart -= p10; d++; }
-            dig[n++] = (char)('0' + d);
-            p10 /= 10;
-        }
-    }
-    intlen = n;
-    frac = ipart < 1 ? ipart : 0;
-    for (i = 0; i < prec; i++) {
-        int d;
-        frac *= 10;
-        d = (int)frac;
-        if (d > 9) d = 9;
-        dig[n++] = (char)('0' + d);
-        frac -= (tv_float)d;
-    }
-    if (frac > (tv_float)0.5 || (frac == (tv_float)0.5 && ((dig[n - 1] - '0') & 1))) {
-        for (i = n - 1; i >= 0; i--) {
-            if (dig[i] < '9') { dig[i]++; break; }
-            dig[i] = '0';
-        }
-    }
-    i = dig[0] == '0' ? 1 : 0;            /* drop the spare digit if unused */
-    for (; i < intlen; i++) buf[pos++] = dig[i];
-    if (prec > 0) {
-        buf[pos++] = '.';
-        for (i = intlen; i < n; i++) buf[pos++] = dig[i];
-    }
-    buf[pos] = 0;
-}
-
-/* %.{prec}e */
-static void fmt_exp(char *buf, tv_float x, int prec) {
-    int e, pos = 0, i;
-    tv_float m;
-    char mant[32];
-    if (fmt_special(buf, x)) return;
-    if (x < 0) { buf[pos++] = '-'; x = -x; }
-    e = fnorm(&x);
-    m = x;
-    fmt_fixed(mant, m, prec);
-    if (mant[0] == '1' && mant[1] == '0') {        /* 9.99 rounded up to 10.0 */
-        m /= 10; e++;
-        fmt_fixed(mant, m, prec);
-    }
-    for (i = 0; mant[i]; i++) buf[pos++] = mant[i];
-    buf[pos++] = 'e';
-    buf[pos++] = e < 0 ? '-' : '+';
-    if (e < 0) e = -e;
-    if (e >= 100) buf[pos++] = (char)('0' + e / 100);
-    buf[pos++] = (char)('0' + (e / 10) % 10);
-    buf[pos++] = (char)('0' + e % 10);
-    buf[pos] = 0;
-}
-#endif
-#endif
+static void fmt_float(sink *s, tv_float x, char kind, int prec);   /* below: exact digits */
 #endif
 
 static void emit_value(sink *s, const tv_val *v, int depth, int quote);
@@ -785,7 +651,7 @@ static void emit_value(sink *s, const tv_val *v, int depth, int quote) {
     case TV_BOOL: sink_cstr(s, v->u.i ? "true" : "false"); return;
     case TV_INT: sink_cstr(s, fmt_int(buf, v->u.i)); return;
 #if TILVM_FLOAT
-    case TV_FLOAT: fmt_g(buf, v->u.f); sink_cstr(s, buf); return;
+    case TV_FLOAT: fmt_float(s, v->u.f, 'g', 6); return;
 #endif
     case TV_STRK:
     case TV_STR: {
@@ -1029,6 +895,55 @@ static tv_int ishr(tv_int a, unsigned n) {
 }
 
 #if TILVM_FLOAT
+/* ─── floats: exact helpers that need no <math.h> ───────────────────────── */
+#if TILVM_FLOAT == 1
+#define TV_F_MANT FLT_MANT_DIG
+#define TV_F_EMIN (FLT_MIN_EXP - FLT_MANT_DIG)    /* exponent of the smallest subnormal */
+#define TV_F_EMAX FLT_MAX_EXP                     /* floats are < 2^TV_F_EMAX */
+#define TV_F_HUGE FLT_MAX
+typedef uint32_t tv_fmant;
+#else
+#define TV_F_MANT DBL_MANT_DIG
+#define TV_F_EMIN (DBL_MIN_EXP - DBL_MANT_DIG)
+#define TV_F_EMAX DBL_MAX_EXP
+#define TV_F_HUGE DBL_MAX
+typedef uint64_t tv_fmant;
+#endif
+#define TV_F_TOP ((tv_float)((tv_fmant)1 << (TV_F_MANT - 1)) * 2)    /* 2^TV_F_MANT */
+#define TV_F_2P32 ((tv_float)4294967296.0)
+#define TV_F_2M32 ((tv_float)2.3283064365386962890625e-10)            /* 2^-32 */
+
+static int f_finite(tv_float x) { return x - x == 0; }    /* not inf, not nan */
+
+/* x = *m * 2^e exactly with *m in [2^(TV_F_MANT-1), 2^TV_F_MANT) (x > 0, finite):
+ * scaling by powers of two towards that range never rounds */
+static int f_decomp(tv_float x, tv_fmant *m) {
+    int e = 0;
+    while (x >= TV_F_TOP * TV_F_2P32) { x *= TV_F_2M32; e += 32; }
+    while (x >= TV_F_TOP) { x *= (tv_float)0.5; e++; }
+    while (x * TV_F_2P32 < TV_F_TOP) { x *= TV_F_2P32; e -= 32; }
+    while (x * 2 < TV_F_TOP) { x *= 2; e--; }
+    *m = (tv_fmant)x;
+    return e;
+}
+
+/* int(x) of a finite float: truncated toward zero and wrapped to TILVM_INT_BITS
+ * bits like integer arithmetic (the reference VM: wrap_int64(int(x))). Exact for
+ * every float, without an out-of-range conversion. */
+static tv_int f_to_int(tv_float x) {
+    tv_fmant m;
+    tv_uint u = 0;
+    int e, neg = x < 0;
+    if (neg) x = -x;
+    if (x >= 1) {
+        e = f_decomp(x, &m);
+        if (e < 0) u = (tv_uint)(m >> -e);
+        else if (e < TILVM_INT_BITS) u = (tv_uint)((tv_uint)m << e);
+    }
+    if (neg) u = (tv_uint)((tv_uint)0 - u);
+    return (tv_int)u;
+}
+
 #ifdef TV_HAVE_MATH
 #define F_SQRT(x) ((tv_float)sqrt((double)(x)))
 #define F_POW(x, y) ((tv_float)pow((double)(x), (double)(y)))
@@ -1036,34 +951,223 @@ static tv_int ishr(tv_int a, unsigned n) {
 #define F_FLOOR(x) ((tv_float)floor((double)(x)))
 #define F_CEIL(x) ((tv_float)ceil((double)(x)))
 #else
+/* TILVM_NO_MATH: floor, ceil and fmod are exact and sqrt is correctly rounded,
+ * like the C library's; pow is exact for integer exponents only when the result
+ * needs no rounding (repeated squaring), and reports an error for a fractional
+ * exponent (vm/README.md) */
 static tv_float F_FLOOR(tv_float x) {
-    tv_float t = (tv_float)(long)x;
-    return (t > x) ? t - 1 : t;
+    tv_float a = x < 0 ? -x : x, t;
+    if (!(a < TV_F_TOP)) return x;                  /* an integer already, inf or nan */
+    t = (tv_float)(tv_fmant)a;                      /* exact: |x| truncated */
+    if (x < 0) { t = -t; if (t > x) t -= 1; }
+    return t;
 }
 static tv_float F_CEIL(tv_float x) { return -F_FLOOR(-x); }
+
+/* x - n*y with n = trunc(x / y), exactly (the sign of x, as C's fmod) */
 static tv_float F_FMOD(tv_float x, tv_float y) {
-    tv_float q = x / y;
-    q = q < 0 ? -F_FLOOR(-q) : F_FLOOR(q);
-    return x - q * y;
+    tv_float a = x < 0 ? -x : x, b = y < 0 ? -y : y, t;
+    if (!f_finite(x) || y != y) return (tv_float)0 / (tv_float)0;
+    if (!f_finite(y) || a < b) return x;
+    for (t = b; t * 2 <= a; t *= 2) {}              /* the largest b * 2^k <= a */
+    for (; t >= b; t *= (tv_float)0.5)              /* b <= t <= a < 2t: a - t is exact */
+        if (a >= t) a -= t;
+    return x < 0 ? -a : a;
 }
+
+/* y * 2^e (exact for the results F_SQRT computes) */
+static tv_float f_scale(tv_float y, int e) {
+    for (; e >= 32; e -= 32) y *= TV_F_2P32;
+    for (; e > 0; e--) y *= 2;
+    for (; e <= -32; e += 32) y *= TV_F_2M32;
+    for (; e < 0; e++) y *= (tv_float)0.5;
+    return y;
+}
+
+/* correctly rounded square root (x >= 0): the integer square root of the
+ * mantissa shifted left by s bits, one bit at a time, then rounded to even */
 static tv_float F_SQRT(tv_float x) {
-    tv_float g = x > 1 ? x / 2 : 1;
+    tv_fmant m, q = 0, r = 0, t;
+    int e, j, s;
+    if (!(x > 0) || !f_finite(x)) return x;         /* +-0, inf, nan */
+    e = f_decomp(x, &m);
+    s = TV_F_MANT + 1 + (int)((unsigned)(e - TV_F_MANT - 1) & 1u);   /* e - s even */
+    for (j = TV_F_MANT; j >= 0; j--) {              /* bits 2j+1, 2j of m * 2^s */
+        int b = 2 * j - s;
+        r = (r << 2) | (b >= 0 ? (m >> b) & 3u : b == -1 ? (m << 1) & 2u : 0u);
+        t = (q << 2) | 1u;
+        q <<= 1;
+        if (r >= t) { r -= t; q |= 1u; }
+    }
+    t = q >> 1;                                     /* q has TV_F_MANT + 1 bits */
+    if ((q & 1u) && (r || (t & 1u))) t++;
+    return f_scale((tv_float)t, (e - s) / 2 + 1);
+}
+
+/* x ** y. Integer y: repeated squaring; nan / +-inf y: as C99's pow. */
+static int f_pow(tilvm *vm, tv_float x, tv_float y, tv_float *out) {
+    tv_float r = 1, n = y < 0 ? -y : y, h, a = x < 0 ? -x : x;
+    if (y != y) { *out = x == 1 ? r : y; return 1; }
+    if (!f_finite(y)) {
+        *out = x != x ? x : a == 1 ? r : (a > 1) == (y > 0) ? n : 0;
+        return 1;
+    }
+    if (F_FLOOR(n) != n) {                          /* a fractional exponent: the exact cases */
+        h = TV_F_HUGE;
+        h += h;                                     /* inf */
+        if (x != x || x == 1) *out = x;
+        else if (x == 0 || !f_finite(x)) *out = (y > 0) == (x == 0) ? 0 : h;
+        else if (x < 0) *out = h - h;               /* nan */
+        else return fail(vm, "pow with a fractional exponent is not available in this VM build");
+        return 1;
+    }
+    for (; n > 0; n = h, x *= x) {
+        h = F_FLOOR(n * (tv_float)0.5);
+        if (n != h * 2) r *= x;                     /* an odd exponent */
+    }
+    *out = y < 0 ? 1 / r : r;
+    return 1;
+}
+#endif
+
+/* ─── floats -> text with exact digits ──────────────────────────────────
+ * A finite float is m * 2^e, so its decimal expansion is finite: the integer
+ * N = m * 2^e (e >= 0), or N = m * 5^-e with the decimal point -e digits from
+ * the right. N is built in base 10000 (at most 770 digits for a double), and
+ * %g / %.Nf / %.Ne round its digits half to even - the exact value, as glibc's
+ * printf and the reference VM do - in every build, with or without stdio, at
+ * any precision and for any magnitude. */
+#define TV_FDIGITS ((TV_F_MANT * 30103L - TV_F_EMIN * 69898L) / 100000L + 4)
+#define TV_FGROUPS (TV_FDIGITS / 4 + 2)
+static const uint16_t TV_P10[4] = { 1, 10, 100, 1000 };
+
+typedef struct tv_fdec {
+    uint16_t g[TV_FGROUPS];     /* N in base 10000, least significant group first */
+    int ng;                     /* groups in use */
+    int k;                      /* digits after the decimal point */
+    int top;                    /* weight of the first nonzero digit (10^top); 0 for 0.0 */
+    int up, last;               /* rounding (fdec_round): round up; the lowest kept weight that is not 9 */
+} tv_fdec;
+
+static void fdec_mul(tv_fdec *d, uint32_t m) {   /* N *= m (m <= 16384) */
+    uint32_t c = 0;
     int i;
-    if (x <= 0) return 0;
-    for (i = 0; i < 40; i++) g = (g + x / g) / 2;
-    return g;
+    for (i = 0; i < d->ng; i++) {
+        c += (uint32_t)d->g[i] * m;
+        d->g[i] = (uint16_t)(c % 10000u);
+        c /= 10000u;
+    }
+    for (; c; c /= 10000u) d->g[d->ng++] = (uint16_t)(c % 10000u);
 }
-static tv_float F_POW(tv_float x, tv_float y) {
-    tv_float r = 1;
-    long n = (long)y;
-    int neg = n < 0;
-    if ((tv_float)n != y) return 0;    /* fractional powers need <math.h> */
-    if (neg) n = -n;
-    while (n) { if (n & 1) r *= x; x *= x; n >>= 1; }
-    return neg ? 1 / r : r;
+
+/* the digit of weight 10^w (0 outside N) */
+static int fdec_dig(const tv_fdec *d, int w) {
+    int i = w + d->k;
+    if (i < 0 || i / 4 >= d->ng) return 0;
+    return d->g[i / 4] / TV_P10[i % 4] % 10;
 }
-#endif
-#endif
+
+static void fdec_init(tv_fdec *d, tv_float x) {   /* x >= 0, finite */
+    tv_fmant m = 0;
+    int e = 0, i;
+    d->ng = d->k = d->top = 0;
+    if (x == 0) return;
+    e = f_decomp(x, &m);
+    while (e < 0 && !(m & 1u)) { m >>= 1; e++; }      /* fewer digits after the point */
+    for (; m; m /= 10000u) d->g[d->ng++] = (uint16_t)(m % 10000u);
+    if (e >= 0) {
+        for (; e >= 13; e -= 13) fdec_mul(d, 8192u);
+        fdec_mul(d, 1u << e);
+    } else {
+        d->k = -e;
+        for (; e <= -6; e += 6) fdec_mul(d, 15625u);   /* 5^6 */
+        for (; e < 0; e++) fdec_mul(d, 5u);
+    }
+    for (i = 4 * d->ng - 1; i > 0 && !fdec_dig(d, i - d->k); i--) {}
+    d->top = i - d->k;
+}
+
+/* round to the digits of weight >= 10^lo, half to even */
+static void fdec_round(tv_fdec *d, int lo) {
+    int r = fdec_dig(d, lo - 1), i = lo - 1 + d->k, sticky = 0, j;
+    if (r == 5 && i > 0) {                          /* any nonzero digit below the 5? */
+        j = i / 4 < d->ng ? i / 4 : d->ng;
+        if (j < d->ng && d->g[j] % TV_P10[i % 4]) sticky = 1;
+        while (!sticky && j-- > 0) sticky = d->g[j] != 0;
+    }
+    d->up = r > 5 || (r == 5 && (sticky || (fdec_dig(d, lo) & 1)));
+    for (d->last = lo; d->up && fdec_dig(d, d->last) == 9; d->last++) {}
+}
+
+/* the digit of weight 10^w after rounding (w >= lo) */
+static char fdec_rdig(const tv_fdec *d, int w) {
+    int c = fdec_dig(d, w);
+    if (d->up && w <= d->last) c = w == d->last ? c + 1 : 0;
+    return (char)('0' + c);
+}
+
+typedef struct tv_fout { sink *s; unsigned n; char b[32]; } tv_fout;   /* buffered sink_put */
+
+static void fo_put(tv_fout *o, char c) {
+    if (o->n == sizeof o->b) { sink_put(o->s, o->b, (tv_len)o->n); o->n = 0; }
+    o->b[o->n++] = c;
+}
+
+static void fo_exp(tv_fout *o, int x) {          /* e+05, e-123 */
+    fo_put(o, 'e');
+    fo_put(o, x < 0 ? '-' : '+');
+    if (x < 0) x = -x;
+    if (x >= 100) fo_put(o, (char)('0' + x / 100));
+    fo_put(o, (char)('0' + x / 10 % 10));
+    fo_put(o, (char)('0' + x % 10));
+}
+
+/* x as printf's %g (kind 'g', prec significant digits >= 1), %.{prec}e or %.{prec}f;
+ * nan is always "nan" (never "-nan") */
+static void fmt_float(sink *s, tv_float x, char kind, int prec) {
+    tv_fdec d;
+    tv_fout o;
+    int w, top, z;
+    o.s = s;
+    o.n = 0;
+    if (x != x) { sink_cstr(s, "nan"); return; }
+    if (x < 0 || (x == 0 && (tv_float)1 / x < 0)) { fo_put(&o, '-'); x = -x; }
+    if (!f_finite(x)) {
+        fo_put(&o, 'i'); fo_put(&o, 'n'); fo_put(&o, 'f');
+    } else {
+        fdec_init(&d, x);
+        top = d.top;
+        if (kind == 'f') {
+            fdec_round(&d, -prec);
+            if (d.up && d.last > top) top = d.last;
+            for (w = top < 0 ? 0 : top; w >= -prec; w--) {
+                fo_put(&o, fdec_rdig(&d, w));
+                if (!w && prec) fo_put(&o, '.');
+            }
+        } else {
+            if (kind == 'e') prec++;                  /* significant digits */
+            fdec_round(&d, top - prec + 1);
+            if (d.up && d.last > top) top = d.last;   /* 9.99 -> 10.0 */
+            z = top - prec + 1;                       /* the lowest digit shown */
+            if (kind == 'g')                          /* %g drops trailing zeros */
+                while (z < top && fdec_rdig(&d, z) == '0') z++;
+            if (kind == 'g' && top >= -4 && top < prec) {
+                for (w = top < 0 ? 0 : top; w >= z || w >= 0; w--) {
+                    fo_put(&o, fdec_rdig(&d, w));
+                    if (!w && z < 0) fo_put(&o, '.');
+                }
+            } else {
+                fo_put(&o, fdec_rdig(&d, top));
+                if (z < top) fo_put(&o, '.');
+                for (w = top - 1; w >= z; w--) fo_put(&o, fdec_rdig(&d, w));
+                fo_exp(&o, top);
+            }
+        }
+    }
+    sink_put(s, o.b, (tv_len)o.n);
+}
+
+#endif /* TILVM_FLOAT */
 
 #ifndef TILVM_LEAN
 static int tv_array_concat(tilvm *vm);
@@ -1095,7 +1199,11 @@ static int arith(tilvm *vm, int op) {
         case OP_MUL: r = x * y; break;
         case OP_DIV: r = x / y; break;
         case OP_MOD: r = (y == 0) ? (tv_float)0 / (tv_float)0 : F_FMOD(x, y); break;
+#ifdef TV_HAVE_MATH
         default: r = F_POW(x, y); break;
+#else
+        default: if (!f_pow(vm, x, y, &r)) return 0; break;
+#endif
         }
         set_float(a, r);
         SP--;
@@ -1272,7 +1380,7 @@ static int tv_array_concat(tilvm *vm) {
 /* normalize map keys: 2.0 -> 2 */
 static void map_key(tv_val *k) {
 #if TILVM_FLOAT
-    if (k->t == TV_FLOAT && k->u.f == (tv_float)(tv_int)k->u.f) set_int(k, (tv_int)k->u.f);
+    if (k->t == TV_FLOAT && f_finite(k->u.f) && k->u.f == (tv_float)f_to_int(k->u.f)) set_int(k, f_to_int(k->u.f));
 #else
     (void)k;
 #endif
@@ -1530,19 +1638,6 @@ static int parse_int(const char *p, tv_len n, tv_int *out_i) {
  * than 768 (double) or 113 (float) significant digits. A smaller
  * TILVM_FLOAT_DIGITS saves stack (about 2 bytes per digit) on tiny devices
  * at the price of exactness for longer inputs. */
-#if TILVM_FLOAT == 1
-#define TV_F_MANT FLT_MANT_DIG
-#define TV_F_EMIN (FLT_MIN_EXP - FLT_MANT_DIG)    /* exponent of the smallest subnormal */
-#define TV_F_EMAX FLT_MAX_EXP                     /* floats are < 2^TV_F_EMAX */
-#define TV_F_HUGE FLT_MAX
-typedef uint32_t tv_fmant;
-#else
-#define TV_F_MANT DBL_MANT_DIG
-#define TV_F_EMIN (DBL_MIN_EXP - DBL_MANT_DIG)
-#define TV_F_EMAX DBL_MAX_EXP
-#define TV_F_HUGE DBL_MAX
-typedef uint64_t tv_fmant;
-#endif
 #ifdef TILVM_FLOAT_DIGITS
 #define TV_FDIG TILVM_FLOAT_DIGITS
 #elif TILVM_FLOAT == 1
@@ -1776,20 +1871,10 @@ static int cast_slot(tilvm *vm, uint16_t slot, int kind) {
         case TV_BOOL: set_int(v, v->u.i); return 1;
         case TV_NIL: set_int(v, 0); return 1;
 #if TILVM_FLOAT
-        case TV_FLOAT: {
-            tv_float f = v->u.f;
-            if (f != f || f - f != f - f) return fail(vm, "cannot convert nan/inf to int");
-#if TILVM_INT_BITS == 64 && defined(TV_HAVE_MATH)
-            if (f >= (tv_float)9.2e18 || f <= (tv_float)-9.2e18) {
-                double m = fmod((double)f, 18446744073709551616.0);
-                if (m < 0) m += 18446744073709551616.0;
-                set_int(v, (tv_int)(uint64_t)m);
-                return 1;
-            }
-#endif
-            set_int(v, (tv_int)f);
+        case TV_FLOAT:
+            if (!f_finite(v->u.f)) return fail(vm, E_NANINF);
+            set_int(v, f_to_int(v->u.f));
             return 1;
-        }
 #endif
         case TV_STR: case TV_STRK: {
             tv_len n;
@@ -1824,112 +1909,94 @@ static int cast_slot(tilvm *vm, uint16_t slot, int kind) {
 
 #ifndef TILVM_LEAN
 /* ─── f-string format specs ─────────────────────────────────────────────── */
-static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
-    /* [<>^][0][width][.prec][fdxXobe%] - same rules as til_format_spec() */
-    char body[96], *b = body;
-    tv_len slen, blen;
-    uint32_t pad, i, width = 0;
-    const char *sp = str_data(vm, &STK[spec_slot], &slen);
-    char align = 0, kind = 0;
-    int zero = 0, prec = -1, ok = 1, explicit_align;
-    tv_val *v = &STK[vslot];
-    uint32_t k = 0;
-    if (k < slen && (sp[k] == '<' || sp[k] == '>' || sp[k] == '^')) align = sp[k++];
-    if (k < slen && sp[k] == '0') { zero = 1; k++; }
-    while (k < slen && sp[k] >= '0' && sp[k] <= '9') width = width * 10 + (uint32_t)(sp[k++] - '0');
-    if (k < slen && sp[k] == '.') {
-        prec = 0; k++;
-        while (k < slen && sp[k] >= '0' && sp[k] <= '9') prec = prec * 10 + (sp[k++] - '0');
-    }
-    if (k < slen) kind = sp[k++];
-    explicit_align = align != 0;
-    if (k != slen || (kind && !strchr("fdxXobe%", kind))) ok = 0;
-    if (width > 60) width = 60;
-    if (prec > 30) prec = 30;
-    body[0] = 0;
-    if (!ok || !is_num(v)) {
-        if (!to_str_slot(vm, vslot)) return 0;
-        if (!ok) return 1;
-        b = 0;
-    } else if (kind == 'f' || kind == 'e' || kind == '%') {
+/* the text of a formatted number (kinds as in format_slot; d/x/X/o/b: v is an int) */
+static void format_body(sink *s, const tv_val *v, char kind, int prec) {
+    if (kind == 'f' || kind == 'e' || kind == '%') {
 #if TILVM_FLOAT
-        tv_float x = as_float(v) * (kind == '%' ? 100 : 1);
-#ifndef TILVM_NO_STDIO
-        snprintf(body, 80, kind == 'e' ? "%.*e" : "%.*f", prec < 0 ? 6 : prec, (double)x);
+        fmt_float(s, as_float(v) * (kind == '%' ? 100 : 1), kind == 'e' ? 'e' : 'f', prec < 0 ? 6 : prec);
 #else
-        if (kind == 'e') fmt_exp(body, x, prec < 0 ? 6 : prec);
-        else fmt_fixed(body, x, prec < 0 ? 6 : prec);
+        (void)prec;
+        emit_value(s, v, 0, 0);
 #endif
-        if (kind == '%') strcat(body, "%");
-#else
-        strcpy(body, fmt_int(body + 64, v->u.i));
-#endif
+        if (kind == '%') sink_put(s, "%", 1);
     } else if (kind == 'd' || kind == 'x' || kind == 'X' || kind == 'o' || kind == 'b') {
-        tv_int n;
-        tv_uint u;
-        char tmp[80], *q = tmp + 79;
+        char tmp[80], *q = tmp + sizeof tmp;
+        tv_int n = v->u.i;
+        tv_uint u = n < 0 ? (tv_uint)0 - (tv_uint)n : (tv_uint)n;
         unsigned base = kind == 'd' ? 10 : kind == 'o' ? 8 : kind == 'b' ? 2 : 16;
-#if TILVM_FLOAT
-        n = v->t == TV_INT ? v->u.i : (tv_int)v->u.f;
-#else
-        n = v->u.i;
-#endif
-        u = n < 0 ? (tv_uint)0 - (tv_uint)n : (tv_uint)n;
-        *q = 0;
         do {
             unsigned d = (unsigned)(u % base);
             *--q = (char)(d < 10 ? '0' + d : (kind == 'X' ? 'A' : 'a') + d - 10);
             u /= base;
         } while (u);
         if (n < 0) *--q = '-';
-        strcpy(body, q);
-    } else {
+        sink_put(s, q, (tv_len)(tmp + sizeof tmp - q));
+    }
 #if TILVM_FLOAT
-        if (v->t == TV_FLOAT && prec >= 0) {
-#ifndef TILVM_NO_STDIO
-            snprintf(body, 80, "%.*g", prec, (double)v->u.f);
-#else
-            fmt_gp(body, v->u.f, prec == 0 ? 1 : prec);
+    else if (v->t == TV_FLOAT && prec >= 0) fmt_float(s, v->u.f, 'g', prec ? prec : 1);
 #endif
-        } else
+    else emit_value(s, v, 0, 0);
+}
+
+static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
+    /* [<>^][0][width][.prec][fdxXobe%] - same rules as til_format_spec() */
+    tv_len slen;
+    uint32_t pad, i, width = 0, total, left;
+    const char *sp = str_data(vm, &STK[spec_slot], &slen);
+    char align = 0, kind = 0;
+    int zero = 0, prec = -1, ok = 1, numeric, zpad;
+    tv_val *v = &STK[vslot];
+    uint32_t k = 0;
+    sink s;
+    tv_ref r;
+    char *d;
+    if (k < slen && (sp[k] == '<' || sp[k] == '>' || sp[k] == '^')) align = sp[k++];
+    if (k < slen && sp[k] == '0') { zero = 1; k++; }
+    for (; k < slen && sp[k] >= '0' && sp[k] <= '9'; k++)          /* saturates: "string too long" */
+        if (width <= TV_STR_MAX) width = width * 10 + (uint32_t)(sp[k] - '0');
+    if (k < slen && sp[k] == '.') {
+        prec = 0;
+        if (++k == slen || sp[k] < '0' || sp[k] > '9') ok = 0;        /* a digit must follow */
+        for (; k < slen && sp[k] >= '0' && sp[k] <= '9'; k++)
+            if (prec <= (int)(TV_STR_MAX / 10)) prec = prec * 10 + (sp[k] - '0');
+    }
+    if (k < slen) kind = sp[k++];
+    if (k != slen || (kind && !strchr("fdxXobe%", kind))) ok = 0;
+    numeric = ok && is_num(v);
+    if (!numeric) {
+        if (!to_str_slot(vm, vslot)) return 0;
+        if (!ok) return 1;
+    }
+#if TILVM_FLOAT
+    else if (v->t == TV_FLOAT && kind && strchr("dxXob", kind)) {   /* int(x) first */
+        if (!f_finite(v->u.f)) return fail(vm, E_NANINF);
+        set_int(v, f_to_int(v->u.f));
+    }
+    if (numeric && prec > (int)TV_STR_MAX) return fail(vm, E_STR_LONG);
 #endif
-        {
-            sink s;
-            s.vm = vm; s.mode = 1; s.dst = body; s.len = 0;
-            emit_value(&s, v, 0, 0);
-            body[s.len] = 0;
-        }
+    s.vm = vm; s.mode = 0; s.dst = 0; s.len = 0;                  /* measure */
+    if (numeric) format_body(&s, v, kind, prec);
+    else { str_data(vm, v, &slen); s.len = slen; }
+    total = s.len < width ? width : s.len;
+    if (total > TV_STR_MAX) return fail(vm, E_STR_LONG);
+    pad = total - s.len;
+    zpad = pad && zero && numeric && !align;                        /* zeros after the sign */
+    if (!align) align = numeric ? '>' : '<';
+    left = zpad || align == '>' ? pad : align == '<' ? 0 : pad / 2;
+    r = new_str(vm, total);                                         /* may move objects */
+    if (!r) return 0;
+    v = &STK[vslot];
+    d = STROBJ(vm, r)->data;
+    for (i = 0; i < total; i++) d[i] = ' ';
+    s.mode = 1; s.dst = d; s.len = left;
+    if (numeric) format_body(&s, v, kind, prec);
+    else { const char *p = str_data(vm, v, &slen); memcpy(d + left, p, slen); }
+    if (zpad) {
+        i = d[pad] == '-' || d[pad] == '+';
+        if (i) d[0] = d[pad];
+        for (; i < pad + (d[0] == '-' || d[0] == '+'); i++) d[i] = '0';
     }
-    {
-        /* build the padded result */
-        const char *src;
-        uint32_t total;
-        tv_ref r;
-        int numeric = is_num(&STK[vslot]) && b != 0;
-        if (b) { src = body; blen = (tv_len)strlen(body); }
-        else src = str_data(vm, &STK[vslot], &blen);
-        total = blen < width ? width : blen;
-        r = new_str(vm, total);
-        if (!r) return 0;
-        if (!b) src = str_data(vm, &STK[vslot], &blen);
-        pad = total - blen;
-        {
-            char *d = STROBJ(vm, r)->data;
-            if (!align) align = numeric ? '>' : '<';
-            if (pad && zero && numeric && !explicit_align) {
-                uint32_t sign = (src[0] == '-' || src[0] == '+') ? 1 : 0;
-                memcpy(d, src, sign);
-                for (i = 0; i < pad; i++) d[sign + i] = '0';
-                memcpy(d + sign + pad, src + sign, blen - sign);
-            } else {
-                uint32_t left = align == '<' ? 0 : align == '>' ? pad : pad / 2;
-                for (i = 0; i < left; i++) d[i] = ' ';
-                memcpy(d + left, src, blen);
-                for (i = left + blen; i < total; i++) d[i] = ' ';
-            }
-        }
-        set_ref(&STK[vslot], TV_STR, r);
-    }
+    set_ref(&STK[vslot], TV_STR, r);
     return 1;
 }
 
@@ -1937,9 +2004,11 @@ static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
 
 /* ─── natives ───────────────────────────────────────────────────────────── */
 #if TILVM_FLOAT
-static tv_float f_round(tv_float x) {
+static tv_float f_round(tv_float x) {     /* copysign(floor(|x| + 0.5), x), as the reference VM */
+    tv_float r;
     if (x != x) return x;
-    return x < 0 ? -F_FLOOR(-x + (tv_float)0.5) : F_FLOOR(x + (tv_float)0.5);
+    r = F_FLOOR((x < 0 ? -x : x) + (tv_float)0.5);
+    return (x < 0 || (x == 0 && (tv_float)1 / x < 0)) ? -r : r;
 }
 #endif
 
@@ -2399,7 +2468,7 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     case N_ABS:
         if (a->t == TV_INT) set_int(&res, a->u.i < 0 ? (tv_int)((tv_uint)0 - (tv_uint)a->u.i) : a->u.i);
 #if TILVM_FLOAT
-        else if (a->t == TV_FLOAT) set_float(&res, a->u.f < 0 ? -a->u.f : a->u.f);
+        else if (a->t == TV_FLOAT) set_float(&res, a->u.f <= 0 ? (tv_float)0 - a->u.f : a->u.f);   /* abs(-0.0) = 0.0 */
 #endif
         else return failn(vm, "abs expects a number, got ", type_name(vm, a), 0, 0, 0, 0);
         break;
@@ -2411,8 +2480,10 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
         x = as_float(a);
         switch (id) {
         case N_SQRT: x = x < 0 ? (tv_float)0 / (tv_float)0 : F_SQRT(x); break;
-        case N_FLOOR: x = F_FLOOR(x); break;
-        case N_CEIL: x = F_CEIL(x); break;
+        case N_FLOOR: case N_CEIL:              /* the reference VM: float(math.floor(x)): never -0.0 */
+            x = id == N_FLOOR ? F_FLOOR(x) : F_CEIL(x);
+            if (x == 0) x = 0;
+            break;
         case N_ROUND: x = f_round(x); break;
 #ifdef TV_HAVE_MATH
         case N_SIN: x = (tv_float)sin((double)x); break;
@@ -2429,7 +2500,15 @@ static int call_native(tilvm *vm, uint8_t id, uint8_t argc) {
     }
     case N_POW:
         if (!is_num(a) || !is_num(a + 1)) return fail(vm, "pow expects numbers");
+#ifdef TV_HAVE_MATH
         set_float(&res, F_POW(as_float(a), as_float(a + 1)));
+#else
+        {
+            tv_float x;
+            if (!f_pow(vm, as_float(a), as_float(a + 1), &x)) return 0;
+            set_float(&res, x);
+        }
+#endif
         break;
 #endif
     case N_MIN: case N_MAX: case N_SUM: {
@@ -3162,9 +3241,30 @@ static void reset_state(tilvm *vm) {
     vm->err_msg = 0;
 }
 
+/* a string constant? (names of functions, types and fields must be) */
+static int str_const(const tilvm *vm, uint16_t k) {
+    return k < vm->n_consts && vm->bc[vm->const_off[k] - 1] == 3;
+}
+
+/* n records of `size` bytes from offset p: they lie inside the file and (at < size)
+ * the function index at byte `at` of each exists. The offset after them, 0 if not. */
+static tv_off ld_records(const tilvm *vm, tv_off p, uint16_t n, uint8_t size, uint8_t at) {
+    for (; n; n--, p += size)
+        if ((tv_off)((tv_off)vm->bc_size - p) < size || (at < size && RD16(vm->bc + p + at) >= vm->n_funcs))
+            return 0;
+    return p;
+}
+
+/* Load and check a program: every section must lie inside `size` bytes and the
+ * records must refer to existing constants / functions / code, so nothing here or
+ * later (error reports, line numbers, names) reads outside the file. The
+ * instructions themselves are trusted: their operands are not checked. */
 int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
-    uint32_t p = 6, i;
-    uint16_t n;
+    tv_off p = 6, sz = (tv_off)size;
+    uint32_t k;
+    uint16_t i, n;
+/* fewer than n bytes left after offset p (p <= sz always holds) */
+#define LACK(n) ((tv_off)(sz - p) < (n))
     if (size < 16 || bc[0] != 'T' || bc[1] != 'I' || bc[2] != 'L' || bc[3] != 'B') return -1;
     if (bc[4] < TILVM_BYTECODE_MIN_VERSION || bc[4] > TILVM_BYTECODE_VERSION) return -2;
 #ifdef TILVM_ADDR16
@@ -3187,51 +3287,69 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
     if (n > TILVM_MAX_CONSTS) return -4;
     vm->n_consts = n;
     for (i = 0; i < n; i++) {
-        uint8_t tag;
-        if (p >= size) return -5;
-        tag = bc[p++];
-        vm->const_off[i] = p;
-        if (tag == 1) {
+        const uint8_t *q = bc + p;
+        tv_off len = 8;                                /* int, float: 8 bytes */
+        if (LACK(9)) return -5;                        /* tag + 8 bytes, or tag + length */
+        vm->const_off[i] = ++p;
+        if (*q == 3) {                                 /* string: u16 length + bytes */
+            len = RD16(q + 1);
+            if (len > (tv_off)(sz - p - 2)) return -5;
+            len += 2;
+        } else if (*q != 1 && *q != 2) return -5;
 #if TILVM_INT_BITS < 64
-            /* the constant must fit this VM's integer width */
-            uint32_t lo = RD32(bc + p), hi = RD32(bc + p + 4);
-            int32_t v = (int32_t)lo;
-            if (hi != (v < 0 ? 0xFFFFFFFFu : 0u)) return -6;
-#if TILVM_INT_BITS == 16
-            if (v < -32768 || v > 32767) return -6;
+        if (*q == 1) {           /* the constant must fit this VM's integer width: */
+            uint8_t j;           /* the bytes above it repeat its sign */
+            for (j = 1 + TILVM_INT_BITS / 8; j < 9; j++)
+                if (q[j] != (q[TILVM_INT_BITS / 8] & 0x80u ? 0xFFu : 0u)) return -6;
+        }
 #endif
-#endif
-            p += 8;
-        } else if (tag == 2) p += 8;
-        else if (tag == 3) p += 2u + RD16(bc + p);
-        else return -5;
+        p += len;
     }
+    if (LACK(2)) return -5;
     vm->n_funcs = RD16(bc + p); p += 2;
     vm->funcs_off = p;
 #if TILVM_MAX_FUNCS > 0
     if (vm->n_funcs > TILVM_MAX_FUNCS) return -10;
 #endif
-    p += 11u * vm->n_funcs;
+    if (vm->entry >= vm->n_funcs || !(p = ld_records(vm, p, vm->n_funcs, 11, 11)) || LACK(2))
+        return -5;                                     /* 11-byte records (checked below) */
     n = RD16(bc + p); p += 2;
     if (n > TILVM_MAX_TYPES) return -7;
     vm->n_types = n;
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < n; i++) {                          /* name, n fields, field names */
+        const uint8_t *q = bc + p;
+        tv_off len;
         vm->type_off[i] = p;
-        p += 3u + 2u * bc[p + 2];
+        if (LACK(3)) return -5;
+        len = 3u + 2u * q[2];
+        if (LACK(len) || !str_const(vm, RD16(q))) return -5;
+        for (q += 3; q < bc + p + len; q += 2)
+            if (!str_const(vm, RD16(q))) return -5;
+        p += len;
     }
+    if (LACK(2)) return -5;
     vm->n_methods = RD16(bc + p); p += 2;
     vm->methods_off = p;
-    p += 6u * vm->n_methods;
+    if (!(p = ld_records(vm, p, vm->n_methods, 6, 4)) || LACK(1)) return -5;   /* type, name, function */
     vm->n_prelude = bc[p++];
     vm->prelude_off = p;
-    p += 3u * vm->n_prelude;
-    vm->code_size = RD32(bc + p); p += 4;
+    if (!(p = ld_records(vm, p, vm->n_prelude, 3, 1)) || LACK(4)) return -5;   /* method id, function */
+    k = RD32(bc + p); p += 4;
+    if (k > (tv_off)(sz - p)) return -5;
+    vm->code_size = (tv_off)k;
     vm->code_off = p;
     p += vm->code_size;
-    if (p + 2 > size) return -5;
+    if (LACK(2)) return -5;
     vm->n_lines = RD16(bc + p); p += 2;
     vm->lines_off = p;
-    if (vm->n_globals + 8 > TILVM_STACK_SIZE) return -8;
+    if (!ld_records(vm, p, vm->n_lines, 6, 6)) return -5;   /* pc u32, line u16 (a debug-info section may follow) */
+#undef LACK
+    for (i = 0; i < vm->n_funcs; i++) {                /* names are strings, code lies in the code section */
+        const uint8_t *f = func_rec(vm, i);
+        if (!str_const(vm, FN_NAME(f)) || FN_OFFSET(f) >= k) return -5;
+    }
+    n = FN_NLOCALS(func_rec(vm, vm->entry));           /* the stack holds the globals and __start__'s locals */
+    if (n > TILVM_STACK_SIZE - 8 || vm->n_globals > TILVM_STACK_SIZE - 8 - n) return -8;
 #if TILVM_MAX_FUNCS > 0
     for (i = 0; i < vm->n_funcs; i++) {       /* decode the function records once */
         const uint8_t *f = func_rec(vm, (uint16_t)i);
@@ -3257,28 +3375,18 @@ int tilvm_load(tilvm *vm, const uint8_t *bc, uint32_t size) {
 #else
     vm->bc_hash = 0;           /* only snapshots use it: none in lean builds */
 #endif
+    memset(vm, 0, offsetof(tilvm, bc));   /* the host bindings: write ... host */
 #ifndef TILVM_NO_STDIO
     vm->write = tilvm_default_write;
     vm->write_err = default_write_err;
     vm->read_line = default_read_line;
-#else
-    vm->write = 0;
-    vm->write_err = 0;
-    vm->read_line = 0;
-#endif
-#ifdef TV_HAVE_CLOCK
-    vm->clock_ms = default_clock_ms;
-#else
-    vm->clock_ms = 0;
-#endif
-    vm->ctx = 0;
-    vm->max_steps = 0;
-    vm->idle_count = 0;
-    memset(&vm->host, 0, sizeof(vm->host));
-#ifndef TILVM_NO_STDIO
     vm->host.read_file = default_read_file;
     vm->host.write_file = default_write_file;
 #endif
+#ifdef TV_HAVE_CLOCK
+    vm->clock_ms = default_clock_ms;
+#endif
+    vm->idle_count = 0;
     reset_state(vm);
 #ifdef TILVM_STATS
     {   /* paint the free stack slots so tilvm_get_stats() can find the high-water mark */
@@ -3383,6 +3491,42 @@ static int recover(tilvm *vm, int target) {
     return 1;
 }
 
+#if TILVM_FLOAT && !(TILVM_FLOAT == 2 && DBL_MANT_DIG == 53)
+/* binary32 floats (TILVM_FLOAT=1; also SDCC's and AVR's 32-bit double): the
+ * float nearest to a binary64 value (hi, lo words), ties to even, without a
+ * 64-bit double (float constants, portable snapshots) */
+typedef char tv_check_float32[sizeof(tv_float) == 4 ? 1 : -1];
+static tv_float f32_from_bits(uint32_t hi, uint32_t lo) {   /* round to nearest even */
+    uint32_t sign = hi & 0x80000000u, m, rest, b;
+    int32_t e = (int32_t)((hi >> 20) & 0x7FFu);
+    tv_float f;
+    if (e == 0x7FF) b = sign | 0x7F800000u | (((hi & 0xFFFFFu) | lo) ? 0x400000u : 0u);
+    else if (e == 0) b = sign;                        /* zero / double subnormal: far below */
+    else {
+        e += 127 - 1023;
+        m = 0x800000u | ((hi & 0xFFFFFu) << 3) | (lo >> 29);   /* 24 bits */
+        rest = lo & 0x1FFFFFFFu;                               /* 29 bits below them */
+        if (e <= 0) {                                 /* a float subnormal */
+            uint32_t s = (uint32_t)(1 - e), lost, half;
+            if (s > 25) b = sign;
+            else {
+                lost = m & ((1u << s) - 1u);
+                half = 1u << (s - 1u);
+                m >>= s;
+                if (lost > half || (lost == half && (rest || (m & 1u)))) m++;
+                b = sign | m;
+            }
+        } else {
+            if (rest > 0x10000000u || (rest == 0x10000000u && (m & 1u))) m++;
+            if (m == 0x1000000u) { m >>= 1; e++; }
+            b = e >= 0xFF ? sign | 0x7F800000u : sign | ((uint32_t)e << 23) | (m & 0x7FFFFFu);
+        }
+    }
+    memcpy(&f, &b, 4);
+    return f;
+}
+#endif
+
 /* constant k (int / float / string kept in ROM) -> *dst */
 static void load_const(tilvm *vm, uint16_t k, tv_val *dst) {
     const uint8_t *p = vm->bc + vm->const_off[k];
@@ -3395,25 +3539,13 @@ static void load_const(tilvm *vm, uint16_t k, tv_val *dst) {
         set_int(dst, (tv_int)(int32_t)RD32(p));
 #endif
     } else {
-#if TILVM_FLOAT == 2 && !defined(__SDCC)
+#if TILVM_FLOAT == 2 && DBL_MANT_DIG == 53
         uint64_t bits = (uint64_t)RD32(p) | ((uint64_t)RD32(p + 4) << 32);
         double d;
         memcpy(&d, &bits, sizeof d);
         set_float(dst, (tv_float)d);
 #elif TILVM_FLOAT
-        /* single precision (or SDCC, where double is 32-bit): decode IEEE754 */
-        uint32_t hi = RD32(p + 4), lo = RD32(p);
-        int e = (int)((hi >> 20) & 0x7FF) - 1023;
-        tv_float m = (tv_float)1 + (tv_float)(hi & 0xFFFFF) / (tv_float)1048576.0
-                     + (tv_float)lo / (tv_float)4503599627370496.0;
-        if (((hi >> 20) & 0x7FF) == 0) m = 0;
-        if (e > 200) m = (tv_float)1e30 * (tv_float)1e30;   /* inf in float */
-        else if (e < -200) m = 0;
-        else {
-            while (e > 0) { m *= 2; e--; }
-            while (e < 0) { m /= 2; e++; }
-        }
-        set_float(dst, (hi >> 31) ? -m : m);
+        set_float(dst, f32_from_bits(RD32(p + 4), RD32(p)));   /* correctly rounded */
 #else
         set_nil(dst);
 #endif
@@ -3616,24 +3748,57 @@ static int concat_values(tilvm *vm, uint8_t n) {
     return 1;
 }
 
-/* retry / timeout / intent recovery point */
+/* retry / timeout / intent recovery point. A timeout of v ms expires when the
+ * clock (32-bit ms) has advanced by more than v: v = far * 2^30 + left, the
+ * deadline is now + left + 1 (never 0, which means "no deadline") and each time
+ * it passes while far > 0 it moves on by 2^30 ms (TV_FAR_TIMEOUTS builds: up to
+ * 2^62 ms; nan and +inf never expire, like the reference VM's float deadline). */
 static int push_try(tilvm *vm, uint8_t op, tv_off handler) {
     tilvm_state *st = &vm->st;
     tv_try *t;
     uint32_t deadline = 0;
+#ifdef TV_FAR_TIMEOUTS
+    uint32_t far = 0;
+#endif
     if (op == OP_TRY_TIMEOUT) {
         tv_val *ms = &STK[--SP];
-        tv_int v = ms->t == TV_INT ? ms->u.i : 0;
+        uint32_t left = 0;
+        if (!is_num(ms)) return failn(vm, "timeout expects a number, got ", type_name(vm, ms), 0, 0, 0, 0);
 #if TILVM_FLOAT
-        if (ms->t == TV_FLOAT) v = (tv_int)ms->u.f;
+        if (ms->t == TV_FLOAT) {
+            tv_float f = ms->u.f, q;
+            if (f != f || f >= (tv_float)4611686018427387904.0) far = 0xFFFFFFFFu;   /* 2^62 */
+            else if (f > 0) {
+                q = F_FLOOR(f * (tv_float)9.31322574615478515625e-10);            /* f / 2^30 */
+                far = (uint32_t)q;
+                left = (uint32_t)(f - q * (tv_float)1073741824.0);
+            }
+        } else
 #endif
-        deadline = now_ms(vm) + (uint32_t)(v > 0 ? v : 0) + 1;
+        if (ms->u.i > 0) {
+#ifdef TV_FAR_TIMEOUTS
+            tv_uint v = (tv_uint)ms->u.i;
+            left = (uint32_t)(v & 0x3FFFFFFFu);
+#if TILVM_INT_BITS == 64
+            far = (v >> 30) > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)(v >> 30);
+#else
+            far = (uint32_t)((uint32_t)v >> 30);
+#endif
+#else
+            left = (uint32_t)ms->u.i;
+#endif
+        }
+        deadline = now_ms(vm) + left + 1;
+        if (!deadline) deadline = 1;
     }
     if (st->n_try >= TILVM_MAX_TRY) return fail(vm, "too many nested retry/timeout blocks");
     t = &st->tries[st->n_try++];
     TV_STAT_MAX(peak_try, st->n_try);
     t->handler = handler;
     t->deadline = deadline;
+#ifdef TV_FAR_TIMEOUTS
+    t->far = far;
+#endif
     t->n_frames = st->n_frames;
     t->sp = SP;
     t->n_handlers = st->n_handlers;
@@ -3661,8 +3826,20 @@ static int expired_try(tilvm *vm) {
     tilvm_state *st = &vm->st;
     uint32_t now = now_ms(vm);
     uint16_t i;
-    for (i = 0; i < st->n_try; i++)
-        if (st->tries[i].deadline && (int32_t)(now - st->tries[i].deadline) >= 0) return i;
+    for (i = 0; i < st->n_try; i++) {
+        tv_try *t = &st->tries[i];
+        if (t->deadline && (int32_t)(now - t->deadline) >= 0) {
+#ifdef TV_FAR_TIMEOUTS
+            if (t->far) {                   /* a long timeout: wait another 2^30 ms */
+                t->far--;
+                t->deadline += 0x40000000u;
+                if (!t->deadline) t->deadline = 1;
+                continue;
+            }
+#endif
+            return i;
+        }
+    }
     return -1;
 }
 
@@ -5323,9 +5500,7 @@ static uint32_t crc32_add(uint32_t c, const uint8_t *p, uint32_t n) {   /* = zli
 }
 
 #if TILVM_FLOAT && !(TILVM_FLOAT == 2 && DBL_MANT_DIG == 53)
-/* binary32 floats (TILVM_FLOAT=1; also AVR's 32-bit double) <-> the binary64
- * bits of the file (hi, lo words), without a 64-bit double */
-typedef char tv_check_float32[sizeof(tv_float) == 4 ? 1 : -1];
+/* binary32 floats -> the binary64 bits of the file (hi, lo words) */
 static void f32_bits(tv_float f, uint32_t *hi, uint32_t *lo) {
     uint32_t b, e, m;
     memcpy(&b, &f, 4);
@@ -5342,35 +5517,6 @@ static void f32_bits(tv_float f, uint32_t *hi, uint32_t *lo) {
     *lo = m << 29;
 }
 
-static tv_float f32_from_bits(uint32_t hi, uint32_t lo) {   /* round to nearest even */
-    uint32_t sign = hi & 0x80000000u, m, rest, b;
-    int32_t e = (int32_t)((hi >> 20) & 0x7FFu);
-    tv_float f;
-    if (e == 0x7FF) b = sign | 0x7F800000u | (((hi & 0xFFFFFu) | lo) ? 0x400000u : 0u);
-    else if (e == 0) b = sign;                        /* zero / double subnormal: far below */
-    else {
-        e += 127 - 1023;
-        m = 0x800000u | ((hi & 0xFFFFFu) << 3) | (lo >> 29);   /* 24 bits */
-        rest = lo & 0x1FFFFFFFu;                               /* 29 bits below them */
-        if (e <= 0) {                                 /* a float subnormal */
-            uint32_t s = (uint32_t)(1 - e), lost, half;
-            if (s > 25) b = sign;
-            else {
-                lost = m & ((1u << s) - 1u);
-                half = 1u << (s - 1u);
-                m >>= s;
-                if (lost > half || (lost == half && (rest || (m & 1u)))) m++;
-                b = sign | m;
-            }
-        } else {
-            if (rest > 0x10000000u || (rest == 0x10000000u && (m & 1u))) m++;
-            if (m == 0x1000000u) { m >>= 1; e++; }
-            b = e >= 0xFF ? sign | 0x7F800000u : sign | ((uint32_t)e << 23) | (m & 0x7FFFFFu);
-        }
-    }
-    memcpy(&f, &b, 4);
-    return f;
-}
 #endif
 
 /* ─── saving ─── */
@@ -5626,6 +5772,10 @@ uint32_t tilvm_save_portable(tilvm *vm, tilvm_put_fn put, void *ctx) {
         if (t->deadline) {                  /* time left; at least 1 (0 = no deadline) */
             int32_t d = (int32_t)(t->deadline - now_ms(vm) - 1u);
             v[1] = d < 1 ? 1u : (uint32_t)d;
+#ifdef TV_FAR_TIMEOUTS
+            if (t->far)                     /* + far * 2^30 ms, at most 0xFFFFFFFF (as the reference VM) */
+                v[1] = t->far > 3u || v[1] > 0xFFFFFFFFu - (t->far << 30) ? 0xFFFFFFFFu : v[1] + (t->far << 30);
+#endif
         }
         v[2] = t->n_frames;
         v[3] = (uint32_t)(t->sp - g);
@@ -5836,6 +5986,155 @@ static void tp_patch(tp_in *r, tv_val *v, uint32_t n) {
         }
 }
 
+/* ─── the frames of a snapshot against the bytecode ───
+ * code_depths() in src/til.py does the same: the operand stack depth (values above
+ * a frame's locals) at an instruction, by one linear pass over the function's code
+ * from its first instruction (depth 0) that follows forward jumps. TP_OPS, per
+ * opcode 0x00-0xBF: operand bytes (bits 0-2; 7 = no such opcode), the stack
+ * effect + 3 when it is fixed (bits 3-5; tp_depth computes the others), bit 6: the
+ * last operand is a jump, bit 7: the next instruction is reached only by a jump
+ * (and after END_HANDLE the depth comes from the HANDLE's jump too). */
+static const uint8_t TP_OPS[0xC0] = {
+    0x18, 0x20, 0x20, 0x20, 0x21, 0x22, 0x22, 0x10, 0x20, 0x28, 0x18, 0x07, 0x07, 0x07, 0x07, 0x07,
+    0x21, 0x11, 0x22, 0x12, 0x21, 0x11, 0x21, 0x11, 0x19, 0x21, 0x5B, 0x07, 0x07, 0x07, 0x07, 0x07,
+    0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x18, 0x18, 0x10, 0x10, 0x10, 0x18, 0x10, 0x10, 0x07, 0x07,
+    0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+    0xDA, 0x52, 0x52, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+    0x1B, 0x19, 0x1C, 0x90, 0x98, 0x1A, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+    0x1A, 0x1A, 0x1B, 0x10, 0x00, 0x1A, 0x0A, 0x19, 0x1B, 0x22, 0x19, 0x63, 0x1A, 0x19, 0x1A, 0x07,
+    0x5A, 0x52, 0x18, 0x90, 0x18, 0x18, 0x5B, 0x98, 0x1D, 0x98, 0x07, 0x07, 0x07, 0x07, 0x07, 0x98,
+    0x2A, 0x23, 0x1A, 0x1A, 0x91, 0x09, 0x1A, 0x19, 0x22, 0x99, 0x5C, 0x07, 0x07, 0x07, 0x07, 0x07,
+    0x4B, 0x54, 0x55, 0x5D, 0x5E, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07, 0x07,
+    0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A,
+    0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19
+};
+#define TP_NONE 0xFFFFFFFFu
+
+/* The depth at code offset pc (relative to the code section) in function f, or
+ * -1 (not known there / not an instruction start), -2 (more pending jumps than
+ * the free arena holds: 8 bytes each). *prev = the instruction before pc. The
+ * pending jumps (target lo, hi, depth lo, hi) use the arena, which is empty
+ * while the frames are checked. */
+static long tp_depth(tilvm *vm, uint16_t f, uint32_t pc, uint32_t *prev) {
+    const uint8_t *code = vm->bc + vm->code_off;
+    uint16_t *land = (uint16_t *)(void *)(vm->mem.heap + vm->st.heap_top);
+    uint32_t pos = (uint32_t)(F_CODE(vm, f) - vm->code_off), n = 0, i, len, target;
+    uint32_t cap = ((uint32_t)TILVM_HEAP_SIZE - vm->st.heap_top) / 8u;
+    long d = 0, after;
+    *prev = TP_NONE;
+    for (; pos <= pc && pos < vm->code_size; *prev = pos, pos += len) {
+        uint8_t op = code[pos], t = op < 0xC0 ? TP_OPS[op] : 7;
+        for (i = 0; i < n; ) {                      /* a forward jump lands here; drop passed ones */
+            target = land[4 * i] | (uint32_t)land[4 * i + 1] << 16;
+            if (target == pos && d < 0) d = (long)(land[4 * i + 2] | (uint32_t)land[4 * i + 3] << 16);
+            if (target <= pos) { n--; memmove(land + 4 * i, land + 4 * n, 8); }
+            else i++;
+        }
+        if (pos == pc) return d;
+        len = 1u + (t & 7u);
+        if ((t & 7u) == 7u || len > vm->code_size - pos) return -1;
+        if (d < 0) continue;
+        switch (op) {                               /* effects that depend on an operand */
+        case OP_CALL: case OP_NEW_STRUCT: case OP_MAKE_CLOSURE: after = d + 1 - code[pos + 3]; break;
+        case OP_CALL_VALUE: after = d - code[pos + 1]; break;
+        case OP_INVOKE: after = d - code[pos + 4]; break;
+        case OP_NATIVE: after = d + 1 - code[pos + 2]; break;
+        case OP_NATIVE_POP: after = d - code[pos + 2]; break;
+        case OP_NEW_ARRAY: after = d + 1 - (long)RD16(code + pos + 1); break;
+        case OP_NEW_MAP: after = d + 1 - 2L * RD16(code + pos + 1); break;
+        case OP_CONCAT: after = d + 1 - code[pos + 1]; break;
+        case OP_PERFORM: after = d + 1 - code[pos + 5]; break;
+        default: after = d + (long)((t >> 3) & 7u) - 3;
+        }
+        if (t & 0x40) {                             /* a jump: remember where a forward one lands */
+            long at = after + (op == OP_TRY || op == OP_TRY_TIMEOUT ? 1 : op == OP_FOR_ITER ? -1 :
+                               op == OP_HANDLE ? 1 - 2L * code[pos + 1] : 0);
+            long tg = (long)(pos + len) + (int16_t)RD16(code + pos + len - 2);
+            target = (uint32_t)tg;
+            for (i = 0; i < n && (land[4 * i] | (uint32_t)land[4 * i + 1] << 16) != target; i++) {}
+            if (tg > (long)pos && at >= 0 && i == n) {
+                if (n == cap) return -2;
+                land[4 * n] = (uint16_t)target;
+                land[4 * n + 1] = (uint16_t)(target >> 16);
+                land[4 * n + 2] = (uint16_t)at;
+                land[4 * n + 3] = (uint16_t)((uint32_t)at >> 16);
+                n++;
+            }
+        }
+        d = (t & 0x80) || after < 0 ? -1 : after;
+    }
+    return -1;
+}
+
+/* *top = the stack depth (from the first value after the globals) at code
+ * offset pc in frame fi; 0 or an error code */
+static int tp_at(tilvm *vm, uint32_t fi, tv_off pc, long *top, uint32_t *prev) {
+    const tv_frame *f = &vm->st.frames[fi];
+    long d = tp_depth(vm, f->func, (uint32_t)(pc - vm->code_off), prev);
+    if (d < 0) return d == -2 ? TILVM_P_TOO_BIG : TILVM_P_CORRUPT;
+    *top = (long)f->base + F_NLOCALS(vm, f->func) + d;
+    return 0;
+}
+
+/* the frames, recovery points and handler records sit where the bytecode puts
+ * them (see TILVM._check_snapshot_depths in src/til.py); bases and sps are
+ * still relative to the first value after the globals, depth = S. 0 or an error. */
+static int tp_check_depths(tilvm *vm, uint16_t nf, uint32_t depth) {
+    tilvm_state *st = &vm->st;
+    const uint8_t *code = vm->bc + vm->code_off;
+    uint32_t i, prev;
+    long top;
+    for (i = 0; i < nf; i++) {
+        const tv_frame *f = &st->frames[i];
+        int e = tp_at(vm, i, f->pc, &top, &prev), ok;
+        uint16_t callee;
+        uint8_t op;
+        if (e) return e;
+        if (i + 1 == nf) return top == (long)depth ? 0 : TILVM_P_CORRUPT;
+        callee = f[1].func;
+        op = prev == TP_NONE ? 0 : code[prev];
+        ok = (long)f[1].base - f[1].extra == top - 1;
+        switch (op) {
+        case OP_CALL: ok = ok && !f[1].extra && callee == RD16(code + prev + 1); break;
+        case OP_CALL_VALUE: ok = ok && f[1].extra; break;
+        case OP_INVOKE: break;
+        case OP_PERFORM:
+            ok = ok && !f[1].extra && (callee == RD16(code + prev + 3) || (F_FLAGS(vm, callee) & FLAG_EFFECT_CLAUSE));
+            break;
+        default: ok = 0;
+        }
+        if (!ok) return TILVM_P_CORRUPT;
+    }
+    return 0;
+}
+
+/* recovery points and handle records: where their handler / abort pc continues */
+static int tp_check_records(tilvm *vm, uint16_t nt, uint16_t nh) {
+    tilvm_state *st = &vm->st;
+    uint32_t i, prev;
+    long top;
+    for (i = 0; i < nt; i++) {
+        const tv_try *t = &st->tries[i];
+        int e = tp_at(vm, t->n_frames - 1u, t->handler, &top, &prev);
+        if (e) return e;
+        if (top != (long)t->sp + 1) return TILVM_P_CORRUPT;
+    }
+#ifndef TILVM_NO_EFFECTS
+    for (i = 0; i < nh; i++) {
+        const tv_handler *h = &st->handlers[i];
+        const tv_frame *f = &st->frames[h->n_frames - 1];
+        int e = tp_at(vm, h->n_frames - 1u, h->kind ? f->pc : h->abort_pc, &top, &prev);
+        if (e) return e;
+        if (h->kind ? vm->bc[vm->code_off + prev] != OP_PERFORM || !(F_FLAGS(vm, f[1].func) & FLAG_EFFECT_CLAUSE)
+                    : top != (long)h->sp + 1)
+            return TILVM_P_CORRUPT;
+    }
+#else
+    (void)nh;
+#endif
+    return 0;
+}
+
 int tilvm_load_portable(tilvm *vm, tilvm_get_fn get, void *ctx) {
     tilvm_state *st = &vm->st;
     tp_in r;
@@ -5929,6 +6228,8 @@ int tilvm_load_portable(tilvm *vm, tilvm_get_fn get, void *ctx) {
     for (i = 0; i < nh; i++)
         if (!st->handlers[i].kind && st->handlers[i].sp + 2u * st->handlers[i].n > depth) tp_fail(&r, TILVM_P_CORRUPT);
 #endif
+    if (!r.err) tp_fail(&r, tp_check_depths(vm, nf, depth));
+    if (!r.err) tp_fail(&r, tp_check_records(vm, nt, nh));
     w = tp_rd(&r, 2);
     h = tp_rd(&r, 2);
     if ((w == 0) != (h == 0) || w > 4096 || h > 4096) tp_fail(&r, TILVM_P_CORRUPT);
@@ -6061,7 +6362,15 @@ int tilvm_load_portable(tilvm *vm, tilvm_get_fn get, void *ctx) {
     for (i = 0; i < nt; i++) {
         tv_try *t = &st->tries[i];
         t->sp = (uint16_t)(t->sp + g);
-        if (t->deadline) { t->deadline = now_ms(vm) + t->deadline + 1u; st->n_deadlines++; }
+        if (t->deadline) {                  /* time left -> a deadline (see push_try) */
+#ifdef TV_FAR_TIMEOUTS
+            t->far = t->deadline >> 30;
+            t->deadline &= 0x3FFFFFFFu;
+#endif
+            t->deadline = now_ms(vm) + t->deadline + 1u;
+            if (!t->deadline) t->deadline = 1;
+            st->n_deadlines++;
+        }
     }
 #ifndef TILVM_NO_EFFECTS
     for (i = 0; i < nh; i++)
