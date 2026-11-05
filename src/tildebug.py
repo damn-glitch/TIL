@@ -339,7 +339,10 @@ class DebugVM(til.TILVM):
         if name == 'clock_ms':
             return int(self.vclock())
         if name == 'sleep_ms':
-            ms = max(0, self.num(args[0], 'sleep_ms'))
+            ms = args[0]
+            if type(ms) is not int:             # the checks of TILVM.call_native
+                self.panic("sleep_ms() needs an integer")
+            ms = min(max(0, ms), til.SLEEP_MAX_MS)
             return self.nd('sleep', lambda: time.sleep(ms / 1000.0))
         if name in ('read_file', 'file_exists', 'write_file'):
             self.path_arg(name, args[0])            # its errors come from the program
