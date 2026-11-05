@@ -10,6 +10,9 @@ C99:
   heap, stack and call-depth sizes
 * **pluggable I/O** — `write`, `read_line`, `clock_ms` callbacks
 * **snapshots** — pause a running program, save it, resume it after a power cycle
+* **portable snapshots** — save a paused program as a device-independent `.tilp`
+  stream and continue it on another VM build or the reference VM: start on a PC,
+  continue on a calculator ([docs/TIL_SNAPSHOTS.md](../docs/TIL_SNAPSHOTS.md))
 * **step budgets** — run N steps at a time (UI loops, cooperative multitasking),
   sandbox limits, real `timeout(ms)` blocks
 * **screen and keys** — lines, rectangles, circles and a 5×7 font are drawn
@@ -89,6 +92,7 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_FIELD_CACHE` | 64 (lean: 0) | entries of the (struct type, name) → field / method lookup caches (power of two, 6 bytes each, two caches) |
 | `TILVM_COMPUTED_GOTO` | 1 with GCC/Clang, except lean and `-Os` | 1 = "labels as values" dispatch (one indirect jump per handler), 0 = portable `switch` |
 | `TILVM_FAST_PATHS` | 1, except lean and `-Os` | inline integer fast paths in the interpreter; 0 = smaller code, same results |
+| `TILVM_NO_PORTABLE` | off | leave out portable snapshots (`tilvm_save_portable` / `tilvm_load_portable` report "not available"; never in `TILVM_LEAN` builds); saves ~5 KB on ARM |
 | `TILVM_NO_GFX` | off | leave out the screen/keys natives (`screen_init` … `wait_key` report "not available in this VM build"); saves ~2.7 KB on ARM, ~7.5 KB on the Z80 (the Z80 build uses it) |
 | `TILVM_GFX_MAX_W` / `TILVM_GFX_MAX_H` | 4096 / 4096 | largest screen `screen_init` accepts: set the display's size on a device (`screen_init(400, 300)` on a 320×240 build is a runtime error, so the screen hooks never get coordinates outside the display) |
 | `TILVM_ROM` | empty | storage qualifier for the 480-byte font table, e.g. `__flash` for avr-gcc (keeps it out of RAM) |
@@ -147,11 +151,23 @@ tilvm_restore(&vm, buffer, n);       /* same program + same VM build */
 tilvm_run(&vm);                      /* continues where it stopped */
 ```
 
+Continue on another device (any VM build, or `til exec prog.tbc --resume`):
+
+```c
+tilvm_save_portable(&vm, put, ctx);  /* after a TILVM_YIELD: put(ctx, bytes, n) streams the .tilp */
+/* ... on the other device, with the same .tbc: */
+tilvm_load(&vm, tbc, size);
+tilvm_load_portable(&vm, get, ctx);  /* get(ctx, buf, n) reads n bytes; 0 or TILVM_P_* < 0 */
+tilvm_run(&vm);
+```
+
 The desktop runner exposes the same features:
 
 ```bash
 vm/tilvm --snapshot-after 300 state.snap prog.tbc   # run 300 steps, save, exit 3
 vm/tilvm --resume state.snap prog.tbc               # continue
+vm/tilvm --save-portable-after 300 s.tilp prog.tbc  # portable snapshot: continue on any VM build
+vm/tilvm --resume-portable s.tilp prog.tbc          # (or: til exec prog.tbc --resume s.tilp)
 vm/tilvm --max-steps 100000 prog.tbc                # sandbox
 vm/tilvm --stats prog.tbc                           # GC / heap statistics (+ high-water marks with TILVM_STATS)
 vm/tilvm --screen out.ppm prog.tbc                  # graphics: final frame as a PPM image

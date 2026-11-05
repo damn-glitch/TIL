@@ -6846,6 +6846,7 @@ class TBCModule:
         self.uses_float = False
         self.version = TBC_VERSION           # of a loaded file (written files: TBC_VERSION)
         self.debug_info = False              # write the debug-info section (see DEBUG_RECORD)
+        self.raw: Optional[bytes] = None     # from_bytes(): the bytes it was read from
 
     def const(self, value) -> int:
         if isinstance(value, str):
@@ -7022,6 +7023,7 @@ class TBCModule:
             f.lines = [(pc - f.offset, line) for pc, line in m.lines if f.offset <= pc < end]
         if debug is not None:
             m.read_debug_records(debug)
+        m.raw = bytes(data)         # the file itself (portable snapshots hash it)
         return m
 
     def read_debug_records(self, recs):
@@ -8958,6 +8960,57 @@ class TILExit(Exception):
         self.code = code
 
 
+class TILPause(Exception):
+    """Raised by the step check when TILVM.run_steps() reaches its pause point
+    (the instruction that counted the step has completed and the top frame's pc
+    is saved). Not an error: run_steps() returns TILVM.YIELD."""
+
+
+class SnapshotError(ValueError):
+    """A portable snapshot (.tilp, docs/TIL_SNAPSHOTS.md) cannot be saved or
+    loaded. `code` is what tilvm_load_portable() returns for the same problem
+    (TILVM_P_* in vm/tilvm.h); the message is TILP_ERRORS[code] plus details."""
+    def __init__(self, code: int, detail: str = ""):
+        base = TILP_ERRORS.get(code)        # code 0: a save problem, the detail says it all
+        super().__init__(detail if base is None else base + (f" ({detail})" if detail else ""))
+        self.code = code
+
+
+TILP_MAGIC = b"TILP"
+TILP_VERSION = 1
+# value tags and object kinds of the .tilp format (docs/TIL_SNAPSHOTS.md §3.1)
+TILP_NIL, TILP_FALSE, TILP_TRUE, TILP_INT, TILP_FLOAT, TILP_CONST, TILP_REF, TILP_FUNC, TILP_UNDEF = range(9)
+TILP_STR, TILP_ARRAY, TILP_MAP, TILP_STRUCT, TILP_CLOSURE, TILP_CELL = range(1, 7)
+TILP_ERRORS = {     # code -> message; vm/main.c prints the same texts
+    -1: "not a portable TIL snapshot (.tilp)",
+    -2: "unsupported snapshot version",
+    -3: "the snapshot was saved by a different program",
+    -4: "the snapshot is damaged or incomplete",
+    -5: "the program's state does not fit this VM",
+    -6: "the snapshot holds an integer that does not fit this VM",
+    -7: "the snapshot holds floats, but this VM has no floats",
+    -8: "the snapshot's screen is larger than this VM can show",
+    -9: "portable snapshots are not available in this VM build",
+    -10: "the snapshot uses effect handlers, which this VM build leaves out",
+}
+
+
+def fnv1a32(data: bytes) -> int:
+    """FNV-1a-32: identifies the program in snapshots (vm->bc_hash in the C VM)."""
+    h = 2166136261
+    for b in data:
+        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+class _PRef:
+    """An object reference read from a snapshot before its object is built."""
+    __slots__ = ('i',)
+
+    def __init__(self, i: int):
+        self.i = i
+
+
 class VMStruct:
     __slots__ = ('t', 'f')
 
@@ -9065,6 +9118,7 @@ GFX_FIRST_NATIVE, GFX_LAST_NATIVE = NATIVE_ID['screen_init'], NATIVE_ID['screen_
 KEY_NAMES = {'UP': 1, 'DOWN': 2, 'LEFT': 3, 'RIGHT': 4, 'ENTER': 13, 'ESC': 27, 'SPACE': 32,
              'TAB': 9, 'BACKSPACE': 8, 'COMMA': 44, 'NONE': 0}
 GFX_RUN_OPTIONS = ('screen', 'keys', 'screen_ansi')     # run options that need the VM
+SNAPSHOT_RUN_OPTIONS = ('pause_after', 'save', 'resume')  # portable snapshots: also need the VM
 
 
 def gfx_line_points(x0: int, y0: int, x1: int, y1: int):
@@ -9480,10 +9534,16 @@ class TILVM:
     CHECK_INTERVAL = 256
     MAX_FRAMES = 2000
     MAX_HANDLERS = 32     # = TILVM_MAX_HANDLERS of the default C VM build
+    # run_steps() results: the same numbers as TILVM_DONE ... TILVM_EXIT in vm/tilvm.h
+    DONE, ERROR, YIELD, EXIT = 0, 1, 2, 3
 
     def __init__(self, module: TBCModule, write=None, read_line=None, max_steps: int = 0,
-                 argv: Optional[List[Any]] = None, screen: Optional['TILScreen'] = None, keys=None):
+                 argv: Optional[List[Any]] = None, screen: Optional['TILScreen'] = None, keys=None,
+                 tbc: Optional[bytes] = None):
         self.m = module
+        # the .tbc bytes (portable snapshots name the program by their hash):
+        # given, else the file the module was read from, else module.serialize()
+        self._tbc = tbc
         # program arguments for args(): bytes (str is encoded as UTF-8)
         self.argv = [a.encode('utf-8') if isinstance(a, str) else bytes(a) for a in (argv or [])]
         # screen and keys: an offscreen framebuffer and no keys unless the host passes
@@ -9528,6 +9588,10 @@ class TILVM:
         self.tick = 0
         self.stack: list = []
         self.frames: List[list] = []      # [func, pc, base, closure, extra]
+        self.started = False              # entry frame set up (start() or load_portable())
+        self.status: Optional[int] = None  # DONE / ERROR / EXIT once the program has ended
+        self.exit_code: Optional[int] = None
+        self.pause_at = 0                 # run_steps(): pause when steps reaches this (0: never)
 
     @staticmethod
     def _stdout_write(data: bytes):
@@ -10255,34 +10319,68 @@ class TILVM:
             parts.append(f"  at {self.m.funcs[fr[0]].name}" + (f" (line {ln})" if ln else ""))
         return ("\n".join(parts[:8])).encode()
 
-    def run(self) -> int:
-        """Run the module; returns the process exit code."""
+    def start(self):
+        """Set up the entry frame (once; load_portable() sets up a saved program instead)."""
+        if self.started:
+            return
+        self.started = True
+        if self.frames:                   # set up by the caller (til debug)
+            return
         entry = self.m.funcs[self.m.entry]
         self.frames = [[self.m.entry, entry.offset, 0, None, 0]]
         self.stack = [None] * entry.n_locals
+
+    def run(self) -> int:
+        """Run the module (to the end, also after run_steps() paused it); returns
+        the process exit code."""
+        if self.status is not None:
+            return self.exit_code
+        self.start()
         try:
             return self._run()
         finally:
             self.flush()
+
+    def run_steps(self, budget: int = 0) -> int:
+        """Run at most `budget` steps (loop back-edges and calls, counted exactly as
+        the C VM's tilvm_run_steps() counts them; 0 = no limit). Returns DONE, ERROR,
+        EXIT (see self.exit_code) or YIELD: paused after exactly `budget` steps,
+        at an instruction boundary - call again to continue, or save_portable()."""
+        if self.status is not None:
+            return self.status
+        self.start()
+        self.pause_at = self.steps + budget if budget > 0 else 0
+        try:
+            self._run()
+            return self.status
+        except TILPause:
+            return self.YIELD
+        finally:
+            self.pause_at = 0
+            self.flush()
+
+    def _end(self, status: int, code: int) -> int:
+        self.status, self.exit_code = status, code
+        return code
 
     def _run(self) -> int:
         try:
             while True:
                 try:
                     self.execute()
-                    return 0
+                    return self._end(self.DONE, 0)
                 except TILPanic as p:
                     if not self.recover_from(p):
                         self.report(b"runtime error: " + p.msg, p.pc)
-                        return 1
+                        return self._end(self.ERROR, 1)
         except TILFatal as f:
             self.report(b"fatal error: " + f.msg, f.pc)
-            return 1
+            return self._end(self.ERROR, 1)
         except TILExit as e:
-            return e.code
+            return self._end(self.EXIT, e.code)
         except RecursionError:
             self.report(b"fatal error: native recursion limit", -1)
-            return 1
+            return self._end(self.ERROR, 1)
 
     def report(self, msg: bytes, pc: int):
         out = getattr(sys.stderr, 'buffer', None)
@@ -10363,6 +10461,8 @@ class TILVM:
         return True
 
     def check_budget(self, pc: int):
+        """One step (a loop back-edge or a call). `pc` = where the program goes on
+        (after the jump / at the called function's start): a pause saves it."""
         self.steps += 1
         if self.max_steps and self.steps > self.max_steps:
             err = TILFatal(f"step limit exceeded ({self.max_steps})")
@@ -10374,7 +10474,367 @@ class TILVM:
                 now = _time.monotonic() * 1000.0
                 for i, rf in enumerate(self.recover):
                     if rf[3] and now > rf[3]:
+                        if self.pause_at:
+                            self.pause_at += 1     # as in C: a timeout's step is not part of the budget
                         raise TILPanic(b"timeout", target=i)
+        if self.steps == self.pause_at:
+            self.frames[-1][1] = pc
+            raise TILPause()
+
+    # ── portable snapshots (.tilp, TIL 3.1; docs/TIL_SNAPSHOTS.md) ──────────
+    # The byte layout, the traversal order and the canonical encodings are
+    # specified there; vm/tilvm.c (tilvm_save_portable / tilvm_load_portable)
+    # writes and checks exactly the same, so both VMs write the same bytes.
+
+    def program_bytes(self) -> bytes:
+        """The .tbc file this VM runs: snapshots name the program by its hash."""
+        if self._tbc is None:
+            raw = getattr(self.m, 'raw', None)
+            self._tbc = raw if raw is not None else self.m.serialize()
+        return self._tbc
+
+    def program_hash(self) -> int:
+        h = getattr(self, '_tbc_hash', None)
+        if h is None:
+            h = self._tbc_hash = fnv1a32(self.program_bytes())
+        return h
+
+    def save_portable(self) -> bytes:
+        """The paused program as a portable snapshot: after run_steps() returned
+        YIELD, or before the program started (step 0)."""
+        if self.status is not None:
+            raise SnapshotError(0, "the program has ended: there is nothing to save")
+        self.program_hash()               # serialize() first: it may add name constants
+        self.start()
+        import zlib
+        pack = _struct.pack
+        out = bytearray()
+        consts: Dict[bytes, int] = {}
+        for i, c in enumerate(self.consts):
+            if type(c) is bytes and c not in consts:
+                consts[c] = i             # strings equal to a constant: its lowest index
+        ids: Dict[int, int] = {}          # id(object) -> object id
+        strs: Dict[bytes, int] = {}       # string bytes -> object id (one object per content)
+        objs: list = []                   # objects in id order (also keeps them alive)
+
+        def ref(o) -> int:
+            k = ids.get(id(o))
+            if k is None:
+                objs.append(o)
+                k = ids[id(o)] = len(objs)
+            return k
+
+        def value(v):
+            if v is None:
+                out.append(TILP_NIL)
+            elif v is False:
+                out.append(TILP_FALSE)
+            elif v is True:
+                out.append(TILP_TRUE)
+            else:
+                t = type(v)
+                if t is int:
+                    out.append(TILP_INT)
+                    out.extend(pack('<q', v))
+                elif t is float:
+                    out.append(TILP_FLOAT)
+                    out.extend(pack('<d', v))
+                elif t is bytes:
+                    k = consts.get(v)
+                    if k is not None:
+                        out.append(TILP_CONST)
+                        out.extend(pack('<H', k))
+                        return
+                    k = strs.get(v)
+                    if k is None:
+                        objs.append(v)
+                        k = strs[v] = len(objs)
+                    out.append(TILP_REF)
+                    out.extend(pack('<I', k))
+                elif t is VMClosure and not v.up:
+                    out.append(TILP_FUNC)
+                    out.extend(pack('<H', v.fn))
+                elif t is list or t is dict or t is VMStruct or t is VMClosure or t is VMCell:
+                    out.append(TILP_REF)
+                    out.extend(pack('<I', ref(v)))
+                elif v is _UNDEF:
+                    out.append(TILP_UNDEF)
+                else:
+                    raise SnapshotError(0, f"cannot save a value of type {t.__name__}")
+
+        try:
+            out += TILP_MAGIC + bytes((TILP_VERSION, 0)) + pack('<I', self.program_hash())
+            # energy mode (design §11): reserved, 0
+            out += pack('<IQHBB', self.steps & 0xFFFFFFFF, self.rng & INT64_MASK, self.tick, 0, 0)
+            out += pack('<H', len(self.globals))
+            out += pack('<H', len(self.frames))
+            for func, pc, base, clos, extra in self.frames:
+                out += pack('<HIHBI', func, pc, base, extra, ref(clos) if clos is not None and clos.up else 0)
+            now = _time.monotonic() * 1000.0
+            out += pack('<H', len(self.recover))
+            for handler, n_frames, sp, deadline, n_handlers in self.recover:
+                left = min(max(1, int(_math.ceil(deadline - now))), 0xFFFFFFFF) if deadline else 0
+                out += pack('<IIHHH', handler, left, n_frames, sp, n_handlers)
+            out += pack('<H', len(self.handlers))
+            for kind, n_frames, sp, n_try, abort_pc, n in self.handlers:
+                out += pack('<BHHHIH', kind, n_frames, sp, n_try, abort_pc, n)
+            for v in self.globals:
+                value(v)
+            out += pack('<H', len(self.stack))
+            for v in self.stack:
+                value(v)
+            out += pack('<HH', self.screen.w, self.screen.h)
+            k = 0
+            while k < len(objs):              # breadth-first: objects first referenced here
+                o = objs[k]                   # get the next ids
+                k += 1
+                t = type(o)
+                if t is bytes:
+                    out.append(TILP_STR)
+                    out += pack('<I', len(o))
+                    out += o
+                elif t is list:
+                    out.append(TILP_ARRAY)
+                    out += pack('<I', len(o))
+                    for x in o:
+                        value(x)
+                elif t is dict:
+                    out.append(TILP_MAP)
+                    out += pack('<I', len(o))
+                    for x, y in o.items():
+                        value(x)
+                        value(y)
+                elif t is VMStruct:
+                    out.append(TILP_STRUCT)
+                    out += pack('<HH', o.t, len(o.f))
+                    for x in o.f:
+                        value(x)
+                elif t is VMClosure:
+                    out.append(TILP_CLOSURE)
+                    out += pack('<HH', o.fn, len(o.up))
+                    for x in o.up:
+                        value(x)
+                else:
+                    out.append(TILP_CELL)
+                    value(o.v)
+            out += pack('<I', len(objs))
+        except _struct.error as e:            # a count or index the format cannot hold
+            raise SnapshotError(0, f"the program's state cannot be written as a snapshot ({e})")
+        out += pack('<I', zlib.crc32(out) & 0xFFFFFFFF)
+        return bytes(out)
+
+    def load_portable(self, data: bytes):
+        """Continue a program saved by save_portable() or by the C VM's
+        tilvm_save_portable(): call after construction, before running (then
+        run() or run_steps()). Raises SnapshotError (.code as in C)."""
+        if self.started:
+            raise SnapshotError(0, "load_portable() must come before the program runs")
+        import zlib
+        data = bytes(data)
+        unpack = _struct.unpack_from
+        m = self.m
+        funcs, consts, code_size = m.funcs, self.consts, len(m.code)
+        pos = 0
+        n_ids = 0                          # object ids assigned so far
+
+        def take(fmt: str, size: int):
+            nonlocal pos
+            if pos + size > len(data):
+                raise SnapshotError(-4, "truncated")
+            v = unpack(fmt, data, pos)
+            pos += size
+            return v
+
+        def new_id(i: int) -> _PRef:
+            nonlocal n_ids
+            if i == 0 or i > n_ids + 1:
+                raise SnapshotError(-4, f"object id {i} out of order")
+            if i > n_ids:
+                n_ids = i
+            return _PRef(i)
+
+        func_values: Dict[int, VMClosure] = {}
+
+        def value():
+            nonlocal pos
+            if pos >= len(data):
+                raise SnapshotError(-4, "truncated")
+            tag = data[pos]
+            pos += 1
+            if tag <= TILP_TRUE:
+                return None if tag == TILP_NIL else tag == TILP_TRUE
+            if tag == TILP_INT:
+                return take('<q', 8)[0]
+            if tag == TILP_FLOAT:
+                return take('<d', 8)[0]
+            if tag == TILP_CONST:
+                k = take('<H', 2)[0]
+                if k >= len(consts) or type(consts[k]) is not bytes:
+                    raise SnapshotError(-4, f"constant {k} is not a string constant")
+                return consts[k]
+            if tag == TILP_REF:
+                return new_id(take('<I', 4)[0])
+            if tag == TILP_FUNC:
+                k = take('<H', 2)[0]
+                if k >= len(funcs):
+                    raise SnapshotError(-4, f"function {k} out of range")
+                f = func_values.get(k)
+                if f is None:
+                    f = func_values[k] = VMClosure(k)
+                return f
+            if tag == TILP_UNDEF:
+                return _UNDEF
+            raise SnapshotError(-4, f"bad value tag {tag}")
+
+        # header (checked in the order of tilvm_load_portable: the same error codes)
+        if len(data) < 4:
+            raise SnapshotError(-4, "truncated")
+        if data[:4] != TILP_MAGIC:
+            raise SnapshotError(-1)
+        pos = 4
+        version, flags = take('<BB', 2)
+        if version != TILP_VERSION or flags != 0:
+            raise SnapshotError(-2, f"version {version}, flags {flags}")
+        if take('<I', 4)[0] != self.program_hash():
+            raise SnapshotError(-3)
+        steps, rng, tick, energy, _reserved = take('<IQHBB', 16)
+        if energy > 2 or tick > 255:
+            raise SnapshotError(-4, "bad state")
+        if take('<H', 2)[0] != len(self.globals):
+            raise SnapshotError(-4, "global count")
+        # frames, recovery points, handler records
+        n_frames = take('<H', 2)[0]
+        if n_frames == 0:
+            raise SnapshotError(-4, "no frames")
+        if n_frames > self.MAX_FRAMES:
+            raise SnapshotError(-5, f"{n_frames} call frames, at most {self.MAX_FRAMES}")
+        frames = []
+        for _ in range(n_frames):
+            func, pc, base, extra, clos = take('<HIHBI', 13)
+            if func >= len(funcs) or pc >= code_size or extra > 1:
+                raise SnapshotError(-4, "bad frame")
+            frames.append([func, pc, base, new_id(clos) if clos else None, extra])
+        recover = []
+        for _ in range(take('<H', 2)[0]):
+            handler, left, nf, sp, nh = take('<IIHHH', 14)
+            if handler >= code_size or not 1 <= nf <= n_frames or (recover and nf < recover[-1][1]):
+                raise SnapshotError(-4, "bad recovery point")
+            recover.append([handler, nf, sp, left, nh])
+        n_handlers = take('<H', 2)[0]
+        if n_handlers > self.MAX_HANDLERS:
+            raise SnapshotError(-5, f"{n_handlers} effect handler entries, at most {self.MAX_HANDLERS}")
+        handlers: List[list] = []
+        for i in range(n_handlers):
+            kind, nf, sp, n_try, abort_pc, n = take('<BHHHIH', 13)
+            if kind > 1 or nf > n_frames or n_try > len(recover) or (handlers and nf < handlers[-1][1]):
+                raise SnapshotError(-4, "bad handler record")
+            if kind == 0 and (nf == 0 or abort_pc >= code_size):
+                raise SnapshotError(-4, "bad handler record")
+            if kind == 1 and (nf == 0 or nf >= n_frames or n >= i or handlers[n][0] != 0 or sp or abort_pc):
+                raise SnapshotError(-4, "bad handler record")
+            handlers.append([kind, nf, sp, n_try, abort_pc, n])
+        # values
+        globals_ = [value() for _ in range(len(self.globals))]
+        depth = take('<H', 2)[0]
+        stack = [value() for _ in range(depth)]
+        for i, (func, _pc, base, _clos, extra) in enumerate(frames):
+            # the locals of a frame lie below the next frame's arguments (and its callee slot)
+            top = frames[i + 1][2] - frames[i + 1][4] if i + 1 < n_frames else depth
+            if base < extra or (i == 0 and base) or base + funcs[func].n_locals > top:
+                raise SnapshotError(-4, "bad frame")
+        for rec in recover:
+            if rec[2] > depth or rec[4] > n_handlers:
+                raise SnapshotError(-4, "bad recovery point")
+        for h in handlers:
+            if h[0] == 0 and h[2] + 2 * h[5] > depth:
+                raise SnapshotError(-4, "bad handler record")
+        width, height = take('<HH', 4)
+        if (width == 0) != (height == 0) or width > GFX_MAX_SIZE or height > GFX_MAX_SIZE:
+            raise SnapshotError(-4, "bad screen size")
+        if width > self.screen.max_w or height > self.screen.max_h:
+            raise SnapshotError(-8, f"{width}x{height}")
+        # the object table: build every object, then resolve the references
+        objs: list = []
+        fill = []
+        while len(objs) < n_ids:
+            kind = take('<B', 1)[0]
+            if kind == TILP_STR:
+                n = take('<I', 4)[0]
+                if pos + n > len(data):
+                    raise SnapshotError(-4, "truncated")
+                objs.append(data[pos:pos + n])
+                pos += n
+                continue
+            if kind == TILP_ARRAY:
+                o = []
+                raw = [value() for _ in range(take('<I', 4)[0])]
+            elif kind == TILP_MAP:
+                o = {}
+                raw = [(value(), value()) for _ in range(take('<I', 4)[0])]
+            elif kind == TILP_STRUCT:
+                t, n = take('<HH', 4)
+                if t >= len(m.types) or n != len(m.types[t][1]):
+                    raise SnapshotError(-4, f"bad struct (type {t}, {n} fields)")
+                o = VMStruct(t, [])
+                raw = [value() for _ in range(n)]
+            elif kind == TILP_CLOSURE:
+                fn, n = take('<HH', 4)
+                if fn >= len(funcs) or n != funcs[fn].n_upvals:
+                    raise SnapshotError(-4, f"bad closure (function {fn}, {n} upvalues)")
+                o = VMClosure(fn)
+                raw = [value() for _ in range(n)]
+            elif kind == TILP_CELL:
+                o = VMCell(None)
+                raw = value()
+            else:
+                raise SnapshotError(-4, f"bad object kind {kind}")
+            objs.append(o)
+            fill.append((o, raw))
+        if take('<I', 4)[0] != n_ids:
+            raise SnapshotError(-4, "object count")
+        if take('<I', 4)[0] != zlib.crc32(data[:pos - 4]) & 0xFFFFFFFF or pos != len(data):
+            raise SnapshotError(-4, "checksum")
+
+        def res(v):
+            return objs[v.i - 1] if type(v) is _PRef else v
+
+        for o, raw in fill:
+            t = type(o)
+            if t is list:
+                o.extend([res(x) for x in raw])
+            elif t is dict:
+                for k, v in raw:
+                    k = res(k)
+                    if not (k is None or type(k) in (bool, int, float, bytes)):
+                        raise SnapshotError(-4, "bad map key")
+                    o[k] = res(v)
+            elif t is VMStruct:
+                o.f = [res(x) for x in raw]
+            elif t is VMClosure:
+                o.up = tuple(res(x) for x in raw)
+                if any(type(c) is not VMCell for c in o.up):
+                    raise SnapshotError(-4, "an upvalue is not a cell")
+            else:
+                o.v = res(raw)
+        for fr in frames:
+            if fr[3] is not None:
+                fr[3] = res(fr[3])
+                if type(fr[3]) is not VMClosure or fr[3].fn != fr[0]:
+                    raise SnapshotError(-4, "a frame's closure is not a closure of its function")
+        # commit
+        now = _time.monotonic() * 1000.0
+        self.steps = steps
+        self.rng = rng or 0x9E3779B97F4A7C15
+        self.tick = tick
+        self.globals = [res(v) for v in globals_]
+        self.stack = [res(v) for v in stack]
+        self.frames = frames
+        self.recover = [[r[0], r[1], r[2], now + r[3] if r[3] else 0.0, r[4]] for r in recover]
+        self.deadlines = sum(1 for r in recover if r[3])
+        self.handlers = handlers
+        if width:
+            self.screen.init(width, height)
+        self.started = True
 
     def binop(self, op: int, a, b):
         """Binary operator `op` (ADD..GE) exactly as its plain instruction computes it
@@ -10454,9 +10914,10 @@ class TILVM:
                 elif op == JUMP:
                     rel = code[pc] | (code[pc + 1] << 8)
                     if rel >= 0x8000:
-                        rel -= 0x10000
-                        self.check_budget(op_pc)
-                    pc += 2 + rel
+                        pc += rel - 0xFFFE          # 2 + rel - 0x10000: a loop back-edge (a step)
+                        self.check_budget(pc)
+                    else:
+                        pc += 2 + rel
                 elif op == INC_LOCAL:
                     # LOAD_LOCAL a; PUSH_I8 k; ADD; STORE_LOCAL a
                     slot = base + code[pc]
@@ -10487,9 +10948,10 @@ class TILVM:
                     else:
                         rel = code[pc + 3] | (code[pc + 4] << 8)
                         if rel >= 0x8000:
-                            rel -= 0x10000
-                            self.check_budget(op_pc)
-                        pc += 5 + rel
+                            pc += rel - 0xFFFB      # 5 + rel - 0x10000
+                            self.check_budget(pc)
+                        else:
+                            pc += 5 + rel
                 elif op == LOAD_LOCAL_FIELD:
                     # LOAD_LOCAL a; GET_FIELD name
                     stack.append(self.get_field(stack[base + code[pc]], code[pc + 1] | (code[pc + 2] << 8)))
@@ -10632,7 +11094,7 @@ class TILVM:
                     pc = fn.offset
                     base = new_base
                     closure = new_closure
-                    self.check_budget(op_pc)
+                    self.check_budget(pc)
                 elif op == RETURN or op == RETURN_NIL or op == CAST_RETURN or op == RETURN_LOCAL:
                     if op == RETURN:
                         result = stack.pop()
@@ -10711,9 +11173,10 @@ class TILVM:
                     else:
                         rel = code[pc] | (code[pc + 1] << 8)
                         if rel >= 0x8000:
-                            rel -= 0x10000
-                            self.check_budget(op_pc)
-                        pc += 2 + rel
+                            pc += rel - 0xFFFE
+                            self.check_budget(pc)
+                        else:
+                            pc += 2 + rel
                 elif op == PUSH_I8:
                     v = code[pc]
                     stack.append(v - 256 if v > 127 else v)
@@ -10764,9 +11227,10 @@ class TILVM:
                     if t == (op == JUMP_IF_TRUE):
                         rel = code[pc] | (code[pc + 1] << 8)
                         if rel >= 0x8000:
-                            rel -= 0x10000
-                            self.check_budget(op_pc)
-                        pc += 2 + rel
+                            pc += rel - 0xFFFE
+                            self.check_budget(pc)
+                        else:
+                            pc += 2 + rel
                     else:
                         pc += 2
                 elif op == LT or op == LE or op == GT or op == GE:
@@ -11022,7 +11486,7 @@ class TILVM:
                     pc = fn.offset
                     base = new_base
                     closure = new_closure
-                    self.check_budget(op_pc)
+                    self.check_budget(pc)
                 elif op == Op.HANDLE:
                     # HANDLE n, rel_end: the n (clause, name) pairs below stay on the stack
                     n = code[pc]
@@ -11872,6 +12336,9 @@ Options:
   --screen <file.ppm>     graphics: save the final screen as a PPM image
   --screen-ansi           graphics: draw the screen in the terminal (24-bit colour)
   --keys <list>           graphics: scripted keys, e.g. "UP,UP,ENTER,a,ESC"
+  --pause-after <n> --save <file.tilp>
+                          VM: run n steps, save a portable snapshot, exit 3
+  --resume <file.tilp>    VM: continue a portable snapshot (any VM, e.g. a calculator's)
   -O0, -O1, -O2, -O3      Optimization level for native builds (default -O2)
   --keep-c                Keep generated C file
   --no-check              Disable type warnings
@@ -11964,17 +12431,35 @@ def run_bytecode(module: TBCModule, max_steps: int = 0, argv: Optional[List[str]
     `opts` = run options parsed by main() (see RUN_VALUE_OPTIONS)."""
     opts = opts or {}
     try:
+        pause = portable_pause(opts)
         screen, keys = screen_and_keys(opts)
     except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(localize(f"Error: {e}"), file=sys.stderr)
         return 2
     vm = TILVM(module, max_steps=max_steps, argv=argv, screen=screen, keys=keys)
+    if opts.get('resume'):              # continue a portable snapshot (docs/TIL_SNAPSHOTS.md)
+        path = opts['resume']
+        try:
+            with open(path, 'rb') as f:
+                data = f.read()
+            vm.load_portable(data)
+        except OSError:
+            keys.close()
+            print(localize(f"til: cannot read {path}"), file=sys.stderr)
+            return 2
+        except SnapshotError as e:
+            keys.close()
+            print(localize(f"til: cannot resume {path}: {e}"), file=sys.stderr)
+            return 2
     if isinstance(keys, TerminalKeys):
         vm.read_line = keys.cooked(vm.read_line)
     ctrl_c = CtrlC()
     try:
         try:
-            rc = vm.run()
+            if pause is None:
+                rc = vm.run()
+            else:
+                rc = run_and_save(vm, pause, opts['save'])
             ctrl_c.running = False
         except KeyboardInterrupt:   # Ctrl-C: the program ends; the cleanup below still runs
             ctrl_c.running, ctrl_c.hit, rc = False, True, 130
@@ -11984,6 +12469,54 @@ def run_bytecode(module: TBCModule, max_steps: int = 0, argv: Optional[List[str]
         keys.close()
         ctrl_c.restore()
     return end_by_sigint() if ctrl_c.hit else rc
+
+
+def portable_pause(opts: Dict[str, Any]) -> Optional[int]:
+    """--pause-after N --save FILE: N (>= 0), or None without them. ValueError if
+    only one of the two is given or N is not a number."""
+    if opts.get('pause_after') is None and opts.get('save') is None:
+        return None
+    if opts.get('pause_after') is None or not opts.get('save'):
+        raise ValueError("--pause-after N and --save FILE go together")
+    try:
+        n = int(opts['pause_after'])
+    except ValueError:
+        n = -1
+    if n < 0:
+        raise ValueError("--pause-after needs a number of steps")
+    return n
+
+
+def run_and_save(vm: 'TILVM', steps: int, path: str) -> int:
+    """Run `steps` more steps (0: none), then save the paused program as a portable
+    snapshot: exit code 3. A program that ends first ends as usual (nothing saved)."""
+    status = vm.run_steps(steps) if steps else (vm.YIELD if vm.status is None else vm.status)
+    if status != vm.YIELD:
+        print(localize("til: the program ended before the pause point (nothing saved)"), file=sys.stderr)
+        return vm.exit_code
+    try:
+        data = vm.save_portable()
+        with open(path, 'wb') as f:
+            f.write(data)
+    except SnapshotError as e:
+        print(localize(f"til: cannot save {path}: {e}"), file=sys.stderr)
+        return 2
+    except OSError:
+        print(localize(f"til: cannot write {path}"), file=sys.stderr)
+        return 2
+    print(localize(f"til: paused after {steps} steps; saved {path} ({len(data)} bytes)"), file=sys.stderr)
+    return 3
+
+
+def cvm_snapshot_flags(opts: Dict[str, Any]) -> List[str]:
+    """The portable snapshot options for the C VM runner (vm/main.c)."""
+    flags = []
+    pause = portable_pause(opts)
+    if pause is not None:
+        flags += ['--save-portable-after', str(pause), opts['save']]
+    if opts.get('resume'):
+        flags += ['--resume-portable', opts['resume']]
+    return flags
 
 
 class CtrlC:
@@ -12791,11 +13324,18 @@ def main():
             use_vm = 'py'
         if command == 'run' and use_vm is None and any(o in opts for o in GFX_RUN_OPTIONS):
             use_vm = 'py'           # screen/keys options: the VM implements the graphics natives
+        if command == 'run' and use_vm is None and any(o in opts for o in SNAPSHOT_RUN_OPTIONS):
+            use_vm = 'py'           # portable snapshots: only the VMs can pause and resume
 
         if command == 'run' and use_vm:
             module = compile_to_bytecode(source, input_file, compiler.verify, fuse)
             if use_vm == 'py':
                 return run_bytecode(module, max_steps, prog_args, opts)
+            try:
+                snap_flags = cvm_snapshot_flags(opts)
+            except ValueError as e:
+                print(localize(f"Error: {e}"), file=sys.stderr)
+                return 2
             exe = _cvm_binary(compiler.verbose)
             if exe is None:
                 print(localize("Error: cannot build the C VM (need vm/ sources and a C compiler)"),
@@ -12806,7 +13346,7 @@ def main():
                 with os.fdopen(fd, 'wb') as f:
                     f.write(module.serialize())
                 cmd = [exe] + (['--max-steps', str(max_steps)] if max_steps else []) + \
-                    cvm_screen_flags(opts) + [tbc_path] + prog_args
+                    cvm_screen_flags(opts) + snap_flags + [tbc_path] + prog_args
                 rc = run_localized(cmd)                # C VM error reports in the message language
             finally:
                 os.unlink(tbc_path)

@@ -56,6 +56,9 @@
  *                      `perform E()` still calls the top-level function E (TIL 3.0)
  *   TILVM_NO_GFX       leave out the screen/keys natives (screen_init ... wait_key
  *                      report "not available in this VM build")
+ *   TILVM_NO_PORTABLE  leave out portable snapshots (about 5 KB of code on ARM; they
+ *                      are never in TILVM_LEAN builds): tilvm_save_portable /
+ *                      tilvm_load_portable report "not available"
  *   TILVM_GFX_MAX_W    largest screen the device can show (default 4096 x 4096, the
  *   TILVM_GFX_MAX_H    language limit): a host with a fixed display sets its size;
  *                      screen_init(w, h) beyond it is then a runtime error, and the
@@ -384,6 +387,38 @@ int tilvm_run_steps(tilvm *vm, uint32_t budget);
 uint32_t tilvm_snapshot_size(const tilvm *vm);
 uint32_t tilvm_snapshot(const tilvm *vm, uint8_t *out, uint32_t cap);   /* bytes written, 0 = error */
 int tilvm_restore(tilvm *vm, const uint8_t *data, uint32_t size);      /* after tilvm_load */
+
+/* Portable snapshots (.tilp, docs/TIL_SNAPSHOTS.md): a paused program as a
+ * device-independent byte stream. Another VM build (16/32/64-bit ints, with or
+ * without floats, another heap size) or the reference VM in src/til.py
+ * continues it, given the same .tbc. Not in TILVM_LEAN / TILVM_NO_PORTABLE
+ * builds (both functions then only report "not available": 0 / TILVM_P_UNAVAILABLE).
+ *
+ * tilvm_save_portable: after tilvm_run_steps() returned TILVM_YIELD (or right
+ * after tilvm_load: step 0); returns the number of bytes passed to `put`
+ * (0 = error: `put` failed, or the program has ended). No malloc and no arena
+ * allocation: object numbers live in heap object headers while it runs
+ * (restored afterwards), its queue in the free end of the arena (or the GC's
+ * mark stack, with heap rescans). The VM can continue or save again afterwards.
+ *
+ * tilvm_load_portable: after tilvm_load() of the same .tbc and after setting
+ * the host hooks (a saved screen is re-created with host.gfx_init), before
+ * running. Returns 0 or a TILVM_P_ code; after an error the VM is reset and
+ * failed (load the program again). */
+typedef int (*tilvm_put_fn)(void *ctx, const uint8_t *data, uint32_t len);   /* 0 = ok */
+typedef int (*tilvm_get_fn)(void *ctx, uint8_t *buf, uint32_t len);         /* 0 = len bytes read */
+uint32_t tilvm_save_portable(tilvm *vm, tilvm_put_fn put, void *ctx);
+int tilvm_load_portable(tilvm *vm, tilvm_get_fn get, void *ctx);
+#define TILVM_P_NOT_TILP     (-1)   /* not a portable snapshot */
+#define TILVM_P_VERSION      (-2)   /* another format version / unknown flags */
+#define TILVM_P_PROGRAM      (-3)   /* saved by another program (bytecode hash) */
+#define TILVM_P_CORRUPT      (-4)   /* truncated, damaged or malformed */
+#define TILVM_P_TOO_BIG      (-5)   /* stack, frames, recovery points, handlers, heap, array or string too big */
+#define TILVM_P_INT_RANGE    (-6)   /* an integer this build's TILVM_INT_BITS cannot hold */
+#define TILVM_P_NO_FLOAT     (-7)   /* a float in a build without floats */
+#define TILVM_P_SCREEN       (-8)   /* a screen this build cannot show */
+#define TILVM_P_UNAVAILABLE  (-9)   /* TILVM_LEAN build */
+#define TILVM_P_NO_EFFECTS   (-10)  /* effect handlers in a TILVM_NO_EFFECTS build */
 
 /* Memory statistics */
 uint32_t tilvm_heap_used(const tilvm *vm);

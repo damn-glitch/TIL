@@ -381,7 +381,10 @@ A missing required hook makes the function report `... is not available on
 this device`. `tilvm_restore` (raw snapshots) keeps the screen *size* of the
 saved program and calls `gfx_init` again (the pixels are not part of a
 snapshot), so install the hooks before restoring; programs that redraw every
-frame continue seamlessly.
+frame continue seamlessly. Portable snapshots (`tilvm_load_portable`,
+`til run --resume`, docs/TIL_SNAPSHOTS.md) do the same, also across VM
+builds and the reference VM; a screen larger than the build allows (or any
+screen in a `TILVM_NO_GFX` build) is refused with error -8.
 
 A complete host with an in-memory framebuffer for a 320×240 display — for a
 device, replace the array accesses with the display driver. Compile it and

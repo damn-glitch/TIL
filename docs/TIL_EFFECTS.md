@@ -371,12 +371,14 @@ any other code; fused and unfused bytecode behave identically, steps included
   snapshot can be taken at any step, also inside a clause. The struct size
   is part of the snapshot header, so builds with a different
   `TILVM_MAX_HANDLERS` (or TIL 3.0 builds) reject each other's snapshots.
-* Portable snapshots (`.tilp`, §2 of the design): write `n_handlers` and, per
-  entry, the six fields with `abort_pc` made relative to the code section
-  (kind 1: 0) and `sp` / `n_frames` / `n_try` as they are; the extra
-  `n_handlers` of every recovery point; the clause pairs are ordinary stack
-  values (closure objects and constant strings). Without any handler the
-  section is empty.
+* Portable snapshots (`.tilp`, `docs/TIL_SNAPSHOTS.md`): write `n_handlers`
+  and, per entry, the six fields with `abort_pc` made relative to the code
+  section and `sp` relative to the first value after the globals (kind 1: both
+  0), `n_frames` / `n_try` / `n` as they are; the extra `n_handlers` of every
+  recovery point; the clause pairs are ordinary stack values (closure objects
+  or function values, and constant strings). Without any handler the section
+  is empty. A pause inside a clause and inside a handled body both work
+  (tested in `tests/test_portable.py`).
 * Python VM state for the time-travel debugger: `handlers` (list of lists) is
   part of the VM state together with `stack`, `frames`, `recover`.
 
