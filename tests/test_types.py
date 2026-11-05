@@ -638,8 +638,7 @@ class TestNativeEqualsVM:
     def test_floor_ceil_and_integer_formats_of_big_floats(self):
         # floor/ceil are float(math.floor(x)) on the reference VM (never -0);
         # {x:d} of a float beyond int64 is the exact integer (Python's int(x)).
-        # Compared with the reference VM only: the C VM differs here
-        # (docs/TIL_TYPES.md, "Known differences of the C VM").
+        # (The C VM prints the same: tests/test_vm_robustness.py.)
         src = ('main()\n    let a = 0.0 - 0.00001\n    let z = 0.0 - 0.0\n'
                '    print(ceil(a), floor(z), ceil(-0.5), floor(-0.5), round(a))\n'
                '    let big = 1e100\n    let neg = 0.0 - 9223372036854775808.0\n'

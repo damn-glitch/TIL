@@ -83,9 +83,9 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_MAX_HANDLERS` | 32 | active effect handlers + running clauses (`handle ... with`, 16 bytes each; [docs/TIL_EFFECTS.md](../docs/TIL_EFFECTS.md)) |
 | `TILVM_NO_EFFECTS` | off | leave effect handlers out (~1–3 KB of code): `handle` reports "not available", `perform` still calls the default function (the Z80 build uses it) |
 | `TILVM_MAX_CONSTS` / `TILVM_MAX_TYPES` | 4096 / 512 | per-program table sizes |
-| `TILVM_NO_STDIO` | off | no `<stdio.h>`: built-in number formatting, host sets `write` |
+| `TILVM_NO_STDIO` | off | no `<stdio.h>`: the host sets `write` (float formatting never uses stdio: see [Floats](#floats)) |
 | `TILVM_NO_TIME` | off | no `<time.h>`: `clock_ms()`/`timeout` count 1 ms per 1000 steps |
-| `TILVM_NO_MATH` | off | no `<math.h>`: built-in `sqrt`/`floor`/`pow` (integer powers) |
+| `TILVM_NO_MATH` | off | no `<math.h>`: built-in exact `floor`/`ceil`/`%`, correctly rounded `sqrt`, `pow` with integer exponents; `sin`/`cos`/`tan`/`log`/`exp` and `pow` with a fractional exponent are runtime errors (see [Floats](#floats)) |
 | `TILVM_ADDR16` | off | 16-bit address space (Z80, AVR): bytecode offsets and object lengths are 16-bit (needs heap ≤ 65535; programs above 64 KB are rejected with load error -10). Much smaller code on 8-bit CPUs |
 | `TILVM_LEAN` | off | smallest code for 8-bit CPUs: the whole language core, without format specs, snapshots, `input/chr/ord/type_of/clock_ms/random/sleep_ms`, str `split/replace/trim/repeat/count/to_float`, array `insert/remove/sort/reverse/slice/copy/join/sum/min/max`, map `values/copy/clear` (calling them reports "not available" / "no method"), array `+` array ("unsupported operand types"), and the map-literal key check (`{"a": 1, "a": 2}` keeps both entries, `2.0` stays a float key). `til fit --device` reports all of them. ~25% smaller: the data opcodes and every superinstruction run in a compact second function (`lean_op`), with switch dispatch and without the integer fast paths (same results and steps). Effect handlers and the screen/keys natives stay in |
 | `TILVM_MAX_FUNCS` | `TILVM_MAX_CONSTS` (lean: 0) | function records decoded once at load, 8 bytes each; more functions → load error -10. 0 = read records from the bytecode on every call (no limit, no RAM) |
@@ -113,6 +113,54 @@ Speed: the interpreter keeps its registers in C locals, dispatches with computed
 goto on GCC/Clang and runs the superinstructions of bytecode v2
 ([docs/TIL_BYTECODE_V2.md](../docs/TIL_BYTECODE_V2.md)); on the desktop it is
 1.7–3x faster than TIL 3.0 (`benchmarks/RESULTS.md`, `python3 benchmarks/run.py`).
+
+## Loading, errors, floats
+
+`tilvm_load()` returns 0 or a negative code: -1 not a `.tbc` file, -2 an
+unknown bytecode version, -3 the program uses floats (a build without them),
+-4 more constants than `TILVM_MAX_CONSTS`, **-5 a truncated or malformed
+file**, -6 an integer constant too large for `TILVM_INT_BITS`, -7 more types
+than `TILVM_MAX_TYPES`, -8 more globals than the value stack holds, -10 more
+functions than `TILVM_MAX_FUNCS` (or, `TILVM_ADDR16`, a file above 64 KB).
+Loading is memory safe for any input: every section is checked against the
+file size, and the records against the rest of the file (constant and
+function indexes in range, names are string constants, function code inside
+the code section, the line table complete), so neither loading nor the error
+reports (names, line numbers) read outside the buffer. A file that loaded is
+then **trusted like code**: instruction operands (jump offsets, local slots,
+constant indexes in instructions) are not checked while the program runs - a
+`.tbc` written by `til` is always consistent; a deliberately broken one can
+still make the interpreter misbehave. Portable snapshots (`.tilp`) are
+checked against the bytecode as well, see docs/TIL_SNAPSHOTS.md.
+
+<a id="floats"></a>**Floats.** Every build prints floats from the exact
+binary value: `print`/`str` (`%g`), and the f-string specs `.Nf`, `.Ne`,
+`.N`, `%` produce the digits of the float's exact decimal expansion rounded
+half to even - the same text as glibc's `printf` and the reference VM, with or
+without `TILVM_NO_STDIO`, for any magnitude (`f"{1e100:.2f}"` prints all 101
+digits) and precision; a NaN prints `nan` (never `-nan`). `TILVM_FLOAT=1`
+builds print the float32 value the same way, so their output equals the
+reference VM's output for that float32 value (float constants are rounded
+to the nearest float32 when they load). `int(x)` and typed `int` parameters
+truncate a float exactly and wrap it to `TILVM_INT_BITS` like integer
+arithmetic (the reference VM: 64 bits); `f"{x:d}"` (`x`, `X`, `o`, `b`) of a
+float prints its exact integer part, whatever its size (`f"{1e30:d}"` is
+`1000000000000000019884624838656`, as on the reference VM); nan/inf are the
+runtime error `cannot convert nan/inf to int`. Without `<math.h>` (`TILVM_NO_MATH`),
+`floor`, `ceil`, `round` and `%` are exact and `sqrt` is correctly rounded
+(the same results as the C library); `x ** y` with an integer `y` is computed
+by repeated squaring - exact whenever the result needs no rounding, otherwise
+within a few units in the last place of the C library's `pow`; nan / infinite
+exponents, 0, 1, inf and negative bases follow C99 `pow`; any other
+fractional exponent is the runtime error `pow with a fractional exponent is
+not available in this VM build` (never a silently wrong value).
+
+**Timeouts.** `timeout(ms)` takes any non-negative number of milliseconds:
+deadlines are kept as a 32-bit clock value plus a count of further 2^30 ms
+periods, so `timeout(3000000000)` (or more) waits that long instead of
+expiring at once, up to 2^62 ms; `nan` and `inf` never expire (as the
+reference VM's float deadlines). A non-number is the runtime error
+`timeout expects a number, got <type>` (lean builds: 0 ms).
 
 ## API
 

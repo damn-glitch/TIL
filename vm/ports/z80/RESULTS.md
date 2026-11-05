@@ -3,7 +3,7 @@
 **Summary:** the 16-bit lean VM (`TILVM_LEAN`, `TILVM_ADDR16`, 16-bit ints, no
 floats; TIL 3.1 with the faster interpreter and superinstructions, without
 effect handlers, the screen natives and energy saving) compiles with SDCC 4.2,
-its code and constants end at **0xBE38** (below 0xC000), and it runs TIL programs on the
+its code and constants end at **0xBF31** (below 0xC000), and it runs TIL programs on the
 ucsim Z80 simulator (`sz80`) with output identical to the reference VM for every
 example that fits 16-bit integers without floats. A real TI-83 Plus / TI-84 Plus additionally needs a multi-page
 Flash application (see *Real calculators* below); the TI-84 Plus CE has its own
@@ -116,6 +116,15 @@ remains is the idle counter (4 bytes of RAM) and its reset at load: VM
 VM state 5,840 bytes. A Flash application (see below) would have room for
 energy saving, and the TI-84 Plus CE port includes it (`delay()` as idle).
 
+### Memory-safe loading (TIL 3.1 review)
+
+`tilvm_load` checks every section of a `.tbc` against the file size and every
+record against the rest of the file (a damaged file is load error -5 instead of
+reads outside the buffer; vm/README.md). On the Z80 this costs 153 bytes
+(`tilvm_load` -107 B, the record walk `ld_records` 168 B, `str_const` 77 B,
+`ld16` 20 B, `push_try` +18 B for deadlines that wrap to 0): code
+0x0110-0xBF31 (VM `_CODE` 48,278 B), **207 bytes free**.
+
 Desktop builds keep their behaviour and speed: the interpreter loop of the
 default build compiles from the same code as before the merge (the lean-only
 paths are `#ifdef TILVM_LEAN`); outside it only `arith`, `equal`, `report`,
@@ -190,7 +199,7 @@ ignored and duplicate keys in map literals are not merged.
 
 ```
 0x0000-0x010F  reset vectors, startup
-0x0110-0xBFFF  VM code and constants (ends at 0xBE38)
+0x0110-0xBFFF  VM code and constants (ends at 0xBF31)
 0xC000-0xD7FF  VM state (5,840 bytes used)
 0xD800-0xEFEF  program bytecode (u16 length + .tbc), written by run_sim.py
 0xEFF0-0xEFFF  results (output length, exit code, steps, heap, GC count, C stack mark)
@@ -230,7 +239,7 @@ Plus CE (`../ti84ce/`) has no such limit.
 
 ## Keeping it below 0xC000
 
-Only 456 bytes are free. New features in `tilvm.c` should be excluded from
+Only 207 bytes are free. New features in `tilvm.c` should be excluded from
 `TILVM_LEAN` builds (as the lean list above) or get a `TILVM_NO_...` switch for
 the Z80 Makefile, or the Z80 image overflows — `TIL_TEST_CROSS=1 python3 -m
 pytest tests/test_z80.py` reports the code end and the interpreter's frame size.

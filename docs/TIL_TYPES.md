@@ -393,9 +393,8 @@ with `TIL_TEST_SLOW=1`).
 Not part of the native backend, found while testing it: the C VM compares an
 `int` with a `float` after converting the int to a double
 (`9007199254740993 == 9007199254740992.0` is `true` there, `false` on the
-reference VM and natively), truncates very long fixed-point formats
-(`{1e100:.1f}`), gives `-0` for `ceil(-0.5)` and `floor(-0.0)` (the reference VM
-and the native code give `0`), and formats a float beyond the 64-bit range with
-`{x:d}`/`{x:x}`/`{x:o}`/`{x:b}` after wrapping it to an int64, like `int(x)` (the
-reference VM prints the exact integer). For `inf`/`nan` both VMs report
+reference VM and natively). Long fixed-point formats (`{1e100:.1f}`), `ceil` /
+`floor` of values that round to zero (`0`, never `-0`) and `{x:d}` / `{x:x}` /
+`{x:o}` / `{x:b}` of floats beyond the 64-bit range (the exact integer) print as
+on the reference VM (vm/README.md, "Floats"). For `inf`/`nan` both VMs report
 `cannot convert nan/inf to int`, an error `retry` catches.

@@ -448,14 +448,11 @@ def test_wasm_vm_matches_desktop_vm(builds, tmp_path, name, source, filename):
         assert wsteps == dsteps, f"step counts differ: wasm {wsteps}, desktop {dsteps}"
 
 
-# Known differences of the freestanding float formatting in vm/tilvm.c
-# (#ifdef TILVM_NO_STDIO: fmt_gp/fmt_fixed/fmt_exp, also used by calculator
-# builds) from printf: exact ties, near-ties, -0.0 and huge fixed-point
-# numbers. Not a playground bug; tracked here so a fix shows up as XPASS.
+# The freestanding float formatting of vm/tilvm.c (the playground is a
+# TILVM_NO_STDIO build) prints the exact binary value like printf: exact ties,
+# near-ties, -0.0 and huge fixed-point numbers.
 @needs_node
 @pytest.mark.skipif(CC is None, reason="no C compiler for the desktop VM")
-@pytest.mark.xfail(reason="TILVM_NO_STDIO float formatting in vm/tilvm.c differs from printf "
-                          "(see website/playground/README.md)", strict=False)
 def test_float_formatting_matches_printf(builds, tmp_path):
     src = '''
 print(123456.5, 999999.5, 65081.35, -0.0)

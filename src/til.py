@@ -7057,6 +7057,9 @@ class TBCModule:
         m.types = []
         if data[:4] != TBC_MAGIC:
             raise ValueError("not a TIL bytecode file (bad magic)")
+        damaged = "damaged bytecode file (truncated or malformed)"
+        if len(data) < 16:
+            raise ValueError(damaged)
         if not TBC_MIN_VERSION <= data[4] <= TBC_VERSION:
             raise ValueError(f"unsupported bytecode version {data[4]} "
                              f"(this VM loads versions {TBC_MIN_VERSION}..{TBC_VERSION})")
@@ -7067,11 +7070,21 @@ class TBCModule:
         if m.energy > ENERGY_LOW:
             raise ValueError(f"bad bytecode header (energy mode {m.energy})")
         pos = 6
+
         def rd(fmt):
             nonlocal pos
+            size = _struct.calcsize('<' + fmt)
+            if pos + size > len(data):
+                raise ValueError(damaged)
             vals = _struct.unpack_from('<' + fmt, data, pos)
-            pos += _struct.calcsize('<' + fmt)
+            pos += size
             return vals if len(vals) > 1 else vals[0]
+
+        def name(ix: int) -> str:
+            # names of functions, types and fields: string constants (as vm/tilvm.c checks)
+            if ix >= len(m.consts) or not isinstance(m.consts[ix], bytes):
+                raise ValueError(damaged)
+            return m.consts[ix].decode('utf-8', 'replace')
         n_globals, m.entry = rd('HH')
         m.globals = [f"g{i}" for i in range(n_globals)]
         for _ in range(rd('H')):
@@ -7082,6 +7095,8 @@ class TBCModule:
                 value = rd('d')
             elif tag == 3:
                 n = rd('H')
+                if pos + n > len(data):
+                    raise ValueError(damaged)
                 value = bytes(data[pos:pos + n])
                 pos += n
             else:
@@ -7091,20 +7106,28 @@ class TBCModule:
             m._const_index.setdefault(key, len(m.consts))
             m.consts.append(value)
         for _ in range(rd('H')):
-            name, np_, nr, nl, nu, fl, off = rd('HBBBBBI')
-            f = TBCFunction(m.consts[name].decode('utf-8', 'replace'))
+            name_ix, np_, nr, nl, nu, fl, off = rd('HBBBBBI')
+            f = TBCFunction(name(name_ix))
             f.n_params, f.n_required, f.n_locals, f.n_upvals, f.flags, f.offset = np_, nr, nl, nu, fl, off
             m.funcs.append(f)
+        if m.entry >= len(m.funcs):
+            raise ValueError(damaged)
         for _ in range(rd('H')):
-            name, nf = rd('HB')
-            fields = [m.consts[rd('H')].decode('utf-8', 'replace') for _ in range(nf)]
-            m.types.append((m.consts[name].decode('utf-8', 'replace'), fields))
+            name_ix, nf = rd('HB')
+            tname = name(name_ix)
+            m.types.append((tname, [name(rd('H')) for _ in range(nf)]))
         for _ in range(rd('H')):
             m.methods.append(rd('HHH'))
+            if m.methods[-1][2] >= len(m.funcs):
+                raise ValueError(damaged)
         for _ in range(rd('B')):
             mid, fidx = rd('BH')
+            if fidx >= len(m.funcs):
+                raise ValueError(damaged)
             m.prelude[mid] = fidx
         n = rd('I')
+        if pos + n > len(data) or any(f.offset >= n for f in m.funcs):
+            raise ValueError(damaged)
         m.code = bytes(data[pos:pos + n])
         pos += n
         for _ in range(rd('H')):
@@ -7445,6 +7468,49 @@ _JUMP_LANDING = {
 # the next instruction is only reached through a jump
 _ENDS_FLOW = frozenset((Op.JUMP, Op.RETURN, Op.RETURN_NIL, Op.PANIC, Op.RESUME, Op.HALT,
                         Op.CAST_RETURN, Op.RETURN_LOCAL))
+
+
+def code_depths(code: bytes, start: int, until: int) -> Dict[int, tuple]:
+    """Operand stack depths for checking a portable snapshot's call frames,
+    recovery points and handler records against the bytecode (docs/TIL_SNAPSHOTS.md
+    3.4). One linear pass from a function's first instruction `start` (depth 0:
+    nothing above the locals) to `until`, with the effects of _STACK_EFFECT, that
+    follows forward jumps (the compiler places loop heads before their back-edges,
+    so every reachable instruction gets its depth); the depth after END_HANDLE and
+    after an instruction that ends the flow comes from a jump landing there, or is
+    unknown. Returns {pc: (depth or None, pc of the previous instruction)} for the
+    instruction starts in [start, until]. vm/tilvm.c (tp_depth) computes the same."""
+    out: Dict[int, tuple] = {}
+    pending: Dict[int, int] = {}            # forward jump target -> depth (the first one wins)
+    depth: Optional[int] = 0
+    pos, prev = start, -1
+    while pos <= until and pos < len(code):
+        if depth is None:
+            depth = pending.get(pos)
+        out[pos] = (depth, prev)
+        op = code[pos]
+        fmt = OP_OPERANDS.get(op, '')
+        size = 1 + sum(_OPERAND_SIZE[k] for k in fmt)
+        if op not in _STACK_EFFECT and op not in _OPERAND_EFFECT or pos + size > len(code):
+            break
+        if depth is not None:
+            if op in _OPERAND_EFFECT:
+                idx, factor, const = _OPERAND_EFFECT[op]
+                at = pos + 1 + sum(_OPERAND_SIZE[k] for k in fmt[:idx])
+                n = code[at] | (code[at + 1] << 8 if fmt[idx] == 'h' else 0)
+                after = depth + const - factor * n
+            else:
+                after = depth + _STACK_EFFECT[op]
+            if op in _JUMP_LANDING:
+                rel = code[pos + size - 2] | (code[pos + size - 1] << 8)
+                target = pos + size + (rel - 0x10000 if rel >= 0x8000 else rel)
+                landing = depth + _JUMP_LANDING[op] - (2 * code[pos + 1] if op == Op.HANDLE else 0)
+                if target > pos and landing >= 0:
+                    pending.setdefault(target, landing)
+            depth = None if op in _ENDS_FLOW or op == Op.END_HANDLE or after < 0 else after
+        prev = pos
+        pos += size
+    return out
 
 
 class _FoldEnv:
@@ -9195,6 +9261,21 @@ def fmt_g(x: float) -> bytes:
     return ('%g' % x).encode()
 
 
+def c_pow(a: float, b: float) -> float:
+    """C99's pow() (the C VM's results): math.pow, with the overflow and pole
+    results instead of Python's exceptions."""
+    try:
+        return _math.pow(a, b)
+    except OverflowError:                          # |result| too large: inf, negative for x < 0 ** odd n
+        odd = b == _math.floor(b) and _math.fmod(b, 2.0) != 0.0
+        return float('-inf') if a < 0 and odd else float('inf')
+    except ValueError:
+        if a == 0.0:                               # 0 ** negative: a pole
+            odd = b == _math.floor(b) and _math.fmod(b, 2.0) != 0.0
+            return _math.copysign(float('inf'), a) if odd else float('inf')
+        return float('nan')                        # negative ** fractional
+
+
 FMT_MAX_WIDTH, FMT_MAX_PREC = 60, 30     # = format_slot() in vm/tilvm.c
 # Limits of the reference VM's builtins, so that a huge argument is a TIL runtime
 # error (as on the C VM) instead of exhausting the host: the longest string
@@ -9252,7 +9333,7 @@ def til_format_spec(v, spec: bytes, to_str) -> bytes:
     elif kind in (b'd', b'x', b'X', b'o', b'b') and is_num:
         if v != v or v in (float('inf'), float('-inf')):
             raise TILPanic(b"cannot convert nan/inf to int")
-        n = int(v)
+        n = int(v)                      # a float's exact integer part (vm/tilvm.c: fmt_float_int)
         digits = {b'd': '%d', b'x': '%x', b'X': '%X', b'o': '%o'}.get(kind)
         body = (digits % abs(n)).encode() if digits else bin(abs(n))[2:].encode()
         if n < 0:
@@ -10909,7 +10990,9 @@ class TILVM:
             now = _time.monotonic() * 1000.0
             out += pack('<H', len(self.recover))
             for handler, n_frames, sp, deadline, n_handlers in self.recover:
-                left = min(max(1, int(_math.ceil(deadline - now))), 0xFFFFFFFF) if deadline else 0
+                rem = deadline - now                    # nan / inf deadlines: never (the maximum)
+                left = 0 if not deadline else 1 if rem < 1 else int(_math.ceil(rem)) if rem < 0xFFFFFFFF \
+                    else 0xFFFFFFFF
                 out += pack('<IIHHH', handler, left, n_frames, sp, n_handlers)
             out += pack('<H', len(self.handlers))
             for kind, n_frames, sp, n_try, abort_pc, n in self.handlers:
@@ -10958,6 +11041,60 @@ class TILVM:
             raise SnapshotError(0, f"the program's state cannot be written as a snapshot ({e})")
         out += pack('<I', zlib.crc32(out) & 0xFFFFFFFF)
         return bytes(out)
+
+    def _check_snapshot_depths(self, frames, recover, handlers, depth: int):
+        """A snapshot's call frames, recovery points and handler records must sit
+        where the bytecode puts them (docs/TIL_SNAPSHOTS.md 3.4): every frame's pc
+        has a known operand stack depth (code_depths); a frame below the top is
+        at a call whose result slot is the next frame's base minus its callee slot
+        (CALL: the called function, no callee slot; CALL_VALUE: a callee slot;
+        PERFORM: no callee slot, a clause or the default function); the top frame's
+        depth ends at the stack depth; a recovery point's handler and a handle's
+        abort pc are where its saved stack depth plus the pushed message / value
+        is. So a forged file cannot make the VM pop below a frame or return into
+        the wrong slot. -4 otherwise (vm/tilvm.c checks the same)."""
+        m, code, funcs = self.m, self.m.code, self.m.funcs
+        cache: Dict[int, Dict[int, tuple]] = {}
+
+        def at(fi: int, pc: int):
+            func = frames[fi][0]
+            known = cache.get(func)
+            if known is None or pc not in known and pc > max(known):
+                known = cache[func] = code_depths(code, funcs[func].offset, pc if known is None
+                                                  else max(pc, max(known)))
+            d, prev = known.get(pc, (None, -1))
+            if d is None:
+                raise SnapshotError(-4, "a frame, recovery point or handler is not at a known stack depth")
+            return frames[fi][2] + funcs[func].n_locals + d, prev
+
+        n_frames = len(frames)
+        for i in range(n_frames):
+            top, prev = at(i, frames[i][1])
+            if i == n_frames - 1:
+                if top != depth:
+                    raise SnapshotError(-4, "bad frame")
+                continue
+            callee, base, extra = frames[i + 1][0], frames[i + 1][2], frames[i + 1][4]
+            op = code[prev] if prev >= 0 else -1
+            ok = base - extra == top - 1 and (
+                (op == Op.CALL and extra == 0 and callee == code[prev + 1] | (code[prev + 2] << 8)) or
+                (op == Op.CALL_VALUE and extra == 1) or op == Op.INVOKE or
+                (op == Op.PERFORM and extra == 0 and
+                 (callee == code[prev + 3] | (code[prev + 4] << 8) or
+                  funcs[callee].flags & TBCFunction.FLAG_EFFECT_CLAUSE)))
+            if not ok:
+                raise SnapshotError(-4, "bad frame")
+        for handler, nf, sp, _left, _nh in recover:
+            if at(nf - 1, handler)[0] != sp + 1:
+                raise SnapshotError(-4, "bad recovery point")
+        for kind, nf, sp, _n_try, abort_pc, _n in handlers:
+            if kind == 0:
+                ok = at(nf - 1, abort_pc)[0] == sp + 1
+            else:
+                prev = at(nf - 1, frames[nf - 1][1])[1]
+                ok = code[prev] == Op.PERFORM and bool(funcs[frames[nf][0]].flags & TBCFunction.FLAG_EFFECT_CLAUSE)
+            if not ok:
+                raise SnapshotError(-4, "bad handler record")
 
     def load_portable(self, data: bytes):
         """Continue a program saved by save_portable() or by the C VM's
@@ -11084,6 +11221,7 @@ class TILVM:
         for h in handlers:
             if h[0] == 0 and h[2] + 2 * h[5] > depth:
                 raise SnapshotError(-4, "bad handler record")
+        self._check_snapshot_depths(frames, recover, handlers, depth)
         width, height = take('<HH', 4)
         if (width == 0) != (height == 0) or width > GFX_MAX_SIZE or height > GFX_MAX_SIZE:
             raise SnapshotError(-4, "bad screen size")

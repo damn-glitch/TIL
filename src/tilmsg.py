@@ -1050,6 +1050,9 @@ COMPILER_MESSAGES: List[Tuple[str, str, str]] = [
     ("bad constant tag {tag}",
      "неверный тег константы {tag}",
      "тұрақтының тегі қате: {tag}"),
+    ("damaged bytecode file (truncated or malformed)",
+     "повреждённый файл байт-кода (обрезан или неверно сформирован)",
+     "байт-код файлы бүлінген (толық емес немесе құрылымы қате)"),
     # the optional debug-info section (til build --debug-info, til debug)
     ("truncated debug-info section",
      "секция отладочной информации обрезана",
@@ -1675,6 +1678,9 @@ RUNTIME_MESSAGES: List[Tuple[str, str, str]] = [
     ("str_bytes() expects a string, got {type:type}",
      "str_bytes() ожидает строку, получено {type}",
      "str_bytes() жол күтеді, бірақ {type} берілді"),
+    ("pow with a fractional exponent is not available in this VM build",
+     "pow с дробным показателем недоступна в этой сборке VM",
+     "бөлшек дәрежелі pow бұл VM құрастырмасында қолжетімсіз"),
     ("{name}() is not available in this VM build",
      "{name}() недоступна в этой сборке VM",
      "{name}() бұл VM құрастырмасында қолжетімсіз"),
@@ -2254,6 +2260,9 @@ COMMAND_LINE_MESSAGES: List[Tuple[str, str, str]] = [
     ("an upvalue is not a cell",
      "захваченная переменная не является ячейкой",
      "алынған айнымалы ұяшық емес"),
+    ("a frame, recovery point or handler is not at a known stack depth",
+     "кадр, точка восстановления или обработчик не находится на известной глубине стека",
+     "кадр, қалпына келтіру нүктесі немесе өңдеуші стектің белгілі тереңдігінде емес"),
     ("a frame's closure is not a closure of its function",
      "замыкание кадра не относится к его функции",
      "кадрдың тұйықтамасы оның функциясына жатпайды"),
@@ -2316,6 +2325,24 @@ COMMAND_LINE_MESSAGES: List[Tuple[str, str, str]] = [
      "(TILVM_MAX_FUNCS))",
      "{path} жүктеу мүмкін емес (қате {code}: бұл VM құрастырмасы үшін функциялар тым көп "
      "(TILVM_MAX_FUNCS))"),
+    ("cannot load {path:text} (error {code:int}: truncated or malformed file)",
+     "не удаётся загрузить {path} (ошибка {code}: файл обрезан или неверно сформирован)",
+     "{path} жүктеу мүмкін емес (қате {code}: файл толық емес немесе құрылымы қате)"),
+    ("cannot load {path:text} (error {code:int}: too many constants for this VM build (TILVM_MAX_CONSTS))",
+     "не удаётся загрузить {path} (ошибка {code}: слишком много констант для этой сборки VM "
+     "(TILVM_MAX_CONSTS))",
+     "{path} жүктеу мүмкін емес (қате {code}: бұл VM құрастырмасы үшін тұрақтылар тым көп "
+     "(TILVM_MAX_CONSTS))"),
+    ("cannot load {path:text} (error {code:int}: too many types for this VM build (TILVM_MAX_TYPES))",
+     "не удаётся загрузить {path} (ошибка {code}: слишком много типов для этой сборки VM "
+     "(TILVM_MAX_TYPES))",
+     "{path} жүктеу мүмкін емес (қате {code}: бұл VM құрастырмасы үшін типтер тым көп "
+     "(TILVM_MAX_TYPES))"),
+    ("cannot load {path:text} (error {code:int}: too many globals for the value stack (TILVM_STACK_SIZE))",
+     "не удаётся загрузить {path} (ошибка {code}: слишком много глобальных переменных для стека значений "
+     "(TILVM_STACK_SIZE))",
+     "{path} жүктеу мүмкін емес (қате {code}: мәндер стегі үшін ғаламдық айнымалылар тым көп "
+     "(TILVM_STACK_SIZE))"),
     ("cannot load {path:text} (error {code:int}: program larger than 64 KB (TILVM_ADDR16 build))",
      "не удаётся загрузить {path} (ошибка {code}: программа больше 64 КБ (сборка TILVM_ADDR16))",
      "{path} жүктеу мүмкін емес (қате {code}: бағдарлама 64 КБ-тан үлкен (TILVM_ADDR16 құрастырмасы))"),
