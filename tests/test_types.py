@@ -429,6 +429,102 @@ FORMERLY_FALLBACK = {
 }
 
 
+# side effects and run-time errors whose order C leaves unspecified: the native
+# code must follow the VMs' left-to-right order (BytecodeCompiler)
+EVAL_ORDER = {
+    'global_compound': (
+        'var G = 0\n\nbump(x: int) -> int\n    G += 1\n    return x\n\nmain()\n'
+        '    G += bump(10)\n    print(G)\n    var a = [1, 2]\n    G = 0\n    G = G + bump(5)\n'
+        '    print(G)\n'
+    ),
+    'compound_assignments': (
+        'struct P\n    x: int\n    f: float\n    s: str\n\nvar G = 0\nvar S = "s"\n'
+        'var p = P { x: 1, f: 1.5, s: "a" }\nvar xs = [10, 20, 30]\nvar m = {"a": 1, "b": 2}\n'
+        'var I = 0\nvar log = []\n\ng(v: int) -> int\n    G += 1\n    S = S + "!"\n'
+        '    p.x += 100\n    p.f *= 2.0\n    p.s = p.s + "z"\n    xs[0] += 1000\n'
+        '    m["a"] += 50\n    I += 1\n    return v\n\ntag(t: str, v: int) -> int\n'
+        '    log.push(t)\n    return v\n\ngrow(v: int) -> int\n    for i in 0..50\n'
+        '        xs.push(i)\n    return v\n\nmain()\n    G = 7\n    G += g(3)\n    print(G)\n'
+        '    G = 7\n    G -= g(3)\n    print(G)\n    G = 7\n    G *= g(3)\n    print(G)\n'
+        '    G = 7\n    G /= g(3)\n    print(G)\n    G = 7\n    G %= g(3)\n    print(G)\n'
+        '    S += str(g(1))\n    print(S)\n    p.x += g(5)\n    p.f += g(1)\n'
+        '    p.s += str(g(2))\n    print(p)\n    xs[0] += g(1)\n    print(xs)\n'
+        '    m["a"] += g(1)\n    print(m)\n    I = 0\n    xs[I] += g(I + 5)\n    print(xs, I)\n'
+        '    xs[tag("idx", 1)] += tag("val", 2)\n    print(xs[1], log)\n    log = []\n'
+        '    m[str(tag("key", 1))] = tag("val", 7)\n    print(m, log)\n    xs[2] = grow(77)\n'
+        '    print(xs[2], len(xs))\n    var local = 5\n    local += g(local)\n'
+        '    print(local, G)\n'
+    ),
+    'operands_and_literals': (
+        'struct P\n    x: int\n    s: str\n\nvar G = 0\nvar log = []\n\n'
+        't(tag: str, v: int) -> int\n    log.push(tag)\n    G += 1\n    return v\n\n'
+        'bump(x: int) -> int\n    G += 1\n    return x\n\nts(tag: str) -> str\n'
+        '    log.push(tag)\n    return tag\n\nh(a: int, b: int, c: int) -> int\n'
+        '    return a * 100 + b * 10 + c\n\nmain()\n    G = 0\n    G += bump(10)\n'
+        '    print(G)\n    G = 0\n    G = G + bump(5)\n    print(G)\n    G = 0\n'
+        '    G -= bump(3)\n    print(G)\n    G = 5\n    G *= bump(2)\n    print(G)\n'
+        '    G = 50\n    G /= bump(5)\n    print(G)\n    G = 7\n    G %= bump(4)\n'
+        '    print(G)\n    var s = "a"\n    s += ts("b") + s\n    print(s, log)\n    log = []\n'
+        '    print(t("a", 1) - t("b", 2), t("c", 3) * t("d", 4) - t("e", 5), log)\n'
+        '    log = []\n    print(h(t("x", 1), t("y", 2), t("z", 3)), log)\n    log = []\n'
+        '    let arr = [t("p", 1), t("q", 2), G]\n    print(arr, log)\n    log = []\n'
+        '    let m = {ts("k1"): t("v1", 1), ts("k2"): t("v2", 2)}\n    print(m, log)\n'
+        '    log = []\n    let p = P { s: ts("s"), x: t("x", 9) }\n    print(p, log)\n'
+        '    log = []\n    let a1 = "f1"\n    let a2 = "f2"\n'
+        '    print(f"{t(a1, 1)}{t(a2, 2)}{G}", log)\n'
+    ),
+    'receivers_and_indexes': (
+        'struct Box\n    v: int\n\nimpl Box\n    get(self, k: int) -> int\n'
+        '        return self.v * 10 + k\n\nvar cur = Box { v: 1 }\nvar xs = [1, 2, 3]\n'
+        'var name = "abc"\nvar m = {"a": 1}\n\nswap() -> int\n    cur = Box { v: 2 }\n'
+        '    return 5\n\ngrow() -> int\n    xs = [7, 8, 9, 10]\n    return 1\n\n'
+        'rename() -> int\n    name = "zzzz"\n    return 1\n\nremap() -> int\n'
+        '    m = {"a": 100}\n    return 3\n\nmain()\n    print(cur.get(swap()))\n'
+        '    cur = Box { v: 1 }\n    print(cur.v + swap(), cur.v)\n    print(xs[grow()])\n'
+        '    xs = [1, 2, 3]\n    print(xs.len() + grow())\n    xs = [1, 2, 3]\n'
+        '    xs.push(grow())\n    print(xs)\n    print(name.slice(0, rename()), name)\n'
+        '    name = "abc"\n    print(len(name) + rename())\n    m["a"] += remap()\n'
+        '    print(m)\n    m = {"a": 1}\n    m["b"] = remap()\n    print(m)\n'
+    ),
+    'callee_first': (
+        'struct H\n    f: fn(int) -> int\n\ninc(x: int) -> int\n    return x + 1\n\n'
+        'dbl(x: int) -> int\n    return x * 2\n\nvar OP = inc\nvar hh = H { f: inc }\n\n'
+        'change() -> int\n    OP = dbl\n    hh = H { f: dbl }\n    return 10\n\nmain()\n'
+        '    print(OP(change()))\n    OP = inc\n    hh = H { f: inc }\n'
+        '    print(hh.f(change()))\n    var q: H = None\n    let r = retry(1)\n'
+        '        q.f(change())\n    else\n        -1\n    print(r)\n'
+    ),
+    'assignment_error_order': (
+        'struct P\n    x: int\n\nsay(t: str) -> int\n    print(t)\n    return 1\n\nmain()\n'
+        '    var q: P = None\n    let r1 = retry(1)\n        q.x = say("set")\n        0\n'
+        '    else\n        error\n    print(r1)\n    let r2 = retry(1)\n'
+        '        q.x += say("add")\n        0\n    else\n        error\n    print(r2)\n'
+        '    var xs = [1]\n    let r3 = retry(1)\n        xs[5] = say("idx")\n        0\n'
+        '    else\n        error\n    print(r3)\n    let r4 = retry(1)\n'
+        '        xs[5] += say("idx2")\n        0\n    else\n        error\n    print(r4)\n'
+        '    var m = {"a": 1}\n    let r5 = retry(1)\n        m["zz"] += say("key")\n'
+        '        0\n    else\n        error\n    print(r5)\n    let r6 = retry(1)\n'
+        '        xs[0] = grow(xs)\n        0\n    else\n        error\n'
+        '    print(r6, len(xs), xs[0])\n\ngrow(a: [int]) -> int\n    for i in 0..100\n'
+        '        a.push(i)\n    return 42\n'
+    ),
+    'operand_error_order': (
+        'struct P\n    x: int\n\nsay(t: str) -> int\n    print(t)\n    return 0\n\nmain()\n'
+        '    let xs = [1, 2]\n    let m = {"a": 1}\n    let z = 0\n    var q: P = None\n'
+        '    let r1 = retry(1)\n        xs[5] + m["k"]\n    else\n        -1\n    print(r1)\n'
+        '    let e1 = retry(1)\n        str(xs[5] + m["k"])\n    else\n        error\n'
+        '    print(e1)\n    let e2 = retry(1)\n        str(m["k"] + xs[5])\n    else\n'
+        '        error\n    print(e2)\n    let e3 = retry(1)\n        str(1 / z + xs[9])\n'
+        '    else\n        error\n    print(e3)\n    let e4 = retry(1)\n'
+        '        str(q.x + int("nope"))\n    else\n        error\n    print(e4)\n'
+        '    let e5 = retry(1)\n        str([xs[7], m["q"]])\n    else\n        error\n'
+        '    print(e5)\n    let e6 = retry(1)\n        str(max(int("a1"), xs[8]))\n    else\n'
+        '        error\n    print(e6)\n    let e7 = retry(1)\n'
+        '        str(xs[9] + say("after"))\n    else\n        error\n    print(e7)\n'
+    ),
+}
+
+
 @needs_cc
 class TestNativeEqualsVM:
     @pytest.mark.parametrize("name", sorted(FORMERLY_FALLBACK))
@@ -553,6 +649,15 @@ class TestNativeEqualsVM:
         assert rc == 0 and run_native(src) == (0, out)
         assert out.startswith("0\n0\n0\n-1\n-0\n1000000000000000015902891109759918046836080856394528138978132755"
                               "7747838772170381060813469985856815104\n-8000000000000000\n1" + "0" * 70 + "\n123\n0\n")
+
+    @pytest.mark.parametrize("name", sorted(EVAL_ORDER))
+    def test_evaluation_order_of_side_effects_and_errors(self, name):
+        """`G += f()` reads G before the call (also fields, elements, strings);
+        a[i] and p.f are evaluated before the value and stored (checked) after
+        it; receivers and called values before the arguments; operands, arguments
+        and literal elements left to right, including which run-time error
+        comes first (BytecodeCompiler.compile_assignment / compile_expr)."""
+        native_matches_vm(EVAL_ORDER[name])
 
     def test_kazakh_program(self):
         native_matches_vm('қосу(а: int, б: int) -> int\n    return а + б\nнегізгі()\n'
@@ -680,6 +785,25 @@ class TestFallback:
     def test_dead_code_does_not_force_a_fallback(self):
         c = c_code('unused(k: int)\n    let mixed = [k, "a"]\n    print(mixed)\nmain()\n    print(1)\n')
         assert 'til_main' in c and 'til_unused' not in c
+
+    @needs_cc
+    def test_classic_backend_refuses_an_observable_operand_order(self, tmp_path):
+        """--no-types: the classic C backend writes operands as one C expression
+        (order unspecified), so where the order is observable the VM runs it."""
+        prog = tmp_path / 'order.til'
+        prog.write_text(EVAL_ORDER['global_compound'])
+        r = cli('run', str(prog), env={'TIL_NO_TYPES': '1'})
+        assert r.returncode == 0 and r.stdout == "10\n5\n" and "running it on the TIL VM" in r.stderr
+        r = cli('build', '--no-types', str(prog), '-o', str(tmp_path / 'order'))
+        assert r.returncode == 1 and "left-to-right order" in r.stderr
+        hazard = til.classic_order_hazard
+        assert hazard(program(EVAL_ORDER['compound_assignments'])) is not None
+        assert hazard(program(EVAL_ORDER['callee_first'])) is not None
+        # pure functions and locals: nothing observable, the classic backend compiles it
+        assert hazard(program('fib(n: int) -> int\n    if n < 2\n        return n\n'
+                              '    return fib(n - 1) + fib(n - 2)\nfact(n: int) -> int\n'
+                              '    return 1 if n <= 1 else n * fact(n - 1)\nmain()\n    var t = 0\n'
+                              '    t += fib(10)\n    print(t, fact(5), [fib(3), fib(4)])\n')) is None
 
     @needs_cc
     def test_classic_behaviour_without_the_module(self, tmp_path):
