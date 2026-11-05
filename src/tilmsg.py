@@ -318,14 +318,12 @@ COMPILER_MESSAGES: List[Tuple[str, str, str]] = [
     ("'match' is not supported",
      "'match' не поддерживается",
      "'match' қолдау көрсетілмейді"),
-    ("'{name}' here is a local that shadows the constant '{name}': the bytecode compiler computes this "
-     "expression with the constant, native code with the local (rename the local)",
-     "'{name}' здесь — локальная переменная, которая скрывает константу '{name}': компилятор байт-кода "
-     "вычисляет это выражение с константой, а нативный код — с локальной переменной (переименуйте "
-     "локальную переменную)",
-     "мұнда '{name}' — '{name}' тұрақтысын жасыратын жергілікті айнымалы: байт-код компиляторы бұл "
-     "өрнекті тұрақтымен, ал нативті код жергілікті айнымалымен есептейді (жергілікті айнымалының атын "
-     "өзгертіңіз)"),
+    ("'{name}' here is a local that shadows the constant '{name}' (the prover does not model such "
+     "shadowing; rename the local)",
+     "'{name}' здесь — локальная переменная, которая скрывает константу '{name}' (доказатель не "
+     "моделирует такое скрытие; переименуйте локальную переменную)",
+     "'{name}' мұнда — '{name}' тұрақтысын жасыратын жергілікті айнымалы (дәлелдеуіш мұндай жасыруды "
+     "модельдемейді; жергілікті айнымалының атын өзгертіңіз)"),
     ("call passes too few arguments",
      "в вызове слишком мало аргументов",
      "шақыруда аргументтер тым аз"),
@@ -1883,6 +1881,9 @@ COMMAND_LINE_MESSAGES: List[Tuple[str, str, str]] = [
     ("No input file specified",
      "не указан входной файл",
      "кіріс файлы көрсетілмеген"),
+    ("--max-steps needs a number >= 0, got '{value:text}'",
+     "--max-steps требует число >= 0, получено '{value}'",
+     "--max-steps үшін >= 0 сан керек, берілгені: '{value}'"),
     ("File not found: {path:text}",
      "файл не найден: {path}",
      "файл табылмады: {path}"),
