@@ -62,12 +62,18 @@ fetch() {
     fi
 }
 fetch src/til.py "$TIL_BIN/til.py"
+# TIL 3.1 tools next to the compiler: packages, proofs, device fit, debugger,
+# Kazakh/Russian messages, type inference (each is optional; til.py works without them)
+for m in tilpkg tilprove tilfit tildebug tilmsg tiltypes; do fetch "src/$m.py" "$TIL_BIN/$m.py"; done
 
 # Standard library and the portable TIL VM (for `til build --target c-vm` / `til run --cvm`)
 echo -e "${BLUE}Downloading standard library and TIL VM...${NC}"
 mkdir -p "$TIL_HOME/stdlib" "$TIL_HOME/vm"
 for f in math.til strings.til; do fetch "stdlib/$f" "$TIL_HOME/stdlib/$f"; done
 for f in tilvm.c tilvm.h main.c Makefile README.md; do fetch "vm/$f" "$TIL_HOME/vm/$f"; done
+# The self-hosted compiler (TIL written in TIL): til run --vm ~/.til/selfhost/tilc.til in.til out.tbc
+mkdir -p "$TIL_HOME/selfhost"
+fetch selfhost/tilc.til "$TIL_HOME/selfhost/tilc.til"
 
 # Create wrapper script
 cat > "$TIL_BIN/til" << 'EOF'
