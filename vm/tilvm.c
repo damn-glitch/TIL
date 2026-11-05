@@ -485,6 +485,7 @@ void tilvm_get_stats(const tilvm *vm, tilvm_stats *out) {
     if (vm->st.n_frames > out->peak_frames) out->peak_frames = vm->st.n_frames;
     if (vm->st.n_try > out->peak_try) out->peak_try = vm->st.n_try;
     if (vm->st.heap_top > out->peak_heap) out->peak_heap = vm->st.heap_top;
+    if (vm->st.n_handlers > out->peak_handlers) out->peak_handlers = vm->st.n_handlers;
 }
 #endif
 
@@ -675,6 +676,7 @@ static void fmt_gp(char *buf, tv_float x, int sig) {
 
 static void fmt_g(char *buf, tv_float x) { fmt_gp(buf, x, 6); }
 
+#ifndef TILVM_LEAN      /* format specs %.Nf / %.Ne (lean builds ignore specs) */
 /* %.{prec}f  (exact ties round to even, like printf) */
 static void fmt_fixed(char *buf, tv_float x, int prec) {
     char dig[72];
@@ -743,6 +745,7 @@ static void fmt_exp(char *buf, tv_float x, int prec) {
     buf[pos++] = (char)('0' + e % 10);
     buf[pos] = 0;
 }
+#endif
 #endif
 #endif
 
@@ -3734,6 +3737,7 @@ TV_NOINLINE static int effect_target(tilvm *vm, uint16_t name_c, uint16_t dflt, 
                      fmt_int(n1, (tv_int)np), " argument(s), got ", fmt_int(n2, (tv_int)argc));
     if (st->n_handlers >= TILVM_MAX_HANDLERS) return fail(vm, "too many nested handlers");
     m = &st->handlers[st->n_handlers++];
+    TV_STAT_MAX(peak_handlers, st->n_handlers);
     m->kind = 1;
     m->n_frames = st->n_frames;
     m->sp = 0;
@@ -4759,6 +4763,7 @@ do_return:
         ip += 3;
         if (st->n_handlers >= TILVM_MAX_HANDLERS) { fail(vm, "too many nested handlers"); goto panic; }
         h = &st->handlers[st->n_handlers++];
+        TV_STAT_MAX(peak_handlers, st->n_handlers);
         h->kind = 0;
         h->n_frames = st->n_frames;
         h->sp = (uint16_t)(TOPSLOT(0) - 2u * n);

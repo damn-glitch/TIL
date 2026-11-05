@@ -310,6 +310,7 @@ typedef struct tilvm_stats {
     uint32_t peak_try;      /* most nested retry/timeout/intent blocks */
     uint32_t peak_heap;     /* arena high-water mark (heap_top), bytes */
     uint32_t peak_live;     /* most heap in use right after a collection, bytes */
+    uint32_t peak_handlers; /* most effect handler entries (open handle blocks + running clauses) */
 } tilvm_stats;
 #endif
 

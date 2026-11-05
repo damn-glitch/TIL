@@ -92,7 +92,7 @@ Define before including `tilvm.h` (or pass `-D...`):
 | `TILVM_NO_GFX` | off | leave out the screen/keys natives (`screen_init` … `wait_key` report "not available in this VM build"); saves ~2.7 KB on ARM, ~7.5 KB on the Z80 (the Z80 build uses it) |
 | `TILVM_GFX_MAX_W` / `TILVM_GFX_MAX_H` | 4096 / 4096 | largest screen `screen_init` accepts: set the display's size on a device (`screen_init(400, 300)` on a 320×240 build is a runtime error, so the screen hooks never get coordinates outside the display) |
 | `TILVM_ROM` | empty | storage qualifier for the 480-byte font table, e.g. `__flash` for avr-gcc (keeps it out of RAM) |
-| `TILVM_STATS` | off | record high-water marks (value stack, frames, recovery points, heap): `tilvm_get_stats()`, second `--stats` line; used by `til fit --run` (docs/TIL_FIT.md) |
+| `TILVM_STATS` | off | record high-water marks (value stack, frames, recovery points, heap, effect handler entries): `tilvm_get_stats()`, second `--stats` line; used by `til fit --run` (docs/TIL_FIT.md) |
 | `TILVM_PACK` | off | pack values and heap objects like 8-bit CPUs do (GCC/Clang): desktop emulation of AVR / Z80 / eZ80 heap use |
 
 Profiles in the `Makefile`: `make` (desktop), `make small` (32-bit, float,
