@@ -139,13 +139,12 @@ The prover uses exactly the semantics of both TIL VMs (`TILVM` in
 | comparisons | signed |
 
 Constant subexpressions are folded exactly like the compiler folds them
-(`BytecodeCompiler.try_fold`), because that is what the bytecode computes -
-with the compiler's rules, which are not always the run-time rules: the
-constant expression `1 == true` is folded to `true` (both VMs print `true`),
-and the prover agrees. The compiler also folds an expression like `N + 1`
-with the constant `N` where a local variable or parameter named `N` shadows
-the constant, while native code uses the local; such an expression makes the
-function unsupported (rename the local).
+(`BytecodeCompiler.try_fold`), because that is what the bytecode computes.
+Since TIL 3.1 folding follows the run-time rules (`1 == true` is `false` and
+`~true` is a run-time error on every backend), and a local or parameter that
+shadows a module constant is used as the local everywhere. The prover is
+still conservative there: an expression that uses a shadowed constant name
+makes the function unsupported (rename the local).
 
 `x ** e` is exact for constant exponents up to 64, for variable exponents up
 to 8, for negative exponents, for the bases 0, 1 and -1, and for even bases

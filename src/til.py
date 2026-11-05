@@ -13104,7 +13104,14 @@ def run_extra_command(command: str, argv: List[str]) -> int:
         print(localize(f"til {command}: not available in this installation ({module_name}.py is missing)"),
               file=sys.stderr)
         return 1
-    return module.main(argv)
+    try:
+        return module.main(argv)
+    except BrokenPipeError:              # `til fit ... | head`: the reader is gone
+        try:
+            sys.stdout = open(os.devnull, 'w')
+        except OSError:
+            pass
+        return 0
 
 
 def run_proofs(program: 'Program', source: str, filename: str, explicit: bool) -> List[str]:
@@ -13313,10 +13320,26 @@ def run_repl():
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
+_COMMANDS = ('run', 'build', 'check', 'repl', 'exec', 'dis', 'translate', 'version')
+_VALUE_FLAGS = ('-o', '--target', '--to', '--max-steps')
+
+
+def _command_first(args: List[str]) -> List[str]:
+    """Options written before the command (`til -v --lang ru run x.til`) move
+    behind it. Only leading options are moved; nothing after the command changes."""
+    i = 0
+    while i < len(args) and args[i].startswith('-') and args[i] != '--':
+        i += 2 if (args[i] in _VALUE_FLAGS or args[i] in RUN_VALUE_OPTIONS) else 1
+    if 0 < i < len(args) and (args[i] in _COMMANDS or args[i] in EXTRA_COMMANDS):
+        return [args[i]] + args[:i] + args[i + 1:]
+    return args
+
+
 @scoped_message_language
 def main():
     args = sys.argv[1:]
 
+    args = _command_first(args)                    # `til --lang ru run x.til` == `til run --lang ru x.til`
     lang_error = set_message_language(args)       # messages: --lang / TIL_LANG (pragma: below)
     if lang_error:
         print(lang_error, file=sys.stderr)
@@ -13325,11 +13348,12 @@ def main():
     if args and args[0] in EXTRA_COMMANDS:      # before -h/--help: `til pkg --help` is the tool's own help
         return run_extra_command(args[0], without_lang_option(args[1:]))
 
-    if not args or '-h' in args or '--help' in args:
+    til_options = args[:args.index('--')] if '--' in args else args     # after `--`: the program's
+    if not args or '-h' in til_options or '--help' in til_options:
         print_help()
         return 0
 
-    if '--version' in args or args[0] == 'version':
+    if '--version' in til_options or args[0] == 'version':
         print(f"TIL Compiler v{TIL_VERSION}")
         print("Author: Alisher Beisembekov")
         print("Backends: native (C via gcc/clang), TIL VM (bytecode: Python, C99 / calculators)")
@@ -13390,7 +13414,13 @@ def main():
         elif arg.startswith('--to='):
             lang_to = arg.split('=', 1)[1]
         elif arg == '--max-steps' and i + 1 < len(args):
-            max_steps = int(args[i + 1])
+            try:
+                max_steps = int(args[i + 1])
+            except ValueError:
+                max_steps = -1
+            if max_steps < 0:
+                print(localize(f"Error: --max-steps needs a number >= 0, got '{args[i + 1]}'"), file=sys.stderr)
+                return 2
             i += 2
             continue
         elif arg == '-c':
@@ -13443,6 +13473,20 @@ def main():
             if command == 'dis':
                 print(disassemble(module))
                 return 0
+            if use_vm == 'c':                          # til exec prog.tbc --cvm: the C VM runs the file
+                try:
+                    snap_flags = cvm_snapshot_flags(opts)
+                except ValueError as e:
+                    print(localize(f"Error: {e}"), file=sys.stderr)
+                    return 2
+                exe = _cvm_binary(compiler.verbose)
+                if exe is None:
+                    print(localize("Error: cannot build the C VM (need vm/ sources and a C compiler)"),
+                          file=sys.stderr)
+                    return 1
+                cmd = [exe] + (['--max-steps', str(max_steps)] if max_steps else []) + \
+                    cvm_screen_flags(opts) + snap_flags + [input_file] + prog_args
+                return foreground_exit(run_localized(cmd))
             return run_bytecode(module, max_steps, prog_args, opts)
 
         with open(input_file, 'r', encoding='utf-8') as f:

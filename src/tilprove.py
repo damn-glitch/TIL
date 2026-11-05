@@ -1307,15 +1307,14 @@ class _Encoder:
 
     def check_fold(self, node, st: _State):
         """The bytecode compiler folds a constant expression with the literal
-        constants even where a local (or a parameter) shadows one of them;
-        native code uses the local.  The two disagree there: nothing is
-        claimed about such code."""
+        constants even where a local (or a parameter) shadows one of them
+        (fixed in TIL 3.1: every backend now uses the local).  The prover
+        still claims nothing about such code (conservative)."""
         for name in _names_in(node):
             if name in self.p.inline_consts and (st.lookup(name) is not None or
                                                  (name == 'result' and self.result is not None)):
-                raise Unsupported(f"'{name}' here is a local that shadows the constant '{name}': the "
-                                  f"bytecode compiler computes this expression with the constant, native "
-                                  f"code with the local (rename the local)", node)
+                raise Unsupported(f"'{name}' here is a local that shadows the constant '{name}' "
+                                  f"(the prover does not model such shadowing; rename the local)", node)
 
     def ev_struct_init(self, node, st: _State) -> _V:
         """Like compile_struct_init: the fields in the order of the struct

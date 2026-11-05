@@ -795,7 +795,7 @@ print(<span class="s">f"|p| = {p.length()}"</span>)
             </div>
             
             <div class="install-code">
-                <code id="install-cmd">curl -fsSL https://til-dev.vercel.app/install.sh | sh</code>
+                <code id="install-cmd">curl -fsSL https://til-dev.vercel.app/install.sh | bash</code>
             </div>
             
             <p style="text-align: center; margin-top: 2rem; color: var(--text-secondary);">
@@ -826,7 +826,7 @@ print(<span class="s">f"|p| = {p.length()}"</span>)
             const cmd = document.getElementById('install-cmd');
             switch(os) {
                 case 'linux':
-                    cmd.textContent = 'curl -fsSL https://til-dev.vercel.app/install.sh | sh';
+                    cmd.textContent = 'curl -fsSL https://til-dev.vercel.app/install.sh | bash';
                     break;
                 case 'windows':
                     cmd.textContent = 'irm https://til-dev.vercel.app/install.ps1 | iex';

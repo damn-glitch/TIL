@@ -1030,8 +1030,7 @@ int main(int argc, char **argv) {
 @needs_cc
 class TestCAPI:
     @pytest.fixture(scope='class')
-    @classmethod
-    def host(cls, tmp_path_factory):
+    def host(self, tmp_path_factory):        # (no @classmethod: pytest on Python 3.9 rejects it)
         d = tmp_path_factory.mktemp('host')
         src = os.path.join(str(d), 'host.c')
         with open(src, 'w') as f:

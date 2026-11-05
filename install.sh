@@ -1,7 +1,7 @@
 #!/bin/bash
 # TIL Language Installer
 # Author: Alisher Beisembekov
-# Usage: curl -fsSL https://til-dev.vercel.app/install.sh | sh
+# Usage: curl -fsSL https://til-dev.vercel.app/install.sh | bash
 
 set -e
 

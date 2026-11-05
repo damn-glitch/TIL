@@ -9,7 +9,7 @@ program runs through `til`.
 ```
 $ til run --vm --lang kk prog.til
 қате[E-VM]: өзгермейтін 'x' айнымалысына екінші рет мән меншіктеуге болмайды
- --> prog.til:3:5
+ --> prog.til:3:7
   2 |     let x = 1
   3 |     x = 2
     |     ^
