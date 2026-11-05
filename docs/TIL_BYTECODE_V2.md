@@ -124,7 +124,10 @@ and `compile_to_bytecode(..., fuse=False)` turn it off):
    `else`) is removed;
 4. among all possible choices, dynamic programming picks the one with the
    fewest instructions (`LOAD_LOCAL2` counts slightly more than one instruction,
-   so `LOAD_LOCAL a; ADD_L b` is preferred over `LOAD_LOCAL2 a b; ADD`);
+   so `LOAD_LOCAL a; ADD_L b` is preferred over `LOAD_LOCAL2 a b; ADD`). The
+   costs are integers (20 per instruction, 21 for `LOAD_LOCAL2`), so the
+   choice is exact arithmetic: the self-hosted compiler `selfhost/tilc.til`
+   makes the same one;
 5. the code is laid out again, every jump offset is recomputed and the line
    table is remapped (a removed `JUMP 0` hands its line entry to the next
    instruction unless that one has its own).
