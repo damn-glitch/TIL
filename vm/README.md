@@ -141,10 +141,12 @@ without `TILVM_NO_STDIO`, for any magnitude (`f"{1e100:.2f}"` prints all 101
 digits) and precision; a NaN prints `nan` (never `-nan`). `TILVM_FLOAT=1`
 builds print the float32 value the same way, so their output equals the
 reference VM's output for that float32 value (float constants are rounded
-to the nearest float32 when they load). `int(x)`, typed `int` parameters and
-`f"{x:d}"` of a float truncate it exactly and wrap to `TILVM_INT_BITS` like
-integer arithmetic (the reference VM: 64 bits); nan/inf are the runtime error
-`cannot convert nan/inf to int`. Without `<math.h>` (`TILVM_NO_MATH`),
+to the nearest float32 when they load). `int(x)` and typed `int` parameters
+truncate a float exactly and wrap it to `TILVM_INT_BITS` like integer
+arithmetic (the reference VM: 64 bits); `f"{x:d}"` (`x`, `X`, `o`, `b`) of a
+float prints its exact integer part, whatever its size (`f"{1e30:d}"` is
+`1000000000000000019884624838656`, as on the reference VM); nan/inf are the
+runtime error `cannot convert nan/inf to int`. Without `<math.h>` (`TILVM_NO_MATH`),
 `floor`, `ceil`, `round` and `%` are exact and `sqrt` is correctly rounded
 (the same results as the C library); `x ** y` with an integer `y` is computed
 by repeated squaring - exact whenever the result needs no rounding, otherwise

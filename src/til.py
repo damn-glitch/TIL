@@ -9333,7 +9333,7 @@ def til_format_spec(v, spec: bytes, to_str) -> bytes:
     elif kind in (b'd', b'x', b'X', b'o', b'b') and is_num:
         if v != v or v in (float('inf'), float('-inf')):
             raise TILPanic(b"cannot convert nan/inf to int")
-        n = wrap_int64(int(v))          # as int(x): wraps to 64 bits (vm/tilvm.c: f_to_int)
+        n = int(v)                      # a float's exact integer part (vm/tilvm.c: fmt_float_int)
         digits = {b'd': '%d', b'x': '%x', b'X': '%X', b'o': '%o'}.get(kind)
         body = (digits % abs(n)).encode() if digits else bin(abs(n))[2:].encode()
         if n < 0:

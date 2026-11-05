@@ -5,8 +5,9 @@ Robustness of the two VMs (TIL 3.1 review fixes):
      against the file size and every record (constant, function, type, method,
      prelude, line table) and fails with -5; the reference VM raises
      ValueError("damaged bytecode file ..."). Fuzzed under AddressSanitizer.
-  2. int(x) of a float (also typed parameters and f"{x:d}") is exact and wraps
-     like the reference VM's wrap_int64(int(x)); nan/inf is a catchable error.
+  2. int(x) of a float (also typed parameters) is exact and wraps like the
+     reference VM's wrap_int64(int(x)); f"{x:d}" (x/o/b) prints the exact integer
+     part of any float; nan/inf is a catchable error.
   3. timeouts of 2^31 ms and more, and deadlines that wrap to 0.
   4. signed zeros: abs(-0.0), floor/ceil/round of zeros as the reference VM.
   5. float formatting: exact digits (ties to even on the binary value) in
@@ -403,8 +404,9 @@ def test_float_to_int_wraps_exactly():
     expect += [str(v) for v in (int(-9.21e18), int(-9.2e18 - 4096.0), int(9.2e18 + 4096.0), -2 ** 63)]
     expect += [str(wrap64(int(v))) for v in (2.0 ** 63, 1e19, -1e19, 1e30, 2.0 ** 63, 2.0 ** 64 + 4096.0)]
     expect += ["0", "0", "0", "4503599627370497", "-123456"]
-    expect.append(" ".join([str(wrap64(int(1e30))), signed_hex(-9223372036854774784, '%x'), "0", "-1",
-                            "%o" % 3000000000, signed_hex(wrap64(int(1e19)), '%X')]))
+    # f"{x:d}": the float's exact integer part, any size (not wrapped like int(x))
+    expect.append(" ".join([str(int(1e30)), signed_hex(-9223372036854774784, '%x'), "1" + "0" * 70, "-1",
+                            "%o" % 3000000000, "%X" % int(1e19)]))
     expect += ["E:cannot convert nan/inf to int"] * 6
     assert out.splitlines() == expect
 
@@ -428,7 +430,7 @@ main()
     w32 = lambda n: (n & 0xFFFFFFFF) - (1 << 32 if n & 0x80000000 else 0)   # noqa: E731
     assert rc == 0, err
     assert out.split() == [str(w32(v)) for v in (10 ** 10, -10 ** 10, 3 * 10 ** 9, 3 * 2 ** 32 + 1024,
-                                                 2 ** 31 - 128, 3 * 10 ** 9)]
+                                                 2 ** 31 - 128)] + ["3000000000"]      # f"{x:d}": exact
 
 
 @needs_cc
@@ -453,8 +455,7 @@ main()
     exe = build('ubsan', sanitize=True)
     rc, out, err = run_exe(exe, tbc_bytes(src))
     assert rc == 0 and "runtime error" not in err, err
-    assert out.splitlines() == ["a", "b", "c", "5", "6", str(wrap64(int(1e300))),
-                                signed_hex(wrap64(int(-1e300)), '%x')]
+    assert out.splitlines() == ["a", "b", "c", "5", "6", str(wrap64(int(1e300))), signed_hex(int(-1e300), '%x')]
     assert out == py_out(src)
 
 
@@ -1029,3 +1030,18 @@ def test_reviewer_forged_frame_base(tmp_path):
     r = subprocess.run([cvm_binary(), '--resume-portable', str(tmp_path / 'f.tilp'), str(tmp_path / 'f.tbc')],
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 2 and "the snapshot is damaged or incomplete" in r.stderr
+
+
+def test_big_float_integer_formats_and_zeros_match_the_reference_vm():
+    """The program of tests/test_types.py (native == reference VM) on the C VM too."""
+    src = ('main()\n    let a = 0.0 - 0.00001\n    let z = 0.0 - 0.0\n'
+           '    print(ceil(a), floor(z), ceil(-0.5), floor(-0.5), round(a))\n'
+           '    let big = 1e100\n    let neg = 0.0 - 9223372036854775808.0\n'
+           '    print(f"{big:d}", f"{neg:x}", f"{2.0 ** 70:b}")\n'
+           '    print(f"{123.9:d}", f"{-0.5:d}", f"{1e19:X}", f"{-1e300:o}", f"{5e-324:b}")\n')
+    out = run_both(src)
+    assert out.splitlines()[5:7] == [str(int(1e100)), "-8000000000000000"]
+    if CC:
+        for name in ('nostdio-nomath',):
+            rc, cout, err = run_exe(build('fmt-' + name, FLOAT_BUILDS[name]), tbc_bytes(src))
+            assert (rc, cout) == (0, out), err

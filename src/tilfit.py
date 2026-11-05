@@ -396,6 +396,7 @@ def _typedefs(dev: 'Device') -> Dict[str, Tuple[int, int]]:
 _NO_EFFECTS = lambda d: not d.no_effects              # noqa: E731  #ifndef TILVM_NO_EFFECTS
 _FUNCS = lambda d: d.funcs_table > 0                   # noqa: E731  #if TILVM_MAX_FUNCS > 0
 _CACHE = lambda d: d.cache_entries > 0                 # noqa: E731  #if TILVM_FIELD_CACHE > 0
+_FAR = lambda d: d.int_bits > 16 or d.float != 0 or not d.lean   # noqa: E731  #ifdef TV_FAR_TIMEOUTS
 
 # vm/tilvm.h, in the order of the header (structs before their users).  'union' members
 # overlap; TV_PACK (TILVM_PACK) is not modelled: the 8-bit ABIs have no padding anyway.
@@ -405,8 +406,8 @@ VM_STRUCTS: List[Tuple[str, str, List[tuple]]] = [
     ('tv_val', 'struct', [_f('t', 'u8'), _f('u', 'tv_val.u')]),
     ('tv_frame', 'struct', [_f('ret_pc', 'tv_off'), _f('pc', 'tv_off'), _f('func', 'u16'), _f('base', 'u16'),
                             _f('closure', 'tv_ref'), _f('extra', 'u8')]),
-    ('tv_try', 'struct', [_f('handler', 'tv_off'), _f('deadline', 'u32'), _f('n_frames', 'u16'),
-                          _f('sp', 'u16'), _f('n_handlers', 'u16')]),
+    ('tv_try', 'struct', [_f('handler', 'tv_off'), _f('deadline', 'u32'), _f('far', 'u32', when=_FAR),
+                          _f('n_frames', 'u16'), _f('sp', 'u16'), _f('n_handlers', 'u16')]),
     ('tv_handler', 'struct', [_f('abort_pc', 'tv_off'), _f('n_frames', 'u16'), _f('sp', 'u16'),
                               _f('n_try', 'u16'), _f('n', 'u16'), _f('kind', 'u8'), _f('_pad', 'u8', 3)]),
     ('tilvm_state', 'struct', [

@@ -1222,6 +1222,39 @@ static void fmt_float(sink *s, tv_float x, char kind, int prec) {
     sink_put(s, o.b, (tv_len)o.n);
 }
 
+#ifndef TILVM_LEAN
+/* f"{x:d}" (x/X/o/b) of a finite float: its exact integer part in that base, of
+ * any magnitude (the reference VM: Python's int(x)): m * 2^e is the digits of m,
+ * then e zero bits (bases 2, 8, 16), or the exact decimal digits (base 10) */
+static void fmt_float_int(sink *s, tv_float x, char kind) {
+    tv_fout o;
+    tv_fmant m = 0;
+    int e = 0, k = kind == 'b' ? 1 : kind == 'o' ? 3 : 4, nbits = 0, i, j;
+    o.s = s;
+    o.n = 0;
+    x = F_FLOOR(x < 0 ? -x : x) * (x < 0 ? -1 : 1);       /* truncated toward zero */
+    if (x <= -1) { fo_put(&o, '-'); x = -x; }
+    if (kind == 'd' || x < 1) {
+        if (o.n) sink_put(s, "-", 1);
+        fmt_float(s, x < 1 ? 0 : x, 'f', 0);              /* an integer: exact digits */
+        return;
+    }
+    e = f_decomp(x, &m);
+    while (e < 0) { m >>= 1; e++; }                       /* (x is an integer: no bits lost) */
+    for (; (m >> nbits) > 1; nbits++) {}
+    nbits += 1 + e;                                       /* the number's bits */
+    for (i = (nbits - 1) / k; i >= 0; i--) {              /* digit i covers bits ik .. ik+k-1 */
+        unsigned d = 0;
+        for (j = k - 1; j >= 0; j--) {
+            int b = i * k + j - e;                        /* the bit of m (below: a zero) */
+            d = d << 1 | (b >= 0 && b < TV_F_MANT ? (unsigned)(m >> b) & 1u : 0u);
+        }
+        fo_put(&o, (char)(d < 10 ? '0' + d : (kind == 'X' ? 'A' : 'a') + d - 10));
+    }
+    sink_put(s, o.b, (tv_len)o.n);
+}
+#endif
+
 #endif /* TILVM_FLOAT */
 
 #ifndef TILVM_LEAN
@@ -2001,7 +2034,14 @@ static void format_body(sink *s, const tv_val *v, char kind, int prec) {
         if (kind == '%') sink_put(s, "%", 1);
     } else if (kind == 'd' || kind == 'x' || kind == 'X' || kind == 'o' || kind == 'b') {
         char tmp[80], *q = tmp + sizeof tmp;
-        tv_int n = v->u.i;
+        tv_int n;
+#if TILVM_FLOAT
+        if (v->t == TV_FLOAT) {             /* the exact integer part, of any size (finite) */
+            fmt_float_int(s, v->u.f, kind);
+            return;
+        }
+#endif
+        n = v->u.i;
         tv_uint u = n < 0 ? (tv_uint)0 - (tv_uint)n : (tv_uint)n;
         unsigned base = kind == 'd' ? 10 : kind == 'o' ? 8 : kind == 'b' ? 2 : 16;
         do {
@@ -2049,10 +2089,8 @@ static int format_slot(tilvm *vm, uint16_t vslot, uint16_t spec_slot) {
         if (!ok) return 1;
     }
 #if TILVM_FLOAT
-    else if (v->t == TV_FLOAT && kind && strchr("dxXob", kind)) {   /* int(x) first */
-        if (!f_finite(v->u.f)) return fail(vm, E_NANINF);
-        set_int(v, f_to_int(v->u.f));
-    }
+    else if (v->t == TV_FLOAT && kind && strchr("dxXob", kind) && !f_finite(v->u.f))
+        return fail(vm, E_NANINF);                                  /* as int(x) */
 #endif
     s.vm = vm; s.mode = 0; s.dst = 0; s.len = 0;                  /* measure */
     if (numeric) format_body(&s, v, kind, prec);
