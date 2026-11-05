@@ -1681,6 +1681,15 @@ class Parser:
         # Save position
         pos = self.pos
         self.advance()  # name
+
+        if self.match(TokenType.LT):        # generic parameters: name<T, U>(...)
+            self.advance()
+            while self.match(TokenType.IDENT, TokenType.COMMA):
+                self.advance()
+            if not self.match(TokenType.GT):
+                self.pos = pos
+                return False
+            self.advance()
         
         if not self.match(TokenType.LPAREN):
             self.pos = pos
@@ -1710,11 +1719,28 @@ class Parser:
     def parse_fn(self) -> FuncDef:
         self.consume(TokenType.FN)
         name = self.consume(TokenType.IDENT).value
+        self.parse_type_params()
         return self.parse_func_body(name)
     
     def parse_func_def_simple(self) -> FuncDef:
         name = self.consume(TokenType.IDENT).value
+        self.parse_type_params()
         return self.parse_func_body(name)
+
+    def parse_type_params(self):
+        """`name<T, U>(...)`: same as #[generic: T, U] (TIL 3.1)."""
+        if not self.match(TokenType.LT):
+            return
+        self.advance()
+        names = []
+        while not self.match(TokenType.GT):
+            names.append(self.consume(TokenType.IDENT, "Expected a type parameter name").value)
+            if not self.match(TokenType.COMMA):
+                break
+            self.advance()
+        self.consume(TokenType.GT, "Expected '>' after the type parameters")
+        if names:
+            self.pending_attributes.append("generic:" + ",".join(names))
     
     def parse_func_body(self, name: str, allow_signature: bool = False) -> FuncDef:
         name_tok = self.tokens[self.pos - 1] if self.pos > 0 else self.current()
@@ -3802,6 +3828,34 @@ class NativeUnsupported(CompileError):
     """The native (C) backend cannot compile this program, but the TIL VM can:
     `til run` falls back to the VM, `til build` reports it."""
     pass
+
+
+# ── gradual type inference (TIL 3.1, src/tiltypes.py; optional) ─────────────────
+def types_module():
+    """The type inference / typed native backend module, or None when this
+    installation does not have it (then: no E-TYPE checks, classic C backend)."""
+    if os.environ.get('TIL_NO_TYPES'):
+        return None
+    try:
+        return feature_module('tiltypes')
+    except ImportError as e:
+        if getattr(e, 'name', None) != 'tiltypes':
+            raise
+        return None
+
+
+def type_errors(program: 'Program', source: str, filename: str) -> List[str]:
+    """E-TYPE errors (definite type errors only; empty when tiltypes is missing)."""
+    tt = types_module()
+    if tt is None:
+        return []
+    try:
+        return tt.check_program(program, source, filename)
+    except Exception as e:          # an inference bug must never reject a program
+        if os.environ.get('TIL_DEBUG_TYPES'):
+            raise
+        print(f"[TIL] type inference skipped (internal error: {type(e).__name__}: {e})", file=sys.stderr)
+        return []
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              CODE GENERATOR
@@ -10928,6 +10982,10 @@ def compile_to_bytecode(source: str, filename: str = "<stdin>", verify: bool = T
         if errors:
             raise CompileError("\n\n".join(errors))
     module = BytecodeCompiler(source, filename, fuse=fuse).compile_program(program)
+    if verify:
+        errors = type_errors(program, source, filename)
+        if errors:
+            raise CompileError("\n\n".join(errors))
     module.link()
     return module
 
@@ -11443,6 +11501,8 @@ class TILCompiler:
         self.keep_c = False
         self.check_types = True
         self.verify = True      # effects / capabilities / constant contracts (fatal errors)
+        self.typed = True       # TIL 3.1: type inference + typed C backend (src/tiltypes.py)
+        self.last_c_error = ""
 
     def compile(self, source: str, filename: str = "<stdin>") -> str:
         """Compile TIL source to C code"""
@@ -11466,6 +11526,31 @@ class TILCompiler:
             if errors:
                 raise CompileError("\n\n".join(errors))
 
+        tt = types_module() if self.typed else None
+        self.typed_c = tt is not None
+        if tt is not None:
+            if self.verbose:
+                print(f"[TIL] Inferring types...")
+            try:
+                inference = tt.infer_program(ast, source, filename)
+            except Exception as e:
+                if os.environ.get('TIL_DEBUG_TYPES'):
+                    raise
+                raise NativeUnsupported(f"native backend: type inference failed "
+                                        f"({type(e).__name__}: {e})")
+            if self.verify and inference.errors:
+                raise CompileError("\n\n".join(inference.errors))
+            if self.verbose:
+                print(f"[TIL] Generating C code (typed backend)...")
+            try:
+                return tt.generate_c(ast, source, filename, inference)
+            except NativeUnsupported:
+                raise
+            except Exception as e:      # a bug in the typed backend: the VM still runs the program
+                if os.environ.get('TIL_DEBUG_TYPES'):
+                    raise
+                raise NativeUnsupported(f"native backend: internal error ({type(e).__name__}: {e})")
+
         if self.check_types:
             if self.verbose:
                 print(f"[TIL] Type checking...")
@@ -11487,15 +11572,16 @@ class TILCompiler:
     def compile_to_executable(self, source: str, output: str, filename: str = "<stdin>",
                               quiet: bool = False) -> bool:
         """Compile TIL source to native executable"""
-
+        
         try:
             c_code = self.compile(source, filename)
-        except NativeUnsupported as e:          # e.g. effect handlers: VM only
+        except NativeUnsupported as e:
             self.last_c_error = str(e)
             if not quiet:
-                print(f"error: {e}", file=sys.stderr)
+                print(localize(f"{e}"), file=sys.stderr)
+                print(localize("hint: run it on the TIL VM: `til run --vm` or `til build --target vm`"), file=sys.stderr)
             return False
-
+        
         # Find C compiler
         cc = self.find_c_compiler()
         if not cc:
@@ -11511,7 +11597,11 @@ class TILCompiler:
         try:
             # Compile C to executable
             opt_flags = ["-O0", "-O1", "-O2", "-O3"][min(self.optimize, 3)]
-            cmd = [cc, c_file, "-o", output, opt_flags, "-lm"]
+            # -fwrapv: TIL int arithmetic wraps around (two's complement), like the VMs
+            cmd = [cc, c_file, "-o", output, opt_flags, "-fwrapv", "-lm"]
+            if getattr(self, 'typed_c', False) and os.path.basename(cc) in ('gcc', 'clang'):
+                # typed backend: mixing up ints and pointers is a bug -> fall back to the VM
+                cmd[4:4] = ["-Werror=int-conversion", "-Werror=incompatible-pointer-types"]
             
             if self.verbose:
                 print(f"[TIL] Compiling: {' '.join(cmd)}")
@@ -11586,8 +11676,9 @@ Options:
   -O0, -O1, -O2, -O3      Optimization level for native builds (default -O2)
   --keep-c                Keep generated C file
   --no-check              Disable type warnings
-  --no-verify             Disable effect/capability/contract verification
-  -v, --verbose           Verbose output
+  --no-verify             Disable effect/capability/contract/type verification
+  --no-types              No type inference: classic C backend, no E-TYPE checks
+  -v, --verbose           Verbose output (shows why a program runs on the VM)
   --                      Everything after it is passed to the program (args())
 
 Program arguments:        til run prog.til a b c   ->  args() == ["a", "b", "c"]
@@ -12414,6 +12505,9 @@ def main():
             compiler.check_types = False
         elif arg == '--no-verify':
             compiler.verify = False
+        elif arg == '--no-types':
+            compiler.typed = False          # no type inference: classic C backend, no E-TYPE
+            os.environ['TIL_NO_TYPES'] = '1'
         elif arg in ('-v', '--verbose'):
             compiler.verbose = True
         elif arg in ('-O0', '-O1', '-O2', '-O3'):
@@ -12462,6 +12556,11 @@ def main():
                     print(localize(err), file=sys.stderr)
                 return 1
             BytecodeCompiler(source, input_file).compile_program(ast)   # names, arity, immutability
+            errors = type_errors(ast, source, input_file) if compiler.typed else []
+            if errors:
+                for err in errors:
+                    print(err, file=sys.stderr)
+                return 1
             proof_errors = run_proofs(ast, source, input_file, bool(opts.get('prove')))
             if proof_errors:
                 for err in proof_errors:

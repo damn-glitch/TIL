@@ -1,0 +1,1209 @@
+{
+ "summary": {
+  "programs": 233,
+  "compared": 231,
+  "native": 205,
+  "native_ok": 203,
+  "native_mismatch": 2,
+  "fallback": 26,
+  "vm_limit": 2,
+  "vm_error": 0
+ },
+ "programs": [
+  {
+   "id": "a52ea60fb515",
+   "label": "tests/test_compiler.py:363",
+   "status": "native-ok"
+  },
+  {
+   "id": "d64510d6e515",
+   "label": "tests/test_compiler.py:379",
+   "status": "native-ok"
+  },
+  {
+   "id": "1256be03c8bd",
+   "label": "tests/test_compiler.py:402",
+   "status": "native-ok"
+  },
+  {
+   "id": "59a47fa28910",
+   "label": "tests/test_compiler.py:776",
+   "status": "native-ok"
+  },
+  {
+   "id": "142865faaa22",
+   "label": "tests/test_compiler.py:813",
+   "status": "native-ok"
+  },
+  {
+   "id": "6b0b50313880",
+   "label": "tests/test_compiler.py:824",
+   "status": "native-ok"
+  },
+  {
+   "id": "71b624e69811",
+   "label": "tests/test_compiler.py:854",
+   "status": "native-ok"
+  },
+  {
+   "id": "8500a6939bed",
+   "label": "tests/test_compiler.py:865",
+   "status": "native-ok"
+  },
+  {
+   "id": "99fbeaeb5005",
+   "label": "tests/test_compiler.py:877",
+   "status": "native-ok"
+  },
+  {
+   "id": "8998462be855",
+   "label": "tests/test_compiler.py:963",
+   "status": "native-ok"
+  },
+  {
+   "id": "05969e112125",
+   "label": "tests/test_compiler.py:1144",
+   "status": "native-ok"
+  },
+  {
+   "id": "4596f4f35eaa",
+   "label": "tests/test_compiler.py:1149",
+   "status": "native-ok"
+  },
+  {
+   "id": "4b162a97ffe6",
+   "label": "tests/test_compiler.py:1154",
+   "status": "native-ok"
+  },
+  {
+   "id": "54345300916f",
+   "label": "tests/test_compiler.py:1202",
+   "status": "native-ok"
+  },
+  {
+   "id": "836da71e11c0",
+   "label": "tests/test_compiler.py:1223",
+   "status": "native-ok"
+  },
+  {
+   "id": "5d9fba994f2d",
+   "label": "tests/test_compiler.py:1237",
+   "status": "native-ok"
+  },
+  {
+   "id": "2822ba214e5f",
+   "label": "tests/test_compiler.py:1248",
+   "status": "native-ok"
+  },
+  {
+   "id": "ab19b23e0f96",
+   "label": "tests/test_compiler.py:1263",
+   "status": "native-ok"
+  },
+  {
+   "id": "c05b1cb641d4",
+   "label": "tests/test_compiler.py:1280",
+   "status": "native-ok"
+  },
+  {
+   "id": "64f8ab46c706",
+   "label": "tests/test_compiler.py:1318",
+   "status": "native-ok"
+  },
+  {
+   "id": "515f72c2f15e",
+   "label": "tests/test_compiler.py:1335",
+   "status": "native-ok"
+  },
+  {
+   "id": "5d8c92c8f222",
+   "label": "tests/test_compiler.py:1357",
+   "status": "native-ok"
+  },
+  {
+   "id": "8229d49ec4b5",
+   "label": "tests/test_compiler.py:1366",
+   "status": "native-ok"
+  },
+  {
+   "id": "6edad9437f06",
+   "label": "tests/test_compiler.py:1376",
+   "status": "native-ok"
+  },
+  {
+   "id": "85402e959499",
+   "label": "tests/test_compiler.py:1385",
+   "status": "native-ok"
+  },
+  {
+   "id": "2db6aae4ebeb",
+   "label": "tests/test_compiler.py:1393",
+   "status": "native-ok"
+  },
+  {
+   "id": "ae1fb49ed565",
+   "label": "tests/test_compiler.py:1403",
+   "status": "native-ok"
+  },
+  {
+   "id": "104c18cee2c3",
+   "label": "tests/test_compiler.py:1419",
+   "status": "native-ok"
+  },
+  {
+   "id": "9e3e7243c332",
+   "label": "tests/test_compiler.py:1433",
+   "status": "native-ok"
+  },
+  {
+   "id": "01138690e6d1",
+   "label": "tests/test_compiler.py:1446",
+   "status": "native-ok"
+  },
+  {
+   "id": "7f1208d3c40e",
+   "label": "tests/test_compiler.py:1460",
+   "status": "native-ok"
+  },
+  {
+   "id": "1d44cc533a50",
+   "label": "tests/test_compiler.py:1472",
+   "status": "native-ok"
+  },
+  {
+   "id": "32c05a0a9401",
+   "label": "tests/test_compiler.py:1486",
+   "status": "native-ok"
+  },
+  {
+   "id": "f78c5e4f2fc0",
+   "label": "tests/test_compiler.py:1498",
+   "status": "native-ok"
+  },
+  {
+   "id": "fba9cc5e420d",
+   "label": "tests/test_compiler.py:1510",
+   "status": "native-ok"
+  },
+  {
+   "id": "96284b02fd65",
+   "label": "tests/test_compiler.py:1520",
+   "status": "native-ok"
+  },
+  {
+   "id": "8d80e67dd1a0",
+   "label": "tests/test_compiler.py:1531",
+   "status": "native-ok"
+  },
+  {
+   "id": "8bcbffa926f4",
+   "label": "tests/test_compiler.py:1542",
+   "status": "native-ok"
+  },
+  {
+   "id": "69825849f895",
+   "label": "tests/test_compiler.py:1561",
+   "status": "native-ok"
+  },
+  {
+   "id": "15c7a51eb66a",
+   "label": "tests/test_compiler.py:1573",
+   "status": "native-ok"
+  },
+  {
+   "id": "7e7f5581d843",
+   "label": "tests/test_compiler.py:1585",
+   "status": "native-ok"
+  },
+  {
+   "id": "3d9c109266ad",
+   "label": "tests/test_compiler.py:1597",
+   "status": "native-ok"
+  },
+  {
+   "id": "c991ef9a5ea2",
+   "label": "tests/test_compiler.py:1609",
+   "status": "native-ok"
+  },
+  {
+   "id": "5545f66dac43",
+   "label": "tests/test_compiler.py:1619",
+   "status": "native-ok"
+  },
+  {
+   "id": "4658da7ad739",
+   "label": "tests/test_compiler.py:1636",
+   "status": "native-ok"
+  },
+  {
+   "id": "d675654961e9",
+   "label": "tests/test_compiler.py:1647",
+   "status": "native-ok"
+  },
+  {
+   "id": "80c1cf0bf500",
+   "label": "tests/test_compiler.py:1660",
+   "status": "native-ok"
+  },
+  {
+   "id": "3cc9921a1be8",
+   "label": "tests/test_compiler.py:1674",
+   "status": "native-ok"
+  },
+  {
+   "id": "c81c7b5a0c70",
+   "label": "tests/test_compiler.py:1685",
+   "status": "native-ok"
+  },
+  {
+   "id": "e2031e11f574",
+   "label": "tests/test_compiler.py:1697",
+   "status": "native-ok"
+  },
+  {
+   "id": "f84c4998266a",
+   "label": "tests/test_compiler.py:1709",
+   "status": "native-ok"
+  },
+  {
+   "id": "2814028f8a5b",
+   "label": "tests/test_compiler.py:1747",
+   "status": "native-ok"
+  },
+  {
+   "id": "fd850a735ab9",
+   "label": "tests/test_compiler.py:1760",
+   "status": "native-ok"
+  },
+  {
+   "id": "11cc1b9aabc2",
+   "label": "tests/test_compiler.py:1773",
+   "status": "native-ok"
+  },
+  {
+   "id": "e15d4e5a8c0c",
+   "label": "tests/test_compiler.py:1789",
+   "status": "native-ok"
+  },
+  {
+   "id": "953186a5f1d1",
+   "label": "tests/test_compiler.py:1805",
+   "status": "native-ok"
+  },
+  {
+   "id": "c06359a85e61",
+   "label": "tests/test_compiler.py:1819",
+   "status": "native-ok"
+  },
+  {
+   "id": "292ddddc0682",
+   "label": "tests/test_compiler.py:1831",
+   "status": "native-ok"
+  },
+  {
+   "id": "6e267af26eae",
+   "label": "tests/test_compiler.py:1853",
+   "status": "native-ok"
+  },
+  {
+   "id": "23d525bb8dae",
+   "label": "tests/test_compiler.py:1864",
+   "status": "native-ok"
+  },
+  {
+   "id": "42bc7f5d6006",
+   "label": "tests/test_compiler.py:1890",
+   "status": "native-ok"
+  },
+  {
+   "id": "1a2a36313e76",
+   "label": "tests/test_compiler.py:1901",
+   "status": "native-ok"
+  },
+  {
+   "id": "df7bfb2b1496",
+   "label": "tests/test_compiler.py:1916",
+   "status": "native-ok"
+  },
+  {
+   "id": "54c048703f09",
+   "label": "tests/test_compiler.py:1925",
+   "status": "native-ok"
+  },
+  {
+   "id": "276d65d162f6",
+   "label": "tests/test_compiler.py:1936",
+   "status": "native-ok"
+  },
+  {
+   "id": "c2c11a8b4e58",
+   "label": "tests/test_compiler.py:1952",
+   "status": "native-ok"
+  },
+  {
+   "id": "248f50cae90b",
+   "label": "tests/test_compiler.py:1961",
+   "status": "native-ok"
+  },
+  {
+   "id": "956e4d0cbf49",
+   "label": "tests/test_compiler.py:1974",
+   "status": "native-ok"
+  },
+  {
+   "id": "5636725f11e1",
+   "label": "tests/test_compiler.py:1983",
+   "status": "native-ok"
+  },
+  {
+   "id": "bed53a26427e",
+   "label": "tests/test_compiler.py:1993",
+   "status": "native-ok"
+  },
+  {
+   "id": "b7cb02e29ad3",
+   "label": "tests/test_compiler.py:2002",
+   "status": "native-ok"
+  },
+  {
+   "id": "a8de5f4fb1ff",
+   "label": "tests/test_compiler.py:2026",
+   "status": "native-ok"
+  },
+  {
+   "id": "6b64d41a168e",
+   "label": "tests/test_compiler.py:2042",
+   "status": "native-ok"
+  },
+  {
+   "id": "739a97400454",
+   "label": "tests/test_compiler.py:2051",
+   "status": "native-ok"
+  },
+  {
+   "id": "99f5eae0c009",
+   "label": "tests/test_compiler.py:2064",
+   "status": "native-ok"
+  },
+  {
+   "id": "80c068f7e945",
+   "label": "tests/test_compiler.py:2075",
+   "status": "native-ok"
+  },
+  {
+   "id": "3128bf57d6ee",
+   "label": "tests/test_compiler.py:2086",
+   "status": "native-ok"
+  },
+  {
+   "id": "d80a34e422d9",
+   "label": "tests/test_compiler.py:2106",
+   "status": "native-ok"
+  },
+  {
+   "id": "2a428b44d0df",
+   "label": "tests/test_compiler.py:2118",
+   "status": "native-ok"
+  },
+  {
+   "id": "dc5ab640440b",
+   "label": "tests/test_compiler.py:2134",
+   "status": "native-ok"
+  },
+  {
+   "id": "cfcba112c2d8",
+   "label": "tests/test_compiler.py:2147",
+   "status": "native-ok"
+  },
+  {
+   "id": "693752874f68",
+   "label": "tests/test_compiler.py:2163",
+   "status": "native-ok"
+  },
+  {
+   "id": "1288961a34fa",
+   "label": "tests/test_compiler.py:2172",
+   "status": "native-ok"
+  },
+  {
+   "id": "b065086ec50a",
+   "label": "tests/test_compiler.py:2185",
+   "status": "native-ok"
+  },
+  {
+   "id": "08f06c622d08",
+   "label": "tests/test_compiler.py:2198",
+   "status": "native-ok"
+  },
+  {
+   "id": "fde37844483a",
+   "label": "tests/test_compiler.py:2213",
+   "status": "native-ok"
+  },
+  {
+   "id": "35809b017c7b",
+   "label": "tests/test_compiler.py:2225",
+   "status": "native-ok"
+  },
+  {
+   "id": "ab56ea4cffbf",
+   "label": "tests/test_compiler.py:2237",
+   "status": "native-ok"
+  },
+  {
+   "id": "ee0ba63959b0",
+   "label": "tests/test_compiler.py:2251",
+   "status": "native-ok"
+  },
+  {
+   "id": "ab98b2d72e98",
+   "label": "tests/test_compiler.py:151",
+   "status": "native-ok"
+  },
+  {
+   "id": "93b79c2fb765",
+   "label": "tests/test_compiler.py:179",
+   "status": "native-ok"
+  },
+  {
+   "id": "4082aa224cd5",
+   "label": "tests/test_compiler.py:287",
+   "status": "native-ok"
+  },
+  {
+   "id": "088230513b18",
+   "label": "tests/test_compiler.py:305",
+   "status": "native-ok"
+  },
+  {
+   "id": "7708384d4e22",
+   "label": "tests/test_compiler.py:309",
+   "status": "native-ok"
+  },
+  {
+   "id": "423efa0c208c",
+   "label": "tests/test_compiler.py:313",
+   "status": "native-ok"
+  },
+  {
+   "id": "0b619933a0b8",
+   "label": "tests/test_compiler.py:317",
+   "status": "native-ok"
+  },
+  {
+   "id": "8cab69ff0361",
+   "label": "tests/test_compiler.py:321",
+   "status": "native-ok"
+  },
+  {
+   "id": "782e7d6bd140",
+   "label": "tests/test_compiler.py:325",
+   "status": "native-ok"
+  },
+  {
+   "id": "5f00e401a723",
+   "label": "tests/test_compiler.py:335",
+   "status": "native-ok"
+  },
+  {
+   "id": "cc1b061b8362",
+   "label": "tests/test_compiler.py:339",
+   "status": "native-ok"
+  },
+  {
+   "id": "1410584623eb",
+   "label": "tests/test_compiler.py:343",
+   "status": "native-ok"
+  },
+  {
+   "id": "68514533ff67",
+   "label": "tests/test_compiler.py:347",
+   "status": "native-ok"
+  },
+  {
+   "id": "98c9c59da3be",
+   "label": "tests/test_compiler.py:351",
+   "status": "native-ok"
+  },
+  {
+   "id": "27d002cf61d0",
+   "label": "tests/test_compiler.py:355",
+   "status": "native-ok"
+  },
+  {
+   "id": "123ebbb92c9f",
+   "label": "tests/test_compiler.py:359",
+   "status": "native-ok"
+  },
+  {
+   "id": "94356091b11b",
+   "label": "tests/test_compiler.py:390",
+   "status": "native-ok"
+  },
+  {
+   "id": "9e80c0460b1f",
+   "label": "tests/test_compiler.py:394",
+   "status": "native-ok"
+  },
+  {
+   "id": "b97118ab0e06",
+   "label": "tests/test_compiler.py:398",
+   "status": "native-ok"
+  },
+  {
+   "id": "cd551dbb7c40",
+   "label": "tests/test_compiler.py:648",
+   "status": "native-ok"
+  },
+  {
+   "id": "c498342a57cd",
+   "label": "tests/test_compiler.py:665",
+   "status": "native-ok"
+  },
+  {
+   "id": "6b4f160dd7e4",
+   "label": "tests/test_compiler.py:698",
+   "status": "native-ok"
+  },
+  {
+   "id": "8209c4de2720",
+   "label": "tests/test_compiler.py:702",
+   "status": "native-ok"
+  },
+  {
+   "id": "48b0616d6656",
+   "label": "tests/test_compiler.py:706",
+   "status": "native-ok"
+  },
+  {
+   "id": "b880d65b58c1",
+   "label": "tests/test_compiler.py:710",
+   "status": "native-ok"
+  },
+  {
+   "id": "2af2906d1aee",
+   "label": "tests/test_compiler.py:720",
+   "status": "native-ok"
+  },
+  {
+   "id": "00a7688d12f9",
+   "label": "tests/test_compiler.py:737",
+   "status": "native-ok"
+  },
+  {
+   "id": "31c5356d206c",
+   "label": "tests/test_compiler.py:748",
+   "status": "native-ok"
+  },
+  {
+   "id": "b69dac0f6e79",
+   "label": "tests/test_compiler.py:752",
+   "status": "native-ok"
+  },
+  {
+   "id": "1f8d913d799f",
+   "label": "tests/test_compiler.py:756",
+   "status": "native-ok"
+  },
+  {
+   "id": "65d1d5b5baa2",
+   "label": "tests/test_compiler.py:760",
+   "status": "native-ok"
+  },
+  {
+   "id": "e3e2f3db4e12",
+   "label": "tests/test_compiler.py:764",
+   "status": "native-ok"
+  },
+  {
+   "id": "bc4ff1b048ee",
+   "label": "tests/test_compiler.py:768",
+   "status": "native-ok"
+  },
+  {
+   "id": "3aee38d6af92",
+   "label": "tests/test_compiler.py:772",
+   "status": "native-ok"
+  },
+  {
+   "id": "61afeec5a1e0",
+   "label": "tests/test_compiler.py:781",
+   "status": "native-ok"
+  },
+  {
+   "id": "20bed001453c",
+   "label": "tests/test_compiler.py:785",
+   "status": "native-ok"
+  },
+  {
+   "id": "dc31b417a479",
+   "label": "tests/test_compiler.py:789",
+   "status": "native-ok"
+  },
+  {
+   "id": "4c5f812489b1",
+   "label": "tests/test_compiler.py:793",
+   "status": "native-ok"
+  },
+  {
+   "id": "5435a6b1dee1",
+   "label": "tests/test_compiler.py:797",
+   "status": "native-ok"
+  },
+  {
+   "id": "f82eb93dc7ec",
+   "label": "tests/test_compiler.py:801",
+   "status": "native-ok"
+  },
+  {
+   "id": "8053dc07e277",
+   "label": "tests/test_compiler.py:805",
+   "status": "native-ok"
+  },
+  {
+   "id": "b2dc64362eaf",
+   "label": "tests/test_compiler.py:809",
+   "status": "native-ok"
+  },
+  {
+   "id": "d663e4ffb935",
+   "label": "tests/test_compiler.py:913",
+   "status": "native-ok"
+  },
+  {
+   "id": "4daf0abb068d",
+   "label": "tests/test_compiler.py:930",
+   "status": "native-ok"
+  },
+  {
+   "id": "b9860c53977c",
+   "label": "tests/test_compiler.py:936",
+   "status": "native-ok"
+  },
+  {
+   "id": "20a611e4cb80",
+   "label": "tests/test_compiler.py:969",
+   "status": "native-ok"
+  },
+  {
+   "id": "260dc97175e3",
+   "label": "tests/test_compiler.py:975",
+   "status": "native-ok"
+  },
+  {
+   "id": "0fb89c916dc2",
+   "label": "tests/test_compiler.py:986",
+   "status": "native-ok"
+  },
+  {
+   "id": "99c5523c9864",
+   "label": "tests/test_compiler.py:991",
+   "status": "native-ok"
+  },
+  {
+   "id": "936b0959754c",
+   "label": "tests/test_compiler.py:1041",
+   "status": "fallback",
+   "reason": "cc: incompatible types when initializing type ‘int64_t’ {aka ‘long int’} using type ‘TIL_Option_int’"
+  },
+  {
+   "id": "3a73ae5a216a",
+   "label": "tests/test_compiler.py:1045",
+   "status": "native-ok"
+  },
+  {
+   "id": "608286371a58",
+   "label": "tests/test_compiler.py:1056",
+   "status": "native-ok"
+  },
+  {
+   "id": "9f51f8a61d11",
+   "label": "tests/test_compiler.py:1062",
+   "status": "native-ok"
+  },
+  {
+   "id": "70799d68a978",
+   "label": "tests/test_compiler.py:1066",
+   "status": "native-ok"
+  },
+  {
+   "id": "888baa3a4485",
+   "label": "tests/test_compiler.py:1070",
+   "status": "native-ok"
+  },
+  {
+   "id": "a92f4e5449de",
+   "label": "tests/test_compiler.py:1074",
+   "status": "native-ok"
+  },
+  {
+   "id": "b99d379a8228",
+   "label": "tests/test_compiler.py:1105",
+   "status": "native-ok"
+  },
+  {
+   "id": "a9beadb95afb",
+   "label": "tests/test_compiler.py:1118",
+   "status": "native-ok"
+  },
+  {
+   "id": "223672bc8d29",
+   "label": "tests/test_compiler.py:1274",
+   "status": "native-ok"
+  },
+  {
+   "id": "0b1b567d6437",
+   "label": "tests/test_compiler.py:1305",
+   "status": "native-ok"
+  },
+  {
+   "id": "ba5b57f1419f",
+   "label": "tests/test_compiler.py:1312",
+   "status": "native-ok"
+  },
+  {
+   "id": "df16248329ad",
+   "label": "tests/test_v3.py:174",
+   "status": "native-ok"
+  },
+  {
+   "id": "9faf0ef410e9",
+   "label": "tests/test_v3.py:179",
+   "status": "native-ok"
+  },
+  {
+   "id": "bf7330d2edb5",
+   "label": "tests/test_v3.py:210",
+   "status": "native-ok"
+  },
+  {
+   "id": "1eb1dcb71f0a",
+   "label": "tests/test_v3.py:220",
+   "status": "native-ok"
+  },
+  {
+   "id": "be4f5854e841",
+   "label": "tests/test_v3.py:231",
+   "status": "fallback",
+   "reason": "cc: request for member ‘push’ in something not a structure or union"
+  },
+  {
+   "id": "dfdb63cb57e7",
+   "label": "tests/test_v3.py:238",
+   "status": "native-ok"
+  },
+  {
+   "id": "193b57c00622",
+   "label": "tests/test_v3.py:260",
+   "status": "native-ok"
+  },
+  {
+   "id": "5f7872494172",
+   "label": "tests/test_v3.py:267",
+   "status": "native-ok"
+  },
+  {
+   "id": "cb98ec64f028",
+   "label": "tests/test_v3.py:273",
+   "status": "native-ok"
+  },
+  {
+   "id": "395319f6a475",
+   "label": "tests/test_v3.py:323",
+   "status": "vm-limit",
+   "reason": "VM limit: step budget (5000000), output cap or a fatal error such as the recursion limit"
+  },
+  {
+   "id": "ca438b890dc6",
+   "label": "tests/test_v3.py:328",
+   "status": "native-mismatch",
+   "reason": "stdout b'93830587191560\\n' vs VM b'contract violation: fact requires n >= 0\\n'"
+  },
+  {
+   "id": "10f58a6c61c4",
+   "label": "tests/test_v3.py:359",
+   "status": "fallback",
+   "reason": "cc: void value not ignored as it ought to be"
+  },
+  {
+   "id": "920545338265",
+   "label": "tests/test_v3.py:366",
+   "status": "fallback",
+   "reason": "cc: request for member ‘map’ in something not a structure or union"
+  },
+  {
+   "id": "acbc1ac4925d",
+   "label": "tests/test_v3.py:373",
+   "status": "fallback",
+   "reason": "cc: incompatible types when initializing type ‘long int’ using type ‘Sq’"
+  },
+  {
+   "id": "7e3c8045947d",
+   "label": "tests/test_v3.py:383",
+   "status": "fallback",
+   "reason": "cc: ‘n’ undeclared (first use in this function)"
+  },
+  {
+   "id": "5b811ebbd30c",
+   "label": "tests/test_v3.py:391",
+   "status": "fallback",
+   "reason": "cc: request for member ‘to_int’ in something not a structure or union"
+  },
+  {
+   "id": "50ade419a76c",
+   "label": "tests/test_v3.py:401",
+   "status": "native-ok"
+  },
+  {
+   "id": "35682d5378b0",
+   "label": "tests/test_v3.py:413",
+   "status": "native-ok"
+  },
+  {
+   "id": "3b2544c05f9e",
+   "label": "tests/test_v3.py:422",
+   "status": "native-mismatch",
+   "reason": "stdout b'94783913046274\\n' vs VM b\"intent 'parse config' failed: bad token\\n\""
+  },
+  {
+   "id": "6b2915c3b2b9",
+   "label": "tests/test_v3.py:427",
+   "status": "fallback",
+   "reason": "cc: expected expression before ‘{’ token"
+  },
+  {
+   "id": "7f98e73d2b70",
+   "label": "tests/test_v3.py:439",
+   "status": "fallback",
+   "reason": "cc: request for member ‘delete’ in something not a structure or union"
+  },
+  {
+   "id": "acd1239f3c6c",
+   "label": "tests/test_v3.py:445",
+   "status": "fallback",
+   "reason": "cc: request for member ‘split’ in something not a structure or union"
+  },
+  {
+   "id": "341d8601b6fa",
+   "label": "tests/test_v3.py:453",
+   "status": "native-ok"
+  },
+  {
+   "id": "bd55b2098946",
+   "label": "tests/test_v3.py:457",
+   "status": "fallback",
+   "reason": "cc: expected expression before ‘{’ token"
+  },
+  {
+   "id": "9e47ee8d4a67",
+   "label": "tests/test_v3.py:533",
+   "status": "fallback",
+   "reason": "cc: request for member ‘push’ in something not a structure or union"
+  },
+  {
+   "id": "e06f578c46f4",
+   "label": "tests/test_v3.py:544",
+   "status": "fallback",
+   "reason": "cc: request for member ‘len’ in something not a structure or union"
+  },
+  {
+   "id": "8516142cffbe",
+   "label": "tests/test_v3.py:560",
+   "status": "fallback",
+   "reason": "cc: request for member ‘map’ in something not a structure or union"
+  },
+  {
+   "id": "ef5a060eed2b",
+   "label": "tests/test_v3.py:137",
+   "status": "native-ok"
+  },
+  {
+   "id": "d78a58e7d721",
+   "label": "tests/test_v3.py:142",
+   "status": "native-ok"
+  },
+  {
+   "id": "df0628fd5a42",
+   "label": "tests/test_v3.py:148",
+   "status": "native-ok"
+  },
+  {
+   "id": "956045005cc9",
+   "label": "tests/test_v3.py:154",
+   "status": "native-ok"
+  },
+  {
+   "id": "8a2c07f466cd",
+   "label": "tests/test_v3.py:160",
+   "status": "native-ok"
+  },
+  {
+   "id": "6b51aadcf81c",
+   "label": "tests/test_v3.py:167",
+   "status": "native-ok"
+  },
+  {
+   "id": "6f92306ce98a",
+   "label": "tests/test_v3.py:200",
+   "status": "native-ok"
+  },
+  {
+   "id": "f56b139a2ed1",
+   "label": "tests/test_v3.py:409",
+   "status": "native-ok"
+  },
+  {
+   "id": "87167a120a38",
+   "label": "tests/test_v3.py:420",
+   "status": "native-ok"
+  },
+  {
+   "id": "005a88d94732",
+   "label": "tests/test_v3.py:468",
+   "status": "vm-limit",
+   "reason": "VM limit: step budget (5000000), output cap or a fatal error such as the recursion limit"
+  },
+  {
+   "id": "635230b99eb6",
+   "label": "tests/test_v3.py:564",
+   "status": "native-ok"
+  },
+  {
+   "id": "cf9db0f12293",
+   "label": "tests/test_v3.py:568",
+   "status": "native-ok"
+  },
+  {
+   "id": "ca42920fdbca",
+   "label": "tests/test_v3.py:582",
+   "status": "fallback",
+   "reason": "cc: request for member ‘map’ in something not a structure or union"
+  },
+  {
+   "id": "8b73cf64c9ac",
+   "label": "tests/test_v3.py:594",
+   "status": "fallback",
+   "reason": "cc: expected expression before ‘{’ token"
+  },
+  {
+   "id": "8e5e4570e79e",
+   "label": "tests/test_v3.py:171",
+   "status": "native-ok"
+  },
+  {
+   "id": "496951e415fa",
+   "label": "tests/test_v3.py:204",
+   "status": "native-ok"
+  },
+  {
+   "id": "619e12156a5d",
+   "label": "tests/test_v3.py:228",
+   "status": "native-ok"
+  },
+  {
+   "id": "deaa7a30d1c2",
+   "label": "tests/test_v3.py:280",
+   "status": "native-ok"
+  },
+  {
+   "id": "a793011ba0a8",
+   "label": "tests/test_v3.py:309",
+   "status": "native-ok"
+  },
+  {
+   "id": "ce9137781be6",
+   "label": "tests/test_v3.py:337",
+   "status": "native-ok"
+  },
+  {
+   "id": "722b4bb4c4c9",
+   "label": "tests/test_v3.py:478",
+   "status": "native-ok"
+  },
+  {
+   "id": "0b1b447a7b04",
+   "label": "tests/test_v3.py:193",
+   "status": "native-ok"
+  },
+  {
+   "id": "6f8361486228",
+   "label": "tests/test_v3.py:315",
+   "status": "native-ok"
+  },
+  {
+   "id": "1c94a19ea654",
+   "label": "tests/test_v3.py:325",
+   "status": "native-ok"
+  },
+  {
+   "id": "f3fc16f3d047",
+   "label": "tests/test_foundation.py:85",
+   "status": "fallback",
+   "reason": "cc: subscripted value is neither array nor pointer nor vector"
+  },
+  {
+   "id": "3148f4ea8ba4",
+   "label": "tests/test_foundation.py:264",
+   "status": "fallback",
+   "reason": "cc: ‘x’ undeclared (first use in this function)"
+  },
+  {
+   "id": "c5104d1cc2d5",
+   "label": "tests/test_foundation.py:106",
+   "status": "fallback",
+   "reason": "cc: subscripted value is neither array nor pointer nor vector"
+  },
+  {
+   "id": "9c240da6c736",
+   "label": "tests/test_foundation.py:121",
+   "status": "fallback",
+   "reason": "cc: subscripted value is neither array nor pointer nor vector"
+  },
+  {
+   "id": "4c1ff137186b",
+   "label": "tests/test_foundation.py:158",
+   "status": "fallback",
+   "reason": "cc: expected expression before ‘{’ token"
+  },
+  {
+   "id": "003c0dbda5f5",
+   "label": "tests/test_foundation.py:180",
+   "status": "fallback",
+   "reason": "cc: ‘a_len’ undeclared (first use in this function)"
+  },
+  {
+   "id": "489333b3d997",
+   "label": "tests/test_foundation.py:189",
+   "status": "fallback",
+   "reason": "cc: subscripted value is neither array nor pointer nor vector"
+  },
+  {
+   "id": "4f94805c5cce",
+   "label": "tests/test_foundation.py:256",
+   "status": "fallback",
+   "reason": "cc: ld returned 1 exit status"
+  },
+  {
+   "id": "84ae6a3edaf6",
+   "label": "tests/test_foundation.py:29",
+   "status": "native-ok"
+  },
+  {
+   "id": "ea1bbc536c76",
+   "label": "tests/test_foundation.py:34",
+   "status": "native-ok"
+  },
+  {
+   "id": "f36c28972be9",
+   "label": "tests/test_foundation.py:43",
+   "status": "native-ok"
+  },
+  {
+   "id": "8f1ae7149d3c",
+   "label": "tests/test_foundation.py:210",
+   "status": "fallback",
+   "reason": "cc: ‘i’ undeclared (first use in this function)"
+  },
+  {
+   "id": "c27266f8fa1b",
+   "label": "tests/test_foundation.py:283",
+   "status": "native-ok"
+  },
+  {
+   "id": "87ef18e313db",
+   "label": "examples/01_hello.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "cc557f569353",
+   "label": "examples/02_variables.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "97cbf0659b8d",
+   "label": "examples/03_functions.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "13182dc0e3f4",
+   "label": "examples/04_structs.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "2c884faf4dde",
+   "label": "examples/05_control_flow.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "0c9173df6ba6",
+   "label": "examples/06_enums.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "f19d1eb0bdc7",
+   "label": "examples/07_multilevel.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "2e035fdd8082",
+   "label": "examples/08_imports.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "0525510466a5",
+   "label": "examples/09_v3_features.til",
+   "status": "fallback",
+   "reason": "cc: ‘r’ undeclared (first use in this function)"
+  },
+  {
+   "id": "610bf5bec7c6",
+   "label": "examples/10_verified.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "92262005d992",
+   "label": "examples/advanced/structs.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "acbc081a62b0",
+   "label": "examples/basic/control_flow.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "10d7db3e5daa",
+   "label": "examples/basic/functions.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "d794fc266d2a",
+   "label": "examples/basic/hello.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "fd673a930cd2",
+   "label": "examples/basic/variables.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "b8e290d403a1",
+   "label": "examples/kazakh/salam.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "e51e888216c0",
+   "label": "examples/kazakh/salam_latn.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "2334f35f405b",
+   "label": "examples/multilevel/multilevel.til",
+   "status": "native-ok"
+  },
+  {
+   "id": "02fb6e495712",
+   "label": "examples/russian/privet.til",
+   "status": "native-ok"
+  }
+ ]
+}
