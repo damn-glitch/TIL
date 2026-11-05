@@ -7,9 +7,11 @@ calculators and microcontrollers. Because tilc itself is a `.tbc` program, a
 calculator that runs the TIL VM can now compile TIL programs on its own.
 
 tilc is a port of the Python front end and bytecode compiler (`Lexer`,
-`Parser`, `SemanticChecker`, `BytecodeCompiler`, `TBCModule.to_bytes` in
+`Parser`, `SemanticChecker`, `BytecodeCompiler`, the superinstruction pass
+`fuse_superinstructions`, `TBCModule.to_bytes` and the import resolution of
 `src/til.py`) and produces **the same bytes** as `til build --target vm` for
-every program of the test corpus and every example (see *Results*).
+every program of the test corpus and every example (see *Results*): TIL 3.1
+bytecode with superinstructions, effect handlers and packages.
 
 ## Usage
 
@@ -19,11 +21,14 @@ til run --vm selfhost/tilc.til input.til output.tbc
 
 # build tilc once, then run it on any TIL VM
 til build --target vm selfhost/tilc.til -o tilc.tbc
-vm/tilvm tilc.tbc input.til output.tbc        # tilvm built with a >= 1 MB heap
+vm/tilvm tilc.tbc input.til output.tbc        # (the bootstrap below needs a 2 MB heap)
 vm/tilvm output.tbc                           # run the result
 
 # bootstrap: tilc compiles itself
 vm/tilvm tilc.tbc selfhost/tilc.til tilc2.tbc     # tilc2.tbc == tilc.tbc
+
+# without superinstructions (the bytes of `til build --target vm --no-fuse`)
+vm/tilvm tilc.tbc --no-fuse input.til output.tbc
 ```
 
 * Success: no output, exit code 0, `output.tbc` written.
@@ -31,9 +36,10 @@ vm/tilvm tilc.tbc selfhost/tilc.til tilc2.tbc     # tilc2.tbc == tilc.tbc
   messages are those of the Python compiler (`unknown name 'x'`,
   `cannot assign twice to immutable variable 'x'`, `'f' expects 1 to 2
   argument(s), got 3`, `Unexpected token: DEDENT`, E-EFFECT / E-CAP /
-  E-CONTRACT texts, ...) at the same line; tilc stops at the first error.
-* Constructs it cannot compile: `tilc: FILE:LINE: unsupported: WHAT`,
-  exit code 1.
+  E-CONTRACT / E-IMPORT texts, the effect handlers' errors, ...) at the same
+  line; tilc stops at the first error.
+* Constructs it cannot compile (only an import it cannot find, see below):
+  `tilc: FILE:LINE: unsupported: WHAT`, exit code 1.
 * Wrong command line: usage line, exit code 2.
 
 The file is read with `read_file` and written with `write_file`; the program
@@ -85,20 +91,43 @@ items listed under *Not supported*:
   checks and the compile-time E-CONTRACT check with constant arguments);
   `#[pure]` / `#[effects: ...]` / `#[cap: ...]` (the SemanticChecker's effect
   inference and capability rules, E-EFFECT / E-CAP).
-* **Modules**: `import m`, `import m as x`, `from m import a, b`,
-  `from m import *`, packages (`a.b` -> `a/b.til` or `a/b/mod.til`),
-  qualified calls `m.f()`, import cycles; each module keeps its own keyword
+* **Effects with resumption** (`docs/TIL_EFFECTS.md`): `handle <body> with
+  <clauses>` in every form (block, expression, one line), clauses with
+  parameters (typed ones are converted), expression or block bodies,
+  `perform E(args)` as an expression or a statement, `resume(v)` /
+  `resume()` / `resume`; the contextual keywords `with` / `resume` and the
+  localized `perform` / `handle` / `with` / `resume` of every language; the
+  parser's errors (duplicate clauses or parameters, `resume` outside a clause
+  or as a name inside one, `return` in a clause, code after `resume(...)` or
+  using its value), `break` / `continue` leaving a clause, the static arity
+  check of performs in a `handle`, and the SemanticChecker's handled effects
+  (a `handle` subtracts its clauses' effects from the calls in its body;
+  `perform E` uses the function `E` for capabilities, unless a handle around
+  it in the same function, not through a lambda, has a clause for `E`).
+* **Modules and packages** (`docs/TIL_PACKAGES.md`): `import m`,
+  `import m as x`, `from m import a, b` (which also brings in every
+  definition of `m` that `a` and `b` use, transitively), `from m import *`,
+  dotted modules (`a.b` -> `a/b.til` or `a/b/mod.til`), qualified calls
+  `m.f()`, import cycles; installed packages in `til_modules/` (nearest
+  first, up to the nearest project root; `til.json` `"main"`, else `NAME.til`,
+  `lib.til`, `mod.til`; sub-modules in the package root and next to the entry
+  file; dependencies declared in `til.json` come from `til_modules/` only; a
+  file of an installed package does not search the current directory); the
+  one namespace of a program and its imports (a name two files define is
+  E-IMPORT, with Python's message); each module keeps its own keyword
   languages.
 * **Languages**: English and Kazakh keywords always, `#[lang: kk-latn]` and
   `#[lang: ru]` pragmas, localized builtin names (`басып_шығару`, `печать`, ...),
   Unicode identifiers.
+* **Output**: the superinstruction pass of `docs/TIL_BYTECODE_V2.md` (the same
+  choices as the Python pass), and `break` / `continue` inside an expression
+  pop the values it pushed, as the Python compiler's stack-depth tracking does.
 
 ### Not supported (reported as `unsupported`)
 
 | construct | why |
 |---|---|
-| `handle ... with ...`, `perform E(...)` | effects with resumption are being redesigned for TIL 3.1 (§8 of the design, new opcodes); tilc will follow once that lands |
-| `import m` when `m` is not next to the importing file nor in the current directory | a TIL program cannot see `TIL_PATH` or where the standard library is installed |
+| `import m` when `m` is not next to the importing file, in the current directory or in an installed package (`til_modules/`) | a TIL program cannot see `TIL_PATH` or where the standard library is installed (the Python compiler warns and goes on without the module) |
 
 ### Known differences from the Python compiler
 
@@ -151,17 +180,33 @@ They never change the behaviour of a valid program unless stated:
   stops with the VM's `runtime error: out of memory`; reading or writing a
   file that fails gives `tilc: cannot read FILE (...)` / `tilc: cannot write
   FILE (...)` with the VM's message, exit code 1.
+* Imports (tilc sees the file system only through `file_exists` /
+  `read_file`): the standard library and `$TIL_PATH` are not searched, so a
+  package that is not declared in `til.json` and has the name of a standard
+  module (`math`) is taken from `til_modules/` where the Python compiler takes
+  the standard module; a file reached through a symbolic link and through its
+  real path is two modules (the Python compiler compares real paths); paths
+  in E-IMPORT messages are shown as tilc found them (relative to the importing
+  file's path as given), the Python compiler shows an absolute path below the
+  current directory relative to it; a `til_modules/NAME/` directory without a
+  `til.json`, an entry file or the requested sub-module does not hide a
+  farther one (tilc cannot test for a directory); a file of an installed
+  package compiled by a relative path from inside the package is not
+  recognised as one (the directories above the current one have no names for
+  tilc).
+* Superinstructions: a run of instructions without a jump target or line
+  entry in it (one source line) of more than 4,096 instructions is processed
+  in parts, cut only between two instructions that no superinstruction
+  combines, so the choice is still exactly the Python pass's; only beyond
+  60,000 instructions without such a point (one line of 30,000 `a, a, ...`
+  elements) the cut is forced and the code may differ (still correct).
 
 Quirks of the Python compiler that tilc reproduces on purpose (so that both
 give the same result; reported to the integrator):
 
-* constant folding uses a global `let`/`const` even inside a function where a
-  local of the same name shadows it;
-* inside a lambda, calling a captured function parameter (`|x| f(x)`) is
-  `unknown function 'f'` unless `f` was already used as a value in that
-  lambda;
-* `~true` folds to `-2` and `true == 1` folds to `true`, while the VMs, at run
-  time, reject `~` on a bool and say `false`;
+* inside a lambda (or an effect clause), calling a captured function
+  parameter (`|x| f(x)`) is `unknown function 'f'` unless `f` was already
+  used as a value in that lambda;
 * `Vec<int>.new()` and `HashMap<K, V>.new()` are resolved by the
   SemanticChecker like any `.new` method call: when exactly one impl defines
   a `new` (e.g. `P.new(x)`), its arity and contracts are checked against the
@@ -169,6 +214,16 @@ give the same result; reported to the integrator):
   for effects and capabilities;
 * a compile error in an imported module is reported with the main file's name
   and the module's line number.
+
+Fixed in both compilers in TIL 3.1 (they used to be quirks): constant folding
+used a global `let`/`const` even where a local, a parameter or a captured
+variable of the same name shadows it (`let N = 10` + `f(N: int) -> int:
+return N + 1` gave `f(5) == 11` on the VMs, 6 natively); `~true` folded to
+`-2` and `true == 1` to `true`, while the VMs reject `~` on a bool and say
+`false`. Folding now resolves names like `emit_load_var` and compares like
+the VMs (a bool equals only a bool); the superinstruction pass of
+`src/til.py` chooses with integer costs (the same choices as before for every
+function of the test-suite, and exact arithmetic that tilc reproduces).
 
 ## How it works
 
@@ -195,7 +250,9 @@ tables.
   source position of their body, structs, enums, impls, traits, globals, and
   the positions of script statements. Pass 2 compiles `__start__` and then
   every function in the order of `BytecodeCompiler.pending`, re-reading each
-  body from its saved position.
+  body from its saved position. `Parser.end_block_expr` (a NEWLINE after a
+  `match` / `retry` / `timeout` / `handle` that ends with a block) inserts a
+  token into the stream.
 * **Statements are compiled while they are parsed** (`stmt_c`): only
   expressions become trees. In pass 1 the same code runs with `DRY` set
   (parse only). Consecutive script statements share one item (their position
@@ -209,6 +266,29 @@ tables.
   (a copy of the lexer state) and the block is skipped; when the expression is
   compiled the fork is replayed. A dry pre-scan on another fork finds the last
   statement (`compile_block_value` semantics).
+* **Effects.** A `handle` is a tree whose body and clause bodies are forks
+  (blocks) or trees; a clause is compiled as a function with flag 16 that
+  closes over what it uses, like a lambda. The names a clause body uses are
+  collected while it is parsed (capture analysis). The resume checks of
+  `Parser._check_code_after_resume` run while the clause body is parsed:
+  statements report whether they always reach `resume(...)`, expressions are
+  checked on their trees, and the first error is raised when the clause is
+  parsed. The SemanticChecker's `handled_effects` are handle *frames*: a call
+  or perform remembers the frames around it (through lambdas and not), whose
+  clause names are known once the clauses are parsed. The operand stack depth
+  of `track_depth` is followed for every emitted instruction (`DEPTH_FX`).
+* **Superinstructions.** When a function is finished, its code (a list of
+  strings that each end at an instruction boundary) is read once for the jump
+  targets and then run by run: the instructions between two boundaries (jump
+  targets, line entries) are chosen with the same dynamic programming and
+  integer costs as `fuse_superinstructions` (no sequence spans a boundary, so
+  a run does not depend on the others), jump offsets are fixed up at the end,
+  and each old string is let go once it is processed (small heaps).
+* **Imports.** Modules and packages are resolved with `file_exists` and
+  `read_file` (`til.json` is read by a small JSON reader); `from m import a`
+  uses the words (identifiers, strings, attribute names) of each definition of
+  a module, collected while it is parsed, for `from_import_closure`; the
+  merged definitions are then checked for names defined in two files.
 * **Capture analysis** (`captured_names`) and the **SemanticChecker's call
   graph** are computed while pass 1 parses a function. The call graph is only
   recorded when it can matter: when the main file's tokens (from the lexical
@@ -243,13 +323,21 @@ tables.
   compiles `tilc.til`; stage 3: stage 2 compiles `tilc.til`. The test requires
   **stage 2 == stage 3 == stage 1**, byte for byte.
 * the Python VM running stage 1 produces the same bytes as the C VM (a small
-  program by default; all of `tilc.til` with `TIL_TEST_SLOW=1`, ~45 s);
+  program by default; all of `tilc.til` with `TIL_TEST_SLOW=1`, ~60 s);
 * every example and every program of `tests/selfhost_corpus.txt` (the 262
   sources the test-suite compiles, harvested from `tests/test_compiler.py`,
   `tests/test_v3.py` and `tests/test_foundation.py`) is compiled by stage 2
   and by the Python compiler: the bytes must be identical, or (only for NaN
   folding) both versions must print the same on both VMs; programs the Python
-  compiler rejects must be rejected;
+  compiler rejects must be rejected; every example is also compiled in place
+  (its imports resolve);
+* TIL 3.1 (`TestTablesInSync31`, `TestEffects`, `TestSuperinstructions`,
+  `TestSharedCompilerFixes`, `TestImports31`): the contextual keywords and the
+  opcode / stack-effect tables; effect programs (identical bytes, the same
+  output on both VMs) and the effect errors at Python's line; `break` /
+  `continue` inside expressions, a program using most superinstructions,
+  `--no-fuse`, very long lines; the two folding fixes; `from` closures,
+  E-IMPORT messages, packages in `til_modules/`;
 * diagnostics, unsupported constructs, imports, the calculator configuration,
   and the C VM fixes (below);
 * the findings of the first review: effect and capability checks for every
@@ -263,31 +351,40 @@ tables.
 
 ### Results
 
-* All 20 programs in `examples/` compile to the same bytes as with the Python
-  compiler (including `09_v3_features.til` and `10_verified.til`).
+* All 23 files in `examples/` (compiled where they are) compile to the same
+  bytes as with the Python compiler, including `08_imports.til`,
+  `11_graphics.til`, `12_effects.til` and `13_proofs.til`.
 * Corpus: 244 of 262 programs compile to identical bytes; the other 18 are
   invalid programs that both compilers reject (17 with the same message at the
   same line; one imports a module that does not exist next to it).
 * Programs outside TIL Core: none in the corpus or the examples.
+* About 2,200 more programs (development check, not part of the test-suite):
+  every source the test-suite compiles in-process (recorded from
+  `til.compile_to_bytecode` while it runs), the string literals of the test
+  files, the files of `tests/test_pkg.py` while they exist, and 1,400
+  mutants of the effect programs: identical bytes or the same first error at
+  the same line, except programs that import the standard library or a module
+  reached through a symbolic link (see *Known differences*) and a few invalid
+  programs with several errors of different kinds. No mutant crashed tilc.
 
 ### Performance and memory
 
-Compiling `tilc.til` itself (6,360 lines, 197 KB of source; 118.9 KB of
-bytecode; 2.87 million VM steps — loop iterations and calls). CPU time on the
-development machine (a shared x86-64 server):
+Compiling `tilc.til` itself (8,100 lines, 255 KB of source; 144 KB of
+bytecode with superinstructions; 4.2 million VM steps — loop iterations and
+calls). CPU time on the development machine (a shared x86-64 server):
 
 | compiler / VM | CPU time |
 |---|---|
-| Python compiler (stage 1) | 0.6 s |
-| tilc on the C VM, 64-bit, `-O2`, 1 MB heap | 0.5 s |
-| tilc on the C VM, int32 + float32, 1 MB heap | 0.5 s |
-| tilc on the reference VM (Python) | 43 s |
+| Python compiler (stage 1) | 0.9 s |
+| tilc on the C VM, 64-bit, `-O2`, 1.5 MB heap | 0.4 s |
+| tilc on the C VM, int32 + float32, 1 MB heap | 0.4 s |
+| tilc on the reference VM (Python) | 56 s |
 
-All of them produce the same 118,908 bytes.
+All of them produce the same 144,445 bytes.
 
-Self-compilation needs a heap of about 1 MB (992 KB on the 64-bit VM, 704 KB
-with int32; the default C VM heap is 256 KB: build `tilvm` with
-`-DTILVM_HEAP_SIZE=1048576` or more).
+Self-compilation needs a heap of about 1.3 MB (1.25 MB on the 64-bit VM,
+896 KB with int32; the default C VM heap is 256 KB: build `tilvm` with
+`-DTILVM_HEAP_SIZE=2097152`).
 
 ### Calculator demo
 
@@ -307,15 +404,17 @@ int32/float32 VM, VM steps, and CPU time on the development machine:
 
 | program | lines | heap needed | steps | CPU time |
 |---|---|---|---|---|
-| `print(1)` | 1 | 20 KB | 686 | 2 ms |
-| `TestCalculator` program (structs, loops, f-strings) | 36 | 24 KB | 18,850 | 4 ms |
-| `examples/03_functions.til` | 56 | 28 KB | 15,768 | 4 ms |
-| `examples/04_structs.til` | 81 | 36 KB | 32,966 | 6 ms |
-| `examples/basic/control_flow.til` | 77 | 36 KB | 22,699 | 5 ms |
-| `examples/07_multilevel.til` | 147 | 36 KB | 59,040 | 9 ms |
-| `examples/09_v3_features.til` | 112 | 56 KB | 55,359 | 11 ms |
+| `print(1)` | 1 | 20 KB | 826 | 3 ms |
+| `TestCalculator` program (structs, loops, f-strings) | 36 | 24 KB | 20,736 | 5 ms |
+| `examples/03_functions.til` | 56 | 28 KB | 18,234 | 4 ms |
+| `examples/04_structs.til` | 81 | 36 KB | 35,878 | 5 ms |
+| `examples/basic/control_flow.til` | 77 | 40 KB | 26,437 | 4 ms |
+| `examples/07_multilevel.til` | 147 | 36 KB | 63,889 | 6 ms |
+| `examples/09_v3_features.til` | 112 | 52 KB | 63,007 | 9 ms |
+| `examples/12_effects.til` | 106 | 40 KB | 48,137 | 6 ms |
+| 1,000 script statements `print(i)` | 1,000 | 64 KB | 352,111 | 24 ms |
 
-tilc's own data (keyword tables etc.) takes about 11 KB of that heap. A
+tilc's own data (keyword tables etc.) takes about 12 KB of that heap. A
 calculator CPU is roughly 100-1000 times slower than a desktop one, so these
 compile in well under a minute to a few seconds there (estimate from the step
 counts; not measured on hardware).

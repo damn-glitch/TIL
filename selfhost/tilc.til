@@ -5,9 +5,12 @@
 #   tilvm tilc.tbc input.til output.tbc          (any TIL VM, e.g. a calculator)
 #
 # Produces .tbc bytecode v2 - the same bytes as `til build --target vm`
-# (src/til.py). The structure mirrors the Python front end (Lexer, Parser,
-# SemanticChecker, BytecodeCompiler, TBCModule.to_bytes) so that both accept
-# the same syntax and emit the same instructions, constants and line tables.
+# (src/til.py), with superinstructions (`tilc --no-fuse IN OUT`: without),
+# effect handlers and packages (til_modules/). The structure mirrors the
+# Python front end (Lexer, Parser, SemanticChecker, BytecodeCompiler,
+# fuse_superinstructions, TBCModule.to_bytes, resolve_imports) so that both
+# accept the same syntax and emit the same instructions, constants and line
+# tables.
 #
 # Memory: tokens are streamed (only a small look-ahead window is kept); the
 # first pass parses the whole file but keeps only declarations; the second
@@ -111,7 +114,9 @@ const T_TIMEOUT = 87
 const T_CAP = 88
 const T_PERFORM = 89
 const T_HANDLE = 90
-const T_ATTRIBUTE = 91
+const T_WITH = 91
+const T_RESUME = 92
+const T_ATTRIBUTE = 93
 
 var TT_NAMES = ["INT", "FLOAT", "STRING", "FSTRING", "CHAR", "BOOL", "IDENT", "IF", "ELSE", "ELIF",
     "FOR", "WHILE", "LOOP", "IN", "RETURN", "BREAK", "CONTINUE", "FN", "LET", "VAR", "CONST", "MUT",
@@ -121,7 +126,7 @@ var TT_NAMES = ["INT", "FLOAT", "STRING", "FSTRING", "CHAR", "BOOL", "IDENT", "I
     "FAT_ARROW", "RANGE", "RANGE_INCL", "AMP", "PIPE", "CARET", "TILDE", "SHL", "SHR", "LPAREN",
     "RPAREN", "LBRACKET", "RBRACKET", "LBRACE", "RBRACE", "COMMA", "COLON", "SEMICOLON", "DOT",
     "QUESTION", "AT", "HASH", "NEWLINE", "INDENT", "DEDENT", "EOF", "ASSERT", "INVARIANT", "INTENT",
-    "RETRY", "FALLBACK", "TIMEOUT", "CAP", "PERFORM", "HANDLE", "ATTRIBUTE"]
+    "RETRY", "FALLBACK", "TIMEOUT", "CAP", "PERFORM", "HANDLE", "WITH", "RESUME", "ATTRIBUTE"]
 
 # ── keywords (KEYWORDS / KAZAKH_KEYWORDS / ... of src/til.py) ───────────────
 var KW_EN = {"if": T_IF, "else": T_ELSE, "elif": T_ELIF, "for": T_FOR, "while": T_WHILE,
@@ -140,6 +145,13 @@ var KW_KK = {"егер": T_IF, "әйтпесе": T_ELSE, "үшін": T_FOR, "к�
     "қасиет": T_TRAIT, "сәйкестік": T_MATCH, "импорт": T_IMPORT, "бастап": T_FROM,
     "ретінде": T_AS, "тип": T_TYPE, "өзін": T_SELF, "және": T_AND, "немесе": T_OR, "емес": T_NOT,
     "ақиқат": T_BOOL, "жалған": T_BOOL, "тексеру": T_ASSERT, "қайталау": T_RETRY, "ниет": T_INTENT}
+# effect words are contextual keywords (CONTEXTUAL_KEYWORDS): read as
+# identifiers, they mean with / resume / perform / handle only where an
+# identifier could not stand in a TIL 3.0 program (see ctx_start)
+var CTX_EN = {"with": T_WITH, "resume": T_RESUME}
+var CTX_KK = {"орындау": T_PERFORM, "өңдеу": T_HANDLE, "арқылы": T_WITH, "жалғау": T_RESUME}
+var CTX_KK_LATN = {"oryndau": T_PERFORM, "ondeu": T_HANDLE, "arqyly": T_WITH, "zhalgau": T_RESUME}
+var CTX_RU = {"выполнить": T_PERFORM, "обработать": T_HANDLE, "с": T_WITH, "возобновить": T_RESUME}
 var TRUE_WORDS = {"true": 1, "True": 1, "ақиқат": 1, "aqiqat": 1, "истина": 1}
 var AL_KK = {"басып_шығару": "print", "шығару": "print", "негізгі": "main", "ұзындық": "len",
     "енгізу": "input"}
@@ -151,6 +163,7 @@ struct SrcFile
     kwb: any
     alb: any
     name: str
+    ctx: any
 
 # keywords of `#[lang: kk-latn]` and `#[lang: ru]` (built on demand)
 kw_kk_latn()
@@ -244,7 +257,31 @@ const OP_END_TRY = 114
 const OP_PANIC = 115
 const OP_UNWRAP_OR_RETURN = 116
 const OP_UNWRAP_OR_PANIC = 117
+const OP_HANDLE = 118
+const OP_END_HANDLE = 119
+const OP_PERFORM = 120
+const OP_RESUME = 121
 const OP_HALT = 127
+# superinstructions (fuse_superinstructions); <op>_I = 160 + i, <op>_L =
+# 176 + i for the i-th operator of FUSED_BINOPS (ADD .. GE)
+const OP_LOAD_LOCAL2 = 128
+const OP_LOAD_LOCAL_FIELD = 129
+const OP_INC_LOCAL = 130
+const OP_CAST_LOCAL = 131
+const OP_CAST_RETURN = 132
+const OP_ADD_STORE_LOCAL = 133
+const OP_NATIVE_POP = 134
+const OP_INDEX_L = 135
+const OP_INDEX_LL = 136
+const OP_RETURN_LOCAL = 137
+const OP_FOR_ITER_STORE = 138
+const OP_JUMP_IF_NOT = 144
+const OP_JUMP_IF_NOT_L = 145
+const OP_JUMP_IF_NOT_I = 146
+const OP_JUMP_IF_NOT_LL = 147
+const OP_JUMP_IF_NOT_LI = 148
+const OP_ADD_I = 160
+const OP_ADD_L = 176
 
 # ── natives and builtin methods (order = bytecode format) ───────────────────
 var NATIVES = ["print", "len", "str", "int", "float", "abs", "sqrt", "pow", "sin", "cos", "tan",
@@ -1421,7 +1458,7 @@ pragma_at(src, j0, langs)
             langs.push(code)
 
 setup_languages(src, name)
-    var sf = SrcFile { text: src, kwb: {}, alb: {}, name: name }
+    var sf = SrcFile { text: src, kwb: {}, alb: {}, name: name, ctx: {} }
     var langs = ["en", "kk"]
     let n = len(src)
     var i = 0
@@ -1434,17 +1471,36 @@ setup_languages(src, name)
         while i < n and src[i] != 10
             i += 1
         i += 1
+    # files with the same languages share their keyword tables
+    let lkey = langs.join(",")
+    let cached = LANG_TABLES.get_or(lkey, None)
+    if cached != None
+        sf.kwb = cached[0]
+        sf.alb = cached[1]
+        sf.ctx = cached[2]
+        return sf
+    LANG_TABLES[lkey] = [sf.kwb, sf.alb, sf.ctx]
     add_keywords(sf, KW_EN, None)
+    add_ctx(sf, CTX_EN)
     for code in langs
         if code == "kk"
             add_keywords(sf, KW_KK, AL_KK)
+            add_ctx(sf, CTX_KK)
         elif code == "kk-latn"
             add_keywords(sf, kw_kk_latn(), {"basyp_shygaru": "print", "shygaru": "print",
                 "negizgi": "main", "uzyndyq": "len", "engizu": "input"})
+            add_ctx(sf, CTX_KK_LATN)
         elif code == "ru"
             add_keywords(sf, kw_ru(), {"печать": "print", "вывод": "print", "главная": "main",
                 "длина": "len", "ввод": "input"})
+            add_ctx(sf, CTX_RU)
     return sf
+
+var LANG_TABLES = {}
+
+add_ctx(sf, words)
+    for w in words
+        sf.ctx[w] = words[w]
 
 add_keywords(sf, kw, al)
     for k in kw
@@ -2225,6 +2281,10 @@ const K_LISTCOMP = 24
 const K_RETRY = 25
 const K_TIMEOUT = 26
 const K_FORK = 27
+const K_HANDLE = 28
+const K_CLAUSE = 29
+const K_PERFORM = 30
+const K_RESUME = 33
 const K_VAR = 31
 const K_STMT = 32
 const K_GINIT = 42
@@ -2244,7 +2304,12 @@ const K_IMPORT = 56
 # K_LAMBDA a=body c=[param names] | K_MATCH a=value c=[[pattern, guard, expr]]
 # K_LISTCOMP a=expr s=var b=iter c=condition
 # K_RETRY / K_TIMEOUT a=count|ms b=body c=fallback (expression or K_FORK)
-# K_FORK a=a token stream positioned at a block (compiled later as a value)
+# K_FORK a=a token stream positioned at a block (compiled later as a value),
+# n=whether it is inside an effect clause
+# K_HANDLE a=body (expression or K_FORK) c=[K_CLAUSE]
+# K_CLAUSE s=effect name c=[param names] b=[param types] a=body (expression or
+# K_FORK) n=names used by lambdas and clauses in the body (captured_names)
+# K_PERFORM s=effect name c=args | K_RESUME a=value or None
 # Statements have no tree: they are compiled while they are parsed (stmt_c).
 # Top-level items: K_FUNC a=FI | K_STRUCTDEF s c=[Fld] | K_ENUMDEF s c=[Vnt]
 # K_IMPL s=type b=trait c=[FI] | K_TRAIT s c=[FI] | K_TYPEALIAS s=name
@@ -2305,6 +2370,19 @@ struct TS
 
 var TSG = None
 var TK = None
+var PREV_T = -1
+# parsing the code of an effect clause (resume is a keyword there)
+var IN_CLAUSE = false
+# names of the identifiers parsed (collected while a clause body is parsed)
+var CL_IDS = None
+# resume checks (Parser._check_code_after_resume) while a clause body is
+# parsed: the first error, raised once the clause is parsed; STMT_ENDS /
+# BLK_ENDS: the statement / block just parsed always reaches resume(...)
+var RC_ON = false
+var RC_ERR = None
+var STMT_ENDS = false
+var BLK_ENDS = false
+var IF_ENDS = false
 var PENDING_ATTRS = []
 var ITEMS = []
 var MAIN_SF = None
@@ -2315,7 +2393,6 @@ var DRY = false
 # globals that are compile-time constants (SemanticChecker.consts)
 var CAPT = None
 var SCRIPT_CAPT = {}
-var SINIT_DEPTH = 0
 var SEM_CONSTS = {}
 # kind of the statement stmt_c just read: 1 expression, 2 match, 3 if with
 # else, 4 intent, 0 other (what compile_block_value needs of a last statement)
@@ -2330,16 +2407,62 @@ var SC_SCRIPT = None
 var IO_BUILTINS = {"print": 1, "println": 1, "input": 1, "read_file": 1, "write_file": 1,
     "file_exists": 1, "screen_init": 1, "screen_clear": 1, "draw_pixel": 1, "draw_line": 1,
     "draw_rect": 1, "fill_rect": 1, "draw_circle": 1, "draw_text": 1, "get_pixel": 1,
-    "screen_show": 1, "key_pressed": 1, "wait_key": 1, "energy_mode": 1}
+    "screen_show": 1, "key_pressed": 1, "wait_key": 1, "energy_mode": 1, "screen_width": 1,
+    "screen_height": 1}
 
+# per function: io builtins called (name -> first line), calls (key ->
+# [kind, a, b, line] + the handle frame, if any), names used as values (name
+# -> line, or key -> [name, line, frame] inside a handle) and performs
+# ([name, line, frame, strict frame], in order); ioc and perf: None until used
 struct SCI
-    io: int
+    ioc: any
     calls: any
     refs: any
+    perf: any
+
+new_sci()
+    return SCI { calls: {}, refs: {} }
+
+# The `handle` expressions around the code being parsed (handled_effects):
+# HF_CUR through lambdas, HF_STRICT not through them (a lambda may escape
+# its handle). A clause body sees the frames outside its own handle. The
+# clause names of a frame are known once its clauses are parsed; calls and
+# performs keep their frames and the effects are subtracted by sc_check.
+struct HFrame
+    names: any
+    parent: any
+    sparent: any
+    uid: int
+
+var HF_CUR = None
+var HF_STRICT = None
+var HF_COUNT = 0
+
+# effects handled by a frame and the frames around it (through `parent`, or
+# `sparent` for the strict chain)
+hf_names(fr, strict)
+    var out = {}
+    var f = fr
+    while f != None
+        if f.names != None
+            for n in f.names
+                out[n] = 1
+        if strict
+            f = f.sparent
+        else
+            f = f.parent
+    return out
+
+# the key prefix of a call recorded inside handle frames
+hf_key()
+    if HF_CUR == None
+        return ""
+    return str(HF_CUR.uid) + "|"
 
 new_stream(lx)
     TSG = TS { lx: lx, buf: [], p: 0 }
     TK = peek(0)
+    PREV_T = -1
 
 peek(k)
     let ts = TSG
@@ -2353,6 +2476,9 @@ peek(k)
 
 adv()
     let t = TK
+    PREV_T = t.t
+    if WORDS != None
+        add_words(t)
     let ts = TSG
     ts.p += 1
     if ts.p >= len(ts.buf)
@@ -2372,7 +2498,70 @@ perr(msg)
 expect(t)
     if TK.t == t
         return adv()
-    perr("Expected " + TT_NAMES[t] + ", got " + TT_NAMES[TK.t])
+    var note = ""
+    if t == T_IDENT
+        note = reserved_note()
+    perr("Expected " + TT_NAMES[t] + ", got " + TT_NAMES[TK.t] + note)
+
+# " ('x' is a reserved word ...)" when the current token is a keyword (or any
+# token whose value reads as an identifier, as Parser.reserved_note)
+reserved_note()
+    let t = TK.t
+    if t == T_IDENT or t == T_INT or t == T_FLOAT or t == T_FSTRING or t == T_BOOL
+        return ""
+    var v = TK.v
+    if t == T_CHAR
+        v = utf8(v)
+    if type_of(v) != "str" or not is_identifier(v)
+        return ""
+    return " ('" + v + "' is a reserved word and cannot be used as a name)"
+
+# str.isidentifier() (letters as str.isalpha, digits as isalnum)
+is_identifier(v)
+    let n = len(v)
+    if n == 0
+        return false
+    var p = 0
+    while p < n
+        let c = v[p]
+        if c < 128
+            let letter = (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or c == 95
+            if not letter and (p == 0 or c < 48 or c > 57)
+                return false
+            p += 1
+        else
+            let k = uclass(ucp(v, p))
+            if k == 0 or (p == 0 and k != 1)
+                return false
+            p += ulen(c)
+    return true
+
+# the strings a token puts into the AST (_names_used of a module's definitions)
+add_words(t)
+    let tt = t.t
+    if tt == T_IDENT or tt == T_STRING or tt == T_ATTRIBUTE
+        WORDS[t.v] = 1
+    elif tt == T_CHAR
+        WORDS[utf8(t.v)] = 1
+    elif tt == T_FSTRING
+        for part in t.v
+            if type_of(part) == "str"
+                WORDS["str"] = 1
+                WORDS[part] = 1
+            else
+                WORDS["expr"] = 1
+                if part[1] != None
+                    WORDS[part[1]] = 1
+
+# An expression that ends with an indented block (match, retry, timeout,
+# handle) also ends its statement: a NEWLINE is inserted after its DEDENT
+# (Parser.end_block_expr), so that an `if`, `(`, `[` or `-` on the next line
+# starts a new statement.
+end_block_expr()
+    if (PREV_T == T_DEDENT or PREV_T == T_NEWLINE) and TK.t != T_NEWLINE and TK.t != T_DEDENT and TK.t != T_EOF
+        let tok = Tok { t: T_NEWLINE, v: "\n", ln: TK.ln, sp: TK.sp }
+        TSG.buf.insert(TSG.p, tok)
+        TK = tok
 
 skip_nl()
     while TK.t == T_NEWLINE
@@ -2396,7 +2585,7 @@ parse_program(sf)
         if t == T_IMPORT or t == T_FROM or (t == T_ATTRIBUTE and sc_attribute(tok.v))
             SC_ON = true
     if SC_ON
-        SC_SCRIPT = SCI { calls: {}, refs: {} }
+        SC_SCRIPT = new_sci()
     DRY = true
     new_stream(new_lexer(sf, 0, 1, [0], true))
     skip_nl()
@@ -2407,6 +2596,8 @@ parse_program(sf)
 
 parse_top_level(src)
     let tok = TK
+    if MOD_PARSE
+        WORDS = {}
     skip_nl()
     var attrs = false
     while TK.t == T_ATTRIBUTE
@@ -2450,6 +2641,7 @@ parse_top_level(src)
             expect(T_RBRACE)
         node = mk(K_TYPEALIAS, 0)
         node.s = cap_name
+        node.n = 1
     elif t == T_IDENT and is_func_def()
         node = parse_func_simple(src, 0)
     else
@@ -2469,10 +2661,14 @@ parse_top_level(src)
         stmt_c()
         CAPT = None
         SC_CUR = None
+        WORDS = None
         if node == None
             return
     if node.ln == 0
         node.ln = tok.ln
+    if WORDS != None
+        DEF_WORDS.push(WORDS)
+        WORDS = None
     ITEMS.push(node)
 
 # top-level let / var / const: a global. Only a literal value is kept as a
@@ -2502,7 +2698,7 @@ parse_global(tok)
     CAPT = capt
     var sci = None
     if SC_ON
-        sci = SCI { calls: {}, refs: {} }
+        sci = new_sci()
     SC_CUR = sci
     node.c = [TK.sp, TK.ln, None, sci, TSG.lx.sf]
     let v = parse_expression()
@@ -2601,7 +2797,7 @@ parse_func_body(name_tok, src, ind, allow_sig)
     CAPT = {}
     let save_sc = SC_CUR
     if SC_ON
-        SC_CUR = SCI { calls: {}, refs: {} }
+        SC_CUR = new_sci()
     let nstmts = func_body_c(allow_sig)
     let attrs = PENDING_ATTRS
     PENDING_ATTRS = []
@@ -2623,6 +2819,8 @@ parse_func_body(name_tok, src, ind, allow_sig)
             for e in strip_ws(a.slice(8, len(a))).split(",")
                 if len(strip_ws(e)) > 0
                     decl.push(strip_ws(e))
+                    if WORDS != None
+                        WORDS[strip_ws(e)] = 1
         elif a.starts_with("requires:") or a.starts_with("ensures:")
             let colon = a.find(":")
             let text = strip_ws(a.slice(colon + 1, len(a)))
@@ -2635,6 +2833,8 @@ parse_func_body(name_tok, src, ind, allow_sig)
             for c in a.slice(4, len(a)).split(",")
                 if len(strip_ws(c)) > 0
                     caps.push(strip_ws(c))
+                    if WORDS != None
+                        WORDS[strip_ws(c)] = 1
     # (empty lists and maps are left out: they would cost memory per function)
     let fi = FI { name: name_tok.v, params: params, ret: ret, ln: name_tok.ln, src: src,
                   bpos: bpos, bline: bline, bind: ind, nstmts: nstmts, decl: decl, pure: pure,
@@ -2819,7 +3019,7 @@ parse_impl(src)
         elif TK.t == T_IDENT and is_func_def()
             m = parse_func_simple(src, ind.v)
         else
-            perr("Expected method definition in impl block")
+            perr("Expected method definition in impl block" + reserved_note())
         methods.push(m.a)
         skip_nl()
     if TK.t == T_DEDENT
@@ -2846,7 +3046,7 @@ parse_trait(src)
         if TK.t == T_IDENT and peek(1).t == T_LPAREN
             methods.push(parse_func_body(adv(), src, ind.v, true).a)
         else
-            perr("Expected method definition in trait")
+            perr("Expected method definition in trait" + reserved_note())
         skip_nl()
     if TK.t == T_DEDENT
         adv()
@@ -2881,7 +3081,7 @@ parse_pipe()
             call.a = right
             call.c = [left]
             left = call
-            if SC_CUR != None and SINIT_DEPTH == 0
+            if SC_CUR != None
                 sc_call(right, op.ln)
     return left
 
@@ -2891,8 +3091,11 @@ sc_call(f, ln)
     var key = ""
     var rec = None
     if f.k == K_IDENT
-        if s.io == 0 and IO_BUILTINS.has(f.s)
-            s.io = ln
+        if IO_BUILTINS.has(f.s)
+            if s.ioc == None
+                s.ioc = {}
+            if not s.ioc.has(f.s)
+                s.ioc[f.s] = ln
         key = "1" + f.s
         rec = [1, f.s, None, ln]
     elif f.k == K_ATTR
@@ -2904,6 +3107,9 @@ sc_call(f, ln)
             rec = [3, None, f.s, ln]
     else
         return
+    if HF_CUR != None
+        key = hf_key() + key
+        rec.push(HF_CUR)
     if not s.calls.has(key)
         s.calls[key] = rec
 
@@ -3055,14 +3261,19 @@ parse_power()
 
 parse_postfix()
     var expr = parse_primary()
-    if SC_CUR != None and SINIT_DEPTH == 0 and expr.k == K_IDENT and TK.t != T_LPAREN
-        if not SC_CUR.refs.has(expr.s)
-            SC_CUR.refs[expr.s] = expr.ln
+    if SC_CUR != None and expr.k == K_IDENT and TK.t != T_LPAREN
+        if HF_CUR == None
+            if not SC_CUR.refs.has(expr.s)
+                SC_CUR.refs[expr.s] = expr.ln
+        else
+            let rk = hf_key() + expr.s
+            if not SC_CUR.refs.has(rk)
+                SC_CUR.refs[rk] = [expr.s, expr.ln, HF_CUR]
     loop
         let t = TK.t
         if t == T_LPAREN
             let op = adv()
-            if SC_CUR != None and SINIT_DEPTH == 0
+            if SC_CUR != None
                 sc_call(expr, op.ln)
             var args = []
             if TK.t != T_RPAREN
@@ -3114,11 +3325,20 @@ parse_primary()
 parse_primary_inner()
     let t = TK.t
     if t == T_IDENT
+        # contextual effect keywords: localized perform / handle, resume
+        let kind = ctx_start()
+        if kind == T_HANDLE
+            return parse_handle()
+        if kind == T_PERFORM
+            return parse_perform()
+        if kind == T_RESUME
+            return parse_resume()
         let tok = adv()
         let name = tok.v
         if name == "None"
             let node = mk(K_IDENT, 0)
             node.s = "NULL"
+            note_ident("NULL")
             return node
         if (name == "Vec" or name == "HashMap") and TK.t == T_LT
             adv()
@@ -3131,12 +3351,12 @@ parse_primary_inner()
             expect(T_GT)
             let node = mk(K_IDENT, 0)
             node.s = "__" + name + "__" + targs.join("_")
+            note_ident(node.s)
             return node
         if TK.t == T_LBRACE
             adv()
             var fields = {}
             if TK.t != T_RBRACE
-                SINIT_DEPTH += 1
                 loop
                     let fname = expect(T_IDENT).v
                     expect(T_COLON)
@@ -3144,7 +3364,6 @@ parse_primary_inner()
                     if TK.t != T_COMMA
                         break
                     adv()
-                SINIT_DEPTH -= 1
             expect(T_RBRACE)
             let node = mk(K_SINIT, 0)
             node.s = name
@@ -3152,6 +3371,7 @@ parse_primary_inner()
             return node
         let node = mk(K_IDENT, 0)
         node.s = name
+        note_ident(name)
         return node
     if t == T_INT
         let node = mk(K_INT, 0)
@@ -3261,6 +3481,7 @@ parse_primary_inner()
         adv()
         let node = mk(K_IDENT, 0)
         node.s = "self"
+        note_ident("self")
         return node
     if t == T_PIPE
         return parse_lambda()
@@ -3281,9 +3502,15 @@ parse_primary_inner()
             adv()
             skip_nl()
             node.c = body_or_expr()
+        end_block_expr()
         return node
     if t == T_HANDLE
-        unsupported(TK.ln, "handle (effects)")
+        return parse_handle()
+    if t == T_PERFORM
+        return parse_perform()
+    # (a contextual word retyped by an earlier parse of a forked block)
+    if t == T_RESUME and IN_CLAUSE
+        return parse_resume()
     perr("Unexpected token: " + TT_NAMES[t])
 
 body_or_expr()
@@ -3310,6 +3537,15 @@ parse_lambda()
         parse_type()
     let node = mk(K_LAMBDA, 0)
     node.c = params
+    # a lambda is not the clause around it (resume is a name in it, and the
+    # resume checks do not look into it)
+    let saved_clause = IN_CLAUSE
+    let saved_rc = RC_ON
+    let saved_strict = HF_STRICT
+    IN_CLAUSE = false
+    RC_ON = false
+    # (a lambda may escape the handles around it: handled_effects(strict))
+    HF_STRICT = None
     if TK.t == T_LBRACE
         adv()
         skip_nl()
@@ -3318,9 +3554,11 @@ parse_lambda()
         expect(T_RBRACE)
     else
         node.a = parse_expression()
-    # BytecodeCompiler.captured_names: walk() reaches this lambda unless it
-    # sits in a struct literal (whose fields are a dict, not walked)
-    if CAPT != None and SINIT_DEPTH == 0
+    IN_CLAUSE = saved_clause
+    RC_ON = saved_rc
+    HF_STRICT = saved_strict
+    # BytecodeCompiler.captured_names: the names this lambda uses
+    if CAPT != None
         lambda_names(node, CAPT)
     return node
 
@@ -3331,8 +3569,8 @@ lambda_names(lam, out)
         pm[p] = 1
     walk_idents(lam.a, pm, out)
 
-# the nodes of a tree in walk() order (pre-order: a, b, c, arrays in order;
-# struct literals are opaque), with an explicit stack (no deep recursion)
+# the nodes of a tree in walk() order (pre-order: a, b, c, arrays and the
+# fields of struct literals in order), with an explicit stack (no deep recursion)
 tree_nodes(x)
     var out = []
     var stack = [x]
@@ -3346,7 +3584,13 @@ tree_nodes(x)
                 i -= 1
         elif t == "N"
             out.push(y)
-            if y.k != K_SINIT and y.k != K_IDENT
+            if y.k == K_SINIT
+                let vals = y.c.values()
+                var i = len(vals) - 1
+                while i >= 0
+                    stack.push(vals[i])
+                    i -= 1
+            elif y.k != K_IDENT
                 stack.push(y.c)
                 stack.push(y.b)
                 stack.push(y.a)
@@ -3386,7 +3630,320 @@ parse_match()
     if TK.t == T_DEDENT
         adv()
     node.c = arms
+    end_block_expr()
     return node
+
+# ── effects with resumption (TIL 3.1, docs/TIL_EFFECTS.md) ─────────────────
+# the contextual keyword type of an identifier in the file being parsed, or -1
+ctx_kind(v)
+    let lx = TSG.lx
+    if lx == None or type_of(v) != "str"
+        return -1
+    return lx.sf.ctx.get_or(v, -1)
+
+# Parser.contextual_start: at the start of a primary expression, the effect
+# keyword a contextual word stands for here (-1: an identifier)
+ctx_start()
+    let tok = TK
+    let kind = ctx_kind(tok.v)
+    if kind < 0
+        return -1
+    let nxt = peek(1)
+    if kind == T_RESUME
+        if IN_CLAUSE
+            return kind
+        return -1
+    if kind == T_PERFORM
+        if nxt.t == T_IDENT and nxt.ln == tok.ln
+            return kind
+        return -1
+    if kind == T_HANDLE
+        if nxt.t == T_NEWLINE
+            var k = 2
+            while peek(k).t == T_NEWLINE
+                k += 1
+            if peek(k).t == T_INDENT
+                return kind
+            return -1
+        let u = nxt.t
+        if nxt.ln == tok.ln and (u == T_IDENT or u == T_INT or u == T_FLOAT or u == T_STRING or u == T_FSTRING or u == T_CHAR or u == T_BOOL or u == T_SELF or u == T_PERFORM or u == T_HANDLE or u == T_MATCH or u == T_RETRY or u == T_TIMEOUT)
+            return kind
+    return -1
+
+word_is(tok, kind)
+    return tok.t == kind or (tok.t == T_IDENT and ctx_kind(tok.v) == kind)
+
+# consume a (contextual) keyword; the token is retyped
+take_word(kind)
+    if not word_is(TK, kind)
+        perr("Expected " + TT_NAMES[kind] + ", got " + TT_NAMES[TK.t])
+    TK.t = kind
+    return adv()
+
+# Parser.consume(type, msg)
+expect_msg(t, msg)
+    if TK.t == t
+        return adv()
+    if t == T_IDENT
+        perr(msg + reserved_note())
+    perr(msg)
+
+# an identifier was parsed (the names a clause body uses)
+note_ident(name)
+    if CL_IDS != None
+        CL_IDS[name] = 1
+
+# inside a clause the resume words always mean resume: no variables
+check_binding_name(tok)
+    if IN_CLAUSE and ctx_kind(tok.v) == T_RESUME
+        fail_at(tok.ln, "'" + tok.v + "' is reserved inside an effect clause")
+
+# handle <body> with <clauses> (Parser.parse_handle_expr)
+parse_handle()
+    take_word(T_HANDLE)
+    skip_nl()
+    let node = mk(K_HANDLE, 0)
+    HF_COUNT += 1
+    let fr = HFrame { parent: HF_CUR, sparent: HF_STRICT, uid: HF_COUNT }
+    let saved_cur = HF_CUR
+    let saved_strict = HF_STRICT
+    HF_CUR = fr
+    HF_STRICT = fr
+    if TK.t == T_INDENT
+        node.a = block_ref()
+    else
+        node.a = parse_expression()
+    # the clauses see the handles around this one
+    HF_CUR = saved_cur
+    HF_STRICT = saved_strict
+    skip_nl()
+    if not word_is(TK, T_WITH)
+        perr("Expected 'with' and effect clauses after the body of 'handle'")
+    take_word(T_WITH)
+    skip_nl()
+    var clauses = []
+    if TK.t == T_INDENT
+        adv()
+        while TK.t != T_DEDENT and TK.t != T_EOF
+            skip_nl()
+            if TK.t == T_DEDENT or TK.t == T_EOF
+                break
+            clauses.push(parse_clause(clauses))
+            skip_nl()
+        if TK.t == T_DEDENT
+            adv()
+    else
+        clauses.push(parse_clause(clauses))
+    if len(clauses) == 0
+        perr("'handle ... with' needs at least one effect clause: Name(params) => ...")
+    var names = {}
+    for c in clauses
+        if c.s != "io"
+            names[c.s] = 1
+    fr.names = names
+    node.c = clauses
+    end_block_expr()
+    return node
+
+# Name(params) => expression   |   Name(params) => NEWLINE block
+parse_clause(seen)
+    let name_tok = expect_msg(T_IDENT, "Expected an effect clause: Name(params) => ...")
+    let name = name_tok.v
+    var params = []
+    var ptypes = []
+    if TK.t == T_LPAREN
+        adv()
+        if TK.t != T_RPAREN
+            loop
+                let ptok = expect_msg(T_IDENT, "Expected a parameter name in the effect clause")
+                if ctx_kind(ptok.v) == T_RESUME
+                    fail_at(ptok.ln, "'" + ptok.v + "' is reserved inside an effect clause")
+                var ptype = ""
+                if TK.t == T_COLON
+                    adv()
+                    ptype = parse_type()
+                if params.contains(ptok.v)
+                    fail_at(ptok.ln, "duplicate parameter '" + ptok.v + "' in the clause for effect '" + name + "'")
+                params.push(ptok.v)
+                ptypes.push(ptype)
+                if TK.t != T_COMMA
+                    break
+                adv()
+        expect_msg(T_RPAREN, "Expected ')' after the clause parameters")
+    for c in seen
+        if c.s == name
+            fail_at(name_tok.ln, "duplicate clause for effect '" + name + "' in one handle")
+    expect_msg(T_FAT_ARROW, "Expected '=>' after the effect clause head")
+    let node = mk(K_CLAUSE, name_tok.ln)
+    node.s = name
+    node.c = params
+    node.b = ptypes
+    # the body: resume is a keyword, the resume checks run, and the names it
+    # uses are collected (captured_names)
+    let saved_clause = IN_CLAUSE
+    let saved_rc = RC_ON
+    let saved_err = RC_ERR
+    let saved_capt = CAPT
+    let saved_ids = CL_IDS
+    IN_CLAUSE = true
+    RC_ON = true
+    RC_ERR = None
+    CAPT = {}
+    CL_IDS = {}
+    if TK.t == T_NEWLINE
+        skip_nl()
+        if TK.t != T_INDENT
+            perr("Expected an expression or an indented block after '=>'")
+        node.a = block_ref()
+    else
+        node.a = parse_expression()
+        rc_ends(node.a)
+    let err = RC_ERR
+    let ids = CL_IDS
+    let inner = CAPT
+    IN_CLAUSE = saved_clause
+    RC_ON = saved_rc
+    RC_ERR = saved_err
+    CAPT = saved_capt
+    CL_IDS = saved_ids
+    if err != None
+        fail_at(err[0], err[1])
+    node.n = inner
+    if CAPT != None
+        for k in ids
+            if not params.contains(k)
+                CAPT[k] = 1
+        for k in inner
+            CAPT[k] = 1
+    if CL_IDS != None
+        for k in ids
+            CL_IDS[k] = 1
+    return node
+
+# perform Name(args) (an expression)
+parse_perform()
+    let ptok = take_word(T_PERFORM)
+    let name_tok = expect_msg(T_IDENT, "Expected the effect name after 'perform'")
+    let node = mk(K_PERFORM, 0)
+    node.s = name_tok.v
+    var args = []
+    if TK.t == T_LPAREN
+        adv()
+        if TK.t != T_RPAREN
+            loop
+                args.push(parse_expression())
+                if TK.t != T_COMMA
+                    break
+                adv()
+        expect(T_RPAREN)
+    node.c = args
+    if SC_CUR != None
+        if SC_CUR.perf == None
+            SC_CUR.perf = []
+        SC_CUR.perf.push([node.s, ptok.ln, HF_CUR, HF_STRICT])
+    return node
+
+# resume(v) / resume() / resume: only inside an effect clause
+parse_resume()
+    let tok = take_word(T_RESUME)
+    if not IN_CLAUSE
+        fail_at(tok.ln, "resume(...) outside an effect clause")
+    let node = mk(K_RESUME, tok.ln)
+    if TK.t == T_LPAREN
+        adv()
+        if TK.t != T_RPAREN
+            node.a = parse_expression()
+        expect_msg(T_RPAREN, "resume takes at most one value: resume(v)")
+    return node
+
+# ── resume ends the clause (Parser._check_code_after_resume) ──────────────
+const RC_AFTER = "unreachable code after resume(...)"
+const RC_VALUE = "the value of resume(...) is never available: resume ends the clause"
+
+rc_err(ln, msg)
+    if RC_ERR == None
+        RC_ERR = [ln, msg]
+
+# the line of the first node of a tree that has one (where Python reports it)
+rc_line(x)
+    for y in tree_nodes(x)
+        if y.ln != 0
+            return y.ln
+    return 0
+
+# an expression tree always reaches resume(...); records the errors
+rc_ends(x)
+    if x == None
+        return false
+    let k = x.k
+    if k == K_RESUME
+        if rc_ends(x.a)
+            rc_err(rc_line(x), RC_AFTER)
+        return true
+    if k == K_LAMBDA or k == K_FORK or k == K_CLAUSE
+        return false
+    if k == K_FPART
+        return rc_ends(x.a)
+    if k == K_BIN and (x.s == "and" or x.s == "or")
+        if rc_ends(x.a)
+            rc_err(rc_line(x.a), RC_VALUE)
+        rc_ends(x.b)
+        return false
+    if k == K_IFX
+        if rc_ends(x.a)
+            rc_err(rc_line(x.b), RC_AFTER)
+        let every = rc_ends(x.b)
+        return rc_ends(x.c) and every
+    if k == K_MATCH
+        if rc_ends(x.a)
+            rc_err(x.ln, "the match arms are never reached: resume(...) ends the clause")
+        for arm in x.c
+            rc_ends(arm[0])
+            rc_ends(arm[1])
+            rc_ends(arm[2])
+        return false
+    if k == K_HANDLE
+        rc_ends(x.a)
+        return false
+    if k == K_RETRY or k == K_TIMEOUT or k == K_LISTCOMP
+        rc_ends(x.a)
+        rc_ends(x.b)
+        rc_ends(x.c)
+        return false
+    # the others evaluate all their operands first: resume in one of them
+    # leaves the operation without a value
+    var kids = None
+    if k == K_CALL
+        kids = [x.a]
+        for a in x.c
+            kids.push(a)
+    elif k == K_BIN or k == K_INDEX or k == K_RANGE
+        kids = [x.a, x.b]
+    elif k == K_UN or k == K_ATTR or k == K_CAST or k == K_NULLCHK
+        kids = [x.a]
+    elif k == K_ARRAY or k == K_TUPLE or k == K_DICT or k == K_FSTR or k == K_PERFORM
+        kids = x.c
+    elif k == K_SINIT
+        kids = x.c.values()
+    if kids != None
+        for y in kids
+            if rc_ends(y)
+                rc_err(rc_line(y), RC_VALUE)
+                return false
+    return false
+
+# the line of the first statement of a body about to be parsed
+rc_body_line()
+    if TK.t == T_INDENT
+        return peek(1).ln
+    if TK.t == T_LBRACE
+        var k = 1
+        while peek(k).t == T_NEWLINE
+            k += 1
+        if peek(k).t == T_RBRACE
+            return 0
+        return peek(k).ln
+    return TK.ln
 
 # expression inside an f-string: lexed and parsed on its own, at the line of
 # the f-string (as Parser._parse_fstring_expr)
@@ -3401,16 +3958,18 @@ parse_sub_expr(text, line, walked)
         SC_CUR = None
     let save_ts = TSG
     let save_tk = TK
+    let save_prev = PREV_T
     var l = line
     if l < 1
         l = 1
     let cur = TSG.lx.sf
-    new_stream(new_lexer(SrcFile { text: text, kwb: cur.kwb, alb: cur.alb, name: cur.name }, 0, l, [0], true))
+    new_stream(new_lexer(SrcFile { text: text, kwb: cur.kwb, alb: cur.alb, name: cur.name, ctx: cur.ctx }, 0, l, [0], true))
     let e = parse_expression()
     while TK.t != T_EOF
         adv()
     TSG = save_ts
     TK = save_tk
+    PREV_T = save_prev
     SC_CUR = save_sc
     return e
 
@@ -3467,7 +4026,7 @@ hoist()
             for k in it.a.c[2]
                 main.capt[k] = 1
     if SC_ON
-        var merged = SCI { calls: {}, refs: {} }
+        var merged = new_sci()
         sc_merge(merged, SC_SCRIPT)
         for it in script
             if it.k == K_GINIT
@@ -3500,47 +4059,79 @@ sc_check()
                 if not by_name.has(m.name)
                     by_name[m.name] = []
                 by_name[m.name].push(key)
-    # call edges [callee, line, precise]
+    # per function: call edges [callee, line, precise, handled effects], base
+    # effects (effect -> line of origin) and the performs that may call a
+    # function [name, line] (capabilities)
     var edges = {}
     var inferred = {}
+    var bases = {}
+    var puses = {}
     for key in funcs
         let fi = funcs[key]
         var es = []
         var base = {}
+        var pu = []
         let sc = fi.sc
         if sc != None
-            if sc.io > 0
-                base["io"] = 1
+            # an io builtin, unless a function or a parameter of that name is called
+            var shadow = {}
+            for p in fi.params
+                shadow[p.name] = 1
+            if sc.ioc != None
+                for name in sc.ioc
+                    if not base.has("io") and not funcs.has(name) and not shadow.has(name)
+                        base["io"] = sc.ioc[name]
             for ck in sc.calls
                 let r = sc.calls[ck]
+                var hd = {}
+                if len(r) > 4
+                    hd = hf_names(r[4], false)
                 if r[0] == 1
                     if funcs.has(r[1]) and not r[1].contains(".")
-                        es.push([r[1], r[3], true])
+                        es.push([r[1], r[3], true, hd])
                 else
                     var done = false
                     if r[0] == 2
                         if MODULE_NAMES.has(r[1]) and not structs.has(r[1]) and funcs.has(r[2])
-                            es.push([r[2], r[3], true])
+                            es.push([r[2], r[3], true, hd])
                             done = true
                         elif structs.has(r[1])
                             let k2 = r[1] + "." + r[2]
                             if funcs.has(k2)
-                                es.push([k2, r[3], true])
+                                es.push([k2, r[3], true, hd])
                             done = true
                         elif r[1] == "self" and key.contains(".")
                             let k2 = key.slice(0, key.find(".")) + "." + r[2]
                             if funcs.has(k2)
-                                es.push([k2, r[3], true])
+                                es.push([k2, r[3], true, hd])
                                 done = true
                     if not done
                         let cands = by_name.get_or(r[2], [])
                         for c in cands
-                            es.push([c, r[3], len(cands) == 1])
-            for name in sc.refs
-                if funcs.has(name) and funcs[name].caps != None
-                    es.push([name, sc.refs[name], true])
+                            es.push([c, r[3], len(cands) == 1, hd])
+            # performs: the effect itself, unless a handle around it in this
+            # function handles it; `perform E` calls the function E when no
+            # handler is active (a use of E for capabilities)
+            if sc.perf != None
+                for pf in sc.perf
+                    if funcs.has(pf[0]) and not pf[0].contains(".")
+                        if not hf_names(pf[3], true).has(pf[0])
+                            pu.push([pf[0], pf[1]])
+                    if not base.has(pf[0]) and not hf_names(pf[2], false).has(pf[0])
+                        base[pf[0]] = pf[1]
+            for rk in sc.refs
+                var r = sc.refs[rk]
+                if type_of(r) == "int"
+                    r = [rk, r, None]
+                if funcs.has(r[0]) and funcs[r[0]].caps != None
+                    es.push([r[0], r[1], true, hf_names(r[2], false)])
         edges[key] = es
-        inferred[key] = base
+        bases[key] = base
+        puses[key] = pu
+        var inf = {}
+        for e in base
+            inf[e] = 1
+        inferred[key] = inf
     # interface effects: declared if present, else inferred (fixpoint)
     var changed = true
     while changed
@@ -3549,7 +4140,7 @@ sc_check()
             for e in edges[key]
                 let ce = sc_effects(funcs, inferred, e[0])
                 for eff in ce
-                    if not inferred[key].has(eff)
+                    if not inferred[key].has(eff) and not e[3].has(eff)
                         inferred[key][eff] = 1
                         changed = true
     for key in funcs
@@ -3560,12 +4151,13 @@ sc_check()
                 allowed[d] = 1
             var actual = {}
             var via = {}
-            if fi.sc != None and fi.sc.io > 0
-                actual["io"] = fi.sc.io
+            let base = bases[key]
+            for eff in base
+                actual[eff] = base[eff]
             for e in edges[key]
                 let ce = sc_effects(funcs, inferred, e[0])
                 for eff in ce
-                    if not allowed.has(eff) and not actual.has(eff)
+                    if not allowed.has(eff) and not actual.has(eff) and not e[3].has(eff)
                         actual[eff] = e[1]
                         via[eff] = e[0]
             var bad = []
@@ -3594,11 +4186,17 @@ sc_check()
             if funcs[key].caps != None
                 for c in funcs[key].caps
                     held[c] = 1
+            var uses = []
             for e in edges[key]
-                if e[2] and funcs[e[0]].caps != None
-                    for c in funcs[e[0]].caps
+                if e[2]
+                    uses.push([e[0], e[1]])
+            for pf in puses[key]
+                uses.push(pf)
+            for u in uses
+                if funcs[u[0]].caps != None
+                    for c in funcs[u[0]].caps
                         if not held.has(c)
-                            fail_at(e[1], "'" + key + "' uses '" + e[0] + "', which requires capability '" + c + "', but '" + key + "' does not hold it")
+                            fail_at(u[1], "'" + key + "' uses '" + u[0] + "', which requires capability '" + c + "', but '" + key + "' does not hold it")
 
 # effects of a callee: declared ones if any, else the inferred ones
 sc_effects(funcs, inferred, callee)
@@ -3610,11 +4208,20 @@ sc_effects(funcs, inferred, callee)
         m[e] = 1
     return m
 
-# ── imports (ModuleResolver / resolve_imports): a module is looked for next
-#    to the importing file and in the current directory (not in TIL_PATH or
-#    the standard library: tilc cannot see them) ──────────────────────────
+# ── imports (ModuleResolver / resolve_imports, docs/TIL_PACKAGES.md) ───────
+# A module is looked for next to the importing file and in the current
+# directory, then in the installed packages (til_modules/ of the importing
+# file's directory and its parents, up to the nearest project root). tilc
+# cannot see $TIL_PATH or the standard library.
 var MODULE_NAMES = {}
+# canonical path -> [path the module was first loaded from, its items as
+# [key, item, path, canonical path]]
 var MODULE_CACHE = {}
+# parsing an imported module: the words (strings) of each definition are
+# collected, for `from m import a` (_names_used)
+var MOD_PARSE = false
+var WORDS = None
+var DEF_WORDS = []
 
 dir_of(path)
     var i = len(path) - 1
@@ -3634,20 +4241,360 @@ norm_path(p)
             out.push(part)
     return out.join("/")
 
-resolve_module(name, from_file)
-    let parts = name.replace(".", "/")
-    for d in [dir_of(from_file), ""]
-        var cand = norm_path(d + parts + ".til")
-        if file_exists(cand)
-            return cand
-        cand = norm_path(d + parts + "/mod.til")
-        if file_exists(cand)
-            return cand
+# the directory above d ("a/b/" -> "a/", "" -> "../", "/" -> None); with
+# names: only when d names its last component (for "", "../": None)
+up_dir(d, named)
+    if d == "/"
+        return None
+    if d == "" or d.ends_with("../") or d == ".."
+        if named
+            return None
+        return d + "../"
+    let i = len(dir_of(d.slice(0, len(d) - 1)))
+    if i == 0
+        return ""
+    return d.slice(0, i)
+
+# the last component of a directory "a/b/" -> "b"
+dir_name(d)
+    let t = d.slice(0, len(d) - 1)
+    return t.slice(len(dir_of(t)), len(t))
+
+is_project_root(d)
+    return file_exists(d + "til.json") or file_exists(d + "til.lock")
+
+# [package directory, PROJECT/til_modules/] when `from_file` is a file of an
+# installed package (PROJECT/til_modules/PKG/..., PROJECT with a til.json or
+# til.lock), else None (installed_package_dirs)
+installed_package_dirs(from_file)
+    var d = dir_of(from_file)
+    loop
+        let parent = up_dir(d, true)
+        if parent == None
+            return None
+        if parent != "" and dir_name(parent) == "til_modules"
+            let project = up_dir(parent, true)
+            if project != None and is_project_root(project)
+                return [d, parent]
+        d = parent
+
+# the til_modules/ directories `import NAME` looks in, nearest first
+package_search_dirs(from_file)
+    let owner = installed_package_dirs(from_file)
+    if owner != None
+        return [owner[1]]
+    var dirs = []
+    var d = dir_of(from_file)
+    var n = 0
+    loop
+        dirs.push(d + "til_modules/")
+        if is_project_root(d) or n >= 64
+            return dirs
+        d = up_dir(d, false)
+        if d == None
+            return dirs
+        n += 1
+
+# til.json of a directory (d ends with "/"): [the "main" string (non-empty)
+# or None, the names in "dependencies" (a map) or None]. As json.load: a
+# file that is not valid JSON, not UTF-8 or not an object counts as empty.
+# (tilc does not search the standard library, so a dependency declared in
+# til.json and any other package are both looked up in til_modules/ only:
+# declared_dependencies changes nothing for it.)
+var MANIFESTS = {}
+
+manifest(d)
+    let cached = MANIFESTS.get_or(d, None)
+    if cached != None
+        return cached
+    var res = [None, None]
+    let path = d + "til.json"
+    if file_exists(path)
+        let got = try_read(path)
+        if type_of(got) != "str"
+            var text = got[0]
+            if text.starts_with("\u{FEFF}")
+                text = text.slice(3, len(text))
+            if utf8_error(text) == None
+                let r = json_manifest(text)
+                if r != None
+                    res = r
+    MANIFESTS[d] = res
+    return res
+
+json_ws(s, p)
+    let n = len(s)
+    while p < n and (s[p] == 32 or s[p] == 9 or s[p] == 10 or s[p] == 13)
+        p += 1
+    return p
+
+# a JSON string at p: [its value, end] or None
+json_string(s, p)
+    let n = len(s)
+    if p >= n or s[p] != 34
+        return None
+    p += 1
+    var out = []
+    var a = p
+    while p < n
+        let c = s[p]
+        if c == 34
+            out.push(s.slice(a, p))
+            return [out.join(""), p + 1]
+        if c < 32
+            return None
+        if c == 92
+            out.push(s.slice(a, p))
+            if p + 1 >= n
+                return None
+            let e = s[p + 1]
+            if e == 117
+                if p + 6 > n
+                    return None
+                var cp = 0
+                var k = p + 2
+                while k < p + 6
+                    let h = hex_val(s[k])
+                    if h < 0
+                        return None
+                    cp = cp * 16 + h
+                    k += 1
+                p += 6
+                if cp >= 55296 and cp < 56320 and p + 6 <= n and s[p] == 92 and s[p + 1] == 117
+                    var lo = 0
+                    var ok = true
+                    k = p + 2
+                    while k < p + 6
+                        let h = hex_val(s[k])
+                        if h < 0
+                            ok = false
+                        lo = lo * 16 + h
+                        k += 1
+                    if ok and lo >= 56320 and lo < 57344
+                        cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+                        p += 6
+                out.push(utf8(cp))
+            else
+                let i = "\"\\/bfnrt".find(bytes_to_str([e]))
+                if i < 0
+                    return None
+                out.push(["\"", "\\", "/", "\x08", "\x0c", "\n", "\r", "\t"][i])
+                p += 2
+            a = p
+        else
+            p += 1
     return None
 
-# a module's top-level items (parsed and hoisted once), as [key, item] pairs
+# the end of the JSON number at p, or -1
+json_number(s, p)
+    let n = len(s)
+    if p < n and s[p] == 45
+        p += 1
+    if p >= n or s[p] < 48 or s[p] > 57
+        return -1
+    if s[p] == 48
+        p += 1
+    else
+        while p < n and s[p] >= 48 and s[p] <= 57
+            p += 1
+    if p < n and s[p] == 46
+        p += 1
+        if p >= n or s[p] < 48 or s[p] > 57
+            return -1
+        while p < n and s[p] >= 48 and s[p] <= 57
+            p += 1
+    if p < n and (s[p] == 101 or s[p] == 69)
+        p += 1
+        if p < n and (s[p] == 43 or s[p] == 45)
+            p += 1
+        if p >= n or s[p] < 48 or s[p] > 57
+            return -1
+        while p < n and s[p] >= 48 and s[p] <= 57
+            p += 1
+    return p
+
+# the end of the JSON value at p (any nesting, without recursion), or -1;
+# keys: the keys of the object at p (when it is one) are put there
+json_value(s, p, keys)
+    let n = len(s)
+    var stack = []
+    loop
+        p = json_ws(s, p)
+        if p >= n
+            return -1
+        let c = s[p]
+        if c == 123 or c == 91
+            p = json_ws(s, p + 1)
+            if p < n and s[p] == c + 2
+                p += 1
+            elif c == 91
+                stack.push(2)
+                continue
+            else
+                let k = json_string(s, p)
+                if k == None
+                    return -1
+                if len(stack) == 0 and keys != None
+                    keys[k[0]] = 1
+                p = json_ws(s, k[1])
+                if p >= n or s[p] != 58
+                    return -1
+                p += 1
+                stack.push(1)
+                continue
+        elif c == 34
+            let v = json_string(s, p)
+            if v == None
+                return -1
+            p = v[1]
+        else
+            var done = false
+            for lit in ["true", "false", "null", "NaN", "Infinity", "-Infinity"]
+                if not done and s.slice(p, p + len(lit)) == lit
+                    p += len(lit)
+                    done = true
+            if not done
+                p = json_number(s, p)
+                if p < 0
+                    return -1
+        # after a value: close containers, or the next element / member
+        loop
+            if len(stack) == 0
+                return p
+            p = json_ws(s, p)
+            if p >= n
+                return -1
+            let top = stack[len(stack) - 1]
+            if s[p] == 44
+                p = json_ws(s, p + 1)
+                if top == 1
+                    let k = json_string(s, p)
+                    if k == None
+                        return -1
+                    if len(stack) == 1 and keys != None
+                        keys[k[0]] = 1
+                    p = json_ws(s, k[1])
+                    if p >= n or s[p] != 58
+                        return -1
+                    p += 1
+                break
+            if (top == 1 and s[p] == 125) or (top == 2 and s[p] == 93)
+                stack.pop()
+                p += 1
+            else
+                return -1
+
+# [main, dependency names] of a til.json text, or None if it is not a JSON object
+json_manifest(s)
+    let n = len(s)
+    var p = json_ws(s, 0)
+    if p >= n or s[p] != 123
+        if json_value(s, p, None) >= 0 and json_ws(s, json_value(s, p, None)) == n
+            return [None, None]
+        return None
+    var main = None
+    var deps = None
+    p = json_ws(s, p + 1)
+    if p < n and s[p] == 125
+        p += 1
+    else
+        loop
+            let k = json_string(s, p)
+            if k == None
+                return None
+            p = json_ws(s, k[1])
+            if p >= n or s[p] != 58
+                return None
+            p = json_ws(s, p + 1)
+            if k[0] == "main"
+                main = None
+                if p < n and s[p] == 34
+                    let v = json_string(s, p)
+                    if v != None and len(v[0]) > 0
+                        main = v[0]
+            var keys = None
+            if k[0] == "dependencies"
+                deps = None
+                if p < n and s[p] == 123
+                    keys = {}
+            let e = json_value(s, p, keys)
+            if e < 0
+                return None
+            if keys != None
+                deps = keys
+            p = json_ws(s, e)
+            if p < n and s[p] == 44
+                p = json_ws(s, p + 1)
+            elif p < n and s[p] == 125
+                p += 1
+                break
+            else
+                return None
+    if json_ws(s, p) != n
+        return None
+    return [main, deps]
+
+# the entry file of a package: til.json "main" (inside the package), else
+# NAME.til, lib.til, mod.til (package_entry_file)
+package_entry_file(pkg, name)
+    let main = manifest(pkg + "/")[0]
+    if main != None
+        let m = main.replace("\\", "/")
+        let first = m.split("/")[0]
+        let path = norm_path(pkg + "/" + m)
+        if m.starts_with("/") or first.contains(":") or not path.starts_with(norm_path(pkg) + "/") or not file_exists(path)
+            return None
+        return path
+    for cand in [name + ".til", "lib.til", "mod.til"]
+        if file_exists(pkg + "/" + cand)
+            return pkg + "/" + cand
+    return None
+
+# `import NAME[.sub...]` from the installed packages: the nearest
+# til_modules/NAME/ (a directory that has a til.json, an entry file or the
+# sub-module: tilc cannot test for a directory)
+find_package_module(name, from_file)
+    let parts = name.split(".")
+    let sub = parts.slice(1, len(parts)).join("/")
+    for modules in package_search_dirs(from_file)
+        let pkg = norm_path(modules + parts[0])
+        let entry = package_entry_file(pkg, parts[0])
+        var roots = [pkg]
+        if entry != None and dir_of(entry) != pkg + "/"
+            roots.push(norm_path(dir_of(entry)))
+        if len(parts) == 1
+            if entry != None or file_exists(pkg + "/til.json")
+                return entry
+        else
+            var seen = entry != None or file_exists(pkg + "/til.json")
+            for root in roots
+                for cand in [root + "/" + sub + ".til", root + "/" + sub + "/mod.til"]
+                    if file_exists(cand)
+                        return cand
+            if seen
+                return None
+    return None
+
+resolve_module(name, from_file)
+    let parts = name.replace(".", "/")
+    var dirs = [dir_of(from_file)]
+    if installed_package_dirs(from_file) == None
+        dirs.push(".")
+    for d in dirs
+        var pre = d
+        if d == "."
+            pre = "./"
+        for cand in [pre + parts + ".til", pre + parts + "/mod.til"]
+            if file_exists(cand)
+                if d == "."
+                    return cand
+                return norm_path(cand)
+    return find_package_module(name, from_file)
+
+# a module's top-level items (parsed and hoisted once)
 load_module(path)
-    let cached = MODULE_CACHE.get_or(path, None)
+    let key = norm_path(path)
+    let cached = MODULE_CACHE.get_or(key, None)
     if cached != None
         return cached
     let save_name = FNAME
@@ -3657,28 +4604,84 @@ load_module(path)
     let save_attrs = PENDING_ATTRS
     let save_capt = SCRIPT_CAPT
     let save_sc = SC_SCRIPT
+    let save_mod = MOD_PARSE
+    let save_words = DEF_WORDS
     ITEMS = []
     PENDING_ATTRS = []
     SCRIPT_CAPT = {}
+    MOD_PARSE = true
+    DEF_WORDS = []
     parse_program(setup_languages(text, path))
+    MOD_PARSE = save_mod
     hoist()
+    # (hoist keeps the definitions in order and may add a main at the end:
+    # DEF_WORDS[i] is the words of ITEMS[i])
     var pairs = []
     var i = 0
     for it in ITEMS
-        pairs.push([path + ":" + str(i), it])
+        var w = None
+        if i < len(DEF_WORDS)
+            w = DEF_WORDS[i]
+        pairs.push([key + ":" + str(i), it, path, key, w])
         i += 1
+    DEF_WORDS = save_words
     ITEMS = save_items
     PENDING_ATTRS = save_attrs
     SCRIPT_CAPT = save_capt
     SC_SCRIPT = save_sc
     FNAME = save_name
-    MODULE_CACHE[path] = pairs
-    return pairs
+    let entry = [path, pairs]
+    MODULE_CACHE[key] = entry
+    return entry
 
 def_name(it)
     if it.k == K_FUNC
         return it.a.name
     return it.s
+
+is_importable(it)
+    let k = it.k
+    if k == K_FUNC
+        return it.a.name != "main"
+    return k == K_STRUCTDEF or k == K_ENUMDEF or k == K_IMPL or k == K_TRAIT or k == K_TYPEALIAS or k == K_VAR
+
+# `from m import a, b`: a, b and every definition of m (and of what m
+# imports) they use, transitively (from_import_closure; the words of a
+# definition over-approximate the names it uses)
+from_closure(ms, names)
+    var wanted = {}
+    for n in names
+        wanted[n] = 1
+    var kept = []
+    for m in ms
+        kept.push(false)
+    var changed = true
+    while changed
+        changed = false
+        var i = 0
+        while i < len(ms)
+            if not kept[i]
+                let it = ms[i][1]
+                var hit = wanted.has(def_name(it))
+                if it.k == K_IMPL or it.k == K_ENUMDEF
+                    for m in it.c
+                        if wanted.has(m.name)
+                            hit = true
+                if hit
+                    kept[i] = true
+                    let words = ms[i][4]
+                    if words != None
+                        for w in words
+                            wanted[w] = 1
+                    changed = true
+            i += 1
+    var out = []
+    var j = 0
+    while j < len(ms)
+        if kept[j]
+            out.push(ms[j])
+        j += 1
+    return out
 
 merge_imports(pairs, fname, stack)
     var out = []
@@ -3690,48 +4693,114 @@ merge_imports(pairs, fname, stack)
             let path = resolve_module(it.s, fname)
             if path == None
                 FNAME = fname
-                unsupported(it.ln, "import of '" + it.s + "' (module not found next to the importing file; tilc does not search TIL_PATH or the standard library)")
+                unsupported(it.ln, "import of '" + it.s + "' (module not found next to the importing file or in til_modules/; tilc does not search TIL_PATH or the standard library)")
             let dot_parts = it.s.split(".")
             MODULE_NAMES[dot_parts[len(dot_parts) - 1]] = 1
             if it.b != None
                 MODULE_NAMES[it.b] = 1
-            if not stack.contains(path)
+            let mod = load_module(path)
+            let mkey = norm_path(mod[0])
+            if not stack.contains(mkey)
                 var st2 = stack.copy()
-                st2.push(path)
-                for m in merge_imports(load_module(path), path, st2)
-                    let node = m[1]
-                    let k = node.k
-                    if k == K_FUNC or k == K_STRUCTDEF or k == K_ENUMDEF or k == K_IMPL or k == K_TRAIT or k == K_TYPEALIAS or k == K_VAR
-                        if not (k == K_FUNC and node.a.name == "main")
-                            if it.c == None or it.c.contains(def_name(node))
-                                out.push(m)
+                st2.push(mkey)
+                var ms = []
+                for m in merge_imports(mod[1], mod[0], st2)
+                    if is_importable(m[1])
+                        ms.push(m)
+                if it.c != None
+                    ms = from_closure(ms, it.c)
+                for m in ms
+                    out.push(m)
     return out
 
 resolve_imports()
+    let main_key = norm_path(FNAME)
     var pairs = []
     var i = 0
     var any_import = false
     for it in ITEMS
-        pairs.push(["#" + str(i), it])
+        pairs.push(["#" + str(i), it, FNAME, main_key])
         if it.k == K_IMPORT
             any_import = true
         i += 1
     if not any_import
         return
-    let main_path = norm_path(FNAME)
     var seen = {}
     var out = []
-    for pr in merge_imports(pairs, main_path, [main_path])
+    var items = []
+    for pr in merge_imports(pairs, FNAME, [main_key])
         if not seen.has(pr[0])
             seen[pr[0]] = 1
-            out.push(pr[1])
-    ITEMS = out
+            out.push(pr)
+            items.push(pr[1])
+    ITEMS = items
+    namespace_check(out)
+
+# what the definition is, in E-IMPORT messages (_definition_kind)
+def_kind(it)
+    let k = it.k
+    if k == K_FUNC
+        return "function"
+    if k == K_STRUCTDEF
+        return "struct"
+    if k == K_ENUMDEF
+        return "enum"
+    if k == K_TRAIT
+        return "trait"
+    if k == K_TYPEALIAS
+        if it.n == 1
+            return "capability"
+        return "type alias"
+    if (it.n & 2) != 0
+        return "const"
+    if (it.n & 1) != 0
+        return "var"
+    return "let"
+
+def_place(path, ln)
+    if ln == 0
+        return path + ":?"
+    return path + ":" + str(ln)
+
+# one namespace for the program and everything it imports: a name (or a
+# method of a type) that two files bring in is E-IMPORT (namespace_errors)
+namespace_check(pairs)
+    var first = {}
+    for pr in pairs
+        let it = pr[1]
+        var entries = []
+        if it.k == K_IMPL
+            for m in it.c
+                entries.push(["m" + it.s + "." + m.name, it.s + "." + m.name, m.ln, "method"])
+        elif is_importable(it) or it.k == K_FUNC
+            entries.push(["n" + def_name(it), def_name(it), it.ln, def_kind(it)])
+        for e in entries
+            let prev = first.get_or(e[0], None)
+            if prev == None
+                first[e[0]] = [pr[2], pr[3], e[2], e[3]]
+            elif prev[1] != pr[3]
+                let there = def_place(prev[0], prev[2])
+                let here = def_place(pr[2], e[2])
+                var msg = "'" + e[1] + "' is defined in two files: " + prev[3] + " at " + there + ", " + e[3] + " at " + here
+                if e[3] == prev[3]
+                    msg = e[3] + " '" + e[1] + "' is defined in two files: " + there + " and " + here
+                FNAME = pr[2]
+                fail_at(e[2], msg)
 
 sc_merge(dst, src)
     if src == None
         return
-    if dst.io == 0
-        dst.io = src.io
+    if src.ioc != None
+        if dst.ioc == None
+            dst.ioc = {}
+        for k in src.ioc
+            if not dst.ioc.has(k)
+                dst.ioc[k] = src.ioc[k]
+    if src.perf != None
+        if dst.perf == None
+            dst.perf = []
+        for p in src.perf
+            dst.perf.push(p)
     for k in src.calls
         if not dst.calls.has(k)
             dst.calls[k] = src.calls[k]
@@ -3781,6 +4850,14 @@ struct FS
     captured: any
     rslot: any
     ens_on: bool
+    depth: int
+    dead: bool
+    dlost: bool
+    jd: any
+    handd: int
+    hsps: any
+    clause: bool
+    statfx: any
 
 struct Loc
     slot: int
@@ -3792,6 +4869,8 @@ struct LC
     conts: any
     ctarget: any
     tryd: int
+    hd: int
+    dep: int
 
 # compile-time constant: ty 0 int (small int or limbs), 1 float (8 bytes),
 # 2 str, 3 bool
@@ -3870,8 +4949,33 @@ code_flush(f)
         f.cbase += len(f.code)
         f.code = []
 
+# Operand stack depth (_STACK_EFFECT / track_depth): the values the code
+# leaves above the locals. `break` / `continue` inside an expression pop the
+# values that expression pushed. Per opcode: chr(80 + effect), "?" when it
+# depends on an operand (dep_n), "." unknown; the depth where a jump lands,
+# relative to the depth before it (chr(80 + d)); "1" = flow does not continue.
+var DEPTH_FX = "PQQQQQQOQRP.....QOQOQOQOPQP.....OOOOOOPPOOOPOO..OOOOOO..........POO.............???OP?..........???OMPNP?Q?QPPP.POPOPPPP?P.....P"
+var JUMP_LAND = "..........................P.....................................POO........................................P....QP....Q........."
+var ENDS_FLOW = "00000000000000000000000000000000000000000000000000000000000000001000000000000000000110000000000000000000000000000001000001000001"
+const NO_LANDING = -1000000
+
 emit(op, ln)
     let f = F
+    let x = DEPTH_FX[op]
+    if x != 63
+        if x == 46
+            f.dlost = true
+        let before = f.depth
+        f.depth = before + x - 80
+        let ld = JUMP_LAND[op]
+        if ld != 46
+            let pos = f.cbase + len(f.code) + OP_SIZE[op] - 50
+            if f.dead
+                f.jd[pos] = NO_LANDING
+            else
+                f.jd[pos] = before + ld - 80
+        if ENDS_FLOW[op] == 49
+            f.dead = true
     if len(f.code) >= 512
         code_flush(f)
     if ln != 0 and ln != f.last
@@ -3910,20 +5014,44 @@ put_s(v)
 emit_b(op, v, ln)
     emit(op, ln)
     put_b(v, ln)
+    if DEPTH_FX[op] == 63
+        dep_n(op, v)
 
 emit_h(op, v, ln)
     emit(op, ln)
     put_h(v, ln)
+    if DEPTH_FX[op] == 63
+        dep_n(op, v)
 
 emit_hb(op, h, b, ln)
     emit(op, ln)
     put_h(h, ln)
     put_b(b, ln)
+    if DEPTH_FX[op] == 63
+        dep_n(op, b)
 
 emit_bb(op, b1, b2, ln)
     emit(op, ln)
     put_b(b1, ln)
     put_b(b2, ln)
+    if DEPTH_FX[op] == 63
+        dep_n(op, b2)
+
+# stack effect of the instructions whose effect depends on an operand (n:
+# argument / element count); INVOKE: emit_invoke
+dep_n(op, n)
+    if op == OP_CALL_VALUE
+        F.depth -= n
+    elif op == OP_NEW_MAP
+        F.depth += 1 - 2 * n
+    elif op != OP_INVOKE
+        F.depth += 1 - n
+
+emit_invoke(name, mid, argc, ln)
+    emit_h(OP_INVOKE, const_str(name), ln)
+    put_b(mid, ln)
+    put_b(argc, ln)
+    F.depth -= argc
 
 emit_jump(op, ln)
     emit(op, ln)
@@ -3935,6 +5063,8 @@ patch_to(at, target)
     if rel < -32768 or rel > 32767
         fail_at(0, "function too large: jump offset exceeds 32 KB")
     let f = F
+    if f.jd.has(at)
+        f.jd.delete(at)
     let i = at - f.cbase
     if i >= 0
         f.code[i] = rel & 255
@@ -3953,7 +5083,29 @@ patch_to(at, target)
     ps.insert(lo, [at, rel & 255, (rel >> 8) & 255])
 
 patch_jump(at)
+    land_jump(at)
     patch_to(at, here())
+
+# END_HANDLE keeps the value on top and cuts the stack back to the pairs
+emit_end_handle(pairs_depth, ln)
+    emit(OP_END_HANDLE, ln)
+    F.depth = pairs_depth + 1
+
+# a forward jump (patched at `at`) lands here (land_jump)
+land_jump(at)
+    let f = F
+    let jd = f.jd
+    if not jd.has(at)
+        return
+    let landing = jd[at]
+    jd.delete(at)
+    if landing == NO_LANDING
+        return
+    if f.dead
+        f.depth = landing
+        f.dead = false
+    elif landing != f.depth
+        f.dlost = true
 
 emit_loop(target, ln)
     emit(OP_JUMP, ln)
@@ -4108,8 +5260,13 @@ cv_truthy(c)
         return len(c.v) > 0
     return c.v
 
-# Python equality of two constants: 1 equal, 0 different, -1 unknown
+# equality of two constants as the VMs compare them (a bool equals only a
+# bool): 1 equal, 0 different, -1 unknown
 cv_equal(a, b)
+    if a.ty == 3 or b.ty == 3
+        if a.ty == 3 and b.ty == 3 and a.v == b.v
+            return 1
+        return 0
     if a.ty == 1 or b.ty == 1
         if a.ty == 2 or b.ty == 2
             return 0
@@ -4128,17 +5285,7 @@ cv_equal(a, b)
         if fcmp(ndecode(a), ndecode(b)) == 0
             return 1
         return 0
-    var x = a.v
-    var y = b.v
-    if a.ty == 3
-        x = 0
-        if a.v
-            x = 1
-    if b.ty == 3
-        y = 0
-        if b.v
-            y = 1
-    if i64_cmp(x, y) == 0
+    if i64_cmp(a.v, b.v) == 0
         return 1
     return 0
 
@@ -4155,6 +5302,8 @@ const_eval(node, env)
     if k == K_BOOL
         return CV { ty: 3, v: node.n }
     if k == K_IDENT
+        if env == None
+            return fold_const(node.s)
         return env.get_or(node.s, None)
     if k == K_UN or k == K_BIN
         return chain_values(node, env, false)
@@ -4213,13 +5362,8 @@ cv_unary(op, v)
         return None
     if op == "not"
         return CV { ty: 3, v: not cv_truthy(v) }
-    if op == "~"
-        if v.ty == 0
-            return CV { ty: 0, v: i64_not(v.v) }
-        if v.ty == 3
-            if v.v
-                return CV { ty: 0, v: -2 }
-            return CV { ty: 0, v: -1 }
+    if op == "~" and v.ty == 0
+        return CV { ty: 0, v: i64_not(v.v) }
     return None
 
 # const_eval of the binary operator node whose left operand has the value a
@@ -4548,14 +5692,35 @@ float_repr(b8)
 
 # a folded nan is left to run time: its bits in the Python compiler depend on
 # the CPU (only the comparisons and truthiness of a nan are folded)
-try_fold(node)
-    let c = const_eval(node, INLINE)
-    if c != None and c.ty == 1 and float_is_nan(c.v)
+# the inline constant `name` while compiling (env None of const_eval): not
+# when a local, a parameter, a captured variable or `result` (#[ensures])
+# shadows it, as emit_load_var resolves names
+fold_const(name)
+    let c = INLINE.get_or(name, None)
+    if c == None
         return None
+    let f = F
+    if f.ens_on and name == "result"
+        return None
+    if find_local_in(f, name) != None
+        return None
+    var fs = f
+    while fs.parent != None
+        for u in fs.upvals
+            if u[0] == name
+                return None
+        let loc = find_local_in(fs.parent, name)
+        if loc != None
+            if loc.cell
+                return None
+            return c
+        fs = fs.parent
     return c
 
 # ── errors ─────────────────────────────────────────────────────────────────
 unknown_name(ln, name, what)
+    if what == "function" and (name == "resume" or CTX_KK.get_or(name, 0) == T_RESUME or CTX_KK_LATN.get_or(name, 0) == T_RESUME or CTX_RU.get_or(name, 0) == T_RESUME)
+        fail_at(ln, "unknown function '" + name + "': resume(...) outside an effect clause")
     fail_at(ln, "unknown " + what + " '" + name + "'")
 
 # ── program ────────────────────────────────────────────────────────────────
@@ -4572,24 +5737,530 @@ new_fs(rec, fi, owner)
     if fi != None and fi.capt != None
         capt = fi.capt
     F = FS { rec: rec, fi: fi, owner: owner, code: [], cparts: new_rope(), patches: [], lines: new_rope(),
-             lbuf: [], last: -1, scopes: [{}], next: 0, loops: [], tryd: 0, upvals: [], captured: capt }
+             lbuf: [], last: -1, scopes: [{}], next: 0, loops: [], tryd: 0, upvals: [], captured: capt,
+             jd: {}, hsps: [] }
 
+# the strings of a rope, in order (its groups, then its last parts)
+rope_chunks(r)
+    var out = []
+    for x in r.big
+        out.push(x)
+    for x in r.parts
+        out.push(x)
+    return out
+
+chunks_len(cs)
+    var n = 0
+    for c in cs
+        n += len(c)
+    return n
+
+# The code of a finished function is kept as a list of strings that each end
+# at an instruction boundary (code_flush moves bytes before an opcode), its
+# line table as a list of strings of whole 6-byte entries: the
+# superinstruction pass reads them in order and lets each string go once it
+# is done with it (small heaps), and serialize() writes them as they are.
 finish_fs()
     let f = F
     code_flush(f)
-    var code = rjoin(f.cparts)
+    var chunks = rope_chunks(f.cparts)
     if len(f.patches) > 0
-        let out = new_rope()
-        var at = 0
-        for pt in f.patches
-            radd(out, code.slice(at, pt[0]))
-            radd(out, bytes_to_str([pt[1], pt[2]]))
-            at = pt[0] + 2
-        radd(out, code.slice(at, len(code)))
-        code = rjoin(out)
-    f.rec.code = code
+        # jump operands patched after their bytes went to cparts
+        var pi = 0
+        let ps = f.patches
+        var base = 0
+        var i = 0
+        while i < len(chunks) and pi < len(ps)
+            let c = chunks[i]
+            let end = base + len(c)
+            if ps[pi][0] < end
+                let out = []
+                var at = 0
+                while pi < len(ps) and ps[pi][0] < end
+                    let pt = ps[pi]
+                    out.push(c.slice(at, pt[0] - base))
+                    out.push(bytes_to_str([pt[1], pt[2]]))
+                    at = pt[0] - base + 2
+                    pi += 1
+                out.push(c.slice(at, len(c)))
+                chunks[i] = out.join("")
+            base = end
+            i += 1
+    f.rec.code = chunks
     radd(f.lines, bytes_to_str(f.lbuf))
-    f.rec.lines = rjoin(f.lines)
+    f.rec.lines = rope_chunks(f.lines)
+    f.cparts = None
+    f.lines = None
+    f.lbuf = None
+    f.code = None
+    f.patches = None
+    if FUSE
+        fuse_function(f.rec)
+
+# ── superinstructions (fuse_superinstructions, docs/TIL_BYTECODE_V2.md) ────
+# After a function is compiled, frequent instruction sequences are replaced
+# by superinstructions; the choice minimises the number of instructions
+# (costs F_COST each, LOAD_LOCAL2 one more), exactly as the Python pass does.
+# A sequence never spans a jump target or a line entry (only its first
+# instruction may be one), so the choice inside a run of instructions between
+# two such boundaries does not depend on the rest of the function: the code is
+# processed run by run, and only the new positions of the jump targets are kept.
+var FUSE = true
+const F_COST = 20
+# instruction size by opcode, as a digit ("0": not an opcode)
+var OP_SIZE = "1111233111100000223322222240000011111111111111001111110000000000333000000000000042511300000000003341133243243230331111416100000134332232325000004566700000000000333333333333333322222222222222220000000000000000000000000000000000000000000000000000000000000000"
+# "1": the last operand is a jump offset (relative to the end of the instruction)
+var OP_JUMPS = "0000000000000000000000000010000000000000000000000000000000000000111000000000000000000000000000000000000000010000110000100000000000000000001000001111100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+# "A" + index in FUSED_BINOPS (ADD .. GE) by opcode, "." for the others
+var FUSED_IX = "................................ABCDE...FGH.IJ..KLMNOP.........."
+
+fz_s16(c, p)
+    let v = c[p] + c[p + 1] * 256
+    if v >= 32768
+        return v - 65536
+    return v
+
+# the jump target of the jump instruction at p (size sz)
+fz_target(c, p, sz)
+    return p + sz + fz_s16(c, p + sz - 2)
+
+fuse_function(rec)
+    var chunks = rec.code
+    # jump targets, sorted (tg), and their new positions (tnew)
+    var tl = []
+    var base = 0
+    for ch in chunks
+        let n = len(ch)
+        var pc = 0
+        while pc < n
+            let op = ch[pc]
+            let sz = OP_SIZE[op] - 48
+            if sz <= 0 or pc + sz > n
+                return
+            if OP_JUMPS[op] == 49
+                tl.push(base + fz_target(ch, pc, sz))
+            pc += sz
+        base += n
+    let total = base
+    if total == 0
+        return
+    tl.sort()
+    var tg = []
+    for t in tl
+        if t < 0 or t > total
+            return
+        if len(tg) == 0 or tg[len(tg) - 1] != t
+            tg.push(t)
+    tl = None
+    var tnew = []
+    var lchunks = rec.lines
+    var lci = 0
+    var lcur = ""
+    var li = 0
+    var lpc = -1
+    while lci < len(lchunks) and len(lchunks[lci]) == 0
+        lci += 1
+    if lci < len(lchunks)
+        lcur = lchunks[lci]
+        lpc = lcur[0] + lcur[1] * 256 + lcur[2] * 65536 + lcur[3] * 16777216
+    var ti = 0
+    var tpc = -1
+    if len(tg) > 0
+        tpc = tg[0]
+    let fz = FZ { out: new_rope(), ob: [], obase: 0, fix: [[]], lout: new_rope(), lb: [], pend: [], ps: [],
+                  best: [], ch: [] }
+    rec.code = None
+    rec.lines = None
+    # the old code is read in order: chunk ci starts at cb
+    var ci = 0
+    var cb = 0
+    var cur = chunks[0]
+    var pc = 0
+    while pc < total
+        # a run: from pc up to the next jump target or line entry
+        let at = fz.obase + len(fz.ob)
+        if pc == tpc
+            tnew.push(at)
+            ti += 1
+            tpc = -1
+            if ti < len(tg)
+                tpc = tg[ti]
+        if pc == lpc
+            fz_line(fz, at, lcur[li + 4], lcur[li + 5])
+            li += 6
+            lpc = -1
+            if li >= len(lcur)
+                lchunks[lci] = None
+                lci += 1
+                li = 0
+                while lci < len(lchunks) and len(lchunks[lci]) == 0
+                    lci += 1
+                lcur = ""
+                if lci < len(lchunks)
+                    lcur = lchunks[lci]
+            if li < len(lcur)
+                lpc = lcur[li] + lcur[li + 1] * 256 + lcur[li + 2] * 65536 + lcur[li + 3] * 16777216
+        while pc - cb >= len(cur)
+            chunks[ci] = None
+            cb += len(cur)
+            ci += 1
+            cur = chunks[ci]
+        let ca = ci
+        let cab = cb
+        let ps = fz.ps
+        ps.clear()
+        ps.push(0)
+        var op = cur[pc - cb]
+        var q = pc + OP_SIZE[op] - 48
+        # (a very long run is cut where no sequence can span the cut)
+        while q < total and q != lpc and q != tpc and len(ps) < 60000
+            while q - cb >= len(cur)
+                cb += len(cur)
+                ci += 1
+                cur = chunks[ci]
+            let nop = cur[q - cb]
+            if len(ps) >= 4096 and not fz_pair(op, nop)
+                break
+            ps.push(q - pc)
+            op = nop
+            q += OP_SIZE[op] - 48
+        ps.push(q - pc)
+        # the bytes of the run
+        var rs = ""
+        let c0 = chunks[ca]
+        if q - cab <= len(c0)
+            rs = c0.slice(pc - cab, q - cab)
+        else
+            var parts = [c0.slice(pc - cab, len(c0))]
+            var k = ca + 1
+            var kb = cab + len(c0)
+            while kb + len(chunks[k]) < q
+                parts.push(chunks[k])
+                kb += len(chunks[k])
+                k += 1
+            parts.push(chunks[k].slice(0, q - kb))
+            rs = parts.join("")
+        fz_run(fz, rs, pc)
+        pc = q
+    if pc == tpc
+        tnew.push(fz.obase + len(fz.ob))
+    # the old code and line table are not needed any more
+    chunks = None
+    cur = None
+    lchunks = None
+    lcur = None
+    fz.ps = None
+    fz.best = None
+    fz.ch = None
+    radd(fz.out, bytes_to_str(fz.ob))
+    fz.ob = None
+    var nc = rope_chunks(fz.out)
+    fz.out = None
+    # jump offsets: new target - end of the jump instruction (each one lies
+    # in one string: they end at instruction boundaries)
+    var fi = 0
+    var fk = 0
+    var fix = fz.fix[0]
+    var nb = 0
+    var i = 0
+    while i < len(nc)
+        let c = nc[i]
+        let end = nb + len(c)
+        if fk < len(fix) and fix[fk] < end
+            let out = []
+            var a = 0
+            while fk < len(fix) and fix[fk] < end
+                let pos = fix[fk]
+                let t = fix[fk + 1]
+                var lo = 0
+                var hi = len(tg) - 1
+                while lo < hi
+                    let mid = (lo + hi) / 2
+                    if tg[mid] < t
+                        lo = mid + 1
+                    else
+                        hi = mid
+                let rel = tnew[lo] - (pos + 2)
+                if rel < -32768 or rel > 32767
+                    fail_at(0, "function too large: jump offset exceeds 32 KB")
+                out.push(c.slice(a, pos - nb))
+                out.push(bytes_to_str([rel & 255, (rel >> 8) & 255]))
+                a = pos - nb + 2
+                fk += 2
+                if fk >= len(fix) and fi + 1 < len(fz.fix)
+                    fi += 1
+                    fix = fz.fix[fi]
+                    fk = 0
+            out.push(c.slice(a, len(c)))
+            nc[i] = out.join("")
+        nb = end
+        i += 1
+    rec.code = nc
+    if len(fz.pend) > 0
+        for b in fz.pend
+            fz.lb.push(b)
+    radd(fz.lout, bytes_to_str(fz.lb))
+    rec.lines = rope_chunks(fz.lout)
+
+struct FZ
+    code: str
+    base: int
+    out: any
+    ob: any
+    obase: int
+    fix: any
+    lout: any
+    lb: any
+    pend: any
+    ps: any
+    best: any
+    ch: any
+
+# a line entry at the new position at (one with the same position as the
+# previous entry replaces it: a dropped JUMP shared its line entry)
+fz_line(fz, at, l0, l1)
+    let p = fz.pend
+    if len(p) > 0
+        if p[0] + p[1] * 256 + p[2] * 65536 + p[3] * 16777216 == at
+            p[4] = l0
+            p[5] = l1
+            return
+        let lb = fz.lb
+        for b in p
+            lb.push(b)
+        if len(lb) >= 510
+            radd(fz.lout, bytes_to_str(lb))
+            fz.lb = []
+    fz.pend = [at & 255, (at >> 8) & 255, (at >> 16) & 255, (at >> 24) & 255, l0, l1]
+
+fz_byte(fz, b)
+    fz.ob.push(b)
+
+# (the new code moves to fz.out between instructions)
+fz_flush(fz)
+    let ob = fz.ob
+    if len(ob) >= 512
+        radd(fz.out, bytes_to_str(ob))
+        fz.obase += len(ob)
+        fz.ob = []
+
+# the jump offset of an instruction being written: patched once the new
+# position of the (old) target t is known
+fz_jump(fz, t)
+    var chunk = fz.fix[len(fz.fix) - 1]
+    if len(chunk) >= 8192
+        chunk = []
+        fz.fix.push(chunk)
+    chunk.push(fz.obase + len(fz.ob))
+    chunk.push(t)
+    fz_byte(fz, 0)
+    fz_byte(fz, 0)
+
+fz_s16_out(fz, v)
+    fz_byte(fz, v & 255)
+    fz_byte(fz, (v >> 8) & 255)
+
+# a small integer constant of PUSH_I8 / PUSH_I16 at p
+fz_int(c, p)
+    if c[p] == OP_PUSH_I8
+        let v = c[p + 1]
+        if v >= 128
+            return v - 256
+        return v
+    return fz_s16(c, p + 1)
+
+is_cmp_op(o)
+    return o >= OP_EQ and o <= OP_GE
+
+# instructions a then b can be next to each other in a superinstruction
+fz_pair(a, b)
+    let binop = b < 64 and FUSED_IX[b] >= 65
+    if a == OP_LOAD_LOCAL
+        return binop or b == OP_PUSH_I8 or b == OP_PUSH_I16 or b == OP_LOAD_LOCAL or b == OP_CAST or b == OP_GET_INDEX or b == OP_GET_FIELD or b == OP_RETURN
+    if a == OP_PUSH_I8 or a == OP_PUSH_I16
+        return binop
+    if a == OP_ADD or a == OP_FOR_ITER
+        return b == OP_STORE_LOCAL
+    if is_cmp_op(a)
+        return b == OP_JUMP_IF_FALSE
+    if a == OP_CAST
+        return b == OP_STORE_LOCAL or b == OP_RETURN
+    if a == OP_NATIVE
+        return b == OP_POP
+    return false
+
+# one run of instructions: c = its bytes, at old position base (fz.ps: the
+# positions of its instructions in c, then the end of the run)
+fz_run(fz, c, base)
+    let ps = fz.ps
+    let m = len(ps) - 1
+    let best = fz.best
+    let ch = fz.ch
+    best.clear()
+    ch.clear()
+    var j = 0
+    while j <= m
+        best.push(0)
+        ch.push(0)
+        j += 1
+    var k = m - 1
+    while k >= 0
+        let p0 = ps[k]
+        let o0 = c[p0]
+        var b = F_COST + best[k + 1]
+        var w = 0
+        if o0 == OP_JUMP and c[p0 + 1] == 0 and c[p0 + 2] == 0
+            b = best[k + 1]
+            w = 1
+        let left = m - k
+        if left >= 4
+            let o1 = c[ps[k + 1]]
+            let o2 = c[ps[k + 2]]
+            let o3 = c[ps[k + 3]]
+            if o0 == OP_LOAD_LOCAL and F_COST + best[k + 4] < b
+                if o1 == OP_PUSH_I8 and o2 == OP_ADD and o3 == OP_STORE_LOCAL and c[p0 + 1] == c[ps[k + 3] + 1]
+                    b = F_COST + best[k + 4]
+                    w = 4 * 256 + OP_INC_LOCAL
+                elif is_cmp_op(o2) and o3 == OP_JUMP_IF_FALSE
+                    if o1 == OP_LOAD_LOCAL
+                        b = F_COST + best[k + 4]
+                        w = 4 * 256 + OP_JUMP_IF_NOT_LL
+                    elif o1 == OP_PUSH_I8 or o1 == OP_PUSH_I16
+                        b = F_COST + best[k + 4]
+                        w = 4 * 256 + OP_JUMP_IF_NOT_LI
+        if left >= 3 and F_COST + best[k + 3] < b
+            let o1 = c[ps[k + 1]]
+            let o2 = c[ps[k + 2]]
+            if o0 == OP_LOAD_LOCAL and o1 == OP_CAST and o2 == OP_STORE_LOCAL and c[p0 + 1] == c[ps[k + 2] + 1]
+                b = F_COST + best[k + 3]
+                w = 3 * 256 + OP_CAST_LOCAL
+            elif is_cmp_op(o1) and o2 == OP_JUMP_IF_FALSE
+                if o0 == OP_LOAD_LOCAL
+                    b = F_COST + best[k + 3]
+                    w = 3 * 256 + OP_JUMP_IF_NOT_L
+                elif o0 == OP_PUSH_I8 or o0 == OP_PUSH_I16
+                    b = F_COST + best[k + 3]
+                    w = 3 * 256 + OP_JUMP_IF_NOT_I
+            elif o0 == OP_LOAD_LOCAL and o1 == OP_LOAD_LOCAL and o2 == OP_GET_INDEX
+                b = F_COST + best[k + 3]
+                w = 3 * 256 + OP_INDEX_LL
+        if left >= 2
+            let o1 = c[ps[k + 1]]
+            var f = 0
+            var cost = F_COST
+            if is_cmp_op(o0)
+                if o1 == OP_JUMP_IF_FALSE
+                    f = OP_JUMP_IF_NOT
+            elif o0 == OP_LOAD_LOCAL
+                if o1 == OP_GET_INDEX
+                    f = OP_INDEX_L
+                elif o1 == OP_GET_FIELD
+                    f = OP_LOAD_LOCAL_FIELD
+                elif o1 == OP_RETURN
+                    f = OP_RETURN_LOCAL
+                elif o1 < 64 and FUSED_IX[o1] >= 65
+                    f = OP_ADD_L + FUSED_IX[o1] - 65
+                elif o1 == OP_LOAD_LOCAL
+                    f = OP_LOAD_LOCAL2
+                    cost = F_COST + 1
+            elif o0 == OP_PUSH_I8 or o0 == OP_PUSH_I16
+                if o1 < 64 and FUSED_IX[o1] >= 65
+                    f = OP_ADD_I + FUSED_IX[o1] - 65
+            elif o0 == OP_FOR_ITER
+                if o1 == OP_STORE_LOCAL
+                    f = OP_FOR_ITER_STORE
+            elif o0 == OP_CAST
+                if o1 == OP_RETURN
+                    f = OP_CAST_RETURN
+            elif o0 == OP_ADD
+                if o1 == OP_STORE_LOCAL
+                    f = OP_ADD_STORE_LOCAL
+            elif o0 == OP_NATIVE
+                if o1 == OP_POP
+                    f = OP_NATIVE_POP
+            if f != 0 and cost + best[k + 2] < b
+                b = cost + best[k + 2]
+                w = 2 * 256 + f
+        best[k] = b
+        ch[k] = w
+        k -= 1
+    # write the chosen instructions
+    k = 0
+    while k < m
+        fz_flush(fz)
+        let w = ch[k]
+        let p0 = ps[k]
+        if w == 1
+            k += 1
+        elif w == 0
+            let e = ps[k + 1]
+            var i = p0
+            if OP_JUMPS[c[p0]] == 49
+                while i < e - 2
+                    fz_byte(fz, c[i])
+                    i += 1
+                fz_jump(fz, base + fz_target(c, p0, e - p0))
+            else
+                while i < e
+                    fz_byte(fz, c[i])
+                    i += 1
+            k += 1
+        else
+            let f = w & 255
+            let p1 = ps[k + 1]
+            fz_byte(fz, f)
+            if f >= OP_ADD_L
+                fz_byte(fz, c[p0 + 1])
+            elif f >= OP_ADD_I
+                fz_s16_out(fz, fz_int(c, p0))
+            elif f == OP_INC_LOCAL
+                fz_byte(fz, c[p0 + 1])
+                fz_byte(fz, c[p1 + 1])
+            elif f == OP_JUMP_IF_NOT_LL
+                let p3 = ps[k + 3]
+                fz_byte(fz, c[ps[k + 2]])
+                fz_byte(fz, c[p0 + 1])
+                fz_byte(fz, c[p1 + 1])
+                fz_jump(fz, base + fz_target(c, p3, 3))
+            elif f == OP_JUMP_IF_NOT_LI
+                let p3 = ps[k + 3]
+                fz_byte(fz, c[ps[k + 2]])
+                fz_byte(fz, c[p0 + 1])
+                fz_s16_out(fz, fz_int(c, p1))
+                fz_jump(fz, base + fz_target(c, p3, 3))
+            elif f == OP_CAST_LOCAL
+                fz_byte(fz, c[p0 + 1])
+                fz_byte(fz, c[p1 + 1])
+            elif f == OP_JUMP_IF_NOT_L
+                fz_byte(fz, c[p1])
+                fz_byte(fz, c[p0 + 1])
+                fz_jump(fz, base + fz_target(c, ps[k + 2], 3))
+            elif f == OP_JUMP_IF_NOT_I
+                fz_byte(fz, c[p1])
+                fz_s16_out(fz, fz_int(c, p0))
+                fz_jump(fz, base + fz_target(c, ps[k + 2], 3))
+            elif f == OP_INDEX_LL or f == OP_LOAD_LOCAL2
+                fz_byte(fz, c[p0 + 1])
+                fz_byte(fz, c[p1 + 1])
+            elif f == OP_JUMP_IF_NOT
+                fz_byte(fz, c[p0])
+                fz_jump(fz, base + fz_target(c, p1, 3))
+            elif f == OP_INDEX_L or f == OP_RETURN_LOCAL or f == OP_CAST_RETURN
+                fz_byte(fz, c[p0 + 1])
+            elif f == OP_LOAD_LOCAL_FIELD
+                fz_byte(fz, c[p0 + 1])
+                fz_byte(fz, c[p1 + 1])
+                fz_byte(fz, c[p1 + 2])
+            elif f == OP_FOR_ITER_STORE
+                fz_byte(fz, c[p0 + 1])
+                fz_byte(fz, c[p1 + 1])
+                fz_jump(fz, base + fz_target(c, p0, 4))
+            elif f == OP_ADD_STORE_LOCAL
+                fz_byte(fz, c[p1 + 1])
+            elif f == OP_NATIVE_POP
+                fz_byte(fz, c[p0 + 1])
+                fz_byte(fz, c[p0 + 2])
+            k += w >> 8
 
 declare_enum(it)
     var is_adt = false
@@ -4847,9 +6518,11 @@ stmt_c()
     let tok = TK
     let t = tok.t
     var cls = 0
+    var ends = false
     if t == T_IF
         if if_c(false)
             cls = 3
+            ends = IF_ENDS
     elif t == T_FOR
         for_c(tok.ln)
     elif t == T_WHILE
@@ -4870,86 +6543,118 @@ stmt_c()
         let m = parse_match()
         if m.ln == 0
             m.ln = tok.ln
+        if RC_ON
+            rc_ends(m)
         if not DRY
             cmatch(m, false)
         cls = 2
     elif t == T_INTENT
         intent_c(false)
         cls = 4
-    elif t == T_PERFORM
-        unsupported(tok.ln, "perform (effects)")
     else
         let expr = parse_expression()
         let u = TK.t
         if u == T_EQ or u == T_PLUSEQ or u == T_MINUSEQ or u == T_STAREQ or u == T_SLASHEQ or u == T_PERCENTEQ
             let op = adv()
             let value = parse_expression()
+            if RC_ON
+                if expr.k == K_RESUME
+                    rc_err(op.ln, "'resume' is reserved inside an effect clause")
+                if rc_ends(expr)
+                    rc_err(rc_line(expr), RC_VALUE)
+                elif rc_ends(value)
+                    rc_err(rc_line(value), RC_VALUE)
             if not DRY
                 cassign(expr, op.v, value, op.ln)
         else
             cls = 1
+            if RC_ON
+                ends = rc_ends(expr)
             if not DRY
                 cexpr(expr)
                 emit(OP_POP, 0)
     LAST_STMT = cls
+    STMT_ENDS = ends
 
 # body of if/elif/else/for/while/loop (a scope of its own)
+# (returns whether the body always reaches resume(...), see rc_ends)
 body_c()
     if not DRY
         begin_scope()
+    var ends = false
     if TK.t == T_INDENT
         block_c()
+        ends = BLK_ENDS
     elif TK.t == T_LBRACE
         brace_c()
+        ends = BLK_ENDS
     else
         stmt_c()
+        ends = STMT_ENDS
     if not DRY
         end_scope()
+    return ends
 
 block_c()
     expect(T_INDENT)
     var n = 0
+    var ends = false
     while TK.t != T_DEDENT and TK.t != T_EOF
         skip_nl()
         if TK.t == T_DEDENT or TK.t == T_EOF
             break
+        if ends and RC_ON
+            rc_err(TK.ln, RC_AFTER)
         stmt_c()
+        if STMT_ENDS
+            ends = true
         n += 1
         skip_nl()
     if TK.t == T_DEDENT
         adv()
+    BLK_ENDS = ends
     return n
 
 brace_c()
     expect(T_LBRACE)
     skip_nl()
     var n = 0
+    var ends = false
     while TK.t != T_RBRACE and TK.t != T_EOF
+        if ends and RC_ON
+            rc_err(TK.ln, RC_AFTER)
         stmt_c()
+        if STMT_ENDS
+            ends = true
         n += 1
         skip_nl()
         if TK.t == T_SEMICOLON
             adv()
         skip_nl()
     expect(T_RBRACE)
+    BLK_ENDS = ends
     return n
 
 # if / elif / else; want_value: the branches are value blocks
 # (compile_if(want_value=True)). Returns whether there was an else branch.
+# (IF_ENDS: every branch, and an else, always reach resume(...))
 if_c(want_value)
     adv()
     var cond = parse_expression()
     skip_nl()
     var ends = []
     var nxt = 0
+    var every = true
+    if RC_ON and rc_ends(cond)
+        rc_err(rc_body_line(), RC_AFTER)
     if not DRY
         cexpr(cond)
         nxt = emit_jump(OP_JUMP_IF_FALSE, cond.ln)
     # (branch: inlined, one call frame less per nested block)
     if want_value and not DRY
         value_body_c()
-    else
-        body_c()
+    elif not body_c()
+        every = false
     if not DRY
         ends.push(emit_jump(OP_JUMP, 0))
         patch_jump(nxt)
@@ -4960,13 +6665,15 @@ if_c(want_value)
         adv()
         cond = parse_expression()
         skip_nl()
+        if RC_ON and rc_ends(cond)
+            rc_err(rc_body_line(), RC_AFTER)
         if not DRY
             cexpr(cond)
             nxt = emit_jump(OP_JUMP_IF_FALSE, cond.ln)
         if want_value and not DRY
             value_body_c()
-        else
-            body_c()
+        elif not body_c()
+            every = false
         if not DRY
             ends.push(emit_jump(OP_JUMP, 0))
             patch_jump(nxt)
@@ -4977,14 +6684,15 @@ if_c(want_value)
         skip_nl()
         if want_value and not DRY
             value_body_c()
-        else
-            body_c()
+        elif not body_c()
+            every = false
         has_else = true
     elif want_value and not DRY
         emit(OP_PUSH_NIL, 0)
     if not DRY
         for e in ends
             patch_jump(e)
+    IF_ENDS = has_else and every
     return has_else
 
 # ── blocks used as values (compile_block_value): retry/timeout bodies, the
@@ -5004,6 +6712,7 @@ fork_stream()
 prescan_body()
     let saved = TSG
     let saved_tk = TK
+    let saved_prev = PREV_T
     let saved_dry = DRY
     TSG = fork_stream()
     TK = peek(0)
@@ -5034,6 +6743,7 @@ prescan_body()
     let cls = LAST_STMT
     TSG = saved
     TK = saved_tk
+    PREV_T = saved_prev
     DRY = saved_dry
     return [n, cls]
 
@@ -5108,18 +6818,24 @@ block_ref()
     DRY = saved_dry
     let r = mk(K_FORK, 0)
     r.a = f
+    r.n = IN_CLAUSE
     return r
 
 # compile a remembered block as a value
 replay_value_block(r)
     let saved = TSG
     let saved_tk = TK
+    let saved_prev = PREV_T
+    let saved_clause = IN_CLAUSE
     TSG = r.a
     r.a = fork_stream()
     TK = peek(0)
+    IN_CLAUSE = r.n
     value_body_c()
+    IN_CLAUSE = saved_clause
     TSG = saved
     TK = saved_tk
+    PREV_T = saved_prev
 
 # intent "goal" body (compile_intent)
 intent_c(want_value)
@@ -5130,7 +6846,9 @@ intent_c(want_value)
         if TK.t == T_INDENT
             block_c()
         else
-            parse_expression()
+            let e = parse_expression()
+            if RC_ON
+                rc_ends(e)
         return
     let handler = emit_jump(OP_TRY, tok.ln)
     F.tryd += 1
@@ -5230,6 +6948,8 @@ while_c(ln)
     adv()
     let cond = parse_expression()
     skip_nl()
+    if RC_ON and rc_ends(cond)
+        rc_err(rc_body_line(), RC_AFTER)
     if DRY
         body_c()
         return
@@ -5256,6 +6976,8 @@ loop_c(ln)
 
 return_c(ln)
     adv()
+    if IN_CLAUSE
+        fail_at(ln, "'return' is not allowed in an effect clause")
     var value = None
     let u = TK.t
     if u != T_NEWLINE and u != T_DEDENT and u != T_EOF and u != T_RBRACE
@@ -5274,7 +6996,9 @@ return_c(ln)
 
 vardecl_c(ln, t)
     adv()
-    let name = expect(T_IDENT).v
+    let name_tok = expect(T_IDENT)
+    check_binding_name(name_tok)
+    let name = name_tok.v
     var ty = None
     if TK.t == T_COLON
         adv()
@@ -5283,6 +7007,8 @@ vardecl_c(ln, t)
     if TK.t == T_EQ
         adv()
         value = parse_expression()
+        if RC_ON and rc_ends(value)
+            rc_err(rc_line(value), RC_VALUE)
     if DRY
         return
     if value == None
@@ -5305,6 +7031,8 @@ assert_c(ln, t)
     if TK.t == T_COMMA
         adv()
         msg = expect(T_STRING).v
+    if RC_ON and rc_ends(cond)
+        rc_err(rc_line(cond), RC_VALUE)
     if DRY
         return
     cexpr(cond)
@@ -5339,10 +7067,14 @@ store_loc(loc, ln)
 
 for_c(ln)
     adv()
-    let vname = expect(T_IDENT).v
+    let vtok = expect(T_IDENT)
+    check_binding_name(vtok)
+    let vname = vtok.v
     expect(T_IN)
     let it = parse_expression()
     skip_nl()
+    if RC_ON and rc_ends(it)
+        rc_err(rc_body_line(), RC_AFTER)
     if DRY
         body_c()
         return
@@ -5419,9 +7151,7 @@ ccomprehension(node)
     SEM = false
     emit_b(OP_LOAD_LOCAL, res, node.ln)
     cexpr(node.a)
-    emit_h(OP_INVOKE, const_str("push"), node.ln)
-    put_b(1, node.ln)
-    put_b(1, node.ln)
+    emit_invoke("push", 1, 1, node.ln)
     SEM = saved
     emit(OP_POP, 0)
     if node.c != None
@@ -5434,6 +7164,116 @@ ccomprehension(node)
     emit_b(OP_LOAD_LOCAL, res, 0)
     end_scope()
 
+# ── effect handlers (compile_handle / compile_clause / compile_perform) ────
+# effect -> clause arity of the handles that lexically enclose the code being
+# compiled (same function, not through lambdas): performs they handle are
+# checked at compile time
+var STATFX = []
+
+# <clause 1> PUSH_CONST "E1" ... <clause n> PUSH_CONST "En"; HANDLE n, end;
+# <body value>; END_HANDLE; end: (a clause that finishes without resume)
+chandle(node)
+    let clauses = node.c
+    if len(clauses) > 255
+        fail_at(node.ln, "too many effect clauses in one handle (max 255)")
+    var arities = {}
+    let f = F
+    let pairs_depth = f.depth
+    for c in clauses
+        cclause(c)
+        emit_h(OP_PUSH_CONST, const_str(c.s), c.ln)
+        arities[c.s] = len(c.c)
+    emit(OP_HANDLE, node.ln)
+    put_b(len(clauses), node.ln)
+    put_s(0)
+    let at = here() - 2
+    # an abort lands with the pairs cut away and the clause value pushed
+    let landing = f.jd.get_or(at, NO_LANDING)
+    if landing != NO_LANDING
+        f.jd[at] = landing - 2 * len(clauses)
+    f.handd += 1
+    f.hsps.push(pairs_depth)
+    STATFX.push(arities)
+    if node.a.k == K_FORK
+        replay_value_block(node.a)
+    else
+        cexpr(node.a)
+    STATFX.pop()
+    f.hsps.pop()
+    f.handd -= 1
+    emit_end_handle(pairs_depth, node.ln)
+    patch_jump(at)
+
+# a clause is a function (flag 16) that closes over the variables it uses
+cclause(c)
+    let rec = FuncRec { name: "<clause " + c.s + ":" + str(c.ln) + ">", flags: 16 }
+    let fidx = len(FUNCS)
+    FUNCS.push(rec)
+    let parent = F
+    F = FS { rec: rec, owner: parent.owner, code: [], cparts: new_rope(), patches: [], lines: new_rope(),
+             lbuf: [], last: -1, scopes: [{}], next: 0, loops: [], tryd: 0, parent: parent, upvals: [],
+             captured: c.n, jd: {}, hsps: [], clause: true }
+    let np = len(c.c)
+    rec.np = np
+    rec.nreq = np
+    for p in c.c
+        declare_local(p, true, c.ln)
+    var i = 0
+    while i < np
+        let cast = numeric_cast(c.b[i])
+        if cast >= 0
+            emit_b(OP_LOAD_LOCAL, i, 0)
+            emit_b(OP_CAST, cast, 0)
+            emit_b(OP_STORE_LOCAL, i, 0)
+        i += 1
+    for p in c.c
+        let loc = find_local(p)
+        if loc.cell
+            emit_b(OP_MAKE_CELL, loc.slot, 0)
+    if c.a.k == K_FORK
+        replay_value_block(c.a)
+    else
+        cexpr(c.a)
+    emit(OP_RETURN, c.ln)
+    let ups = F.upvals
+    rec.nup = len(ups)
+    finish_fs()
+    F = parent
+    if len(ups) == 0
+        emit_h(OP_PUSH_FUNC, fidx, c.ln)
+        return
+    for u in ups
+        if u[1]
+            emit_b(OP_LOAD_LOCAL, u[2], c.ln)
+        else
+            emit_b(OP_LOAD_UPVAL_RAW, u[2], c.ln)
+    emit_hb(OP_MAKE_CLOSURE, fidx, len(ups), c.ln)
+
+# perform E(args) -> PERFORM name, default function (or 0xFFFF), argc
+cperform(node)
+    let argc = len(node.c)
+    if argc > 255
+        fail_at(node.ln, "too many arguments (max 255)")
+    var i = len(STATFX) - 1
+    while i >= 0
+        let ar = STATFX[i].get_or(node.s, -1)
+        if ar >= 0
+            if ar != argc
+                fail_at(node.ln, "effect '" + node.s + "' expects " + str(ar) + " argument(s), got " + str(argc))
+            break
+        i -= 1
+    cargs(node.c, node.ln)
+    var dflt = 65535
+    if FUNC_IX.has(node.s)
+        dflt = FUNC_IX[node.s]
+        if dflt >= 65535
+            fail_at(node.ln, "program too large for the bytecode format")
+    emit(OP_PERFORM, node.ln)
+    put_h(const_str(node.s), node.ln)
+    put_h(dflt, node.ln)
+    put_b(argc, node.ln)
+    F.depth += 1 - argc
+
 # |params| body -> a new function; captured variables become upvalues
 clambda(node)
     let rec = FuncRec { name: "<lambda:" + str(node.ln) + ">", flags: 4 }
@@ -5444,7 +7284,7 @@ clambda(node)
     lambda_captures(node.a, capt)
     F = FS { rec: rec, owner: parent.owner, code: [], cparts: new_rope(), patches: [], lines: new_rope(),
              lbuf: [], last: -1, scopes: [{}], next: 0, loops: [], tryd: 0, parent: parent, upvals: [],
-             captured: capt }
+             captured: capt, jd: {}, hsps: [] }
     let np = len(node.c)
     rec.np = np
     rec.nreq = np
@@ -5454,7 +7294,11 @@ clambda(node)
         let loc = find_local(p)
         if loc.cell
             emit_b(OP_MAKE_CELL, loc.slot, 0)
+    # called later: the handles around the lambda are not known statically
+    let saved_fx = STATFX
+    STATFX = []
     cexpr(node.a)
+    STATFX = saved_fx
     emit(OP_RETURN, node.ln)
     let ups = F.upvals
     rec.nup = len(ups)
@@ -5626,15 +7470,34 @@ destructure(subs, names, subj, fails)
         i += 1
 
 cbreak(ln, is_break)
+    var what = "'continue'"
+    if is_break
+        what = "'break'"
     if len(F.loops) == 0
-        if is_break
-            fail_at(ln, "'break' outside of a loop")
-        fail_at(ln, "'continue' outside of a loop")
+        if F.clause
+            fail_at(ln, what + " cannot leave an effect clause")
+        fail_at(ln, what + " outside of a loop")
     let ctx = F.loops[len(F.loops) - 1]
     var i = 0
     while i < F.tryd - ctx.tryd
         emit(OP_END_TRY, 0)
         i += 1
+    let leave = F.handd - ctx.hd
+    if leave > 0
+        # leaving handle bodies: END_HANDLE drops each record and its clause
+        # pairs (keeping the value on top: here a dummy nil)
+        emit(OP_PUSH_NIL, ln)
+        i = 0
+        while i < leave
+            emit_end_handle(F.hsps[len(F.hsps) - 1 - i], ln)
+            i += 1
+        emit(OP_POP, ln)
+    # the values the expression around the break pushed (`total += handle ... continue`)
+    if not F.dlost and not F.dead
+        i = F.depth - ctx.dep
+        while i > 0
+            emit(OP_POP, ln)
+            i -= 1
     if is_break
         ctx.breaks.push(emit_jump(OP_JUMP, ln))
     elif ctx.ctarget != None
@@ -5780,7 +7643,7 @@ emit_store_var(name, ln)
     unknown_name(ln, name, "name")
 
 push_loop(ctarget)
-    let ctx = LC { breaks: [], conts: [], ctarget: ctarget, tryd: F.tryd }
+    let ctx = LC { breaks: [], conts: [], ctarget: ctarget, tryd: F.tryd, hd: F.handd, dep: F.depth }
     F.loops.push(ctx)
     return ctx
 
@@ -5878,6 +7741,18 @@ cexpr(node)
         cretry(node)
     elif k == K_TIMEOUT
         ctimeout(node)
+    elif k == K_HANDLE
+        chandle(node)
+    elif k == K_PERFORM
+        cperform(node)
+    elif k == K_RESUME
+        if not F.clause
+            fail_at(node.ln, "resume(...) outside an effect clause")
+        if node.a == None
+            emit(OP_PUSH_NIL, node.ln)
+        else
+            cexpr(node.a)
+        emit(OP_RESUME, node.ln)
     else
         fail_at(node.ln, "internal error: cannot compile node kind " + str(k))
 
@@ -5904,7 +7779,7 @@ foldable(c)
 # is done with loops: the outermost node that folds is pushed (or the
 # innermost operand compiled), then the operators around it, inside out.
 cunary(node)
-    let cv = chain_values(node, INLINE, true)
+    let cv = chain_values(node, None, true)
     let chain = cv[0]
     let m = cv[1]
     if m < len(chain)
@@ -5923,7 +7798,7 @@ cunary(node)
         i -= 1
 
 cbinary(node)
-    let cv = chain_values(node, INLINE, true)
+    let cv = chain_values(node, None, true)
     let chain = cv[0]
     let m = cv[1]
     var k = 0
@@ -6168,9 +8043,7 @@ ccall(node)
         sem_check_method(node, obj, meth)
         cexpr(obj)
         cargs(args, node.ln)
-        emit_h(OP_INVOKE, const_str(meth), node.ln)
-        put_b(mid, node.ln)
-        put_b(argc, node.ln)
+        emit_invoke(meth, mid, argc, node.ln)
         return
     cexpr(f)
     cargs(args, node.ln)
@@ -6216,7 +8089,6 @@ cstruct_init(node)
         if not found
             fail_at(node.ln, "struct '" + name + "' has no field '" + g + "'")
     let saved = SEM
-    SEM = false
     for fld in fields
         if given.has(fld.name)
             let e = given[fld.name]
@@ -6224,10 +8096,12 @@ cstruct_init(node)
             if FLOAT_TYPES.has(fld.ty) and e.k != K_FLOAT
                 emit_b(OP_CAST, 1, 0)
         elif fld.def != None
+            # (a default value is not part of the function the checker walks)
+            SEM = false
             cexpr(fld.def)
+            SEM = saved
         else
             push_cv(zero_value(fld.ty), node.ln)
-    SEM = saved
     emit_hb(OP_NEW_STRUCT, STRUCT_TYPES[name], len(fields), node.ln)
 
 cfstring(node)
@@ -6266,8 +8140,8 @@ serialize()
     var nlines = 0
     for f in FUNCS
         f.off = off
-        off += len(f.code)
-        nlines += len(f.lines) / 6
+        off += chunks_len(f.code)
+        nlines += chunks_len(f.lines) / 6
     let out = new_rope()
     var flags = 2
     if USES_FLOAT
@@ -6306,20 +8180,21 @@ serialize()
         radd(out, bytes_to_str([mid]) + u16s(PRELUDE[mid]))
     radd(out, u32s(off))
     for f in FUNCS
-        radd(out, f.code)
+        for c in f.code
+            radd(out, c)
         f.code = None
     if nlines > 65535
         nlines = 65535
     radd(out, u16s(nlines))
     var left = nlines
     for f in FUNCS
-        let ls = f.lines
-        var i = 0
-        while i < len(ls) and left > 0
-            let pc = ls[i] + ls[i + 1] * 256 + ls[i + 2] * 65536 + ls[i + 3] * 16777216 + f.off
-            radd(out, u32s(pc) + ls.slice(i + 4, i + 6))
-            left -= 1
-            i += 6
+        for ls in f.lines
+            var i = 0
+            while i < len(ls) and left > 0
+                let pc = ls[i] + ls[i + 1] * 256 + ls[i + 2] * 65536 + ls[i + 3] * 16777216 + f.off
+                radd(out, u32s(pc) + ls.slice(i + 4, i + 6))
+                left -= 1
+                i += 6
     return rjoin(out)
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -6328,9 +8203,13 @@ serialize()
 
 main()
     init_tables()
-    let a = args()
+    var a = args()
+    if len(a) == 3 and a[0] == "--no-fuse"
+        FUSE = false
+        a = a.slice(1, 3)
     if len(a) != 2
         print("usage: tilc INPUT.til OUTPUT.tbc")
+        print("       tilc --no-fuse INPUT.til OUTPUT.tbc   (no superinstructions, as til build --no-fuse)")
         exit(2)
     FNAME = a[0]
     if not file_exists(a[0])

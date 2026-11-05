@@ -3482,7 +3482,7 @@ def const_eval(node, env: Dict[str, Any]):
             return wrap_int64(-v) if isinstance(v, int) else -v
         if node.op == 'not':
             return not v
-        if node.op == '~' and isinstance(v, int):
+        if node.op == '~' and type(v) is int:      # the VMs reject ~ on a bool
             return wrap_int64(~v)
         raise NotConstant(node.op)
     if isinstance(node, BinaryOp):
@@ -3493,7 +3493,12 @@ def const_eval(node, env: Dict[str, Any]):
         a, b = const_eval(node.left, env), const_eval(node.right, env)
         num = (int, float)
         if node.op in ('==', '!='):
-            return (a == b) if node.op == '==' else (a != b)
+            # the VMs' equality: a bool equals only a bool (`true == 1` is false)
+            if isinstance(a, bool) or isinstance(b, bool):
+                eq = type(a) is type(b) and a == b
+            else:
+                eq = a == b
+            return eq if node.op == '==' else not eq
         if node.op in ('<', '>', '<=', '>=') and type(a) in num and type(b) in num:
             return {'<': a < b, '>': a > b, '<=': a <= b, '>=': a >= b}[node.op]
         if type(a) is int and type(b) is int:
@@ -6933,6 +6938,9 @@ _PUSH_INT = (Op.PUSH_I8, Op.PUSH_I16)       # small integer constants (immediate
 # never part of a fused sequence (effects: docs/TIL_EFFECTS.md)
 _NEVER_FUSED = frozenset([Op.HANDLE, Op.END_HANDLE, Op.PERFORM, Op.RESUME])
 _FUSED_INDEX = {op: i for i, op in enumerate(FUSED_BINOPS)}
+# cost of one instruction when the pass chooses sequences (LOAD_LOCAL2 costs
+# 1/20 more: LOAD_LOCAL + <op>_L, which also saves a push, is preferred)
+_COST = 20
 
 
 def _decode_insns(code) -> Optional[List[list]]:
@@ -6963,7 +6971,9 @@ def _decode_insns(code) -> Optional[List[list]]:
 
 def _fusions_at(insns: List[list], i: int, boundary: Set[int]):
     """Superinstructions that can replace insns[i:i+n]: (n, op, operands, cost).
-    Jump operands are absolute targets here (relocated by the caller)."""
+    Jump operands are absolute targets here (relocated by the caller). Costs are
+    integers (one instruction = _COST): the choice is made in exact arithmetic,
+    which the self-hosted compiler (selfhost/tilc.til) reproduces."""
     def ops(n):
         if i + n > len(insns) or any(insns[j][0] in boundary for j in range(i + 1, i + n)):
             return None
@@ -6978,51 +6988,51 @@ def _fusions_at(insns: List[list], i: int, boundary: Set[int]):
         (_, o0, v0, _e0), (_, o1, v1, _e1), (_, o2, v2, _e2), (_, o3, v3, e3) = g
         if o0 == Op.LOAD_LOCAL and o1 == Op.PUSH_I8 and o2 == Op.ADD and o3 == Op.STORE_LOCAL \
                 and v0[0] == v3[0]:
-            found.append((4, Op.INC_LOCAL, [v0[0], v1[0]], 1.0))
+            found.append((4, Op.INC_LOCAL, [v0[0], v1[0]], _COST))
         if o0 == Op.LOAD_LOCAL and o2 in CMP_OPS and o3 == Op.JUMP_IF_FALSE:
             if o1 == Op.LOAD_LOCAL:
-                found.append((4, Op.JUMP_IF_NOT_LL, [o2, v0[0], v1[0], e3 + v3[0]], 1.0))
+                found.append((4, Op.JUMP_IF_NOT_LL, [o2, v0[0], v1[0], e3 + v3[0]], _COST))
             elif o1 in _PUSH_INT:
-                found.append((4, Op.JUMP_IF_NOT_LI, [o2, v0[0], v1[0], e3 + v3[0]], 1.0))
+                found.append((4, Op.JUMP_IF_NOT_LI, [o2, v0[0], v1[0], e3 + v3[0]], _COST))
     g = ops(3)
     if g:
         (_, o0, v0, _e0), (_, o1, v1, _e1), (_, o2, v2, e2) = g
         if o0 == Op.LOAD_LOCAL and o1 == Op.CAST and o2 == Op.STORE_LOCAL and v0[0] == v2[0]:
-            found.append((3, Op.CAST_LOCAL, [v0[0], v1[0]], 1.0))
+            found.append((3, Op.CAST_LOCAL, [v0[0], v1[0]], _COST))
         if o1 in CMP_OPS and o2 == Op.JUMP_IF_FALSE:
             if o0 == Op.LOAD_LOCAL:
-                found.append((3, Op.JUMP_IF_NOT_L, [o1, v0[0], e2 + v2[0]], 1.0))
+                found.append((3, Op.JUMP_IF_NOT_L, [o1, v0[0], e2 + v2[0]], _COST))
             elif o0 in _PUSH_INT:
-                found.append((3, Op.JUMP_IF_NOT_I, [o1, v0[0], e2 + v2[0]], 1.0))
+                found.append((3, Op.JUMP_IF_NOT_I, [o1, v0[0], e2 + v2[0]], _COST))
         if o0 == Op.LOAD_LOCAL and o1 == Op.LOAD_LOCAL and o2 == Op.GET_INDEX:
-            found.append((3, Op.INDEX_LL, [v0[0], v1[0]], 1.0))
+            found.append((3, Op.INDEX_LL, [v0[0], v1[0]], _COST))
     g = ops(2)
     if g:
         (_, o0, v0, e0), (_, o1, v1, e1) = g
         if o0 in CMP_OPS and o1 == Op.JUMP_IF_FALSE:
-            found.append((2, Op.JUMP_IF_NOT, [o0, e1 + v1[0]], 1.0))
+            found.append((2, Op.JUMP_IF_NOT, [o0, e1 + v1[0]], _COST))
         elif o0 == Op.LOAD_LOCAL:
             if o1 == Op.GET_INDEX:
-                found.append((2, Op.INDEX_L, [v0[0]], 1.0))
+                found.append((2, Op.INDEX_L, [v0[0]], _COST))
             elif o1 == Op.GET_FIELD:
-                found.append((2, Op.LOAD_LOCAL_FIELD, [v0[0], v1[0]], 1.0))
+                found.append((2, Op.LOAD_LOCAL_FIELD, [v0[0], v1[0]], _COST))
             elif o1 == Op.RETURN:
-                found.append((2, Op.RETURN_LOCAL, [v0[0]], 1.0))
+                found.append((2, Op.RETURN_LOCAL, [v0[0]], _COST))
             elif o1 in _FUSED_INDEX:
-                found.append((2, 0xB0 + _FUSED_INDEX[o1], [v0[0]], 1.0))
+                found.append((2, 0xB0 + _FUSED_INDEX[o1], [v0[0]], _COST))
             elif o1 == Op.LOAD_LOCAL:
                 # slightly dearer than LOAD_LOCAL + <op>_L, which also saves the push
-                found.append((2, Op.LOAD_LOCAL2, [v0[0], v1[0]], 1.05))
+                found.append((2, Op.LOAD_LOCAL2, [v0[0], v1[0]], _COST + 1))
         elif o0 in _PUSH_INT and o1 in _FUSED_INDEX:
-            found.append((2, 0xA0 + _FUSED_INDEX[o1], [v0[0]], 1.0))
+            found.append((2, 0xA0 + _FUSED_INDEX[o1], [v0[0]], _COST))
         elif o0 == Op.FOR_ITER and o1 == Op.STORE_LOCAL:
-            found.append((2, Op.FOR_ITER_STORE, [v0[0], v1[0], e0 + v0[1]], 1.0))
+            found.append((2, Op.FOR_ITER_STORE, [v0[0], v1[0], e0 + v0[1]], _COST))
         elif o0 == Op.CAST and o1 == Op.RETURN:
-            found.append((2, Op.CAST_RETURN, [v0[0]], 1.0))
+            found.append((2, Op.CAST_RETURN, [v0[0]], _COST))
         elif o0 == Op.ADD and o1 == Op.STORE_LOCAL:
-            found.append((2, Op.ADD_STORE_LOCAL, [v1[0]], 1.0))
+            found.append((2, Op.ADD_STORE_LOCAL, [v1[0]], _COST))
         elif o0 == Op.NATIVE and o1 == Op.POP:
-            found.append((2, Op.NATIVE_POP, [v0[0], v0[1]], 1.0))
+            found.append((2, Op.NATIVE_POP, [v0[0], v0[1]], _COST))
     return found
 
 
@@ -7053,15 +7063,15 @@ def fuse_superinstructions(func: 'TBCFunction') -> Optional[Dict[int, int]]:
         return None
     boundary = targets | {pc for pc, _line in func.lines} | {0}
     n = len(insns)
-    best = [0.0] * (n + 1)
+    best = [0] * (n + 1)
     choice: List[Any] = [None] * n
     for i in range(n - 1, -1, -1):
-        best[i] = 1.0 + best[i + 1]
+        best[i] = _COST + best[i + 1]
         if insns[i][1] == Op.JUMP and insns[i][2][0] == 0:
             best[i] = best[i + 1]               # a jump to the next instruction
             choice[i] = 'drop'
         for length, op, vals, cost in _fusions_at(insns, i, boundary):
-            if cost + best[i + length] < best[i] - 1e-9:
+            if cost + best[i + length] < best[i]:
                 best[i] = cost + best[i + length]
                 choice[i] = (length, op, vals)
     # layout: new pc of every old instruction start (and of the end)
@@ -7171,6 +7181,22 @@ _JUMP_LANDING = {
 # the next instruction is only reached through a jump
 _ENDS_FLOW = frozenset((Op.JUMP, Op.RETURN, Op.RETURN_NIL, Op.PANIC, Op.RESUME, Op.HALT,
                         Op.CAST_RETURN, Op.RETURN_LOCAL))
+
+
+class _FoldEnv:
+    """The constants try_fold may use: the inline constants that are not
+    shadowed by a local of the function being compiled (const_eval only tests
+    `name in env` and reads env[name])."""
+    __slots__ = ('compiler',)
+
+    def __init__(self, compiler: 'BytecodeCompiler'):
+        self.compiler = compiler
+
+    def __contains__(self, name) -> bool:
+        return self.compiler.names_a_constant(name)
+
+    def __getitem__(self, name):
+        return self.compiler.inline_consts[name]
 
 
 class _FuncState:
@@ -8334,12 +8360,31 @@ class BytecodeCompiler:
     def try_fold(self, node):
         if isinstance(node, (BinaryOp, UnaryOp)):
             try:
-                v = const_eval(node, self.inline_consts)
+                v = const_eval(node, _FoldEnv(self))
             except (NotConstant, OverflowError, ValueError, ZeroDivisionError):
                 return None
             if isinstance(v, (bool, int, float, str)):
                 return v
         return None
+
+    def names_a_constant(self, name: str) -> bool:
+        """`name` here is the inline constant: no local, parameter, captured
+        variable or `result` (in #[ensures]) shadows it (as emit_load_var)."""
+        fs = self.fs
+        if name not in self.inline_consts:
+            return False
+        if name == 'result' and getattr(fs, 'ensures_active', False):
+            return False
+        if self.find_local(fs, name) is not None:
+            return False
+        while fs.parent is not None:              # resolve_upval, without recording one
+            if any(u[0] == name for u in fs.upvals):
+                return False
+            local = self.find_local(fs.parent, name)
+            if local is not None:
+                return not local.celled
+            fs = fs.parent
+        return True
 
     def compile_expr(self, node, parent=None):
         t = type(node)
