@@ -13338,6 +13338,19 @@ def _command_first(args: List[str]) -> List[str]:
 
 @scoped_message_language
 def main():
+    """The `til` command line. `--no-types` switches type inference off for this
+    call only (the environment is restored afterwards, also for in-process callers)."""
+    saved = os.environ.get('TIL_NO_TYPES')
+    try:
+        return _main()
+    finally:
+        if saved is None:
+            os.environ.pop('TIL_NO_TYPES', None)
+        else:
+            os.environ['TIL_NO_TYPES'] = saved
+
+
+def _main():
     args = sys.argv[1:]
 
     args = _command_first(args)                    # `til --lang ru run x.til` == `til run --lang ru x.til`

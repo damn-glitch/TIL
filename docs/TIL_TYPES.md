@@ -118,13 +118,24 @@ Not reported (the VMs decide at run time, and tests rely on that):
   (no conversion and no error), and programs rely on that — the soundness tests
   of `til prove` pass ints to `bool` parameters on purpose. The native backend
   runs such programs on the VM;
+* effects (docs/TIL_EFFECTS.md): a `perform E(...)` may be handled by any
+  dynamically enclosing clause for `E`, so when some `handle ... with` in the
+  program has a clause `E`, the arguments and the result of `perform E` are
+  *dynamic* (the default function's annotations do not apply to them), and so
+  is the value of a `handle` with clauses (the body's value, or that of a
+  clause that ends without `resume()`). Clause bodies are inferred (they are
+  closures and may assign variables of the enclosing function) without
+  reporting. A `perform` of an effect that no clause anywhere handles always
+  calls the function `E` and is checked like a call;
 * comparisons, indexing, iteration, calling a non-function, the arguments of
   builtin natives (`read_file(5)`), methods of builtin types — the VMs report
   these at run time with their own messages.
 
 E-TYPE is checked by `til check`, by every compilation to bytecode
 (`til run --vm`, `til build --target vm`, `--cvm`) and by the native backend.
-`--no-types` (or `TIL_NO_TYPES=1`) switches the pass off.
+`--no-types` (or `TIL_NO_TYPES=1`) switches the pass off (the option only for
+that command: an in-process `til.main()` call restores the environment). The
+errors are localized like the other diagnostics (`--lang ru|kk`).
 
 ## 3. The typed native backend
 
@@ -160,9 +171,14 @@ In particular the native code reproduces:
   comparisons between ints and floats (`2**53 + 1 != 2.0**53`), `floor()` and
   `ceil()` that never give `-0` (the reference VM computes `float(math.floor(x))`:
   `ceil(-0.5)` prints `0`);
-* the VMs' constant folding where it differs from run time (`true == 1`, and
-  integer literals beyond 64 bits: `18446744073709551616 > 0` is folded with
-  the exact value, a variable holding that literal is wrapped to `0`);
+* the bytecode compiler's constant folding where it differs from run time:
+  integer literals beyond 64 bits (`18446744073709551616 > 0` is folded with
+  the exact value, a variable holding that literal is wrapped to `0`). Folding
+  uses a global constant only where no local, parameter, loop variable or
+  lambda parameter of the same name is visible (`area(size: int)` computes
+  `size * size` with its parameter even when a global `size` exists), exactly
+  like `BytecodeCompiler.names_a_constant`; `true == 1` is `false` folded or
+  not;
 * where the VMs produce `None` implicitly: `var x` without a value, a
   declaration or struct field that is not given and whose annotation is not a
   primitive type (`var p: Point`, `var xs: [int]`; primitive annotations start
@@ -251,7 +267,9 @@ Programs are de-duplicated by text; a program's id is its SHA-1.
 **Measure.** Reference: the Python VM (no arguments, empty stdin, 5,000,000
 steps). Native: the same driver as `til run` (`-O0` in the tool), empty stdin,
 timeout. Programs the VM cannot finish (step budget, recursion limit) are not
-compared.
+compared. A native program that stops with one of the explicit run-time errors
+of §3 (exit code 1, a message naming the native backend, the same output up to
+there) is counted as `native-refused`, not as a wrong output.
 
 ```
 python3 tools/native_coverage.py                       # summary
@@ -259,12 +277,17 @@ python3 tools/native_coverage.py --details --reasons    # per program / why
 python3 tools/native_coverage.py --compare tools/native_coverage_baseline.json
 ```
 
-| corpus: 233 programs (214 from the tests, 19 examples), 231 compared | before (TIL 3.0 backend) | after (typed backend) |
+| 233 programs of the TIL 3.0 corpus (214 from the tests, 19 examples), 231 compared | before (TIL 3.0 backend) | after (typed backend) |
 |---|---|---|
 | compiled natively | 205 (88.7%) | **225 (97.4%)** |
 | … output identical to the VM | 203 | **225** |
 | … output **different** from the VM | 2 | **0** |
 | fall back to the VM | 26 | 6 |
+
+The TIL 3.1 tree adds four examples (237 programs, 235 compared): 226 compiled
+natively, all identical to the VM; `11_graphics`, `12_effects` and
+`14_energy` use VM-only features (graphics, effect handlers, `energy_mode()`)
+and run on the VM, `13_proofs` is native.
 
 The baseline per-program results are in `tools/native_coverage_baseline.json`:
 the TIL 3.0 backend (commit `6f4d00b`, before this work) measured with this
@@ -288,21 +311,25 @@ exercise, e.g. `print([1, 2, 3])` printed a pointer, `min(1.5, 2.5)` printed `1`
 `abs(-5) / 2` printed `2.5`, `"é"[0]` was negative, string `<` compared
 pointers; all of these now match the VMs.
 
-As an extra check, the TIL programs in the test files of the other TIL 3.1
-feature branches (effects, fit, gfx, i18n, pkg, playground, prove, selfhost,
-selfsync, vmcore, z80) were measured the same way, as those branches stood while this
-one was finished: of the 325 programs this branch can compile (7 more that
-call `sleep()` were left out), 317 were compared and **238 compiled natively,
-all with output identical to the VM**. Of the 79 fallbacks, 43 use the
-graphics/keys natives (VM-only), 23 dynamic values, 6 a `None` that a native
-number cannot hold. This measurement found four of the bugs fixed in this
-branch (`bool` parameters given ints reported as E-TYPE, a global read before
-it is set, an integer literal beyond 64 bits, a call to a function without a
-result used as a value). Over all 662 TIL programs of all branches (tests,
-examples, the self-hosted compiler `tilc.til`) the inference never fails and
-reports E-TYPE only for the deliberately wrong programs of
-`tests/test_types.py`; the self-hosted compiler (6300 lines) is inferred in
-about 0.4 s.
+**The whole TIL 3.1 corpus.** Every TIL program in all test files of the
+integrated tree (`tests/test_*.py`: all 14 features) plus the examples,
+measured the same way (`python3 tools/native_coverage.py tests/test_*.py`;
+13 programs that call `sleep()` were left out, because the in-process VM really
+sleeps): 826 programs, 807 compared, **580 compiled natively: 578 with output
+identical to the VM, 0 different**, and 2 that stop with one of the explicit
+run-time errors above (`chr(0)` and `sort()` of nan in `tests/test_types.py`,
+status `native-refused`). The 227 fallbacks: effect handlers 85, VM-only
+natives (graphics, keys, `energy_mode()`) 58, dynamic values 44, and 40 for
+the other reasons listed in §3 (a global read before it is set 9, a `None`
+that a native number cannot hold 9, closures capturing a variable that
+changes 5, `perform` of an effect without a default function 5, `bytes_to_str`
+4, ...). 11 programs hit a VM limit; the 8 programs the VM cannot compile are
+the deliberately wrong E-TYPE examples of `tests/test_types.py`. Over the same
+corpus (and the self-hosted compiler `selfhost/tilc.til`, 8300 lines,
+inferred in about 0.5 s) the inference never
+fails and reports E-TYPE only for deliberately wrong programs (those of
+`tests/test_types.py` and the type-mismatch test of `tests/test_compiler.py`);
+no program of `tests/test_effects*.py` gets one.
 
 ## 5. Implementation notes
 

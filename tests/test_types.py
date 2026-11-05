@@ -247,6 +247,69 @@ class TestEType:
     def test_valid_programs_have_no_etype(self, src):
         assert etype_errors(src) == []
 
+    @pytest.mark.parametrize("src, out", [
+        # the default function's parameter type does not bind the clause's arguments
+        ('Ask(q: str) -> int\n    return 0\nmain()\n    let r = handle perform Ask(5) with\n'
+         '        Ask(q) => q * 2\n    print(r)\n', "10\n"),
+        ('Ask(q: str) -> int\n    return 0\ng() -> int\n    return perform Ask(5)\n'
+         'main()\n    print(handle g() with\n        Ask(q) => resume(q + 1))\n', "6\n"),
+        # nor does its return type type the value resume() passes back
+        ('Get() -> int\n    return 0\nmain()\n    let s: str = handle perform Get() with\n'
+         '        Get() => resume("hello")\n    print(s)\n', "hello\n"),
+        # a clause that ends without resume() gives the value of the whole handle
+        ('Stop() -> int\n    return 0\nwork() -> int\n    perform Stop()\n    return 1\n'
+         'main()\n    let v: str = handle work() with\n        Stop() => "aborted"\n    print(v)\n',
+         "aborted\n"),
+        # a clause assigns a variable of the enclosing function (a closure)
+        ('Tick() -> int\n    return 0\nmain()\n    var last = "none"\n    handle perform Tick() with\n'
+         '        Tick() =>\n            last = 5\n            resume(0)\n    let n: int = last\n    print(n)\n',
+         "5\n"),
+    ])
+    def test_effect_programs_have_no_etype(self, src, out, tmp_path):
+        """A perform may be handled by any dynamically enclosing clause: its
+        arguments and result are dynamic unless no clause anywhere handles it."""
+        assert etype_errors(src) == []
+        prog = tmp_path / 'eff.til'
+        prog.write_text(src)
+        r = cli('check', str(prog))
+        assert r.returncode == 0, r.stderr
+        assert run_both(src) == out
+
+    def test_a_perform_no_clause_can_handle_is_a_call(self):
+        # no handle anywhere has a clause Ask: perform Ask(5) always calls Ask
+        errors = etype_errors('Ask(q: str) -> int\n    return len(q)\nmain()\n    print(perform Ask(5))\n')
+        assert errors and "argument 'q' of 'Ask' is str, but the value is int" in errors[0]
+        assert native_matches_vm('Ask(q: str) -> int\n    return len(q)\nmain()\n    print(perform Ask("abc") + 1)\n') \
+            == "4\n"
+
+    def test_effect_test_programs_have_no_etype(self):
+        progs = []
+        for name in sorted(os.listdir(os.path.join(ROOT, 'tests'))):
+            if name.startswith('test_effects') and name.endswith('.py'):
+                path = os.path.join(ROOT, 'tests', name)
+                progs += [(f"{name}:{line}", text) for line, text in native_coverage.test_file_candidates(path)
+                          if native_coverage.is_program(text)]
+        assert len(progs) > 100
+        for label, text in progs:
+            assert etype_errors(text) == [], f"E-TYPE on a valid effect program ({label})"
+
+    def test_check_localizes_etype(self, tmp_path):
+        bad = tmp_path / 'bad.til'
+        bad.write_text('main()\n    let s: str = 5\n')
+        r = cli('check', '--lang', 'ru', str(bad))
+        assert r.returncode == 1 and "[E-TYPE]" in r.stderr and not r.stderr.startswith("error")
+        assert r.stderr == cli('run', '--vm', '--lang', 'ru', str(bad)).stderr
+
+    def test_no_types_option_is_scoped_to_one_call(self, tmp_path, monkeypatch):
+        bad = tmp_path / 'bad.til'
+        bad.write_text('main()\n    let s: str = 5\n')
+        monkeypatch.delenv('TIL_NO_TYPES', raising=False)
+        monkeypatch.setattr(sys, 'argv', ['til', 'check', '--no-types', str(bad)])
+        assert til.main() == 0
+        assert 'TIL_NO_TYPES' not in os.environ
+        monkeypatch.setattr(sys, 'argv', ['til', 'check', str(bad)])
+        assert til.main() == 1
+
     def test_error_format(self):
         err = etype_errors('main()\n    let total = 1\n    let x: int = "a"\n')[0]
         assert "error[E-TYPE]" in err and "<test>:3:5" in err and "hint:" in err
@@ -450,6 +513,31 @@ class TestNativeEqualsVM:
         src = ('const BIG = 18446744073709551616\nmain()\n    print(BIG / 2, BIG > 0, BIG % 10, BIG)\n'
                '    let big = 18446744073709551616\n    print(big > 0, 18446744073709551616 > 0, 0 < BIG < 10)\n')
         assert native_matches_vm(src) == "-9223372036854775808\ntrue\n6\n0\nfalse\ntrue\nfalse\n"
+
+    @pytest.mark.parametrize("src, out", [
+        # a parameter, loop variable or lambda parameter named like a global constant
+        ('let size = 10\nlet greeting = "hello"\narea(size: int) -> int\n    return size * size\n'
+         'greet(greeting: str) -> str\n    return greeting + "!"\nmain()\n    print(area(3))\n'
+         '    print(greet("hi"))\n    for size in 0..2\n        print(size + 1)\n'
+         '    print([1, 2].map(|size| size * 2))\n', "9\nhi!\n1\n2\n[2, 4]\n"),
+        # tests/test_selfhost.py FOLDING_FIXES
+        ('let N = 10\nf(N: int) -> int\n    return N + 1\nmain()\n    print(f(5), N + 1)\n', "6\n11\n"),
+        ('const N = 5\nf() -> int\n    let N = 3\n    return N + 1\nmain()\n    let g = |N| N * 2\n'
+         '    var r = 0\n    for N in 0..2\n        r = N * 1\n    let M = 2\n    let h = |x| x + N + M * 10\n'
+         '    print(f(), g(4), r, h(1), N * 2)\n', "4\n8\n1\n26\n10\n"),
+        ('main()\n    print(true == 1, true != 1, 1 == true, true == 1.0, false == 0, true == true, 1 == 1.0)\n',
+         "false\ntrue\nfalse\nfalse\nfalse\ntrue\ntrue\n"),
+        # a local captured by a lambda, and `result` in #[ensures]
+        ('let size = 10\nlet result = 1\n#[ensures: result * 1 == 6]\nsix() -> int\n    return 6\n'
+         'main()\n    let size = 3\n    print([1].map(|x| x + size * 1))\n    var k = 2\n'
+         '    let f = |x: int| x + size * k\n    print(f(1), six(), result * 5)\n', "[4]\n7\n6\n5\n"),
+    ])
+    def test_constant_folding_follows_the_bytecode_compilers_scopes(self, src, out):
+        """The bytecode compiler folds `size * size` with the global constant
+        only where no local, parameter, loop or lambda variable of that name is
+        visible (BytecodeCompiler.names_a_constant); `true == 1` is false
+        there as at run time. The native code computes the same values."""
+        assert native_matches_vm(src) == out
 
     def test_floor_ceil_and_integer_formats_of_big_floats(self):
         # floor/ceil are float(math.floor(x)) on the reference VM (never -0);
