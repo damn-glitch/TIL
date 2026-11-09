@@ -10,9 +10,9 @@
 
 [![CI](https://github.com/damn-glitch/TIL/actions/workflows/ci.yml/badge.svg)](https://github.com/damn-glitch/TIL/actions/workflows/ci.yml)
 [![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-orange.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)](https://github.com/damn-glitch/TIL/releases)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/damn-glitch/TIL)
-[![Tests](https://img.shields.io/badge/tests-255%20passing-brightgreen.svg)](tests/test_compiler.py)
+[![Version](https://img.shields.io/badge/version-3.1.0-green.svg)](https://github.com/damn-glitch/TIL/releases)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20calculators%20%7C%20MCUs-lightgrey.svg)](vm/README.md)
+[![Tests](https://img.shields.io/badge/tests-336%20passing-brightgreen.svg)](tests/)
 
 **Author: Alisher Beisembekov | Patent No 66853**
 
@@ -24,9 +24,11 @@
 
 TIL (The Intelligent Language) is a compiled programming language with a unique **Multi-Level Architecture**. Instead of forcing one paradigm, TIL lets you pick the right level of abstraction for each function — what we call **Mixed Martial Programming**.
 
-TIL compiles to C via GCC, producing native binaries. The entire compiler is a single Python file.
+TIL has **two backends**: it compiles to C (native binaries via GCC/Clang), and — new in 3.0 — to compact **bytecode** for the **TIL VM**, a tiny portable virtual machine that runs the same programs on PCs without a C compiler, on **calculator-class ARM CPUs** and on **8-bit microcontrollers** (both verified in emulators). The entire compiler is still a single Python file.
 
-TIL also supports **Kazakh language keywords** natively — the first programming language with full Kazakh syntax support.
+TIL supports **Kazakh** (Cyrillic and Latin) and **Russian** keywords natively, and translates programs between them.
+
+> **New in 3.0:** [TIL VM for calculators and microcontrollers](vm/README.md) · real `retry` / `timeout` / effects / capabilities / contracts · closures, algebraic data types, traits, `?` · Kazakh-Latin and Russian syntax + `til translate` · snapshots ("hibernate") · [full list (RU)](docs/TIL_3_IDEAS_RU.md) · [bytecode spec](docs/TIL_BYTECODE.md)
 
 ---
 
@@ -35,7 +37,7 @@ TIL also supports **Kazakh language keywords** natively — the first programmin
 ### Requirements
 
 - Python 3.9+
-- GCC (any recent version)
+- GCC or Clang — optional: without a C compiler, programs run on the TIL VM
 
 ### Install & Run
 
@@ -43,8 +45,11 @@ TIL also supports **Kazakh language keywords** natively — the first programmin
 git clone https://github.com/damn-glitch/TIL.git
 cd TIL
 
-# Run a program
+# Run a program (native; falls back to the TIL VM if no C compiler is installed)
 python src/til.py run examples/01_hello.til
+
+# Run on the portable TIL VM (no C compiler needed)
+python src/til.py run --vm examples/01_hello.til
 
 # Compile to binary
 python src/til.py examples/01_hello.til -o hello
@@ -57,23 +62,131 @@ python src/til.py -c examples/01_hello.til
 ### CLI Reference
 
 ```bash
-python src/til.py [command] [options] <input.til>
+python src/til.py <command> [options] <file>
 
 Commands:
-  run <file>              Compile and run immediately
-  build <file>            Compile to executable
-  check <file>            Type-check only (no compilation)
-  repl                    Interactive REPL
+  run <file.til>          Compile and run (native, or the VM when needed)
+  build <file.til>        --target native (default) | vm (.tbc) | c-vm (one C file) | c
+  exec <file.tbc>         Run bytecode on the TIL VM
+  dis <file>              Disassemble bytecode
+  check <file.til>        Verify effects, capabilities, contracts, names
+  translate <file.til>    Translate keywords: --to en | kk | kk-latn | ru
+  repl                    Interactive REPL (on the VM)
+  debug <file.til>        Time-travel debugger: breakpoints, step, step BACK, reverse-continue
+  prove <file.til>        Prove #[requires]/#[ensures] for ALL inputs (Z3)
+  fit <file.til>          Will it fit a device?  --device ti84ce|numworks|z80-16|... [--run]
+  pkg <cmd>               Packages: init | add NAME SPEC | install | remove | list | verify
 
 Options:
+  --vm / --cvm            run on the Python VM / on the C VM
+  --max-steps <n>         VM sandbox limit
+  --strip                 smallest bytecode (no line table)
+  --no-fuse               bytecode without superinstructions
+  --device <name>         build: fail unless the program fits the device
+  --lang en|ru|kk         message language (also TIL_LANG, or #[lang: ...] in the program)
+  --screen <file.ppm>     graphics: save the final screen as a PPM image
+  --screen-ansi           graphics: draw the screen in the terminal (24-bit colour)
+  --keys <list>           graphics: scripted keys, e.g. "UP,UP,ENTER,a,ESC"
+  --pause-after <n> --save <f.tilp>   pause after n steps, save a portable snapshot
+  --resume <f.tilp>       continue a saved program (on any TIL VM)
+  -- <args...>            arguments for the program (args())
   -o <file>               Output file name
-  -c                      Output C code only (don't compile)
-  -O0, -O1, -O2, -O3     Optimization level (default: -O2)
+  -c                      Output C code only (same as --target c)
+  -O0, -O1, -O2, -O3      Optimization level (default: -O2)
   --keep-c                Keep generated C file
-  --no-check              Disable type checking
+  --no-check              Disable type warnings
+  --no-verify             Disable effect/capability/contract verification
   -v, --verbose           Verbose output
   --version               Show version
 ```
+
+---
+
+## TIL 3.0 — Run Anywhere, Even on a Calculator
+
+```bash
+til build --target vm game.til       # -> game.tbc: runs on every TIL VM
+til build --target c-vm game.til     # -> game_vm.c: VM + program in ONE C file
+cc -O2 -o game game_vm.c -lm         # ...or the TI-84 CE / Casio / NumWorks / Arduino toolchain
+```
+
+The TIL VM (`vm/tilvm.c`) is portable C99 with **no malloc**, a **compacting
+garbage collector** in a fixed arena, configurable 16/32/64-bit integers and
+optional floats, pluggable output, step budgets and **snapshots** (pause a
+running program and resume it later, even after a power cycle).
+
+| Verified in simulators | Memory used by VM + program | Result |
+|---|---|---|
+| ARM Cortex-M3, 64 KB RAM (NumWorks / STM32 class, QEMU) | 44.7 KB flash, 24 KB RAM | all examples identical |
+| 8-bit AVR ATmega1284P, 16 KB RAM (Arduino class, simavr) | 53.8 KB flash, 10.5 KB RAM | all examples identical |
+| Z80 (TI-83/84 class, ucsim) — TIL 3.1 | 16-bit lean build: code ends at 0xBF31 (below 0xC000), 5.7 KB RAM — [results](vm/ports/z80/RESULTS.md) | all examples without floats or values beyond 16 bits identical |
+
+Every program in the test-suite runs on three engines — native C, the Python
+VM and the C VM — and must produce byte-identical output. Details:
+[vm/README.md](vm/README.md).
+
+---
+
+## TIL 3.1 — the 14 ideas, done
+
+| # | Idea | How to use it | Docs |
+|---|---|---|---|
+| 1 | **Self-hosted compiler** — TIL compiled by TIL, so a calculator can compile programs itself | `til run --vm selfhost/tilc.til in.til out.tbc` | [selfhost/README.md](selfhost/README.md) |
+| 2 | **Portable snapshots** — start on a PC, continue on a calculator | `til run --vm prog.til --pause-after 5000 --save s.tilp` → `tilvm --resume-portable s.tilp prog.tbc` | [TIL_SNAPSHOTS.md](docs/TIL_SNAPSHOTS.md) |
+| 3 | **Graphics and keys** — `draw_pixel`, `draw_line`, `draw_text`, `key_pressed`, ... | `til run --vm examples/11_graphics.til --screen-ansi` | [TIL_GRAPHICS.md](docs/TIL_GRAPHICS.md) |
+| 4 | **Time-travel debugger** — step back, reverse-continue | `til debug prog.til` (`b 12`, `c`, `back`, `rc`, `p x`) | [TIL_DEBUGGER.md](docs/TIL_DEBUGGER.md) |
+| 5 | **Online playground** — compiler + VM in the browser (WebAssembly) | open `website/playground/` | [playground](website/playground/README.md) |
+| 6 | **Contract proofs for all inputs** (Z3, 64-bit exact) | `til prove prog.til`, `til check --prove` | [TIL_PROOFS.md](docs/TIL_PROOFS.md) |
+| 7 | **Typed native backend + generics** (inference, `E-TYPE`, monomorphization) | `til run prog.til` | [TIL_TYPES.md](docs/TIL_TYPES.md) |
+| 8 | **Effects with resumption** — `handle ... with E(x) => resume(v)` | `examples/12_effects.til` | [TIL_EFFECTS.md](docs/TIL_EFFECTS.md) |
+| 9 | **Z80** — 16-bit build fits below 0xC000; TI-84 Plus CE port | `make -C vm/ports/z80` | [RESULTS.md](vm/ports/z80/RESULTS.md) |
+| 10 | **Will it fit?** — static + measured memory check per device | `til fit prog.til --device ti84ce` | [TIL_FIT.md](docs/TIL_FIT.md) |
+| 11 | **Battery saving** — `#[energy: low]`, `energy_mode()` | `examples/14_energy.til` | [TIL_ENERGY.md](docs/TIL_ENERGY.md) |
+| 12 | **Error messages in Kazakh and Russian** | `til run --lang kk prog.til`, `TIL_LANG=ru` | [TIL_I18N.md](docs/TIL_I18N.md) |
+| 13 | **2–3× faster VM** — computed goto, superinstructions, caches | `python3 benchmarks/run.py` | [TIL_BYTECODE_V2.md](docs/TIL_BYTECODE_V2.md) |
+| 14 | **Package manager** — `til.json`, `til.lock`, git/archive/path/registry sources | `til pkg add utils ../utils && til pkg install` | [TIL_PACKAGES.md](docs/TIL_PACKAGES.md) |
+
+```til
+# effects with resumption: the handler answers, the body continues
+handle
+    let name = perform Ask("name?")
+    print("hello " + name)
+with
+    Ask(question) => resume("Aigerim")
+```
+
+```til
+# graphics: the VM draws the shapes and the 5x7 font, identical pixels everywhere
+screen_init(96, 64)
+screen_clear(0x1E3A5F)
+draw_circle(70, 32, 12, 0xFFD23F)
+draw_text(2, 2, "TIL 3.1", 0xFFFFFF)
+screen_show()
+```
+
+```bash
+til prove examples/13_proofs.til          # proved / counterexample: x = 9223372036854775807
+til fit game.til --device z80-16          # fits / does not fit: <reasons>
+til run --lang kk broken.til              # қате: ... (Kazakh diagnostics)
+til debug prog.til --commands "b 5; c; p x; back; p x; q"
+```
+
+Measured (details in each document):
+
+* **Speed** (C VM, desktop, vs TIL 3.0): `fib(27)` 2.8×, loops 2.6×, arrays 3.0×,
+  strings 2.4×; the Python reference VM 1.1–2.1× faster.
+* **Native backend**: 97.4% of the test-suite and example programs compile
+  natively (TIL 3.0: 88.7%), with output identical to the VM for every one.
+* **Self-hosting**: `tilc.til` (~8,100 lines of TIL) compiles itself to the same
+  bytes as the Python compiler (stage 1 = stage 2 = stage 3) — 0.4 s on the C VM.
+* **Devices** (emulated, VM + program): Cortex-M3 57 KB flash / 30 KB RAM,
+  AVR ATmega1284P 80 KB flash / 14.5 KB RAM, Z80 16-bit lean build below
+  0xC000 / 5.7 KB RAM (the 3.0 table above shows the smaller 3.0 VM).
+  The TI-84 Plus CE port is written but has not been built with the CE
+  toolchain or run on a calculator yet.
+
+Every program in the test-suite runs on the Python VM and the C VM (and
+natively where it compiles) and must produce byte-identical output.
 
 ---
 
@@ -358,10 +471,11 @@ main()
 
 ## Kazakh Language Support
 
-TIL is the first programming language with full Kazakh keyword support. Every English keyword has a Kazakh equivalent:
+TIL is the first programming language with full Kazakh keyword support. Every English keyword has a Kazakh equivalent. Cyrillic Kazakh is always available; Latin-script Kazakh is enabled with `#[lang: kk-latn]` and Russian with `#[lang: ru]`:
 
 ```python
-# Kazakh program
+#[lang: kk-latn]
+# Kazakh program (Latin script)
 negizgi()
     turaqty aty = "Alem"
     turaqty zhasy = 25
@@ -394,6 +508,17 @@ negizgi()
 | өзгермелі | mut | | өзін | self |
 | және | and | | емес | not |
 | ақиқат | true | | жалған | false |
+| әйтпесе егер | elif | | басып_шығару | print |
+| негізгі | main | | тексеру | assert |
+
+Russian (`#[lang: ru]`): `если / иначе / иначе если / для … в / пока / цикл / вернуть / пусть / перем / конст / функция / структура / перечисление / реализация / выбор / и / или / не / истина / ложь / печать / главная`.
+
+Translate any program between languages (the round trip is exact):
+
+```bash
+til translate --to ru program.til > program_ru.til
+til translate --to en program_ru.til
+```
 
 Unicode identifiers are automatically mangled to valid C via `_uXXXX` encoding.
 
@@ -526,10 +651,12 @@ Bye!
 ## Compiler Architecture
 
 ```
-TIL Source --> Lexer --> Parser --> TypeChecker --> CCodeGenerator --> GCC --> Binary
+TIL Source --> Lexer --> Parser --> Imports --> Verifier --+--> CCodeGenerator --> GCC --> Binary
+                                                            |
+                                                            +--> BytecodeCompiler --> .tbc --> TIL VM (Python / C)
 ```
 
-The entire compiler is a single Python file: `src/til.py` (~5000 lines).
+The entire compiler is a single Python file: `src/til.py` (~9800 lines). The Verifier checks effects, capabilities, contracts and arities for both backends.
 
 | Stage | What it does |
 |-------|-------------|
@@ -568,6 +695,12 @@ The `examples/` directory contains progressive tutorials:
 | `06_enums.til` | Enums with values, match expressions |
 | `07_multilevel.til` | Multi-level programming across all levels |
 | `08_imports.til` | Module imports and reuse |
+| `09_v3_features.til` | TIL 3.0: retry, timeout, ADTs, traits, Option/Result |
+| `10_verified.til` | Effects, capabilities and contracts checked by the compiler |
+| `11_graphics.til` | Screen graphics: shapes, text, pixel checksum (3.1) |
+| `12_effects.til` | Effects with resumption: `handle ... with ... resume` (3.1) |
+| `13_proofs.til` | Contracts proved for all inputs with `til prove` (3.1) |
+| `14_energy.til` | Battery saving: `#[energy: low]`, `energy_mode()` (3.1) |
 | `kazakh/salam.til` | Full program written in Kazakh |
 
 Run any example:
@@ -580,11 +713,12 @@ python src/til.py run examples/01_hello.til
 
 ## Testing
 
-**255 tests** covering the full compiler pipeline:
+**336 tests** covering the full compiler pipeline — `tests/test_compiler.py` (255) and `tests/test_v3.py` (81, every program runs natively, on the Python VM and on the C VM, outputs must be identical):
 
 ```bash
 pip install pytest
-python -m pytest tests/test_compiler.py -v
+python -m pytest tests/ -v
+TIL_TEST_CROSS=1 python -m pytest tests/test_v3.py -k Cross   # QEMU / simavr / ucsim runs
 ```
 
 | Area | Tests | Coverage |
@@ -637,7 +771,11 @@ Automated testing on every push via GitHub Actions:
 ```
 TIL/
 ├── src/
-│   └── til.py               # The compiler (single file, ~5000 lines)
+│   └── til.py               # The compiler: front end, verifier, C backend, bytecode compiler, reference VM
+├── vm/
+│   ├── tilvm.c, tilvm.h      # Portable C VM (calculators, microcontrollers, desktops)
+│   ├── main.c                # tilvm command-line runner
+│   └── ports/                # Cortex-M (QEMU), AVR (simavr), Z80 (ucsim) builds
 ├── examples/
 │   ├── 01_hello.til          # Progressive tutorials (01-08)
 │   ├── 02_variables.til
@@ -654,7 +792,8 @@ TIL/
 │   ├── math.til              # Math standard library
 │   └── strings.til           # String standard library
 ├── tests/
-│   └── test_compiler.py      # 255 tests
+│   ├── test_compiler.py      # 255 tests
+│   └── test_v3.py            # 81 tests: native == Python VM == C VM
 ├── .github/
 │   └── workflows/
 │       └── ci.yml            # CI for Linux, macOS, Windows
@@ -707,25 +846,48 @@ TIL/
 
 ### Revolutionary Features (v2.0)
 
-- [x] **Generics** — `#[generic: T]` type parameter annotations
-- [x] **Algebraic Effects** — `#[pure]`, `#[effects: io, fs]` with composable effect types
-- [x] **Capability-Based Security** — `cap FileAccess { read, write }`, `#[cap: FileRead]` function capabilities
-- [x] **Temporal Types** — `timeout(ms) { expr }` timed execution
-- [x] **Gradual Verification** — `assert cond, "msg"`, `invariant cond` runtime verification
-- [x] **Adaptive Error Handling** — `retry(n) { expr }` with automatic retry
+- [x] **Generics** — `#[generic: T]` annotations; on the VM every function is generic (dynamic typing)
+- [x] **Effect System** — `#[pure]`, `#[effects: io, fs]` — effects are inferred and **checked by the compiler** (3.0)
+- [x] **Capability-Based Security** — `#[cap: FileRead]` functions can only be used by functions holding the capability (or `main`) — **compile-time check** (3.0)
+- [x] **Temporal Types** — `timeout(ms) { … } else { … }` **really interrupts** long computations (3.0)
+- [x] **Gradual Verification** — `assert`, `invariant`, `#[requires]`/`#[ensures]`; violations with constant arguments are **compile errors** (3.0)
+- [x] **Adaptive Error Handling** — `retry(n) { … } else { … }` **really re-runs** the body after any runtime error (3.0)
 - [x] **Energy-Aware Compilation** — `#[energy: low|medium|high]` optimization hints
-- [x] **Cross-Level Contracts** — `#[cross_level: 1 -> 2]` level transition validation
+- [x] **Cross-Level Contracts** — `#[cross_level: 1 -> 2]` annotations
 - [x] **Distributed Types** — Channel-like patterns with `Vec<T>` message queues
-- [x] **Intent-Based Programming** — `intent "description" { body }` self-documenting code blocks
+- [x] **Intent-Based Programming** — `intent "description" { body }` — failures report the intent (3.0, VM)
 
-### Roadmap to v3.0
+### New in v3.0
 
-- [ ] Full generics with monomorphization
-- [ ] Full pattern matching with destructuring
-- [ ] Full trait dispatch (dynamic method resolution)
-- [ ] LSP server for editor integration
-- [ ] Package manager
-- [ ] Expanded standard library
+- [x] **TIL VM** — bytecode backend, Python reference VM, portable C VM (no malloc, compacting GC)
+- [x] **Calculators & microcontrollers** — verified on emulated ARM Cortex-M3 and 8-bit AVR (Z80: compiles, does not fit 64 KB yet)
+- [x] **Snapshots** — pause a running program and resume it later
+- [x] **Closures as values**, `map` / `filter` / `reduce` / `each` / `any` / `all`, pipeline `|>`
+- [x] **Algebraic data types** — enum variants with data, destructuring `match`
+- [x] **Traits** with default methods and dynamic dispatch
+- [x] **Option / Result** with `?` propagation and `match` on `Some/None/Ok/Err`
+- [x] **Patterns**: ranges, alternatives `1 | 2`, tuples, struct patterns, guards
+- [x] **Maps** `{"k": v}`, string methods, f-string format specs `{x:.2f}`
+- [x] **Script mode** — top-level statements are a program
+- [x] **Kazakh Latin + Russian** syntax, `til translate`
+- [x] 25+ bug fixes (f-strings, string equality, one-line functions, Kazakh `elif`, injection-safe C output, ...)
+
+### Roadmap
+
+- [x] Full pattern matching with destructuring (VM)
+- [x] Full trait dispatch (dynamic method resolution) (VM)
+- [x] Self-hosted compiler → compile TIL on the calculator itself (3.1)
+- [x] Portable snapshots: start a program on a PC, continue it on a calculator (3.1)
+- [x] Calculator graphics & keypad API (`draw_pixel`, `key_pressed`, ...) (3.1)
+- [x] Contracts proven with an SMT solver (Level 4 "Formal") (3.1)
+- [x] Typed AST + monomorphization for the native backend (3.1)
+- [x] WebAssembly build of the VM for an in-browser playground (3.1)
+- [x] Package manager (3.1)
+- [x] Time-travel debugger, effects with resumption, battery saving, Kazakh/Russian messages, 2–3× faster VM, memory-fit check, Z80 16-bit build (3.1)
+- [ ] TI-84 Plus CE: build and run on a real calculator; TI-84 Plus Flash application (banked Z80)
+- [ ] LSP keyword sync
+
+All ideas, in Russian: [docs/TIL_3_IDEAS_RU.md](docs/TIL_3_IDEAS_RU.md)
 
 ---
 

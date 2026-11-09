@@ -1,0 +1,10 @@
+# Hello, TIL! Edit the code and press Run (or Ctrl+Enter).
+# The program is compiled and run right here, in your browser.
+
+print("Hello, World!")
+print("Сәлем, әлем!")
+print("Привет, мир!")
+
+let language = "TIL"
+let year = 2026
+print(f"{language} says hi from {year}.")

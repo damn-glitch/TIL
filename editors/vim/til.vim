@@ -12,6 +12,7 @@ syn keyword tilKeyword if else elif for while loop in return
 syn keyword tilKeyword break continue fn let var const mut
 syn keyword tilKeyword struct enum impl trait match type pub as
 syn keyword tilKeyword and or not self import from
+syn keyword tilKeyword retry timeout intent assert invariant cap perform handle with resume
 
 " Types
 syn keyword tilType int float str bool char void
@@ -23,6 +24,8 @@ syn keyword tilBoolean true false True False None
 " Built-in functions
 syn keyword tilBuiltin print input sqrt abs pow sin cos tan
 syn keyword tilBuiltin log exp floor ceil round min max len
+syn keyword tilBuiltin str int bool chr ord range format panic exit sum random seed clock_ms type_of
+syn keyword tilBuiltin Some Ok Err
 
 " Numbers
 syn match tilNumber "\<\d\+\>"

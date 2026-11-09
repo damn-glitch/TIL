@@ -1,0 +1,10 @@
+# fib.til - recursive calls (TIL 3.1 VM benchmark)
+# Run: til run --cvm benchmarks/fib.til
+
+fib(n: int) -> int
+    if n < 2
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+main()
+    print(fib(27))

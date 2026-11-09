@@ -38,17 +38,88 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update && sudo apt-get install -y gcc
-          pip install pytest
-      - name: Run unit tests
-        run: python -m pytest tests/test_compiler.py -v --tb=short
-      - name: Compile all examples
+          pip install pytest z3-solver
+      - name: Run unit tests (native == Python VM == C VM)
+        run: python -m pytest tests/ -v --tb=short
+      - name: Run every example natively and on the VM
         run: |
-          for f in examples/[0-9]*.til; do
+          for f in $(find examples -name '*.til' ! -name math_utils.til); do
             echo "Testing: $f"
-            python src/til.py run "$f"
+            (cd "$(dirname "$f")" && python "$GITHUB_WORKSPACE/src/til.py" run "$(basename "$f")" > /tmp/native.txt)
+            (cd "$(dirname "$f")" && python "$GITHUB_WORKSPACE/src/til.py" run --vm "$(basename "$f")" > /tmp/vm.txt)
+            cmp /tmp/native.txt /tmp/vm.txt
           done
-      - name: Test Kazakh example
+      - name: Kazakh example
         run: python src/til.py run examples/kazakh/salam.til
+
+  c-vm:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - name: Strict builds (gcc, clang, all profiles)
+        run: |
+          for cc in gcc clang; do
+            make -C vm clean
+            make -C vm CC=$cc CFLAGS="-std=c99 -O2 -Wall -Wextra -pedantic -Werror" tilvm small tiny
+          done
+          for defs in "-DTILVM_NO_STDIO -DTILVM_NO_TIME" "-DTILVM_NO_STDIO -DTILVM_NO_MATH -DTILVM_FLOAT=1" \
+                      "-DTILVM_INT_BITS=16 -DTILVM_FLOAT=0 -DTILVM_NO_STDIO" \
+                      "-DTILVM_LEAN -DTILVM_INT_BITS=16 -DTILVM_FLOAT=0 -DTILVM_NO_STDIO" \
+                      "-DTILVM_NO_GFX" "-DTILVM_NO_EFFECTS" "-DTILVM_STATS" \
+                      "-DTILVM_LEAN -DTILVM_ADDR16 -DTILVM_INT_BITS=16 -DTILVM_FLOAT=0 -DTILVM_NO_STDIO -DTILVM_HEAP_SIZE=8192 -DTILVM_NO_GFX -DTILVM_NO_EFFECTS"; do
+            for cc in gcc clang; do
+              $cc -std=c99 -Wall -Wextra -pedantic -Werror $defs -c vm/tilvm.c -o /tmp/tilvm.o
+            done
+          done
+      - name: Sanitizers (ASan + UBSan, 4 KB heap - GC stress)
+        run: |
+          make -C vm check
+          python src/til.py build --target vm examples/03_functions.til -o /tmp/f.tbc
+          ./vm/tilvm-check /tmp/f.tbc > /dev/null
+          python src/til.py build --target vm examples/11_graphics.til -o /tmp/g.tbc
+          ./vm/tilvm-check --screen /tmp/g.ppm --keys "" /tmp/g.tbc > /dev/null
+          python src/til.py build --target vm examples/12_effects.til -o /tmp/e.tbc
+          ./vm/tilvm-check /tmp/e.tbc > /dev/null
+
+  cross:
+    runs-on: ubuntu-latest
+    needs: c-vm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install cross toolchains and simulators
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi qemu-system-arm gcc-avr avr-libc simavr sdcc sdcc-ucsim
+          pip install pytest
+      - name: TIL on ARM Cortex-M (QEMU) and 8-bit AVR (simavr)
+        run: TIL_TEST_CROSS=1 python -m pytest tests/test_v3.py -v -k "cortex_m or avr"
+      - name: TIL on the Z80 (SDCC + ucsim)
+        run: TIL_TEST_CROSS=1 python -m pytest tests/test_z80.py -v
+
+  playground:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install clang, lld and Playwright
+        run: |
+          sudo apt-get update && sudo apt-get install -y clang lld
+          pip install pytest
+          npm install --prefix "$RUNNER_TEMP/pw" playwright
+          npx --prefix "$RUNNER_TEMP/pw" playwright install --with-deps chromium
+      - name: Playground (WebAssembly VM + self-hosted compiler in the browser)
+        run: TIL_SLOW_TESTS=1 NODE_PATH="$RUNNER_TEMP/pw/node_modules" python3 -m pytest tests/test_playground.py -v
 
   test-macos:
     runs-on: macos-latest
@@ -62,7 +133,7 @@ jobs:
       - name: Install pytest
         run: pip install pytest
       - name: Run unit tests
-        run: python -m pytest tests/test_compiler.py -v --tb=short
+        run: python -m pytest tests/ -v --tb=short
       - name: Compile examples
         run: |
           for f in examples/[0-9]*.til; do
@@ -83,5 +154,9 @@ jobs:
         run: pip install pytest
       - name: Run unit tests
         run: python -m pytest tests/test_compiler.py -v --tb=short
+      - name: Run on the TIL VM (no C compiler needed)
+        run: |
+          python src/til.py run --vm examples/01_hello.til
+          python src/til.py run --vm examples/05_control_flow.til
       - name: Compile hello example
         run: python src/til.py run examples/01_hello.til

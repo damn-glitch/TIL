@@ -1728,7 +1728,7 @@ class TestREPL:
             [sys.executable, os.path.join('src', 'til.py'), '--version'],
             capture_output=True, text=True, cwd=project_root
         )
-        assert "TIL Compiler v2.0.0" in result.stdout
+        assert "TIL Compiler v3.1.0" in result.stdout
 
     def test_help_mentions_repl(self):
         import subprocess

@@ -127,7 +127,7 @@ clang --version
 Open terminal and run:
 
 ```bash
-curl -fsSL https://til-dev.vercel.app/install.sh | sh
+curl -fsSL https://til-dev.vercel.app/install.sh | bash
 ```
 
 This will:
@@ -350,7 +350,7 @@ til --version
 
 ```bash
 # In WSL terminal, follow Linux instructions
-curl -fsSL https://til-dev.vercel.app/install.sh | sh
+curl -fsSL https://til-dev.vercel.app/install.sh | bash
 ```
 
 ---
@@ -1019,7 +1019,7 @@ Include in bug reports:
 
 ```bash
 # Method 1: Re-run installer
-curl -fsSL https://til-dev.vercel.app/install.sh | sh
+curl -fsSL https://til-dev.vercel.app/install.sh | bash
 
 # Method 2: Manual update
 curl -fsSL https://raw.githubusercontent.com/til-lang/til/main/til.py \

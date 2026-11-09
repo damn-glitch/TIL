@@ -1,0 +1,58 @@
+# 14_energy.til
+# TIL 3.1 - battery saving (docs/TIL_ENERGY.md).
+#
+# On the TIL VM a program can give the CPU away while it runs: the VM idles
+# 1 ms every few hundred steps (a desktop sleeps, a calculator halts until
+# its next interrupt). Results never depend on the energy mode - only the
+# battery, and how long a CPU-bound loop takes.
+#   0 performance   never idle
+#   1 balanced      idle 1 ms every 4096 steps
+#   2 low           idle 1 ms every 512 steps
+# Run: til run --vm examples/14_energy.til
+
+# The program's mode: a pragma before every definition (followed by an empty line)
+#[energy: balanced]
+
+let MODES = ["performance", "balanced", "low"]
+
+# A background job: while it runs the VM behaves as in mode low
+#[energy: low]
+checksum(n: int) -> int
+    var h = 17
+    for i in 0..n
+        h = (h * 31 + i) % 1000003
+    return h
+
+# A short burst at full speed: energy_mode(m) returns the previous mode
+count_primes(limit: int) -> int
+    let saved = energy_mode(0)
+    var count = 0
+    for n in 2..limit
+        var d = 2
+        var prime = true
+        while d * d <= n
+            if n % d == 0
+                prime = false
+                break
+            d += 1
+        if prime
+            count += 1
+    energy_mode(saved)
+    return count
+
+main()
+    print(f"mode at start: {MODES[energy_mode()]}")
+    print(f"checksum: {checksum(20000)}")
+    print(f"primes below 5000: {count_primes(5000)}")
+    print(f"mode after the burst: {MODES[energy_mode()]}")
+    let before = energy_mode(2)
+    print(f"switched from {MODES[before]} to {MODES[energy_mode()]}")
+    var total = 0
+    for i in 0..3000
+        total += i % 10
+    print(f"total: {total}")
+    let r = retry(1)
+        energy_mode(3)
+    else
+        "refused: " + error
+    print(r)

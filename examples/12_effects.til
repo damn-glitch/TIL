@@ -1,0 +1,106 @@
+# 12_effects.til
+# TIL 3.1 - effect handlers with resumption.
+#
+# A function *performs* an effect: `perform Ask("name")`. The nearest
+# `handle ... with` around the call (even many calls up) decides what it means.
+#   resume(v)  - continue right after the perform, which evaluates to v
+#   no resume  - the clause's value becomes the value of the whole handle
+# Run: til run examples/12_effects.til   (handlers run on the TIL VM)
+
+# ── 1. ask the caller instead of reading globals ──────────────────────
+greet() -> str
+    let name = perform Ask("name")
+    let city = perform Ask("city")
+    perform Log("greeting " + name)
+    return f"Hello, {name} from {city}!"
+
+# A top-level function named like the effect is its default handler:
+# it runs when no `handle` around the perform has a clause for it.
+Log(msg: str)
+    print("[log] " + msg)
+
+# ── 2. leave a deep computation early ─────────────────────────────────
+first_negative(rows) -> int
+    for row in rows
+        for x in row
+            if x < 0
+                perform Found(x)
+    return 0
+
+# ── 3. generators: the producer yields, the handler consumes ─────────
+countdown(n: int)
+    var i = n
+    while i > 0
+        perform Yield(i)
+        i -= 1
+
+main()
+    print("== ask / log ==")
+    let text = handle
+        greet()
+    with
+        Ask(key) =>
+            if key == "name"
+                resume("Aigerim")
+            resume("Almaty")
+    print(text)
+
+    print("== early exit ==")
+    let neg = handle
+        first_negative([[1, 2], [3, -4, 5], [-6]])
+    with
+        Found(x) => x
+    print(f"first negative: {neg}")
+
+    print("== generator ==")
+    var squares = []
+    handle
+        countdown(5)
+    with
+        Yield(v) =>
+            squares.push(v * v)
+            resume()
+    print(squares)
+
+    print("== state ==")
+    var counter = 0
+    let total = handle
+        for i in 1..=5
+            perform Add(i)
+        perform Get()
+    with
+        Add(x) =>
+            counter += x
+            resume()
+        Get => resume(counter * 10)
+    print(f"total = {total}")
+
+    print("== nested handlers ==")
+    let r = handle
+        handle
+            perform Log("inner work")
+            "done"
+        with
+            Log(msg) =>
+                perform Log("[inner] " + msg)    # goes to the outer handler
+                resume()
+    with
+        Log(msg) =>
+            print("[outer] " + msg)
+            resume()
+    print(r)
+
+    print("== effects + retry ==")
+    var calls = 0
+    let reading = handle
+        retry(3)
+            perform Sensor()
+        else
+            -1
+    with
+        Sensor() =>
+            calls += 1
+            if calls < 3
+                panic("sensor busy")
+            resume(42)
+    print(f"sensor = {reading} after {calls} calls")

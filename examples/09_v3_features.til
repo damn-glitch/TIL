@@ -1,0 +1,112 @@
+# 09_v3_features.til
+# TIL 3.0 - a tour of the new language features.
+# Run: til run examples/09_v3_features.til      (or: til run --vm ...)
+
+# ── algebraic data types: enum variants that carry data ───────────────
+enum Shape
+    Circle(float)
+    Rect(float, float)
+    Dot
+
+area(s: Shape) -> float
+    return match s
+        Shape.Circle(r) => 3.14159 * r * r
+        Shape.Rect(w, h) => w * h
+        Shape.Dot => 0.0
+
+# ── traits with default methods + dynamic dispatch ────────────────────
+trait Greeter
+    name(self) -> str
+    greet(self) -> str
+        return "Hello, " + self.name() + "!"
+
+struct Student
+    first: str
+
+struct Robot
+    serial: int
+
+impl Greeter for Student
+    name(self) -> str
+        return self.first
+
+impl Greeter for Robot
+    name(self) -> str
+        return f"unit-{self.serial}"
+    greet(self) -> str
+        return "BEEP. " + self.name() + " ONLINE."
+
+# ── closures are values ───────────────────────────────────────────────
+make_multiplier(k: int)
+    return |x: int| x * k
+
+# ── Result + `?` early return ─────────────────────────────────────────
+parse_grade(s: str) -> Result<int, str>
+    if s == ""
+        return Err("empty input")
+    let n = s.to_int()
+    if not (0 <= n <= 100)
+        return Err(f"{n} is out of range")
+    return Ok(n)
+
+curve(s: str) -> Result<int, str>
+    let g = parse_grade(s)?
+    return Ok(min(g + 10, 100))
+
+# ── retry: really runs the body again after a failure ─────────────────
+var attempts = 0
+
+flaky_sensor() -> int
+    attempts += 1
+    assert attempts >= 3, "sensor warming up"
+    return 42
+
+main()
+    print("== ADTs ==")
+    for s in [Shape.Circle(1.0), Shape.Rect(2.0, 3.5), Shape.Dot]
+        print(f"{s} -> area {area(s):.2f}")
+
+    print("== traits ==")
+    for g in [Student { first: "Aigerim" }, Robot { serial: 7 }]
+        print(g.greet())
+
+    print("== closures & higher-order functions ==")
+    let triple = make_multiplier(3)
+    let nums = [1, 2, 3, 4, 5, 6]
+    print(nums.map(triple))
+    print(nums.filter(|n| n % 2 == 0).map(|n| n * n))
+    print(nums.reduce(|a, b| a + b, 0))
+    print(nums |> len)
+
+    print("== Result and ? ==")
+    for input in ["85", "120", ""]
+        match curve(input)
+            Ok(v) => print(f"curved: {v}")
+            Err(e) => print(f"error: {e}")
+
+    print("== maps and strings ==")
+    var votes = {}
+    for word in "tea coffee tea juice tea coffee".split(" ")
+        votes[word] = votes.get_or(word, 0) + 1
+    for k in votes
+        print(f"{k:<7}{votes[k]:>3}")
+
+    print("== retry / timeout / intent ==")
+    let reading = retry(5)
+        flaky_sensor()
+    print(f"sensor = {reading} after {attempts} attempts")
+    let result = timeout(20)
+        var i = 0
+        loop
+            i += 1
+        i
+    else
+        "stopped: " + error
+    print(result)
+    let msg = retry(1)
+        intent "load the class list"
+            let classes = ["7A", "7B"]
+            classes[5]
+    else
+        error
+    print(msg)

@@ -1,7 +1,7 @@
 #!/bin/bash
 # TIL Language Installer
 # Author: Alisher Beisembekov
-# Usage: curl -fsSL https://til-dev.vercel.app/install.sh | sh
+# Usage: curl -fsSL https://til-dev.vercel.app/install.sh | bash
 
 set -e
 
@@ -38,7 +38,8 @@ if command -v gcc &> /dev/null; then
 elif command -v clang &> /dev/null; then
     echo -e "${GREEN}✓ Clang found${NC}"
 else
-    echo -e "${YELLOW}⚠ No C compiler found. Install gcc or clang for compilation.${NC}"
+    echo -e "${YELLOW}⚠ No C compiler found - TIL will run programs on the TIL VM.${NC}"
+    echo -e "${YELLOW}  (install gcc or clang for native executables)${NC}"
 fi
 
 # Create directories
@@ -49,14 +50,30 @@ mkdir -p "$TIL_BIN"
 
 # Download compiler
 echo -e "${BLUE}Downloading TIL compiler...${NC}"
-if command -v curl &> /dev/null; then
-    curl -fsSL https://raw.githubusercontent.com/damn-glitch/TIL/main/src/til.py -o "$TIL_BIN/til.py"
-elif command -v wget &> /dev/null; then
-    wget -q https://raw.githubusercontent.com/damn-glitch/TIL/main/src/til.py -O "$TIL_BIN/til.py"
-else
-    echo -e "${RED}✗ Neither curl nor wget found${NC}"
-    exit 1
-fi
+TIL_RAW="https://raw.githubusercontent.com/damn-glitch/TIL/main"
+fetch() {
+    if command -v curl &> /dev/null; then
+        curl -fsSL "$TIL_RAW/$1" -o "$2"
+    elif command -v wget &> /dev/null; then
+        wget -q "$TIL_RAW/$1" -O "$2"
+    else
+        echo -e "${RED}✗ Neither curl nor wget found${NC}"
+        exit 1
+    fi
+}
+fetch src/til.py "$TIL_BIN/til.py"
+# TIL 3.1 tools next to the compiler: packages, proofs, device fit, debugger,
+# Kazakh/Russian messages, type inference (each is optional; til.py works without them)
+for m in tilpkg tilprove tilfit tildebug tilmsg tiltypes; do fetch "src/$m.py" "$TIL_BIN/$m.py"; done
+
+# Standard library and the portable TIL VM (for `til build --target c-vm` / `til run --cvm`)
+echo -e "${BLUE}Downloading standard library and TIL VM...${NC}"
+mkdir -p "$TIL_HOME/stdlib" "$TIL_HOME/vm"
+for f in math.til strings.til; do fetch "stdlib/$f" "$TIL_HOME/stdlib/$f"; done
+for f in tilvm.c tilvm.h main.c Makefile README.md; do fetch "vm/$f" "$TIL_HOME/vm/$f"; done
+# The self-hosted compiler (TIL written in TIL): til run --vm ~/.til/selfhost/tilc.til in.til out.tbc
+mkdir -p "$TIL_HOME/selfhost"
+fetch selfhost/tilc.til "$TIL_HOME/selfhost/tilc.til"
 
 # Create wrapper script
 cat > "$TIL_BIN/til" << 'EOF'
@@ -98,14 +115,15 @@ echo -e "${GREEN}╔════════════════════
 echo -e "${GREEN}║         TIL INSTALLED SUCCESSFULLY!        ║${NC}"
 echo -e "${GREEN}╚════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "Version: ${CYAN}$(til --version 2>/dev/null || echo '2.0.0')${NC}"
+echo -e "Version: ${CYAN}$(til --version 2>/dev/null | head -1 || echo '3.1.0')${NC}"
 echo ""
 echo -e "${YELLOW}To start using TIL:${NC}"
 echo "  1. Restart your terminal or run: source $RC_FILE"
 echo "  2. Create hello.til:"
 echo "     echo 'main()"
 echo "         print(\"Hello, TIL!\")' > hello.til"
-echo "  3. Run it: til run hello.til"
+echo "  3. Run it: til run hello.til          (or: til run --vm hello.til)"
+echo "  4. Calculators/MCUs: til build --target c-vm hello.til"
 echo ""
 echo -e "${CYAN}Happy coding with TIL!${NC}"
 echo -e "${CYAN}Author: Alisher Beisembekov${NC}"

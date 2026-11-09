@@ -376,98 +376,103 @@
             margin-top: 1rem !important;
         }
         
-        /* Playground */
+        /* Playground (the real one lives at /playground/) */
         .playground {
             padding: 6rem 2rem;
-            max-width: 1400px;
+            max-width: 1100px;
             margin: 0 auto;
         }
-        
-        .playground-container {
+
+        .playground-cta {
             display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 1rem;
+            grid-template-columns: 1.1fr 1fr;
+            gap: 2rem;
+            align-items: center;
             background: var(--bg-secondary);
-            border-radius: 16px;
-            overflow: hidden;
             border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 2.5rem;
         }
-        
+
         @media (max-width: 900px) {
-            .playground-container {
+            .playground-cta {
                 grid-template-columns: 1fr;
+                padding: 1.5rem;
             }
         }
-        
-        .editor-pane, .output-pane {
-            display: flex;
-            flex-direction: column;
+
+        .playground-cta h3 {
+            font-size: 1.5rem;
+            margin-bottom: 0.75rem;
         }
-        
-        .pane-header {
-            background: var(--bg-tertiary);
-            padding: 0.75rem 1rem;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+
+        .playground-cta p {
+            color: var(--text-secondary);
+            margin-bottom: 1rem;
         }
-        
-        .pane-title {
-            font-weight: 600;
+
+        .playground-cta ul {
+            list-style: none;
+            margin-bottom: 1.5rem;
+        }
+
+        .playground-cta li {
+            color: var(--text-secondary);
+            padding: 0.25rem 0 0.25rem 1.5rem;
+            position: relative;
+        }
+
+        .playground-cta li::before {
+            content: "▸";
+            color: var(--accent);
+            position: absolute;
+            left: 0;
+        }
+
+        .playground-examples {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+
+        .playground-examples a {
+            color: var(--accent);
+            border: 1px solid rgba(0, 212, 255, 0.35);
+            border-radius: 999px;
+            padding: 0.25rem 0.85rem;
             font-size: 0.9rem;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
+            text-decoration: none;
         }
-        
-        .run-btn {
-            background: var(--green);
-            color: var(--bg-primary);
-            border: none;
-            padding: 0.5rem 1rem;
-            border-radius: 6px;
-            font-weight: 600;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            gap: 0.5rem;
-            transition: all 0.2s;
+
+        .playground-examples a:hover {
+            background: var(--accent-glow);
         }
-        
-        .run-btn:hover {
-            background: #22c55e;
-            box-shadow: 0 0 20px rgba(74, 222, 128, 0.3);
-        }
-        
-        #editor {
-            width: 100%;
-            min-height: 400px;
+
+        .playground-preview {
             background: var(--bg-primary);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 1.25rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            line-height: 1.7;
+            overflow-x: auto;
+            white-space: pre;
             color: var(--text-primary);
-            border: none;
-            padding: 1rem;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 14px;
-            line-height: 1.6;
-            resize: none;
-            outline: none;
         }
-        
-        #output {
-            width: 100%;
-            min-height: 400px;
-            background: var(--bg-primary);
-            color: var(--green);
-            border: none;
-            padding: 1rem;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 14px;
-            line-height: 1.6;
-            resize: none;
-            outline: none;
+
+        .playground-note {
+            margin-top: 1rem;
+            font-size: 0.9rem;
+            color: var(--yellow);
         }
-        
+
+        .playground-preview .k { color: var(--purple); }
+        .playground-preview .s { color: var(--green); }
+        .playground-preview .c { color: var(--text-secondary); }
+        .playground-preview .o { color: var(--yellow); }
+
         /* Install */
         .install {
             padding: 6rem 2rem;
@@ -594,7 +599,7 @@
             <li><a href="#features">Features</a></li>
             <li><a href="#levels">Levels</a></li>
             <li><a href="#patent">Patent</a></li>
-            <li><a href="#playground">Playground</a></li>
+            <li><a href="/playground/">Playground</a></li>
             <li><a href="#install">Install</a></li>
             <li><a href="https://github.com/damn-glitch/TIL" target="_blank">GitHub</a></li>
         </ul>
@@ -612,7 +617,7 @@
             <p class="tagline-ru">"Проще Python. Быстрее C. Умнее всех."</p>
             
             <div class="hero-buttons">
-                <a href="#playground" class="btn btn-primary">
+                <a href="/playground/" class="btn btn-primary">
                     ▶ Try Online
                 </a>
                 <a href="#install" class="btn btn-secondary">
@@ -732,63 +737,51 @@
     <!-- Playground -->
     <section class="playground" id="playground">
         <h2 class="section-title">Try It Now</h2>
-        <p class="section-subtitle">No installation required</p>
-        
-        <div class="playground-container">
-            <div class="editor-pane">
-                <div class="pane-header">
-                    <span class="pane-title">📝 main.til</span>
-                    <button class="run-btn" onclick="runCode()">
-                        ▶ Run
-                    </button>
-                </div>
-                <textarea id="editor" spellcheck="false"># TIL v2.0 - Mixed Martial Programming
-# Try editing this code!
+        <p class="section-subtitle">The self-hosted compiler and the TIL VM, running in your browser - no installation</p>
 
-struct Point
+        <div class="playground-cta">
+            <div>
+                <h3>TIL Playground</h3>
+                <p>Write TIL, press Run: the self-hosted TIL compiler and the TIL VM, compiled to
+                   WebAssembly, compile and run the program right in your browser - nothing is sent to a
+                   server.</p>
+                <ul>
+                    <li>output, runtime errors with line numbers, <code>input()</code></li>
+                    <li>graphics on a canvas and keyboard input for games</li>
+                    <li>Kazakh and Russian keywords, examples, share links</li>
+                </ul>
+                <a href="/playground/" class="btn btn-primary">▶ Open the Playground</a>
+                <div class="playground-examples">
+                    <a href="/playground/#example=hello">Hello, World</a>
+                    <a href="/playground/#example=graphics">Graphics</a>
+                    <a href="/playground/#example=kazakh">Қазақша</a>
+                    <a href="/playground/#example=russian">Русский</a>
+                    <a href="/playground/#example=input">input()</a>
+                </div>
+                <p class="playground-note" id="playground-note" hidden></p>
+            </div>
+            <pre class="playground-preview" aria-label="Example TIL program"><span class="c"># main.til</span>
+<span class="k">struct</span> Point
     x: float
     y: float
 
-impl Point
-    new(x: float, y: float) -> Point
-        return Point { x: x, y: y }
-    
-    distance(self) -> float
-        return sqrt(self.x ** 2 + self.y ** 2)
+<span class="k">impl</span> Point
+    length(self) -&gt; float
+        <span class="k">return</span> sqrt(self.x * self.x + self.y * self.y)
 
-greet(name: str)
-    print("Hello, " + name + "!")
+<span class="k">let</span> p = Point { x: 3.0, y: 4.0 }
+print(<span class="s">f"|p| = {p.length()}"</span>)
+<span class="k">for</span> i <span class="k">in</span> 1..=3
+    print(<span class="s">f"{i}: Сәлем!"</span>)
 
-main()
-    print("=== TIL Demo ===")
-    
-    # Create a point
-    let p = Point.new(3.0, 4.0)
-    print("Distance from origin:")
-    print(p.distance())
-    
-    # Greet
-    greet("World")
-    
-    # Loop example
-    for i in 1..=5
-        print(i * i)
-    
-    print("=== Done! ===")</textarea>
-            </div>
-            
-            <div class="output-pane">
-                <div class="pane-header">
-                    <span class="pane-title">💻 Output</span>
-                    <button class="run-btn" onclick="clearOutput()" style="background: var(--bg-tertiary); color: var(--text-secondary);">
-                        Clear
-                    </button>
-                </div>
-                <textarea id="output" readonly placeholder="Click 'Run' to execute..."></textarea>
-            </div>
+<span class="c"># Output</span>
+<span class="o">|p| = 5
+1: Сәлем!
+2: Сәлем!
+3: Сәлем!</span></pre>
         </div>
     </section>
-    
+
     <!-- Install -->
     <section class="install" id="install">
         <div class="install-container">
@@ -802,7 +795,7 @@ main()
             </div>
             
             <div class="install-code">
-                <code id="install-cmd">curl -fsSL https://til-dev.vercel.app/install.sh | sh</code>
+                <code id="install-cmd">curl -fsSL https://til-dev.vercel.app/install.sh | bash</code>
             </div>
             
             <p style="text-align: center; margin-top: 2rem; color: var(--text-secondary);">
@@ -825,62 +818,6 @@ main()
     </footer>
     
     <script>
-        // Simple TIL interpreter for playground (limited subset)
-        function runCode() {
-            const code = document.getElementById('editor').value;
-            const output = document.getElementById('output');
-            
-            output.value = "Compiling...\n\n";
-            
-            // Simulate compilation and execution
-            setTimeout(() => {
-                try {
-                    const result = interpretTIL(code);
-                    output.value = result;
-                } catch (e) {
-                    output.value = "Error: " + e.message;
-                }
-            }, 300);
-        }
-        
-        function interpretTIL(code) {
-            // This is a simplified interpreter for demo purposes
-            // Real execution would use WebAssembly or server-side compilation
-            
-            let output = [];
-            const lines = code.split('\n');
-            
-            // Simple pattern matching for demo
-            let inMain = false;
-            let vars = {};
-            
-            // Pre-scan for function definitions
-            const funcs = {
-                'sqrt': (x) => Math.sqrt(x),
-                'pow': (a, b) => Math.pow(a, b),
-                'abs': (x) => Math.abs(x),
-                'print': (x) => { output.push(String(x)); },
-            };
-            
-            // Execute main function simulation
-            output.push("=== TIL Demo ===");
-            output.push("Distance from origin:");
-            output.push("5");
-            output.push("Hello, World!");
-            output.push("1");
-            output.push("4");
-            output.push("9");
-            output.push("16");
-            output.push("25");
-            output.push("=== Done! ===");
-            
-            return output.join('\n');
-        }
-        
-        function clearOutput() {
-            document.getElementById('output').value = '';
-        }
-        
         function showInstall(os) {
             const tabs = document.querySelectorAll('.install-tab');
             tabs.forEach(t => t.classList.remove('active'));
@@ -889,7 +826,7 @@ main()
             const cmd = document.getElementById('install-cmd');
             switch(os) {
                 case 'linux':
-                    cmd.textContent = 'curl -fsSL https://til-dev.vercel.app/install.sh | sh';
+                    cmd.textContent = 'curl -fsSL https://til-dev.vercel.app/install.sh | bash';
                     break;
                 case 'windows':
                     cmd.textContent = 'irm https://til-dev.vercel.app/install.ps1 | iex';
@@ -900,6 +837,21 @@ main()
             }
         }
         
+        // Say what the deployed playground build cannot do yet (development builds)
+        fetch('/playground/build-info.json', { cache: 'no-cache' })
+            .then((r) => (r.ok ? r.json() : null))
+            .then((info) => {
+                if (!info) return;
+                const missing = [];
+                if (info.compiler !== 'tilc') missing.push('the in-browser compiler (only the bundled examples run, precompiled)');
+                if (info.graphics === false) missing.push('graphics and keys');
+                if (!missing.length) return;
+                const note = document.getElementById('playground-note');
+                note.textContent = `Preview build: not in this build yet - ${missing.join('; ')}.`;
+                note.hidden = false;
+            })
+            .catch(() => {});
+
         // Smooth scroll
         document.querySelectorAll('a[href^="#"]').forEach(anchor => {
             anchor.addEventListener('click', function (e) {

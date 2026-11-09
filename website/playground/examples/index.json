@@ -1,0 +1,13 @@
+[
+  {"id": "hello", "title": "Hello, World"},
+  {"id": "basics", "title": "Functions, loops, arrays, maps"},
+  {"id": "structs", "title": "Structs and methods"},
+  {"id": "kazakh", "title": "Қазақша: Kazakh keywords"},
+  {"id": "russian", "title": "Русский: Russian keywords"},
+  {"id": "input", "title": "input(): guess the number"},
+  {"id": "errors", "title": "Runtime error with line number"},
+  {"id": "forever", "title": "Endless computation (press Stop)"},
+  {"id": "graphics", "title": "Graphics: shapes and text", "screen": true},
+  {"id": "animation", "title": "Animation: bouncing ball", "screen": true},
+  {"id": "keys", "title": "Keys: move with the arrow keys", "screen": true}
+]

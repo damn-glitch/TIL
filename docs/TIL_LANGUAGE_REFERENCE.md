@@ -1444,6 +1444,22 @@ fast_function()
 | `#[unsafe]` | Allow unsafe operations | `#[unsafe]` |
 | `#[extern]` | External linkage | `#[extern]` |
 | `#[packed]` | Pack struct without padding | `#[packed]` |
+| `#[energy: low]` | On the TIL VM the function saves battery: while it runs the VM idles 1 ms every 512 steps ([TIL_ENERGY.md](TIL_ENERGY.md)) | `#[energy: low]` |
+
+### 15.2.1 The energy pragma
+
+`#[energy: low]`, `#[energy: balanced]` or `#[energy: performance]` before
+every definition of the program — followed by an empty line, so that it marks
+no function — sets the energy mode the program starts in on the TIL VM;
+`energy_mode()` reads it and `energy_mode(m)` changes it. See
+[TIL_ENERGY.md](TIL_ENERGY.md).
+
+```til
+#[energy: balanced]
+
+main()
+    print(energy_mode())    # 1
+```
 
 ### 15.3 Level Attribute
 

@@ -1,0 +1,3724 @@
+# TIL programs compiled by the test-suite (tests/test_compiler.py, test_v3.py,
+# test_foundation.py), harvested once for tests/test_selfhost.py: each is compiled
+# by the Python compiler and by selfhost/tilc.til and the results are compared.
+# Format: a line '#==== <id> <test that compiled it>' starts each program.
+
+#==== 6b64d41a168e tests/test_compiler.py::TestAdaptiveErrorHandling::test_retry_basic
+
+main()
+    let r = retry(3)
+        42
+    print(r)
+#==== 739a97400454 tests/test_compiler.py::TestAdaptiveErrorHandling::test_retry_expression
+
+main()
+    let r = retry(5)
+        10 + 20
+    print(r)
+#==== 0b1b567d6437 tests/test_compiler.py::TestAdvancedIntegration::test_boolean_logic
+main()
+    print(true and false)
+    print(true or false)
+    print(not true)
+#==== 64f8ab46c706 tests/test_compiler.py::TestAdvancedIntegration::test_comparison_chain
+main()
+    let a = 5
+    let b = 10
+    let c = 15
+    print(a < b)
+    print(b < c)
+    print(a == b)
+    print(a != c)
+#==== c05b1cb641d4 tests/test_compiler.py::TestAdvancedIntegration::test_complex_if_chains
+classify(n: int) -> str
+    if n < 0
+        return "negative"
+    elif n == 0
+        return "zero"
+    elif n < 10
+        return "small"
+    elif n < 100
+        return "medium"
+    else
+        return "large"
+main()
+    print(classify(0))
+    print(classify(5))
+    print(classify(50))
+    print(classify(500))
+#==== 515f72c2f15e tests/test_compiler.py::TestAdvancedIntegration::test_mixed_types_print
+main()
+    print(42)
+    print(3.14)
+    print("hello")
+    print(true)
+#==== ba5b57f1419f tests/test_compiler.py::TestAdvancedIntegration::test_modulo_operations
+main()
+    print(17 % 5)
+    print(100 % 3)
+#==== 2822ba214e5f tests/test_compiler.py::TestAdvancedIntegration::test_multiple_enums
+enum Color
+    Red = 1
+    Green = 2
+    Blue = 3
+enum Direction
+    North = 0
+    South = 1
+main()
+    print(Color.Blue)
+    print(Direction.South)
+#==== 5d9fba994f2d tests/test_compiler.py::TestAdvancedIntegration::test_nested_loops
+main()
+    var count = 0
+    for i in 0..3
+        for j in 0..3
+            count += 1
+    print(count)
+#==== ab19b23e0f96 tests/test_compiler.py::TestAdvancedIntegration::test_recursive_fibonacci
+fib(n: int) -> int
+    if n <= 1
+        return n
+    return fib(n - 1) + fib(n - 2)
+main()
+    print(fib(10))
+#==== 223672bc8d29 tests/test_compiler.py::TestAdvancedIntegration::test_string_operations_chained
+main()
+    let s = "Hello World"
+    print(s.to_upper())
+    print(s.to_lower())
+#==== 836da71e11c0 tests/test_compiler.py::TestAdvancedIntegration::test_struct_with_string_fields
+struct Person
+    name: str
+    age: int
+impl Person
+    greet(self) -> str
+        return self.name
+main()
+    let p = Person { name: "Alice", age: 30 }
+    print(p.greet())
+#==== 42bc7f5d6006 tests/test_compiler.py::TestAlgebraicEffects::test_io_effect
+
+#[effects: io]
+greet(name: str)
+    print(name)
+
+main()
+    greet("hello")
+#==== 1a2a36313e76 tests/test_compiler.py::TestAlgebraicEffects::test_multiple_effects
+
+#[effects: io, fs]
+process(x: int) -> int
+    return x * 2
+
+main()
+    print(process(21))
+#==== df7bfb2b1496 tests/test_compiler.py::TestCapabilitySecurity::test_cap_declaration
+
+cap FileAccess { read, write }
+
+main()
+    print(42)
+#==== 54c048703f09 tests/test_compiler.py::TestCapabilitySecurity::test_cap_function_annotation
+
+#[cap: FileRead]
+read_data(path: str) -> str
+    return path
+
+main()
+    print(read_data("hello.txt"))
+#==== 276d65d162f6 tests/test_compiler.py::TestCapabilitySecurity::test_cap_with_effects
+
+#[cap: NetAccess]
+#[effects: io]
+fetch(url: str) -> str
+    return url
+
+main()
+    print(fetch("example.com"))
+#==== 1a68d57f6324 tests/test_compiler.py::TestCharLit::test_char_codegen
+main()
+    let c = 'x'
+#==== b99d379a8228 tests/test_compiler.py::TestCharLit::test_char_compile_and_run
+main()
+    let c = 'A'
+    print(c)
+#==== 5d8c92c8f222 tests/test_compiler.py::TestClosures::test_basic_closure
+
+main()
+    let x = 10
+    let add_x = |y: int| -> int { y + x }
+    print(add_x(5))
+#==== 8229d49ec4b5 tests/test_compiler.py::TestClosures::test_closure_capture_multiple
+
+main()
+    let a = 3
+    let b = 7
+    let sum_ab = |c: int| -> int { a + b + c }
+    print(sum_ab(10))
+#==== 6edad9437f06 tests/test_compiler.py::TestClosures::test_closure_string_capture
+
+main()
+    let greeting = "Hello"
+    let greet = |name: str| -> str { greeting }
+    print(greet("World"))
+#==== 2db6aae4ebeb tests/test_compiler.py::TestClosures::test_lambda_arithmetic
+
+main()
+    let square = |x: int| -> int { x * x }
+    print(square(5))
+    print(square(3))
+#==== 85402e959499 tests/test_compiler.py::TestClosures::test_lambda_no_capture
+
+main()
+    let double = |x: int| -> int { x * 2 }
+    print(double(7))
+#==== ae1fb49ed565 tests/test_compiler.py::TestClosures::test_lambda_with_function
+
+apply(f: int, x: int) -> int
+    return f + x
+
+main()
+    let offset = 100
+    let add_offset = |v: int| -> int { v + offset }
+    print(add_offset(42))
+#==== a5d93d671efb tests/test_compiler.py::TestCodeGen::test_cast_generates_c_cast
+main()
+    let x = 10 as float
+#==== 782e7d6bd140 tests/test_compiler.py::TestCodeGen::test_default_parameters
+pow2(x: int, n: int = 2) -> int
+    return x
+main()
+    print(pow2(3))
+#==== e30d81e5ce8b tests/test_compiler.py::TestCodeGen::test_enum_generates_c_enum
+enum Color
+    Red
+    Green
+    Blue
+main()
+    let c = Color.Red
+#==== 4082aa224cd5 tests/test_compiler.py::TestCodeGen::test_enum_with_values_generates_c
+enum Http
+    OK = 200
+    NotFound = 404
+main()
+    print(Http.OK)
+#==== ab98b2d72e98 tests/test_compiler.py::TestCodeGen::test_hello_world
+main()
+    print("Hello")
+#==== ad765d47b9fe tests/test_compiler.py::TestCodeGen::test_integer_math
+main()
+    let x = 2 + 3
+#==== 0b619933a0b8 tests/test_compiler.py::TestCodeGen::test_level_0_always_inline
+#[level: 0]
+fast(a: int) -> int
+    return a
+main()
+    print(fast(1))
+#==== 8cab69ff0361 tests/test_compiler.py::TestCodeGen::test_level_1_inline
+#[level: 1]
+foo(a: int) -> int
+    return a
+main()
+    print(foo(1))
+#==== 7166060d9618 tests/test_compiler.py::TestCodeGen::test_method_forward_declarations
+struct Foo
+    x: int
+impl Foo
+    get(self) -> int
+        return self.x
+main()
+    let f = Foo { x: 42 }
+#==== 423efa0c208c tests/test_compiler.py::TestCodeGen::test_print_bool_variable
+main()
+    let x = true
+    print(x)
+#==== 7708384d4e22 tests/test_compiler.py::TestCodeGen::test_print_float_variable
+main()
+    let x = 3.14
+    print(x)
+#==== 088230513b18 tests/test_compiler.py::TestCodeGen::test_string_concat_variables
+main()
+    let name = "World"
+    print("Hello, " + name)
+#==== bf8c79ba9b80 tests/test_compiler.py::TestCodeGen::test_struct_and_constructor
+struct Point
+    x: float
+    y: float
+main()
+    let p = Point { x: 1.0, y: 2.0 }
+#==== 01a20b244cfd tests/test_compiler.py::TestCodeGenPhase2::test_bitwise_operators_codegen
+main()
+    let x = 5 & 3
+    let y = 5 | 3
+    let z = 5 ^ 3
+#==== 3793fefb22b4 tests/test_compiler.py::TestCodeGenPhase2::test_bounds_checking_level2
+main()
+    let arr = [1, 2, 3]
+    let x = arr[0]
+#==== 6b4f160dd7e4 tests/test_compiler.py::TestCodeGenPhase2::test_for_array_literal
+main()
+    for x in [1, 2, 3]
+        print(x)
+#==== 0f72c55e850f tests/test_compiler.py::TestCodeGenPhase2::test_lambda_generates_function
+main()
+    let f = |x| x + 1
+#==== 40e82f9796ac tests/test_compiler.py::TestCodeGenPhase2::test_list_comprehension_codegen
+main()
+    let arr = [x * 2 for x in 0..5]
+#==== 00a7688d12f9 tests/test_compiler.py::TestCodeGenPhase2::test_match_generates_switch
+main()
+    let x = 1
+    match x
+        1 => print("one")
+        2 => print("two")
+#==== da4853d8e8db tests/test_compiler.py::TestCodeGenPhase2::test_not_operator_codegen
+main()
+    let x = not true
+#==== ff5291723bf2 tests/test_compiler.py::TestCodeGenPhase2::test_power_operator_codegen
+main()
+    let x = 2 ** 3
+#==== 8209c4de2720 tests/test_compiler.py::TestCodeGenPhase2::test_string_method_contains
+main()
+    let s = "hello world"
+    let b = s.contains("world")
+#==== b880d65b58c1 tests/test_compiler.py::TestCodeGenPhase2::test_string_method_to_upper
+main()
+    let s = "hello"
+    let u = s.to_upper()
+#==== 48b0616d6656 tests/test_compiler.py::TestCodeGenPhase2::test_string_method_trim
+main()
+    let s = "  hello  "
+    let t = s.trim()
+#==== 9e7d34471343 tests/test_compiler.py::TestCodeGenPhase2::test_ternary_expression
+main()
+    let x = 1 if true else 0
+#==== 0729dcb4f372 tests/test_compiler.py::TestCodeGenPhase2::test_while_true_loop
+main()
+    loop
+        break
+#==== d80a34e422d9 tests/test_compiler.py::TestCrossLevelContracts::test_cross_level_annotation
+
+#[level: 1]
+#[cross_level: 1 -> 2]
+fast_op(x: int) -> int
+    return x * 3
+
+main()
+    print(fast_op(14))
+#==== 2a428b44d0df tests/test_compiler.py::TestCrossLevelContracts::test_level_with_requires
+
+#[level: 1]
+#[requires: x > 0]
+system_fn(x: int) -> int
+    return x * 10
+
+main()
+    print(system_fn(5))
+#==== dc5ab640440b tests/test_compiler.py::TestDistributedTypes::test_channel_simulation
+
+main()
+    let ch = Vec<int>.new()
+    ch.push(10)
+    ch.push(20)
+    ch.push(30)
+    print(ch.get(0))
+    print(ch.get(1))
+    print(ch.get(2))
+#==== cfcba112c2d8 tests/test_compiler.py::TestDistributedTypes::test_message_queue
+
+main()
+    let msgs = Vec<str>.new()
+    msgs.push("hello")
+    msgs.push("world")
+    print(msgs.get(0))
+    print(msgs.get(1))
+    print(msgs.len())
+#==== 32c05a0a9401 tests/test_compiler.py::TestDynamicArrays::test_vec_empty_len
+
+main()
+    let v = Vec<int>.new()
+    print(v.len())
+#==== 01138690e6d1 tests/test_compiler.py::TestDynamicArrays::test_vec_float
+
+main()
+    let v = Vec<float>.new()
+    v.push(1.5)
+    v.push(2.5)
+    print(v.len())
+    print(v.get(0))
+#==== 104c18cee2c3 tests/test_compiler.py::TestDynamicArrays::test_vec_int_basic
+
+main()
+    let v = Vec<int>.new()
+    v.push(10)
+    v.push(20)
+    v.push(30)
+    print(v.len())
+    print(v.get(0))
+    print(v.get(1))
+    print(v.get(2))
+#==== 9e3e7243c332 tests/test_compiler.py::TestDynamicArrays::test_vec_int_push_pop
+
+main()
+    let v = Vec<int>.new()
+    v.push(1)
+    v.push(2)
+    v.push(3)
+    let x = v.pop()
+    print(x)
+    print(v.len())
+#==== 1d44cc533a50 tests/test_compiler.py::TestDynamicArrays::test_vec_multiple_pops
+
+main()
+    let v = Vec<int>.new()
+    v.push(10)
+    v.push(20)
+    v.push(30)
+    v.pop()
+    v.pop()
+    print(v.len())
+    print(v.get(0))
+#==== 7f1208d3c40e tests/test_compiler.py::TestDynamicArrays::test_vec_str
+
+main()
+    let v = Vec<str>.new()
+    v.push("hello")
+    v.push("world")
+    print(v.len())
+    print(v.get(0))
+    print(v.get(1))
+#==== 3cc9921a1be8 tests/test_compiler.py::TestEffectsAndContracts::test_effects_io_annotation
+
+#[effects: io]
+greet(name: str)
+    print(name)
+
+main()
+    greet("Hello")
+#==== 80c1cf0bf500 tests/test_compiler.py::TestEffectsAndContracts::test_ensures_contract
+
+#[ensures: result >= 0]
+abs_val(x: int) -> int
+    if x < 0
+        return 0 - x
+    return x
+
+main()
+    print(abs_val(-5))
+    print(abs_val(3))
+#==== f84c4998266a tests/test_compiler.py::TestEffectsAndContracts::test_multiple_requires
+
+#[requires: a >= 0]
+#[requires: b >= 0]
+safe_add(a: int, b: int) -> int
+    return a + b
+
+main()
+    print(safe_add(10, 20))
+#==== 4658da7ad739 tests/test_compiler.py::TestEffectsAndContracts::test_pure_annotation
+
+#[pure]
+add(a: int, b: int) -> int
+    return a + b
+
+main()
+    print(add(3, 4))
+#==== c81c7b5a0c70 tests/test_compiler.py::TestEffectsAndContracts::test_pure_function_no_side_effects
+
+#[pure]
+multiply(a: int, b: int) -> int
+    return a * b
+
+main()
+    let r = multiply(6, 7)
+    print(r)
+#==== e2031e11f574 tests/test_compiler.py::TestEffectsAndContracts::test_requires_boundary
+
+#[requires: x >= 0]
+#[ensures: result >= 0]
+double_positive(x: int) -> int
+    return x * 2
+
+main()
+    print(double_positive(5))
+#==== d675654961e9 tests/test_compiler.py::TestEffectsAndContracts::test_requires_contract
+
+#[requires: n > 0]
+factorial(n: int) -> int
+    if n == 1
+        return 1
+    return n * factorial(n - 1)
+
+main()
+    print(factorial(5))
+#==== 80c068f7e945 tests/test_compiler.py::TestEnergyAware::test_energy_high
+
+#[energy: high]
+fast_multiply(a: int, b: int) -> int
+    return a * b
+
+main()
+    print(fast_multiply(6, 7))
+#==== 99f5eae0c009 tests/test_compiler.py::TestEnergyAware::test_energy_low
+
+#[energy: low]
+eco_add(a: int, b: int) -> int
+    return a + b
+
+main()
+    print(eco_add(1, 2))
+#==== 3128bf57d6ee tests/test_compiler.py::TestEnergyAware::test_energy_mixed
+
+#[energy: low]
+slow_fn(x: int) -> int
+    return x + 1
+
+#[energy: high]
+fast_fn(x: int) -> int
+    return x * 2
+
+main()
+    print(slow_fn(10))
+    print(fast_fn(10))
+#==== 67d37dff83ca tests/test_compiler.py::TestFString::test_fstring_codegen
+main()
+    let name = "World"
+    let s = f"Hello {name}"
+#==== 05969e112125 tests/test_compiler.py::TestFString::test_fstring_compile_and_run
+main()
+    let name = "World"
+    print(f"Hello {name}!")
+#==== 4b162a97ffe6 tests/test_compiler.py::TestFString::test_fstring_multiple_exprs
+main()
+    let a = "hello"
+    let b = "world"
+    print(f"{a} {b}")
+#==== 4596f4f35eaa tests/test_compiler.py::TestFString::test_fstring_with_int
+main()
+    let x = 42
+    print(f"Answer: {x}")
+#==== 23d525bb8dae tests/test_compiler.py::TestGenerics::test_generic_annotated_function
+
+#[generic: T, U]
+first(a: int, b: int) -> int
+    return a
+
+main()
+    print(first(10, 20))
+#==== 6e267af26eae tests/test_compiler.py::TestGenerics::test_generic_identity
+
+#[generic: T]
+identity(x: int) -> int
+    return x
+
+main()
+    print(identity(42))
+#==== a92f4e5449de tests/test_compiler.py::TestGlobals::test_global_array_const
+const PRIMES = [2, 3, 5]
+main()
+    print(1)
+#==== 608286371a58 tests/test_compiler.py::TestGlobals::test_global_const_codegen
+const MAX = 100
+main()
+    print(MAX)
+#==== 9f51f8a61d11 tests/test_compiler.py::TestGlobals::test_global_const_compile_and_run
+const ANSWER = 42
+main()
+    print(ANSWER)
+#==== 888baa3a4485 tests/test_compiler.py::TestGlobals::test_global_string_const
+const GREETING = "Hello"
+main()
+    print(GREETING)
+#==== 70799d68a978 tests/test_compiler.py::TestGlobals::test_global_variable_compile_and_run
+const X = 10
+const Y = 20
+main()
+    print(X + Y)
+#==== b7cb02e29ad3 tests/test_compiler.py::TestGradualVerification::test_assert_failure
+
+main()
+    let x = 3
+    assert x > 10, "x must be > 10"
+    print(x)
+#==== 956e4d0cbf49 tests/test_compiler.py::TestGradualVerification::test_assert_pass
+
+main()
+    let x = 10
+    assert x > 5, "x must be > 5"
+    print(x)
+#==== 5636725f11e1 tests/test_compiler.py::TestGradualVerification::test_assert_with_expression
+
+main()
+    let a = 3
+    let b = 4
+    assert a + b == 7, "sum should be 7"
+    print(a + b)
+#==== bed53a26427e tests/test_compiler.py::TestGradualVerification::test_invariant_pass
+
+main()
+    let x = 42
+    invariant x > 0, "x must be positive"
+    print(x)
+#==== a8de5f4fb1ff tests/test_compiler.py::TestGradualVerification::test_multiple_asserts
+
+main()
+    let x = 10
+    let y = 20
+    assert x > 0, "x positive"
+    assert y > 0, "y positive"
+    assert x < y, "x less than y"
+    print(x + y)
+#==== fba9cc5e420d tests/test_compiler.py::TestHashMaps::test_hashmap_has
+
+main()
+    let m = HashMap<str, int>.new()
+    m.set("key", 42)
+    print(m.has("key"))
+    print(m.has("missing"))
+#==== 8bcbffa926f4 tests/test_compiler.py::TestHashMaps::test_hashmap_multiple_entries
+
+main()
+    let m = HashMap<str, int>.new()
+    m.set("a", 1)
+    m.set("b", 2)
+    m.set("c", 3)
+    m.set("d", 4)
+    m.set("e", 5)
+    print(m.len())
+    print(m.get("c"))
+    print(m.get("e"))
+#==== 96284b02fd65 tests/test_compiler.py::TestHashMaps::test_hashmap_overwrite
+
+main()
+    let m = HashMap<str, int>.new()
+    m.set("x", 10)
+    m.set("x", 20)
+    print(m.get("x"))
+    print(m.len())
+#==== f78c5e4f2fc0 tests/test_compiler.py::TestHashMaps::test_hashmap_str_int_basic
+
+main()
+    let m = HashMap<str, int>.new()
+    m.set("a", 1)
+    m.set("b", 2)
+    print(m.get("a"))
+    print(m.get("b"))
+    print(m.len())
+#==== 8d80e67dd1a0 tests/test_compiler.py::TestHashMaps::test_hashmap_str_str
+
+main()
+    let m = HashMap<str, str>.new()
+    m.set("name", "Alice")
+    m.set("city", "Almaty")
+    print(m.get("name"))
+    print(m.get("city"))
+#==== cc1b061b8362 tests/test_compiler.py::TestIntegration::test_arithmetic
+main()
+    print(2 + 3)
+#==== d64510d6e515 tests/test_compiler.py::TestIntegration::test_enum_values
+enum Status
+    OK = 200
+    NotFound = 404
+main()
+    print(Status.OK)
+    print(Status.NotFound)
+#==== 1256be03c8bd tests/test_compiler.py::TestIntegration::test_fizzbuzz_15
+main()
+    for i in 1..=15
+        if i % 15 == 0
+            print("FizzBuzz")
+        elif i % 3 == 0
+            print("Fizz")
+        elif i % 5 == 0
+            print("Buzz")
+        else
+            print(i)
+#==== 98c9c59da3be tests/test_compiler.py::TestIntegration::test_for_loop
+main()
+    var sum = 0
+    for i in 1..=5
+        sum += i
+    print(sum)
+#==== 27d002cf61d0 tests/test_compiler.py::TestIntegration::test_function_call
+add(a: int, b: int) -> int
+    return a + b
+main()
+    print(add(3, 4))
+#==== 5f00e401a723 tests/test_compiler.py::TestIntegration::test_hello_world
+main()
+    print("Hello, World!")
+#==== 68514533ff67 tests/test_compiler.py::TestIntegration::test_if_else
+main()
+    let x = 10
+    if x > 5
+        print("big")
+    else
+        print("small")
+#==== 123ebbb92c9f tests/test_compiler.py::TestIntegration::test_recursive_factorial
+fact(n: int) -> int
+    if n <= 1
+        return 1
+    return n * fact(n - 1)
+main()
+    print(fact(5))
+#==== 9e80c0460b1f tests/test_compiler.py::TestIntegration::test_string_concat
+main()
+    let name = "World"
+    print("Hello, " + name + "!")
+#==== a52ea60fb515 tests/test_compiler.py::TestIntegration::test_struct_and_method
+struct Point
+    x: float
+    y: float
+impl Point
+    new(x: float, y: float) -> Point
+        return Point { x: x, y: y }
+    get_x(self) -> float
+        return self.x
+main()
+    let p = Point.new(3.0, 4.0)
+    print(p.get_x())
+#==== 94356091b11b tests/test_compiler.py::TestIntegration::test_type_cast
+main()
+    let x = 10
+    let y = x as float
+    print(y)
+#==== 1410584623eb tests/test_compiler.py::TestIntegration::test_variables
+main()
+    var x = 10
+    x += 5
+    print(x)
+#==== b97118ab0e06 tests/test_compiler.py::TestIntegration::test_while_loop
+main()
+    var n = 5
+    while n > 0
+        n -= 1
+    print(n)
+#==== e3e2f3db4e12 tests/test_compiler.py::TestIntegrationPhase2::test_bitwise_and_run
+main()
+    print(12 & 10)
+#==== bc4ff1b048ee tests/test_compiler.py::TestIntegrationPhase2::test_bitwise_or_run
+main()
+    print(12 | 3)
+#==== c6c671bba18c tests/test_compiler.py::TestIntegrationPhase2::test_bounds_check_catches_overflow
+main()
+    let arr = [1, 2, 3]
+    let x = arr[10]
+#==== 1f8d913d799f tests/test_compiler.py::TestIntegrationPhase2::test_for_array_literal_run
+main()
+    var sum = 0
+    for x in [10, 20, 30]
+        sum += x
+    print(sum)
+#==== 142865faaa22 tests/test_compiler.py::TestIntegrationPhase2::test_list_comprehension_run
+main()
+    let arr = [x * 2 for x in 0..5]
+    var sum = 0
+    for i in 0..5
+        sum += arr[i]
+    print(sum)
+#==== 6b0b50313880 tests/test_compiler.py::TestIntegrationPhase2::test_list_comprehension_with_filter
+main()
+    let arr = [x for x in 0..10 if x > 5]
+    print(arr[0])
+#==== 8500a6939bed tests/test_compiler.py::TestIntegrationPhase2::test_loop_with_counter
+main()
+    var count = 0
+    loop
+        count += 1
+        if count == 5
+            break
+    print(count)
+#==== 71b624e69811 tests/test_compiler.py::TestIntegrationPhase2::test_match_statement_run
+main()
+    let x = 2
+    match x
+        1 => print("one")
+        2 => print("two")
+        3 => print("three")
+#==== 99fbeaeb5005 tests/test_compiler.py::TestIntegrationPhase2::test_multiple_functions
+double(x: int) -> int
+    return x * 2
+triple(x: int) -> int
+    return x * 3
+main()
+    print(double(5))
+    print(triple(5))
+#==== 59a47fa28910 tests/test_compiler.py::TestIntegrationPhase2::test_nested_function_calls
+add(a: int, b: int) -> int
+    return a + b
+main()
+    print(add(add(1, 2), add(3, 4)))
+#==== 3aee38d6af92 tests/test_compiler.py::TestIntegrationPhase2::test_not_operator_run
+main()
+    let x = not false
+    print(x)
+#==== 65d1d5b5baa2 tests/test_compiler.py::TestIntegrationPhase2::test_power_operator_run
+main()
+    print(2 ** 10)
+#==== 61afeec5a1e0 tests/test_compiler.py::TestIntegrationPhase2::test_string_concat_multi
+main()
+    let a = "Hello"
+    let b = " "
+    let c = "World"
+    print(a + b + c)
+#==== 20bed001453c tests/test_compiler.py::TestIntegrationPhase2::test_string_contains
+main()
+    let s = "hello world"
+    print(s.contains("world"))
+#==== 8053dc07e277 tests/test_compiler.py::TestIntegrationPhase2::test_string_ends_with
+main()
+    let s = "hello world"
+    print(s.ends_with("world"))
+#==== b2dc64362eaf tests/test_compiler.py::TestIntegrationPhase2::test_string_replace
+main()
+    let s = "hello world"
+    print(s.replace("world", "TIL"))
+#==== f82eb93dc7ec tests/test_compiler.py::TestIntegrationPhase2::test_string_starts_with
+main()
+    let s = "hello world"
+    print(s.starts_with("hello"))
+#==== 4c5f812489b1 tests/test_compiler.py::TestIntegrationPhase2::test_string_to_lower
+main()
+    let s = "HELLO"
+    print(s.to_lower())
+#==== dc31b417a479 tests/test_compiler.py::TestIntegrationPhase2::test_string_to_upper
+main()
+    let s = "hello"
+    print(s.to_upper())
+#==== 5435a6b1dee1 tests/test_compiler.py::TestIntegrationPhase2::test_string_trim
+main()
+    let s = "  hello  "
+    print(s.trim())
+#==== 31c5356d206c tests/test_compiler.py::TestIntegrationPhase2::test_ternary_expression_run
+main()
+    let x = 10 if true else 20
+    print(x)
+#==== b69dac0f6e79 tests/test_compiler.py::TestIntegrationPhase2::test_ternary_false_branch
+main()
+    let x = 10 if false else 20
+    print(x)
+#==== 693752874f68 tests/test_compiler.py::TestIntentBasedProgramming::test_intent_basic
+
+main()
+    intent "compute sum"
+        let s = 1 + 2 + 3
+        print(s)
+#==== 1288961a34fa tests/test_compiler.py::TestIntentBasedProgramming::test_intent_with_logic
+
+main()
+    intent "find maximum"
+        let a = 10
+        let b = 20
+        if a > b
+            print(a)
+        else
+            print(b)
+#==== b065086ec50a tests/test_compiler.py::TestIntentBasedProgramming::test_intent_with_loop
+
+main()
+    intent "count to 5"
+        for i in 1..6
+            print(i)
+#==== 8998462be855 tests/test_compiler.py::TestKazakh::test_kazakh_hello_compile_and_run
+main()
+    тұрақты x = 42
+    print(x)
+#==== 260dc97175e3 tests/test_compiler.py::TestKazakh::test_unicode_function_name_mangling
+қосу(а: int, б: int) -> int
+    return а + б
+main()
+    print(қосу(1, 2))
+#==== 20a611e4cb80 tests/test_compiler.py::TestKazakh::test_unicode_var_name_mangling
+main()
+    тұрақты нәтиже = 10
+    print(нәтиже)
+#==== 3a73ae5a216a tests/test_compiler.py::TestOptionResult::test_option_in_helpers
+main()
+    print(1)
+#==== 936b0959754c tests/test_compiler.py::TestOptionResult::test_some_codegen
+main()
+    let x = Some(42)
+#==== 5545f66dac43 tests/test_compiler.py::TestPatternMatchingV2::test_match_exact_and_wildcard
+
+main()
+    let x = 2
+    let r = match x
+        1 => "one"
+        2 => "two"
+        3 => "three"
+        _ => "many"
+    print(r)
+#==== 15c7a51eb66a tests/test_compiler.py::TestPatternMatchingV2::test_match_guard
+
+main()
+    let n = 15
+    let r = match n
+        n if n > 10 => "big"
+        n if n > 5 => "medium"
+        _ => "small"
+    print(r)
+#==== 7e7f5581d843 tests/test_compiler.py::TestPatternMatchingV2::test_match_guard_medium
+
+main()
+    let n = 7
+    let r = match n
+        n if n > 10 => "big"
+        n if n > 5 => "medium"
+        _ => "small"
+    print(r)
+#==== 3d9c109266ad tests/test_compiler.py::TestPatternMatchingV2::test_match_guard_small
+
+main()
+    let n = 3
+    let r = match n
+        n if n > 10 => "big"
+        n if n > 5 => "medium"
+        _ => "small"
+    print(r)
+#==== c991ef9a5ea2 tests/test_compiler.py::TestPatternMatchingV2::test_wildcard_only
+
+main()
+    let x = 99
+    let r = match x
+        _ => "catch all"
+    print(r)
+#==== 69825849f895 tests/test_compiler.py::TestPatternMatchingV2::test_wildcard_pattern
+
+main()
+    let x = 42
+    let r = match x
+        1 => "one"
+        2 => "two"
+        _ => "other"
+    print(r)
+#==== ee0ba63959b0 tests/test_compiler.py::TestRevolutionaryIntegration::test_all_annotations_combined
+
+#[level: 1]
+#[pure]
+#[energy: high]
+#[generic: T]
+#[requires: x > 0]
+#[ensures: result >= x]
+double(x: int) -> int
+    return x * 2
+
+main()
+    let r = double(21)
+    assert r == 42, "should be 42"
+    print(r)
+#==== 35809b017c7b tests/test_compiler.py::TestRevolutionaryIntegration::test_cap_with_contract
+
+#[cap: FileRead]
+#[requires: path != 0]
+safe_read(path: int) -> int
+    return path
+
+main()
+    print(safe_read(42))
+#==== fde37844483a tests/test_compiler.py::TestRevolutionaryIntegration::test_energy_with_contract
+
+#[energy: high]
+#[ensures: result > 0]
+positive_square(x: int) -> int
+    return x * x
+
+main()
+    print(positive_square(5))
+#==== ab56ea4cffbf tests/test_compiler.py::TestRevolutionaryIntegration::test_intent_with_vec
+
+main()
+    intent "build a list of squares"
+        let squares = Vec<int>.new()
+        squares.push(1)
+        squares.push(4)
+        squares.push(9)
+        squares.push(16)
+        print(squares.len())
+        print(squares.get(2))
+#==== 08f06c622d08 tests/test_compiler.py::TestRevolutionaryIntegration::test_pure_with_assert
+
+#[pure]
+#[requires: a >= 0]
+#[requires: b >= 0]
+safe_add(a: int, b: int) -> int
+    return a + b
+
+main()
+    let r = safe_add(10, 20)
+    assert r == 30, "result should be 30"
+    print(r)
+#==== c2c11a8b4e58 tests/test_compiler.py::TestTemporalTypes::test_timeout_basic
+
+main()
+    let r = timeout(1000)
+        42
+    print(r)
+#==== 248f50cae90b tests/test_compiler.py::TestTemporalTypes::test_timeout_computation
+
+main()
+    let r = timeout(5000)
+        10 + 20 + 30
+    print(r)
+#==== a9beadb95afb tests/test_compiler.py::TestTypeAlias::test_type_alias_codegen
+type MyInt = int
+main()
+    print(1)
+#==== c06359a85e61 tests/test_compiler.py::TestV2Integration::test_hashmap_str_str_lookup
+
+main()
+    let dict = HashMap<str, str>.new()
+    dict.set("hello", "world")
+    dict.set("foo", "bar")
+    print(dict.get("hello"))
+    print(dict.has("foo"))
+    print(dict.has("baz"))
+#==== fd850a735ab9 tests/test_compiler.py::TestV2Integration::test_hashmap_with_conditional
+
+main()
+    let m = HashMap<str, int>.new()
+    m.set("score", 95)
+    let s = m.get("score")
+    if s > 90
+        print("A")
+    else
+        print("B")
+#==== 292ddddc0682 tests/test_compiler.py::TestV2Integration::test_lambda_with_match
+
+main()
+    let x = 5
+    let r = match x
+        1 => "one"
+        5 => "five"
+        _ => "other"
+    print(r)
+    let double = |n: int| -> int { n * 2 }
+    print(double(x))
+#==== 11cc1b9aabc2 tests/test_compiler.py::TestV2Integration::test_match_with_computation
+
+classify(n: int) -> str
+    let r = match n
+        0 => "zero"
+        1 => "one"
+        _ => "many"
+    return r
+
+main()
+    print(classify(0))
+    print(classify(1))
+    print(classify(42))
+#==== e15d4e5a8c0c tests/test_compiler.py::TestV2Integration::test_pure_math_chain
+
+#[pure]
+square(x: int) -> int
+    return x * x
+
+#[pure]
+add(a: int, b: int) -> int
+    return a + b
+
+main()
+    let r = add(square(3), square(4))
+    print(r)
+#==== 2814028f8a5b tests/test_compiler.py::TestV2Integration::test_vec_in_function
+
+sum_vec(v: int) -> int
+    return v
+
+main()
+    let v = Vec<int>.new()
+    v.push(10)
+    v.push(20)
+    print(v.get(0) + v.get(1))
+#==== 953186a5f1d1 tests/test_compiler.py::TestV2Integration::test_vec_str_accumulate
+
+main()
+    let names = Vec<str>.new()
+    names.push("Alice")
+    names.push("Bob")
+    names.push("Charlie")
+    print(names.get(0))
+    print(names.get(1))
+    print(names.get(2))
+    print(names.len())
+#==== 84ae6a3edaf6 tests/test_foundation.py::TestBytecodeVersion::test_compiler_writes_version_2
+print("hi")
+#==== f36c28972be9 tests/test_foundation.py::TestBytecodeVersion::test_future_version_rejected
+print(1)
+#==== ea1bbc536c76 tests/test_foundation.py::TestBytecodeVersion::test_versions_1_and_2_load_on_both_vms[1]
+print(6 * 7)
+#==== 003c0dbda5f5 tests/test_foundation.py::TestBytesAndArgs::test_args
+let a = args()
+print(len(a))
+for x in a
+    print("[" + x + "]")
+#==== 4c1ff137186b tests/test_foundation.py::TestBytesAndArgs::test_bytes_round_trip
+
+print(str_bytes("AZ"))
+print(str_bytes("ә"))
+print(bytes_to_str([72, 105, 33]))
+print(bytes_to_str(str_bytes("сәлем, TIL")))
+print(len(str_bytes("")))
+let e = retry(1)
+    bytes_to_str([1, 256])
+else
+    error
+print(e)
+let f = retry(1)
+    bytes_to_str("no")
+else
+    error
+print(f)
+#==== 489333b3d997 tests/test_foundation.py::TestBytesAndArgs::test_large_string_from_file
+let t = read_file(args()[0])
+print(len(t))
+print(t[69999])
+print(len(t + "!"))
+#==== 3148f4ea8ba4 tests/test_foundation.py::TestCli::test_value_options_are_parsed
+for x in args()
+    print("<" + x + ">")
+#==== 4f94805c5cce tests/test_foundation.py::TestEffects::test_bytes_natives_are_pure
+#[pure]
+codes(s: str) -> str
+    return bytes_to_str(str_bytes(s))
+
+main()
+    print(codes("ok"))
+#==== 33ed9e8a6e57 tests/test_foundation.py::TestEffects::test_file_natives_are_io
+#[pure]
+load(p: str) -> str
+    return read_file(p)
+
+main()
+    print(load("x"))
+#==== c5104d1cc2d5 tests/test_foundation.py::TestFiles::test_binary_bytes_survive
+
+let p = args()[0]
+var bytes = []
+for i in 0..256
+    bytes.push(i)
+write_file(p, bytes_to_str(bytes))
+let back = str_bytes(read_file(p))
+print(len(back))
+print(back[0], back[127], back[128], back[255])
+#==== 9c240da6c736 tests/test_foundation.py::TestFiles::test_errors_are_catchable_and_identical
+
+let p = args()[0]
+let r = retry(1)
+    read_file(p)
+else
+    error
+print(r)
+let w = retry(1)
+    write_file(p, "x")
+else
+    error
+print(w)
+let d = retry(1)
+    read_file(args()[1])
+else
+    "dir: " + error
+print(d)
+print(file_exists(args()[1]))
+let e = retry(1)
+    read_file("")
+else
+    error
+print(e)
+let k = retry(1)
+    read_file(5)
+else
+    error
+print(k)
+#==== f3fc16f3d047 tests/test_foundation.py::TestFiles::test_write_read_exists
+
+let a = args()
+let p = a[0]
+write_file(p, "line 1\nсәлем")
+print(file_exists(p))
+let t = read_file(p)
+print(t)
+print(len(t))
+write_file(p, 42)
+print(read_file(p) + "!")
+print(file_exists(p + ".missing"))
+#==== b22cb166fbbb tests/test_foundation.py::TestNativeArity::test_compile_time[args(1)-'args'
+print(args(1))
+#==== 92a10e6924a5 tests/test_foundation.py::TestNativeArity::test_compile_time[input(1,
+print(input(1, 2))
+#==== ccf0f64c90fa tests/test_foundation.py::TestNativeArity::test_compile_time[len()-'len'
+print(len())
+#==== 4fbae51b7200 tests/test_foundation.py::TestNativeArity::test_compile_time[min()-'min'
+print(min())
+#==== af490b6570cb tests/test_foundation.py::TestNativeArity::test_compile_time[pow(2)-'pow'
+print(pow(2))
+#==== 77c8206e8cc3 tests/test_foundation.py::TestNativeArity::test_compile_time[write_file("x")-'write_file'
+print(write_file("x"))
+#==== 8f1ae7149d3c tests/test_foundation.py::TestNativeArity::test_range_with_one_argument
+print(range(4))
+for i in range(2)
+    print(i)
+#==== 9596591dcc57 tests/test_foundation.py::TestNativeArity::test_runtime_minimum_both_vms
+print(len("ab"))
+#==== 9e47ee8d4a67 tests/test_v3.py::TestCVM::test_gc_stress_small_heap
+main()
+    var keep = []
+    var total = 0
+    for i in 0..2000
+        let s = f"item-{i}-" + str(i * i)
+        if i % 100 == 0
+            keep.push(s.split("-")[1])
+        total += len(s)
+    print(total)
+    print(keep.join(","))
+#==== cf9db0f12293 tests/test_v3.py::TestCVM::test_small_profile_32bit
+main()
+    print(100000 * 1000)
+    print(1.5 * 2)
+#==== e06f578c46f4 tests/test_v3.py::TestCVM::test_snapshot_and_resume
+var primes = []
+var n = 2
+while primes.len() < 30
+    var ok = true
+    for d in primes
+        if n % d == 0
+            ok = false
+            break
+    if ok
+        primes.push(n)
+        if primes.len() % 10 == 0
+            print(f"{primes.len()} primes, last {n}")
+    n += 1
+#==== 635230b99eb6 tests/test_v3.py::TestCVM::test_tiny_profile
+main()
+    print(1.5)
+#==== 8516142cffbe tests/test_v3.py::TestCVM::test_tiny_profile
+fib(n: int) -> int
+    if n < 2
+        return n
+    return fib(n - 1) + fib(n - 2)
+main()
+    print(fib(15))
+    print([1, 2, 3].map(|x| x * 10))
+#==== 2e035fdd8082 tests/test_v3.py::TestExamplesEverywhere::test_example[examples/08_imports.til]
+# Example 08: Module imports
+# Demonstrates TIL's module system
+
+import math_utils
+
+main()
+    print(square(5))
+    print(cube(3))
+    print(clamp(15, 0, 10))
+#==== 9317782f0199 tests/test_v3.py::TestExamplesEverywhere::test_example[examples/08_imports.til]
+# TIL Math Utilities Module
+# Can be imported with: import math_utils
+
+square(x: int) -> int
+    return x * x
+
+cube(x: int) -> int
+    return x * x * x
+
+clamp(x: int, lo: int, hi: int) -> int
+    if x < lo
+        return lo
+    if x > hi
+        return hi
+    return x
+#==== 610bf5bec7c6 tests/test_v3.py::TestExamplesEverywhere::test_example[examples/10_verified.til]
+# 10_verified.til
+# TIL 3.0 - guarantees checked by the compiler (try breaking them!)
+#
+#   * effects:      #[pure] / #[effects: ...] are checked against the body
+#   * capabilities: only functions holding #[cap: X] (or main) may use X
+#   * contracts:    #[requires] with constant arguments is checked at compile time,
+#                   otherwise at run time (and failures can be caught with retry)
+
+cap Storage { read, write }
+
+#[pure]
+#[requires: b != 0]
+safe_div(a: int, b: int) -> int
+    return a / b
+
+#[pure]
+#[ensures: result >= 0]
+abs_diff(a: int, b: int) -> int
+    if a > b
+        return a - b
+    return b - a
+
+#[effects: io]
+report(label: str, value: int)
+    print(f"{label}: {value}")
+
+#[cap: Storage]
+#[effects: io]
+save(name: str, value: int)
+    print(f"[storage] {name} = {value}")
+
+#[cap: Storage]
+#[effects: io]
+backup(value: int)
+    save("backup", value)      # allowed: backup also holds Storage
+
+main()
+    report("10 / 2", safe_div(10, 2))
+    report("|3 - 8|", abs_diff(3, 8))
+    save("score", 99)          # main holds every capability
+    backup(42)
+
+    # A contract violation with a value known only at run time:
+    var zero = 0
+    let r = retry(1)
+        safe_div(1, zero)
+    else
+        print(error)
+        -1
+    report("fallback", r)
+
+    # These lines would NOT compile - uncomment one to see the error:
+    # report("x", safe_div(1, 0))       error[E-CONTRACT]: breaks #[requires: b != 0]
+    # print(abs_diff(1, 2, 3))          error[E-ARITY]
+#==== 92262005d992 tests/test_v3.py::TestExamplesEverywhere::test_example[examples/advanced/structs.til]
+# structs.til
+# TIL v2.0 - Structures and Methods Example
+# Author: Alisher Beisembekov
+#
+# Demonstrates struct definitions, impl blocks, methods, and OOP patterns.
+#
+# Run with: til run structs.til
+
+# ═══════════════════════════════════════════════════════════
+# Basic Struct
+# ═══════════════════════════════════════════════════════════
+
+struct Point
+    x: float
+    y: float
+
+impl Point
+    # Constructor (static method)
+    new(x: float, y: float) -> Point
+        return Point { x: x, y: y }
+    
+    # Alternative constructors
+    origin() -> Point
+        return Point { x: 0.0, y: 0.0 }
+    
+    unit_x() -> Point
+        return Point { x: 1.0, y: 0.0 }
+    
+    unit_y() -> Point
+        return Point { x: 0.0, y: 1.0 }
+    
+    # Instance methods (use self)
+    distance_from_origin(self) -> float
+        return sqrt(self.x ** 2 + self.y ** 2)
+    
+    distance_to(self, other: Point) -> float
+        let dx = self.x - other.x
+        let dy = self.y - other.y
+        return sqrt(dx ** 2 + dy ** 2)
+    
+    add(self, other: Point) -> Point
+        return Point.new(self.x + other.x, self.y + other.y)
+    
+    scale(self, factor: float) -> Point
+        return Point.new(self.x * factor, self.y * factor)
+    
+    print_point(self)
+        print("Point:")
+        print(self.x)
+        print(self.y)
+
+# ═══════════════════════════════════════════════════════════
+# Rectangle with computed properties
+# ═══════════════════════════════════════════════════════════
+
+struct Rectangle
+    width: float
+    height: float
+
+impl Rectangle
+    new(w: float, h: float) -> Rectangle
+        return Rectangle { width: w, height: h }
+    
+    square(size: float) -> Rectangle
+        return Rectangle { width: size, height: size }
+    
+    area(self) -> float
+        return self.width * self.height
+    
+    perimeter(self) -> float
+        return 2.0 * (self.width + self.height)
+    
+    is_square(self) -> bool
+        return self.width == self.height
+    
+    diagonal(self) -> float
+        return sqrt(self.width ** 2 + self.height ** 2)
+
+# ═══════════════════════════════════════════════════════════
+# Circle
+# ═══════════════════════════════════════════════════════════
+
+struct Circle
+    center: Point
+    radius: float
+
+impl Circle
+    new(x: float, y: float, r: float) -> Circle
+        return Circle { center: Point.new(x, y), radius: r }
+    
+    at_origin(r: float) -> Circle
+        return Circle { center: Point.origin(), radius: r }
+    
+    area(self) -> float
+        return 3.14159 * self.radius ** 2
+    
+    circumference(self) -> float
+        return 2.0 * 3.14159 * self.radius
+    
+    contains_point(self, p: Point) -> bool
+        let dist = self.center.distance_to(p)
+        return dist <= self.radius
+
+# ═══════════════════════════════════════════════════════════
+# Person - More complex struct
+# ═══════════════════════════════════════════════════════════
+
+struct Person
+    name: str
+    age: int
+    height: float
+
+impl Person
+    new(name: str, age: int, height: float) -> Person
+        return Person { name: name, age: age, height: height }
+    
+    introduce(self)
+        print("Hi, I'm " + self.name)
+        print("Age:")
+        print(self.age)
+    
+    is_adult(self) -> bool
+        return self.age >= 18
+    
+    have_birthday(self)
+        self.age = self.age + 1
+        print("Happy Birthday! Now")
+        print(self.age)
+
+# ═══════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════
+
+main()
+    print("=== Point Examples ===")
+    let p1 = Point.new(3.0, 4.0)
+    let p2 = Point.new(6.0, 8.0)
+    let origin = Point.origin()
+    
+    print("P1 distance from origin:")
+    print(p1.distance_from_origin())
+    
+    print("P1 to P2 distance:")
+    print(p1.distance_to(p2))
+    
+    let p3 = p1.add(p2)
+    print("P1 + P2:")
+    p3.print_point()
+    
+    let p4 = p1.scale(2.0)
+    print("P1 scaled by 2:")
+    p4.print_point()
+    
+    print("")
+    print("=== Rectangle Examples ===")
+    let rect = Rectangle.new(10.0, 5.0)
+    print("Rectangle 10x5:")
+    print("Area:")
+    print(rect.area())
+    print("Perimeter:")
+    print(rect.perimeter())
+    print("Diagonal:")
+    print(rect.diagonal())
+    print("Is square?")
+    print(rect.is_square())
+    
+    let sq = Rectangle.square(7.0)
+    print("Square 7x7 is square?")
+    print(sq.is_square())
+    
+    print("")
+    print("=== Circle Examples ===")
+    let circle = Circle.at_origin(5.0)
+    print("Circle radius 5:")
+    print("Area:")
+    print(circle.area())
+    print("Circumference:")
+    print(circle.circumference())
+    
+    let test_point = Point.new(3.0, 3.0)
+    print("Contains (3,3)?")
+    print(circle.contains_point(test_point))
+    
+    let far_point = Point.new(10.0, 10.0)
+    print("Contains (10,10)?")
+    print(circle.contains_point(far_point))
+    
+    print("")
+    print("=== Person Examples ===")
+    var alice = Person.new("Alice", 17, 1.65)
+    alice.introduce()
+    print("Is adult?")
+    print(alice.is_adult())
+    
+    alice.have_birthday()
+    print("Is adult now?")
+    print(alice.is_adult())
+#==== acbc081a62b0 tests/test_v3.py::TestExamplesEverywhere::test_example[examples/basic/control_flow.til]
+# control_flow.til
+# TIL v2.0 - Control Flow Example
+# Author: Alisher Beisembekov
+#
+# Demonstrates if/elif/else, for loops, while loops, and more.
+#
+# Run with: til run control_flow.til
+
+main()
+    print("=== If/Elif/Else ===")
+    let score = 85
+    
+    if score >= 90
+        print("Grade: A")
+    elif score >= 80
+        print("Grade: B")
+    elif score >= 70
+        print("Grade: C")
+    elif score >= 60
+        print("Grade: D")
+    else
+        print("Grade: F")
+    
+    print("")
+    print("=== For Loop (Range) ===")
+    # Exclusive range: 0, 1, 2, 3, 4
+    for i in 0..5
+        print(i)
+    
+    print("")
+    print("=== For Loop (Inclusive Range) ===")
+    # Inclusive range: 1, 2, 3, 4, 5
+    for i in 1..=5
+        print(i)
+    
+    print("")
+    print("=== While Loop ===")
+    var count = 3
+    while count > 0
+        print(count)
+        count = count - 1
+    print("Liftoff!")
+    
+    print("")
+    print("=== Loop with Break ===")
+    var n = 0
+    loop
+        n = n + 1
+        if n > 5
+            break
+        print(n)
+    
+    print("")
+    print("=== Continue (Skip Even Numbers) ===")
+    for i in 1..=10
+        if i % 2 == 0
+            continue
+        print(i)
+    
+    print("")
+    print("=== Nested Loops ===")
+    for i in 1..=3
+        for j in 1..=3
+            print(i * j)
+        print("---")
+    
+    print("")
+    print("=== FizzBuzz (1-20) ===")
+    for i in 1..=20
+        if i % 15 == 0
+            print("FizzBuzz")
+        elif i % 3 == 0
+            print("Fizz")
+        elif i % 5 == 0
+            print("Buzz")
+        else
+            print(i)
+#==== 10d7db3e5daa tests/test_v3.py::TestExamplesEverywhere::test_example[examples/basic/functions.til]
+# functions.til
+# TIL v2.0 - Functions Example
+# Author: Alisher Beisembekov
+#
+# Demonstrates function definitions, parameters, return values, and recursion.
+#
+# Run with: til run functions.til
+
+# Simple function with return value
+add(a: int, b: int) -> int
+    return a + b
+
+# Function without return value
+greet(name: str)
+    print("Hello, " + name + "!")
+
+# Function with default parameters
+power(base: int, exp: int = 2) -> int
+    var result = 1
+    for i in 0..exp
+        result = result * base
+    return result
+
+# Recursive function - Factorial
+factorial(n: int) -> int
+    if n <= 1
+        return 1
+    return n * factorial(n - 1)
+
+# Recursive function - Fibonacci
+fibonacci(n: int) -> int
+    if n <= 1
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+# Function with multiple calculations
+calculate_stats(a: int, b: int, c: int)
+    let sum = a + b + c
+    let product = a * b * c
+    let average = sum / 3
+    
+    print("Sum:")
+    print(sum)
+    print("Product:")
+    print(product)
+    print("Average:")
+    print(average)
+
+# Higher-order style (passing values)
+apply_twice(x: int) -> int
+    return x * 2 * 2
+
+# Early return example
+is_positive(n: int) -> bool
+    if n > 0
+        return true
+    return false
+
+main()
+    print("=== Basic Functions ===")
+    let sum = add(10, 20)
+    print("10 + 20 =")
+    print(sum)
+    
+    print("")
+    print("=== Greeting ===")
+    greet("World")
+    greet("TIL")
+    
+    print("")
+    print("=== Default Parameters ===")
+    print("power(3) = 3^2 =")
+    print(power(3))
+    print("power(2, 10) = 2^10 =")
+    print(power(2, 10))
+    
+    print("")
+    print("=== Factorial (Recursive) ===")
+    print("5! =")
+    print(factorial(5))
+    print("10! =")
+    print(factorial(10))
+    
+    print("")
+    print("=== Fibonacci (Recursive) ===")
+    print("First 10 Fibonacci numbers:")
+    for i in 0..10
+        print(fibonacci(i))
+    
+    print("")
+    print("=== Statistics ===")
+    calculate_stats(10, 20, 30)
+    
+    print("")
+    print("=== Boolean Return ===")
+    print("is_positive(5):")
+    print(is_positive(5))
+    print("is_positive(-3):")
+    print(is_positive(-3))
+#==== d794fc266d2a tests/test_v3.py::TestExamplesEverywhere::test_example[examples/basic/hello.til]
+# hello.til
+# TIL v2.0 - Hello World Example
+# Author: Alisher Beisembekov
+#
+# The simplest TIL program - prints "Hello, World!" to the console.
+#
+# Run with: til run hello.til
+
+main()
+    print("Hello, World!")
+#==== fd673a930cd2 tests/test_v3.py::TestExamplesEverywhere::test_example[examples/basic/variables.til]
+# variables.til
+# TIL v2.0 - Variables and Types Example
+# Author: Alisher Beisembekov
+#
+# Demonstrates variable declarations, types, and basic operations.
+#
+# Run with: til run variables.til
+
+main()
+    # Immutable variables (cannot be reassigned)
+    let name = "TIL"
+    let version = 2
+    let pi = 3.14159
+    let is_awesome = true
+    
+    print("=== Immutable Variables ===")
+    print(name)
+    print(version)
+    print(pi)
+    print(is_awesome)
+    
+    # Mutable variables (can be reassigned)
+    var counter = 0
+    print("")
+    print("=== Mutable Variables ===")
+    print("Initial counter:")
+    print(counter)
+    
+    counter = counter + 1
+    print("After increment:")
+    print(counter)
+    
+    counter += 10
+    print("After += 10:")
+    print(counter)
+    
+    # Constants (compile-time)
+    const MAX_SIZE = 100
+    const APP_NAME = "My TIL App"
+    
+    print("")
+    print("=== Constants ===")
+    print(MAX_SIZE)
+    print(APP_NAME)
+    
+    # Type annotations
+    let explicit_int: int = 42
+    let explicit_float: float = 2.718
+    let explicit_str: str = "Hello"
+    
+    print("")
+    print("=== Explicit Types ===")
+    print(explicit_int)
+    print(explicit_float)
+    print(explicit_str)
+    
+    # Type casting
+    let a = 10
+    let b = a as float
+    print("")
+    print("=== Type Casting ===")
+    print("int to float:")
+    print(b)
+    
+    let c = 3.7
+    let d = c as int
+    print("float to int (truncates):")
+    print(d)
+#==== b8e290d403a1 tests/test_v3.py::TestExamplesEverywhere::test_example[examples/kazakh/salam.til]
+# TIL тілінде қазақша бағдарлама
+# A TIL program written in Kazakh language
+# Бұл TIL тілінің қазақ тілін қолдауын көрсетеді (Patent № 66853)
+
+# Функцияны анықтау
+қосу(а: int, б: int) -> int
+    қайтару а + б
+
+# Факториалды есептеу
+факториал(н: int) -> int
+    егер н <= 1
+        қайтару 1
+    қайтару н * факториал(н - 1)
+
+# Негізгі бағдарлама
+main()
+    print("Сәлем, Әлем!")
+    print("Hello from Kazakh TIL!")
+
+    # Айнымалылар
+    тұрақты нәтиже = қосу(3, 4)
+    print(нәтиже)
+
+    # Цикл
+    айнымалы қосынды = 0
+    үшін и ішінде 1..=5
+        қосынды += и
+    print(қосынды)
+
+    # Факториал
+    print(факториал(5))
+#==== e51e888216c0 tests/test_v3.py::TestExamplesEverywhere::test_example[examples/kazakh/salam_latn.til]
+#[lang: kk-latn]
+# TIL - qazaqsha latyn arpimen (Kazakh in Latin script)
+
+funktsiya qosu(a: int, b: int) -> int
+    qaitaru a + b
+
+negizgi()
+    turaqty aty = "Alem"
+    turaqty zhasy = 25
+    eger zhasy > 18 zhane aqiqat
+        basyp_shygaru("Salam, " + aty + "!")
+    aitpese eger zhasy > 10
+        basyp_shygaru("Salem!")
+    aitpese
+        basyp_shygaru("Salemetsiz be!")
+    aynymaly qosyndy = 0
+    ushin i ishinde 1..=5
+        qosyndy += i
+    basyp_shygaru(qosyndy)
+    basyp_shygaru(qosu(3, 4))
+#==== 2334f35f405b tests/test_v3.py::TestExamplesEverywhere::test_example[examples/multilevel/multilevel.til]
+# multilevel.til
+# TIL v2.0 - Multi-Level Programming Example
+# Author: Alisher Beisembekov
+#
+# Demonstrates TIL's unique multi-level system:
+# - Level 0: Hardware (maximum performance)
+# - Level 1: Systems (C-like control)
+# - Level 2: Safe (default, balanced)
+# - Level 3: Script (maximum productivity)
+#
+# Run with: til run multilevel.til
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 0: HARDWARE
+# Maximum performance, always inlined, no safety checks
+# Use for: inner loops, SIMD, math kernels
+# ═══════════════════════════════════════════════════════════
+
+#[level: 0]
+#[inline]
+fast_add(a: float, b: float) -> float
+    return a + b
+
+#[level: 0]
+#[inline]
+fast_multiply(a: float, b: float) -> float
+    return a * b
+
+#[level: 0]
+fast_dot_product(x1: float, y1: float, x2: float, y2: float) -> float
+    return fast_add(fast_multiply(x1, x2), fast_multiply(y1, y2))
+
+#[level: 0]
+fast_distance(x1: float, y1: float, x2: float, y2: float) -> float
+    let dx = x2 - x1
+    let dy = y2 - y1
+    return sqrt(fast_add(fast_multiply(dx, dx), fast_multiply(dy, dy)))
+
+#[level: 0]
+fast_array_sum(arr: float[], n: int) -> float
+    var sum = 0.0
+    for i in 0..n
+        sum = fast_add(sum, arr[i])
+    return sum
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 1: SYSTEMS
+# C-like control, inline hints, manual optimization
+# Use for: performance-critical algorithms
+# ═══════════════════════════════════════════════════════════
+
+#[level: 1]
+factorial_iterative(n: int) -> int
+    var result = 1
+    for i in 2..=n
+        result = result * i
+    return result
+
+#[level: 1]
+fibonacci_iterative(n: int) -> int
+    if n <= 1
+        return n
+    
+    var a = 0
+    var b = 1
+    
+    for i in 2..=n
+        let temp = a + b
+        a = b
+        b = temp
+    
+    return b
+
+#[level: 1]
+binary_search(arr: int[], target: int, n: int) -> int
+    var low = 0
+    var high = n - 1
+    
+    while low <= high
+        let mid = (low + high) / 2
+        
+        if arr[mid] == target
+            return mid
+        elif arr[mid] < target
+            low = mid + 1
+        else
+            high = mid - 1
+    
+    return -1
+
+#[level: 1]
+is_prime(n: int) -> bool
+    if n <= 1
+        return false
+    if n <= 3
+        return true
+    if n % 2 == 0 or n % 3 == 0
+        return false
+    
+    var i = 5
+    while i * i <= n
+        if n % i == 0 or n % (i + 2) == 0
+            return false
+        i = i + 6
+    
+    return true
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 2: SAFE (DEFAULT)
+# Balanced performance and safety, bounds checking
+# Use for: most application code
+# ═══════════════════════════════════════════════════════════
+
+struct Vector2D
+    x: float
+    y: float
+
+impl Vector2D
+    new(x: float, y: float) -> Vector2D
+        return Vector2D { x: x, y: y }
+    
+    zero() -> Vector2D
+        return Vector2D { x: 0.0, y: 0.0 }
+    
+    # Uses Level 0 functions for performance
+    magnitude(self) -> float
+        return fast_distance(0.0, 0.0, self.x, self.y)
+    
+    dot(self, other: Vector2D) -> float
+        return fast_dot_product(self.x, self.y, other.x, other.y)
+    
+    add(self, other: Vector2D) -> Vector2D
+        return Vector2D.new(
+            fast_add(self.x, other.x),
+            fast_add(self.y, other.y)
+        )
+    
+    scale(self, factor: float) -> Vector2D
+        return Vector2D.new(
+            fast_multiply(self.x, factor),
+            fast_multiply(self.y, factor)
+        )
+    
+    normalize(self) -> Vector2D
+        let mag = self.magnitude()
+        if mag == 0.0
+            return Vector2D.zero()
+        return self.scale(1.0 / mag)
+
+struct Particle
+    position: Vector2D
+    velocity: Vector2D
+    mass: float
+
+impl Particle
+    new(x: float, y: float) -> Particle
+        return Particle {
+            position: Vector2D.new(x, y),
+            velocity: Vector2D.zero(),
+            mass: 1.0
+        }
+    
+    update(self, dt: float)
+        let movement = self.velocity.scale(dt)
+        self.position = self.position.add(movement)
+    
+    apply_force(self, fx: float, fy: float)
+        let acceleration = Vector2D.new(fx / self.mass, fy / self.mass)
+        self.velocity = self.velocity.add(acceleration)
+    
+    kinetic_energy(self) -> float
+        let v_squared = self.velocity.dot(self.velocity)
+        return fast_multiply(0.5, fast_multiply(self.mass, v_squared))
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 3: SCRIPT
+# Maximum productivity, minimal boilerplate
+# Use for: prototyping, scripts, glue code
+# ═══════════════════════════════════════════════════════════
+
+#[level: 3]
+print_header(title: str)
+    print("════════════════════════════════════════")
+    print(title)
+    print("════════════════════════════════════════")
+
+#[level: 3]
+demo_level_0()
+    print_header("LEVEL 0: Hardware Operations")
+    
+    let a = 3.0
+    let b = 4.0
+    
+    print("fast_add(3, 4) =")
+    print(fast_add(a, b))
+    
+    print("fast_multiply(3, 4) =")
+    print(fast_multiply(a, b))
+    
+    print("fast_dot_product(1,2, 3,4) =")
+    print(fast_dot_product(1.0, 2.0, 3.0, 4.0))
+    
+    print("fast_distance(0,0, 3,4) =")
+    print(fast_distance(0.0, 0.0, 3.0, 4.0))
+
+#[level: 3]
+demo_level_1()
+    print_header("LEVEL 1: Systems Operations")
+    
+    print("factorial(10) =")
+    print(factorial_iterative(10))
+    
+    print("fibonacci(20) =")
+    print(fibonacci_iterative(20))
+    
+    print("Primes up to 30:")
+    for n in 2..=30
+        if is_prime(n)
+            print(n)
+
+#[level: 3]
+demo_level_2()
+    print_header("LEVEL 2: Safe Structs & Methods")
+    
+    let v1 = Vector2D.new(3.0, 4.0)
+    let v2 = Vector2D.new(1.0, 2.0)
+    
+    print("v1 magnitude:")
+    print(v1.magnitude())
+    
+    print("v1 dot v2:")
+    print(v1.dot(v2))
+    
+    let v3 = v1.add(v2)
+    print("v1 + v2 = ")
+    print(v3.x)
+    print(v3.y)
+    
+    let normalized = v1.normalize()
+    print("v1 normalized:")
+    print(normalized.x)
+    print(normalized.y)
+    
+    print("")
+    print("Particle simulation:")
+    var particle = Particle.new(0.0, 0.0)
+    particle.apply_force(10.0, 5.0)
+    
+    for step in 0..5
+        particle.update(0.1)
+        print("Position:")
+        print(particle.position.x)
+        print(particle.position.y)
+
+#[level: 3]
+run_all_demos()
+    print("TIL v2.0 - Multi-Level Programming Demo")
+    print("Author: Alisher Beisembekov")
+    print("")
+    print("This demo shows all 4 levels working together!")
+    print("")
+    
+    demo_level_0()
+    print("")
+    
+    demo_level_1()
+    print("")
+    
+    demo_level_2()
+    print("")
+    
+    print_header("DEMO COMPLETE")
+    print("All levels work seamlessly together!")
+    print("Level 0 for speed, Level 2 for safety, Level 3 for ease.")
+
+# ═══════════════════════════════════════════════════════════
+# MAIN ENTRY POINT
+# ═══════════════════════════════════════════════════════════
+
+main()
+    run_all_demos()
+#==== 02fb6e495712 tests/test_v3.py::TestExamplesEverywhere::test_example[examples/russian/privet.til]
+#[lang: ru]
+# TIL на русском языке
+
+структура Точка
+    x: float
+    y: float
+
+функция расстояние(а: Точка, б: Точка) -> float
+    пусть dx = б.x - а.x
+    пусть dy = б.y - а.y
+    вернуть sqrt(dx * dx + dy * dy)
+
+функция факториал(н: int) -> int
+    если н <= 1
+        вернуть 1
+    вернуть н * факториал(н - 1)
+
+главная()
+    печать("Привет, мир!")
+    для i в 1..4
+        если i % 2 == 0
+            печать(f"{i} - чётное")
+        иначе
+            печать(f"{i} - нечётное")
+    печать(факториал(10))
+    пусть а = Точка { x: 0.0, y: 0.0 }
+    пусть б = Точка { x: 3.0, y: 4.0 }
+    печать(расстояние(а, б))
+    перем счёт = 0
+    пока счёт < 3
+        счёт += 1
+    печать(счёт == 3 и истина)
+#==== 743390a05511 tests/test_v3.py::TestFixedBugs::test_assert_message_cannot_inject_c
+main()
+    assert 1 > 2, "bad \" ); exit(42); //"
+#==== 8a2c07f466cd tests/test_v3.py::TestFixedBugs::test_chained_comparisons
+main()
+    let i = 5
+    print(0 <= i < 10)
+    print(3 < 2 < 1)
+    print(1 < 2 < 3 < 4)
+#==== df16248329ad tests/test_v3.py::TestFixedBugs::test_else_if
+main()
+    for x in [1, 5, 50]
+        if x > 10
+            print("big")
+        else if x > 3
+            print("mid")
+        else
+            print("small")
+#==== ef5a060eed2b tests/test_v3.py::TestFixedBugs::test_fstring_with_strings_and_floats
+main()
+    let name = "World"
+    let pi = 3.14
+    print(f"Hello {name}! pi={pi} n={2 + 3}")
+#==== 956045005cc9 tests/test_v3.py::TestFixedBugs::test_integer_power_and_precedence
+main()
+    print(2 ** 10)
+    print(3 ** 40)
+    print(-2 ** 2)
+    print(2.0 ** 0.5)
+#==== 6f92306ce98a tests/test_v3.py::TestFixedBugs::test_intent_text_cannot_inject_c
+main()
+    intent "x\nexit(123);"
+        print(1)
+#==== df0628fd5a42 tests/test_v3.py::TestFixedBugs::test_loops_over_string_and_float_arrays
+main()
+    let names = ["ann", "bob"]
+    for n in names
+        print(n)
+    for x in [1.5, 2.25]
+        print(x)
+    for c in "AB"
+        print(c)
+#==== 1eb1dcb71f0a tests/test_v3.py::TestFixedBugs::test_match_on_strings
+hi(lang: str) -> str
+    return match lang
+        "kk" => "Сәлем"
+        "ru" => "Привет"
+        _ => "Hello"
+main()
+    print(hi("kk"))
+    print(hi("ru"))
+    print(hi("xx"))
+#==== 9faf0ef410e9 tests/test_v3.py::TestFixedBugs::test_nested_struct_float_field
+struct V
+    x: float
+    y: float
+struct P
+    pos: V
+main()
+    let p = P { pos: V { x: 0.5, y: 1.5 } }
+    print(p.pos.x)
+    print(p.pos.y)
+#==== 496951e415fa tests/test_v3.py::TestFixedBugs::test_numeric_literals
+main()
+    print(0x1F)
+    print(0b101)
+    print(0o17)
+    print(1_000_000)
+    print(2.5e3)
+#==== b819ddb5308e tests/test_v3.py::TestFixedBugs::test_numeric_literals
+main()
+    print(0x)
+#==== 6b51aadcf81c tests/test_v3.py::TestFixedBugs::test_one_line_function_bodies
+add(a: int, b: int) -> int => a + b
+main()
+    print(add(2, 3))
+#==== bf7330d2edb5 tests/test_v3.py::TestFixedBugs::test_option_result_native
+find(id: int) -> Option<str>
+    if id == 1
+        return Some("found")
+    return None
+div(a: int, b: int) -> Result<int, str>
+    if b == 0
+        return Err("div by zero")
+    return Ok(a / b)
+calc(a: int, b: int) -> Result<int, str>
+    let q = div(a, b)?
+    return Ok(q * 10)
+main()
+    print(find(1).unwrap())
+    print(find(2).is_none())
+    print(find(2).unwrap_or("none"))
+    print(calc(8, 2).unwrap())
+    print(calc(1, 0).is_err())
+#==== d78a58e7d721 tests/test_v3.py::TestFixedBugs::test_string_concat_equality_and_append
+main()
+    let a = "he" + "llo"
+    print(a == "hello")
+    print(a != "hello")
+    var s = "a"
+    s += "b"
+    s += "c"
+    print(s)
+    print("n=" + 42)
+#==== 8e5e4570e79e tests/test_v3.py::TestFixedBugs::test_trailing_blank_lines
+main()
+    print(1)
+#==== 5f7872494172 tests/test_v3.py::TestMultilingual::test_kazakh_else_if
+негізгі()
+    тұрақты x = 5
+    егер x > 10
+        басып_шығару("үлкен")
+    әйтпесе егер x > 3 немесе x < 0
+        басып_шығару("орташа")
+    әйтпесе
+        басып_шығару("кіші")
+#==== 193b57c00622 tests/test_v3.py::TestMultilingual::test_kazakh_latin_readme_example
+#[lang: kk-latn]
+negizgi()
+    turaqty aty = "Alem"
+    turaqty zhasy = 25
+    eger zhasy > 18
+        basyp_shygaru("Salam, " + aty + "!")
+    aitpese
+        basyp_shygaru("Salemetsiz be!")
+    ushin i ishinde 1..3
+        basyp_shygaru(i)
+#==== cb98ec64f028 tests/test_v3.py::TestMultilingual::test_russian
+#[lang: ru]
+функция факт(н: int) -> int
+    если н <= 1
+        вернуть 1
+    вернуть н * факт(н - 1)
+главная()
+    пусть х = 5
+    если х > 3 и истина
+        печать("да")
+    иначе
+        печать("нет")
+    печать(факт(6))
+#==== deaa7a30d1c2 tests/test_v3.py::TestMultilingual::test_russian_is_opt_in
+main()
+    var и = 0
+    for к in 0..4
+        и += к
+    print(и)
+#==== 87ef18e313db tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/01_hello.til]
+# 01_hello.til
+# TIL v2.0 - Hello World
+# Author: Alisher Beisembekov
+#
+# Run: til run 01_hello.til
+
+main()
+    print("Hello, World!")
+    print("Welcome to TIL!")
+    print("Проще Python. Быстрее C. Умнее всех.")
+#==== 95c3e6e3aae7 tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/01_hello.til]
+#[lang: ru]
+# 01_hello.til
+# TIL v2.0 - Hello World
+# Author: Alisher Beisembekov
+#
+# Run: til run 01_hello.til
+
+главная()
+    печать("Hello, World!")
+    печать("Welcome to TIL!")
+    печать("Проще Python. Быстрее C. Умнее всех.")
+#==== 642642871b3c tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/02_variables.til]
+#[lang: ru]
+# 02_variables.til
+# TIL v2.0 - Variables and Types
+# Author: Alisher Beisembekov
+#
+# Run: til run 02_variables.til
+
+главная()
+    # Immutable (let)
+    пусть name = "TIL"
+    пусть version = 2
+    пусть pi = 3.14159
+    пусть active = истина
+    
+    печать("=== Immutable Variables ===")
+    печать(name)
+    печать(version)
+    печать(pi)
+    печать(active)
+    
+    # Mutable (var)
+    перем counter = 0
+    печать("")
+    печать("=== Mutable Variables ===")
+    печать(counter)
+    counter = counter + 1
+    печать(counter)
+    counter += 10
+    печать(counter)
+    
+    # Constants
+    конст MAX = 100
+    конст APP = "MyApp"
+    печать("")
+    печать("=== Constants ===")
+    печать(MAX)
+    печать(APP)
+    
+    # Explicit types
+    пусть x: int = 42
+    пусть y: float = 2.5
+    пусть s: str = "Hello"
+    печать("")
+    печать("=== Explicit Types ===")
+    печать(x)
+    печать(y)
+    печать(s)
+    
+    # Type casting
+    пусть a = 10
+    пусть b = a как float
+    печать("")
+    печать("=== Type Casting ===")
+    печать(b)
+    
+    пусть c = 3.9
+    пусть d = c как int
+    печать(d)
+#==== cc557f569353 tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/02_variables.til]
+# 02_variables.til
+# TIL v2.0 - Variables and Types
+# Author: Alisher Beisembekov
+#
+# Run: til run 02_variables.til
+
+main()
+    # Immutable (let)
+    let name = "TIL"
+    let version = 2
+    let pi = 3.14159
+    let active = true
+    
+    print("=== Immutable Variables ===")
+    print(name)
+    print(version)
+    print(pi)
+    print(active)
+    
+    # Mutable (var)
+    var counter = 0
+    print("")
+    print("=== Mutable Variables ===")
+    print(counter)
+    counter = counter + 1
+    print(counter)
+    counter += 10
+    print(counter)
+    
+    # Constants
+    const MAX = 100
+    const APP = "MyApp"
+    print("")
+    print("=== Constants ===")
+    print(MAX)
+    print(APP)
+    
+    # Explicit types
+    let x: int = 42
+    let y: float = 2.5
+    let s: str = "Hello"
+    print("")
+    print("=== Explicit Types ===")
+    print(x)
+    print(y)
+    print(s)
+    
+    # Type casting
+    let a = 10
+    let b = a as float
+    print("")
+    print("=== Type Casting ===")
+    print(b)
+    
+    let c = 3.9
+    let d = c as int
+    print(d)
+#==== 97cbf0659b8d tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/03_functions.til]
+# 03_functions.til
+# TIL v2.0 - Functions
+# Author: Alisher Beisembekov
+#
+# Run: til run 03_functions.til
+
+# Basic function
+add(a: int, b: int) -> int
+    return a + b
+
+# No return value
+greet(name: str)
+    print("Hello, " + name + "!")
+
+# Default parameters
+power(base: int, exp: int = 2) -> int
+    var result = 1
+    for i in 0..exp
+        result = result * base
+    return result
+
+# Recursive
+factorial(n: int) -> int
+    if n <= 1
+        return 1
+    return n * factorial(n - 1)
+
+# Recursive Fibonacci
+fib(n: int) -> int
+    if n <= 1
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+main()
+    print("=== Basic Function ===")
+    print(add(10, 20))
+    
+    print("")
+    print("=== Greeting ===")
+    greet("World")
+    greet("TIL")
+    
+    print("")
+    print("=== Default Parameters ===")
+    print(power(3))
+    print(power(2, 10))
+    
+    print("")
+    print("=== Factorial ===")
+    print(factorial(5))
+    print(factorial(10))
+    
+    print("")
+    print("=== Fibonacci ===")
+    for i in 0..10
+        print(fib(i))
+#==== acc6d937bba7 tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/03_functions.til]
+#[lang: ru]
+# 03_functions.til
+# TIL v2.0 - Functions
+# Author: Alisher Beisembekov
+#
+# Run: til run 03_functions.til
+
+# Basic function
+add(a: int, b: int) -> int
+    вернуть a + b
+
+# No return value
+greet(name: str)
+    печать("Hello, " + name + "!")
+
+# Default parameters
+power(base: int, exp: int = 2) -> int
+    перем result = 1
+    для i в 0..exp
+        result = result * base
+    вернуть result
+
+# Recursive
+factorial(n: int) -> int
+    если n <= 1
+        вернуть 1
+    вернуть n * factorial(n - 1)
+
+# Recursive Fibonacci
+fib(n: int) -> int
+    если n <= 1
+        вернуть n
+    вернуть fib(n - 1) + fib(n - 2)
+
+главная()
+    печать("=== Basic Function ===")
+    печать(add(10, 20))
+    
+    печать("")
+    печать("=== Greeting ===")
+    greet("World")
+    greet("TIL")
+    
+    печать("")
+    печать("=== Default Parameters ===")
+    печать(power(3))
+    печать(power(2, 10))
+    
+    печать("")
+    печать("=== Factorial ===")
+    печать(factorial(5))
+    печать(factorial(10))
+    
+    печать("")
+    печать("=== Fibonacci ===")
+    для i в 0..10
+        печать(fib(i))
+#==== 13182dc0e3f4 tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/04_structs.til]
+# 04_structs.til
+# TIL v2.0 - Structs and Methods
+# Author: Alisher Beisembekov
+#
+# Run: til run 04_structs.til
+
+struct Point
+    x: float
+    y: float
+
+impl Point
+    new(x: float, y: float) -> Point
+        return Point { x: x, y: y }
+    
+    origin() -> Point
+        return Point { x: 0.0, y: 0.0 }
+    
+    distance(self) -> float
+        return sqrt(self.x ** 2 + self.y ** 2)
+    
+    add(self, other: Point) -> Point
+        return Point.new(self.x + other.x, self.y + other.y)
+    
+    scale(self, factor: float) -> Point
+        return Point.new(self.x * factor, self.y * factor)
+
+struct Rectangle
+    width: float
+    height: float
+
+impl Rectangle
+    new(w: float, h: float) -> Rectangle
+        return Rectangle { width: w, height: h }
+    
+    area(self) -> float
+        return self.width * self.height
+    
+    perimeter(self) -> float
+        return 2.0 * (self.width + self.height)
+
+struct Person
+    name: str
+    age: int
+
+impl Person
+    new(name: str, age: int) -> Person
+        return Person { name: name, age: age }
+    
+    greet(self)
+        print("Hi, I'm " + self.name)
+    
+    is_adult(self) -> bool
+        return self.age >= 18
+
+main()
+    print("=== Point ===")
+    let p1 = Point.new(3.0, 4.0)
+    let p2 = Point.new(1.0, 2.0)
+    
+    print("P1 distance:")
+    print(p1.distance())
+    
+    let p3 = p1.add(p2)
+    print("P1 + P2:")
+    print(p3.x)
+    print(p3.y)
+    
+    print("")
+    print("=== Rectangle ===")
+    let rect = Rectangle.new(10.0, 5.0)
+    print("Area:")
+    print(rect.area())
+    print("Perimeter:")
+    print(rect.perimeter())
+    
+    print("")
+    print("=== Person ===")
+    let alice = Person.new("Alice", 25)
+    alice.greet()
+    print("Is adult:")
+    print(alice.is_adult())
+#==== cc76a1ee911a tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/04_structs.til]
+#[lang: ru]
+# 04_structs.til
+# TIL v2.0 - Structs and Methods
+# Author: Alisher Beisembekov
+#
+# Run: til run 04_structs.til
+
+структура Point
+    x: float
+    y: float
+
+реализация Point
+    new(x: float, y: float) -> Point
+        вернуть Point { x: x, y: y }
+    
+    origin() -> Point
+        вернуть Point { x: 0.0, y: 0.0 }
+    
+    distance(сам) -> float
+        вернуть sqrt(сам.x ** 2 + сам.y ** 2)
+    
+    add(сам, other: Point) -> Point
+        вернуть Point.new(сам.x + other.x, сам.y + other.y)
+    
+    scale(сам, factor: float) -> Point
+        вернуть Point.new(сам.x * factor, сам.y * factor)
+
+структура Rectangle
+    width: float
+    height: float
+
+реализация Rectangle
+    new(w: float, h: float) -> Rectangle
+        вернуть Rectangle { width: w, height: h }
+    
+    area(сам) -> float
+        вернуть сам.width * сам.height
+    
+    perimeter(сам) -> float
+        вернуть 2.0 * (сам.width + сам.height)
+
+структура Person
+    name: str
+    age: int
+
+реализация Person
+    new(name: str, age: int) -> Person
+        вернуть Person { name: name, age: age }
+    
+    greet(сам)
+        печать("Hi, I'm " + сам.name)
+    
+    is_adult(сам) -> bool
+        вернуть сам.age >= 18
+
+главная()
+    печать("=== Point ===")
+    пусть p1 = Point.new(3.0, 4.0)
+    пусть p2 = Point.new(1.0, 2.0)
+    
+    печать("P1 distance:")
+    печать(p1.distance())
+    
+    пусть p3 = p1.add(p2)
+    печать("P1 + P2:")
+    печать(p3.x)
+    печать(p3.y)
+    
+    печать("")
+    печать("=== Rectangle ===")
+    пусть rect = Rectangle.new(10.0, 5.0)
+    печать("Area:")
+    печать(rect.area())
+    печать("Perimeter:")
+    печать(rect.perimeter())
+    
+    печать("")
+    печать("=== Person ===")
+    пусть alice = Person.new("Alice", 25)
+    alice.greet()
+    печать("Is adult:")
+    печать(alice.is_adult())
+#==== 2c884faf4dde tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/05_control_flow.til]
+# 05_control_flow.til
+# TIL v2.0 - Control Flow
+# Author: Alisher Beisembekov
+#
+# Run: til run 05_control_flow.til
+
+main()
+    print("=== If/Elif/Else ===")
+    let score = 85
+    if score >= 90
+        print("A")
+    elif score >= 80
+        print("B")
+    elif score >= 70
+        print("C")
+    else
+        print("F")
+    
+    print("")
+    print("=== For Loop ===")
+    for i in 0..5
+        print(i)
+    
+    print("")
+    print("=== Inclusive Range ===")
+    for i in 1..=5
+        print(i)
+    
+    print("")
+    print("=== While Loop ===")
+    var count = 3
+    while count > 0
+        print(count)
+        count -= 1
+    print("Go!")
+    
+    print("")
+    print("=== Loop + Break ===")
+    var n = 0
+    loop
+        n += 1
+        if n > 5
+            break
+        print(n)
+    
+    print("")
+    print("=== Continue ===")
+    for i in 1..=10
+        if i % 2 == 0
+            continue
+        print(i)
+    
+    print("")
+    print("=== FizzBuzz ===")
+    for i in 1..=20
+        if i % 15 == 0
+            print("FizzBuzz")
+        elif i % 3 == 0
+            print("Fizz")
+        elif i % 5 == 0
+            print("Buzz")
+        else
+            print(i)
+#==== 58426f31fe34 tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/05_control_flow.til]
+#[lang: ru]
+# 05_control_flow.til
+# TIL v2.0 - Control Flow
+# Author: Alisher Beisembekov
+#
+# Run: til run 05_control_flow.til
+
+главная()
+    печать("=== If/Elif/Else ===")
+    пусть score = 85
+    если score >= 90
+        печать("A")
+    иначе если score >= 80
+        печать("B")
+    иначе если score >= 70
+        печать("C")
+    иначе
+        печать("F")
+    
+    печать("")
+    печать("=== For Loop ===")
+    для i в 0..5
+        печать(i)
+    
+    печать("")
+    печать("=== Inclusive Range ===")
+    для i в 1..=5
+        печать(i)
+    
+    печать("")
+    печать("=== While Loop ===")
+    перем count = 3
+    пока count > 0
+        печать(count)
+        count -= 1
+    печать("Go!")
+    
+    печать("")
+    печать("=== Loop + Break ===")
+    перем n = 0
+    цикл
+        n += 1
+        если n > 5
+            прервать
+        печать(n)
+    
+    печать("")
+    печать("=== Continue ===")
+    для i в 1..=10
+        если i % 2 == 0
+            продолжить
+        печать(i)
+    
+    печать("")
+    печать("=== FizzBuzz ===")
+    для i в 1..=20
+        если i % 15 == 0
+            печать("FizzBuzz")
+        иначе если i % 3 == 0
+            печать("Fizz")
+        иначе если i % 5 == 0
+            печать("Buzz")
+        иначе
+            печать(i)
+#==== 0c9173df6ba6 tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/06_enums.til]
+# 06_enums.til
+# TIL v2.0 - Enumerations
+# Author: Alisher Beisembekov
+#
+# Run: til run 06_enums.til
+
+enum Color
+    Red
+    Green
+    Blue
+
+enum Direction
+    North = 0
+    East = 1
+    South = 2
+    West = 3
+
+enum HttpStatus
+    OK = 200
+    NotFound = 404
+    ServerError = 500
+
+get_status_text(status: HttpStatus) -> str
+    if status == HttpStatus.OK
+        return "Success"
+    elif status == HttpStatus.NotFound
+        return "Not Found"
+    else
+        return "Error"
+
+main()
+    print("=== Basic Enum ===")
+    let color = Color.Red
+    if color == Color.Red
+        print("It's red!")
+    
+    print("")
+    print("=== Enum with Values ===")
+    print("Direction North:")
+    print(Direction.North)
+    print("Direction East:")
+    print(Direction.East)
+    
+    print("")
+    print("=== HTTP Status ===")
+    print("OK status code:")
+    print(HttpStatus.OK)
+    print("NotFound status code:")
+    print(HttpStatus.NotFound)
+    
+    print("")
+    print("=== Status Text ===")
+    print(get_status_text(HttpStatus.OK))
+    print(get_status_text(HttpStatus.NotFound))
+    print(get_status_text(HttpStatus.ServerError))
+#==== 62c9adcba019 tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/06_enums.til]
+#[lang: ru]
+# 06_enums.til
+# TIL v2.0 - Enumerations
+# Author: Alisher Beisembekov
+#
+# Run: til run 06_enums.til
+
+перечисление Color
+    Red
+    Green
+    Blue
+
+перечисление Direction
+    North = 0
+    East = 1
+    South = 2
+    West = 3
+
+перечисление HttpStatus
+    OK = 200
+    NotFound = 404
+    ServerError = 500
+
+get_status_text(status: HttpStatus) -> str
+    если status == HttpStatus.OK
+        вернуть "Success"
+    иначе если status == HttpStatus.NotFound
+        вернуть "Not Found"
+    иначе
+        вернуть "Error"
+
+главная()
+    печать("=== Basic Enum ===")
+    пусть color = Color.Red
+    если color == Color.Red
+        печать("It's red!")
+    
+    печать("")
+    печать("=== Enum with Values ===")
+    печать("Direction North:")
+    печать(Direction.North)
+    печать("Direction East:")
+    печать(Direction.East)
+    
+    печать("")
+    печать("=== HTTP Status ===")
+    печать("OK status code:")
+    печать(HttpStatus.OK)
+    печать("NotFound status code:")
+    печать(HttpStatus.NotFound)
+    
+    печать("")
+    печать("=== Status Text ===")
+    печать(get_status_text(HttpStatus.OK))
+    печать(get_status_text(HttpStatus.NotFound))
+    печать(get_status_text(HttpStatus.ServerError))
+#==== 56feb239ce3b tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/07_multilevel.til]
+#[lang: ru]
+# 07_multilevel.til
+# TIL v2.0 - Multi-Level Programming
+# Author: Alisher Beisembekov
+#
+# This example demonstrates TIL's unique multi-level system.
+# Run: til run 07_multilevel.til
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 0: HARDWARE
+# Maximum performance, always inlined
+# Use for: inner loops, SIMD, math kernels
+# ═══════════════════════════════════════════════════════════
+
+#[level: 0]
+fast_add(a: float, b: float) -> float
+    вернуть a + b
+
+#[level: 0]
+fast_multiply(a: float, b: float) -> float
+    вернуть a * b
+
+#[level: 0]
+fast_distance(x1: float, y1: float, x2: float, y2: float) -> float
+    пусть dx = x2 - x1
+    пусть dy = y2 - y1
+    вернуть sqrt(dx * dx + dy * dy)
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 1: SYSTEMS
+# C-like control, inline hints
+# Use for: performance-critical algorithms
+# ═══════════════════════════════════════════════════════════
+
+#[level: 1]
+factorial(n: int) -> int
+    перем result = 1
+    для i в 2..=n
+        result *= i
+    вернуть result
+
+#[level: 1]
+is_prime(n: int) -> bool
+    если n <= 1
+        вернуть ложь
+    если n <= 3
+        вернуть истина
+    если n % 2 == 0
+        вернуть ложь
+    перем i = 3
+    пока i * i <= n
+        если n % i == 0
+            вернуть ложь
+        i += 2
+    вернуть истина
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 2: SAFE (DEFAULT)
+# Balanced performance and safety
+# Use for: most application code
+# ═══════════════════════════════════════════════════════════
+
+структура Vector2D
+    x: float
+    y: float
+
+реализация Vector2D
+    new(x: float, y: float) -> Vector2D
+        вернуть Vector2D { x: x, y: y }
+    
+    # Uses Level 0 for performance
+    magnitude(сам) -> float
+        вернуть fast_distance(0.0, 0.0, сам.x, сам.y)
+    
+    add(сам, other: Vector2D) -> Vector2D
+        вернуть Vector2D.new(
+            fast_add(сам.x, other.x),
+            fast_add(сам.y, other.y)
+        )
+    
+    scale(сам, factor: float) -> Vector2D
+        вернуть Vector2D.new(
+            fast_multiply(сам.x, factor),
+            fast_multiply(сам.y, factor)
+        )
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 3: SCRIPT
+# Maximum productivity
+# Use for: prototyping, scripts
+# ═══════════════════════════════════════════════════════════
+
+#[level: 3]
+print_header(title: str)
+    печать("════════════════════════════════════")
+    печать(title)
+    печать("════════════════════════════════════")
+
+#[level: 3]
+demo_level_0()
+    print_header("LEVEL 0: Hardware")
+    печать("fast_add(3, 4) =")
+    печать(fast_add(3.0, 4.0))
+    печать("fast_multiply(3, 4) =")
+    печать(fast_multiply(3.0, 4.0))
+    печать("fast_distance(0,0 to 3,4) =")
+    печать(fast_distance(0.0, 0.0, 3.0, 4.0))
+
+#[level: 3]
+demo_level_1()
+    print_header("LEVEL 1: Systems")
+    печать("factorial(10) =")
+    печать(factorial(10))
+    печать("Primes up to 30:")
+    для n в 2..=30
+        если is_prime(n)
+            печать(n)
+
+#[level: 3]
+demo_level_2()
+    print_header("LEVEL 2: Safe")
+    пусть v1 = Vector2D.new(3.0, 4.0)
+    пусть v2 = Vector2D.new(1.0, 2.0)
+    печать("v1 magnitude:")
+    печать(v1.magnitude())
+    пусть v3 = v1.add(v2)
+    печать("v1 + v2:")
+    печать(v3.x)
+    печать(v3.y)
+
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
+
+главная()
+    печать("TIL v2.0 - Multi-Level Demo")
+    печать("Author: Alisher Beisembekov")
+    печать("")
+    
+    demo_level_0()
+    печать("")
+    demo_level_1()
+    печать("")
+    demo_level_2()
+    печать("")
+    
+    print_header("COMPLETE")
+    печать("All levels work together seamlessly!")
+#==== f19d1eb0bdc7 tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/07_multilevel.til]
+# 07_multilevel.til
+# TIL v2.0 - Multi-Level Programming
+# Author: Alisher Beisembekov
+#
+# This example demonstrates TIL's unique multi-level system.
+# Run: til run 07_multilevel.til
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 0: HARDWARE
+# Maximum performance, always inlined
+# Use for: inner loops, SIMD, math kernels
+# ═══════════════════════════════════════════════════════════
+
+#[level: 0]
+fast_add(a: float, b: float) -> float
+    return a + b
+
+#[level: 0]
+fast_multiply(a: float, b: float) -> float
+    return a * b
+
+#[level: 0]
+fast_distance(x1: float, y1: float, x2: float, y2: float) -> float
+    let dx = x2 - x1
+    let dy = y2 - y1
+    return sqrt(dx * dx + dy * dy)
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 1: SYSTEMS
+# C-like control, inline hints
+# Use for: performance-critical algorithms
+# ═══════════════════════════════════════════════════════════
+
+#[level: 1]
+factorial(n: int) -> int
+    var result = 1
+    for i in 2..=n
+        result *= i
+    return result
+
+#[level: 1]
+is_prime(n: int) -> bool
+    if n <= 1
+        return false
+    if n <= 3
+        return true
+    if n % 2 == 0
+        return false
+    var i = 3
+    while i * i <= n
+        if n % i == 0
+            return false
+        i += 2
+    return true
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 2: SAFE (DEFAULT)
+# Balanced performance and safety
+# Use for: most application code
+# ═══════════════════════════════════════════════════════════
+
+struct Vector2D
+    x: float
+    y: float
+
+impl Vector2D
+    new(x: float, y: float) -> Vector2D
+        return Vector2D { x: x, y: y }
+    
+    # Uses Level 0 for performance
+    magnitude(self) -> float
+        return fast_distance(0.0, 0.0, self.x, self.y)
+    
+    add(self, other: Vector2D) -> Vector2D
+        return Vector2D.new(
+            fast_add(self.x, other.x),
+            fast_add(self.y, other.y)
+        )
+    
+    scale(self, factor: float) -> Vector2D
+        return Vector2D.new(
+            fast_multiply(self.x, factor),
+            fast_multiply(self.y, factor)
+        )
+
+# ═══════════════════════════════════════════════════════════
+# LEVEL 3: SCRIPT
+# Maximum productivity
+# Use for: prototyping, scripts
+# ═══════════════════════════════════════════════════════════
+
+#[level: 3]
+print_header(title: str)
+    print("════════════════════════════════════")
+    print(title)
+    print("════════════════════════════════════")
+
+#[level: 3]
+demo_level_0()
+    print_header("LEVEL 0: Hardware")
+    print("fast_add(3, 4) =")
+    print(fast_add(3.0, 4.0))
+    print("fast_multiply(3, 4) =")
+    print(fast_multiply(3.0, 4.0))
+    print("fast_distance(0,0 to 3,4) =")
+    print(fast_distance(0.0, 0.0, 3.0, 4.0))
+
+#[level: 3]
+demo_level_1()
+    print_header("LEVEL 1: Systems")
+    print("factorial(10) =")
+    print(factorial(10))
+    print("Primes up to 30:")
+    for n in 2..=30
+        if is_prime(n)
+            print(n)
+
+#[level: 3]
+demo_level_2()
+    print_header("LEVEL 2: Safe")
+    let v1 = Vector2D.new(3.0, 4.0)
+    let v2 = Vector2D.new(1.0, 2.0)
+    print("v1 magnitude:")
+    print(v1.magnitude())
+    let v3 = v1.add(v2)
+    print("v1 + v2:")
+    print(v3.x)
+    print(v3.y)
+
+# ═══════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════
+
+main()
+    print("TIL v2.0 - Multi-Level Demo")
+    print("Author: Alisher Beisembekov")
+    print("")
+    
+    demo_level_0()
+    print("")
+    demo_level_1()
+    print("")
+    demo_level_2()
+    print("")
+    
+    print_header("COMPLETE")
+    print("All levels work together seamlessly!")
+#==== 0525510466a5 tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/09_v3_features.til]
+# 09_v3_features.til
+# TIL 3.0 - a tour of the new language features.
+# Run: til run examples/09_v3_features.til      (or: til run --vm ...)
+
+# ── algebraic data types: enum variants that carry data ───────────────
+enum Shape
+    Circle(float)
+    Rect(float, float)
+    Dot
+
+area(s: Shape) -> float
+    return match s
+        Shape.Circle(r) => 3.14159 * r * r
+        Shape.Rect(w, h) => w * h
+        Shape.Dot => 0.0
+
+# ── traits with default methods + dynamic dispatch ────────────────────
+trait Greeter
+    name(self) -> str
+    greet(self) -> str
+        return "Hello, " + self.name() + "!"
+
+struct Student
+    first: str
+
+struct Robot
+    serial: int
+
+impl Greeter for Student
+    name(self) -> str
+        return self.first
+
+impl Greeter for Robot
+    name(self) -> str
+        return f"unit-{self.serial}"
+    greet(self) -> str
+        return "BEEP. " + self.name() + " ONLINE."
+
+# ── closures are values ───────────────────────────────────────────────
+make_multiplier(k: int)
+    return |x: int| x * k
+
+# ── Result + `?` early return ─────────────────────────────────────────
+parse_grade(s: str) -> Result<int, str>
+    if s == ""
+        return Err("empty input")
+    let n = s.to_int()
+    if not (0 <= n <= 100)
+        return Err(f"{n} is out of range")
+    return Ok(n)
+
+curve(s: str) -> Result<int, str>
+    let g = parse_grade(s)?
+    return Ok(min(g + 10, 100))
+
+# ── retry: really runs the body again after a failure ─────────────────
+var attempts = 0
+
+flaky_sensor() -> int
+    attempts += 1
+    assert attempts >= 3, "sensor warming up"
+    return 42
+
+main()
+    print("== ADTs ==")
+    for s in [Shape.Circle(1.0), Shape.Rect(2.0, 3.5), Shape.Dot]
+        print(f"{s} -> area {area(s):.2f}")
+
+    print("== traits ==")
+    for g in [Student { first: "Aigerim" }, Robot { serial: 7 }]
+        print(g.greet())
+
+    print("== closures & higher-order functions ==")
+    let triple = make_multiplier(3)
+    let nums = [1, 2, 3, 4, 5, 6]
+    print(nums.map(triple))
+    print(nums.filter(|n| n % 2 == 0).map(|n| n * n))
+    print(nums.reduce(|a, b| a + b, 0))
+    print(nums |> len)
+
+    print("== Result and ? ==")
+    for input in ["85", "120", ""]
+        match curve(input)
+            Ok(v) => print(f"curved: {v}")
+            Err(e) => print(f"error: {e}")
+
+    print("== maps and strings ==")
+    var votes = {}
+    for word in "tea coffee tea juice tea coffee".split(" ")
+        votes[word] = votes.get_or(word, 0) + 1
+    for k in votes
+        print(f"{k:<7}{votes[k]:>3}")
+
+    print("== retry / timeout / intent ==")
+    let reading = retry(5)
+        flaky_sensor()
+    print(f"sensor = {reading} after {attempts} attempts")
+    let result = timeout(20)
+        var i = 0
+        loop
+            i += 1
+        i
+    else
+        "stopped: " + error
+    print(result)
+    let msg = retry(1)
+        intent "load the class list"
+            let classes = ["7A", "7B"]
+            classes[5]
+    else
+        error
+    print(msg)
+#==== 56b26076d26f tests/test_v3.py::TestMultilingual::test_translation_round_trip[/home/user/wt/selfhost/examples/09_v3_features.til]
+#[lang: ru]
+# 09_v3_features.til
+# TIL 3.0 - a tour of the new language features.
+# Run: til run examples/09_v3_features.til      (or: til run --vm ...)
+
+# ── algebraic data types: enum variants that carry data ───────────────
+перечисление Shape
+    Circle(float)
+    Rect(float, float)
+    Dot
+
+area(s: Shape) -> float
+    вернуть выбор s
+        Shape.Circle(r) => 3.14159 * r * r
+        Shape.Rect(w, h) => w * h
+        Shape.Dot => 0.0
+
+# ── traits with default methods + dynamic dispatch ────────────────────
+типаж Greeter
+    name(сам) -> str
+    greet(сам) -> str
+        вернуть "Hello, " + сам.name() + "!"
+
+структура Student
+    first: str
+
+структура Robot
+    serial: int
+
+реализация Greeter для Student
+    name(сам) -> str
+        вернуть сам.first
+
+реализация Greeter для Robot
+    name(сам) -> str
+        вернуть f"unit-{self.serial}"
+    greet(сам) -> str
+        вернуть "BEEP. " + сам.name() + " ONLINE."
+
+# ── closures are values ───────────────────────────────────────────────
+make_multiplier(k: int)
+    вернуть |x: int| x * k
+
+# ── Result + `?` early return ─────────────────────────────────────────
+parse_grade(s: str) -> Result<int, str>
+    если s == ""
+        вернуть Err("empty input")
+    пусть n = s.to_int()
+    если не (0 <= n <= 100)
+        вернуть Err(f"{n} is out of range")
+    вернуть Ok(n)
+
+curve(s: str) -> Result<int, str>
+    пусть g = parse_grade(s)?
+    вернуть Ok(min(g + 10, 100))
+
+# ── retry: really runs the body again after a failure ─────────────────
+перем attempts = 0
+
+flaky_sensor() -> int
+    attempts += 1
+    проверить attempts >= 3, "sensor warming up"
+    вернуть 42
+
+главная()
+    печать("== ADTs ==")
+    для s в [Shape.Circle(1.0), Shape.Rect(2.0, 3.5), Shape.Dot]
+        печать(f"{s} -> area {area(s):.2f}")
+
+    печать("== traits ==")
+    для g в [Student { first: "Aigerim" }, Robot { serial: 7 }]
+        печать(g.greet())
+
+    печать("== closures & higher-order functions ==")
+    пусть triple = make_multiplier(3)
+    пусть nums = [1, 2, 3, 4, 5, 6]
+    печать(nums.map(triple))
+    печать(nums.filter(|n| n % 2 == 0).map(|n| n * n))
+    печать(nums.reduce(|a, b| a + b, 0))
+    печать(nums |> длина)
+
+    печать("== Result and ? ==")
+    для ввод в ["85", "120", ""]
+        выбор curve(ввод)
+            Ok(v) => печать(f"curved: {v}")
+            Err(e) => печать(f"error: {e}")
+
+    печать("== maps and strings ==")
+    перем votes = {}
+    для word в "tea coffee tea juice tea coffee".split(" ")
+        votes[word] = votes.get_or(word, 0) + 1
+    для k в votes
+        печать(f"{k:<7}{votes[k]:>3}")
+
+    печать("== retry / timeout / intent ==")
+    пусть reading = повторить(5)
+        flaky_sensor()
+    печать(f"sensor = {reading} after {attempts} attempts")
+    пусть result = таймаут(20)
+        перем i = 0
+        цикл
+            i += 1
+        i
+    иначе
+        "stopped: " + error
+    печать(result)
+    пусть msg = повторить(1)
+        намерение "load the class list"
+            пусть classes = ["7A", "7B"]
+            classes[5]
+    иначе
+        error
+    печать(msg)
+#==== dfdb63cb57e7 tests/test_v3.py::TestScriptMode::test_functions_see_script_globals
+square(x: int) -> int
+    return x * x
+let total = square(12)
+print(total)
+#==== be4f5854e841 tests/test_v3.py::TestScriptMode::test_globals_initialize_in_source_order
+var primes = []
+for n in 2..20
+    var ok = true
+    for d in primes
+        if n % d == 0
+            ok = false
+    if ok
+        primes.push(n)
+let summary = {"count": primes.len(), "last": primes.last()}
+print(summary)
+#==== 619e12156a5d tests/test_v3.py::TestScriptMode::test_top_level_statements_are_the_program
+print("hi")
+print(1 + 2)
+#==== 7e3c8045947d tests/test_v3.py::TestVMFeatures::test_algebraic_data_types
+enum Expr
+    Num(int)
+    Add(Expr, Expr)
+    Mul(Expr, Expr)
+eval(e: Expr) -> int
+    return match e
+        Expr.Num(n) => n
+        Expr.Add(a, b) => eval(a) + eval(b)
+        Expr.Mul(a, b) => eval(a) * eval(b)
+main()
+    let e = Expr.Add(Expr.Num(2), Expr.Mul(Expr.Num(3), Expr.Num(4)))
+    print(eval(e))
+    print(Expr.Num(7))
+#==== 10f58a6c61c4 tests/test_v3.py::TestVMFeatures::test_closures_capture_by_reference
+make_counter()
+    var n = 0
+    return |step: int| n + step
+adder(k: int)
+    return |x: int| x + k
+main()
+    let add5 = adder(5)
+    print(add5(10))
+    var base = 1
+    let f = |x: int| x + base
+    base = 100
+    print(f(1))
+#==== 722b4bb4c4c9 tests/test_v3.py::TestVMFeatures::test_disassembler
+main()
+    print(1 + 2)
+#==== 341d8601b6fa tests/test_v3.py::TestVMFeatures::test_format_specs
+main()
+    print(f"{3.14159:.2f}|{255:x}|{7:03}|{0.25:%}|{42:<5}|{42:>5}|{1234.5:.1e}")
+#==== 920545338265 tests/test_v3.py::TestVMFeatures::test_higher_order_methods
+main()
+    let xs = [1, 2, 3, 4, 5, 6]
+    print(xs.map(|x| x * x))
+    print(xs.filter(|x| x % 2 == 0))
+    print(xs.reduce(|a, b| a + b, 0))
+    print(xs.any(|x| x > 5))
+    print(xs.all(|x| x > 0))
+    xs.each(|x| print(x * 0))
+    print(xs |> len)
+#==== 62d17e547159 tests/test_v3.py::TestVMFeatures::test_immutability_is_enforced
+main()
+    let x = 1
+    x = 2
+#==== 3b2544c05f9e tests/test_v3.py::TestVMFeatures::test_intent_adds_context_to_errors
+main()
+    let r = retry(1)
+        intent "parse config"
+            panic("bad token")
+    else
+        error
+    print(r)
+#==== 87167a120a38 tests/test_v3.py::TestVMFeatures::test_intent_adds_context_to_errors
+main()
+    intent "load the settings"
+        let xs = [1]
+        print(xs[5])
+#==== 7f98e73d2b70 tests/test_v3.py::TestVMFeatures::test_maps
+main()
+    var m = {"b": 2, "a": 1}
+    m["c"] = 3
+    m["a"] += 10
+    m.delete("b")
+    print(m)
+    print(m.keys())
+    print(m.get_or("zz", 0))
+    print(m.has("c"))
+    for k in m
+        print(k)
+#==== 5b811ebbd30c tests/test_v3.py::TestVMFeatures::test_option_result_match_and_propagation
+parse(s: str) -> Result<int, str>
+    if s == ""
+        return Err("empty")
+    return Ok(s.to_int())
+twice(s: str) -> Result<int, str>
+    let v = parse(s)?
+    return Ok(v * 2)
+main()
+    for s in ["21", ""]
+        match twice(s)
+            Ok(v) => print(f"ok {v}")
+            Err(e) => print(f"err {e}")
+    let o = Some(3)
+    match o
+        Some(x) if x > 2 => print("big")
+        Some(x) => print("small")
+        None => print("none")
+#==== 50ade419a76c tests/test_v3.py::TestVMFeatures::test_retry_really_retries
+var attempts = 0
+flaky() -> int
+    attempts += 1
+    assert attempts >= 3, "not yet"
+    return attempts
+main()
+    let r = retry(5)
+        flaky()
+    print(r)
+    let g = retry(2)
+        panic("broken")
+    else
+        "fallback: " + error
+    print(g)
+#==== f56b139a2ed1 tests/test_v3.py::TestVMFeatures::test_retry_without_fallback_reraises
+main()
+    let r = retry(2)
+        panic("nope")
+    print(r)
+#==== 6b2915c3b2b9 tests/test_v3.py::TestVMFeatures::test_runtime_error_has_line_and_trace
+f(xs: [int]) -> int
+    return xs[10]
+main()
+    print(f([1, 2]))
+#==== 005a88d94732 tests/test_v3.py::TestVMFeatures::test_step_limit_sandbox
+main()
+    loop
+        print(1)
+#==== acd1239f3c6c tests/test_v3.py::TestVMFeatures::test_string_methods
+main()
+    let s = "  Hello, World  "
+    print(s.trim().to_upper())
+    print("a,b,,c".split(","))
+    print(["x", "y"].join("-"))
+    print("banana".count("an"))
+    print("banana".replace("an", "AN"))
+    print("abc".slice(1, 10))
+    print("ab" * 3)
+    print("x y  z".split())
+#==== bd55b2098946 tests/test_v3.py::TestVMFeatures::test_structural_equality
+struct P
+    x: int
+    y: int
+main()
+    print([1, [2, 3]] == [1, [2, 3]])
+    print(P { x: 1, y: 2 } == P { x: 1, y: 2 })
+    print({"a": 1} == {"a": 2})
+#==== 35682d5378b0 tests/test_v3.py::TestVMFeatures::test_timeout_interrupts_infinite_loop
+spin() -> int
+    var i = 0
+    loop
+        i += 1
+    return i
+main()
+    let t = timeout(30)
+        spin()
+    else
+        "gave up: " + error
+    print(t)
+#==== acbc1ac4925d tests/test_v3.py::TestVMFeatures::test_traits_and_dynamic_dispatch
+trait Shape
+    area(self) -> float
+    describe(self) -> str
+        return "shape with area " + str(self.area())
+struct Sq
+    s: float
+struct Ci
+    r: float
+impl Shape for Sq
+    area(self) -> float
+        return self.s * self.s
+impl Shape for Ci
+    area(self) -> float
+        return 3.0 * self.r * self.r
+    describe(self) -> str
+        return "circle"
+main()
+    for sh in [Sq { s: 2.0 }, Ci { r: 1.0 }]
+        print(sh.describe())
+#==== 6277b97d256d tests/test_v3.py::TestVMFeatures::test_unknown_name_suggestion
+main()
+    let total = 1
+    print(totl)
+#==== 0d9ee83147c5 tests/test_v3.py::TestVerifier::test_arity
+f(a: int, b: int = 2) -> int
+    return a + b
+main()
+    print(f(1, 2, 3))
+#==== ce9137781be6 tests/test_v3.py::TestVerifier::test_arity
+f(a: int, b: int = 2) -> int
+    return a + b
+main()
+    print(f(1))
+    print(f(1, 5))
+#==== 46165d954cd5 tests/test_v3.py::TestVerifier::test_capabilities
+cap FileRead { read }
+#[cap: FileRead]
+read_cfg() -> str
+    return "cfg"
+helper() -> str
+    return read_cfg()
+main()
+    print(helper())
+#==== 6f8361486228 tests/test_v3.py::TestVerifier::test_capabilities
+cap FileRead { read }
+#[cap: FileRead]
+read_cfg() -> str
+    return "cfg"
+#[cap: FileRead]
+helper() -> str
+    return read_cfg()
+main()
+    print(helper())
+#==== 4da8b6ad65bb tests/test_v3.py::TestVerifier::test_capability_cannot_be_laundered_through_a_value
+#[cap: Net]
+fetch() -> int
+    return 1
+sneaky() -> int
+    let f = fetch
+    return f()
+main()
+    print(sneaky())
+#==== 1c94a19ea654 tests/test_v3.py::TestVerifier::test_contracts_checked_at_compile_time
+#[requires: b != 0]
+div(a: int, b: int) -> int
+    return a / b
+main()
+    print(div(10, 2))
+#==== abb228b9ef47 tests/test_v3.py::TestVerifier::test_contracts_checked_at_compile_time
+#[requires: b != 0]
+div(a: int, b: int) -> int
+    return a / b
+main()
+    print(div(10, 0))
+#==== ca438b890dc6 tests/test_v3.py::TestVerifier::test_contracts_checked_at_run_time_and_recoverable
+#[requires: n >= 0]
+#[ensures: result >= 1]
+fact(n: int) -> int
+    if n <= 1
+        return 1
+    return n * fact(n - 1)
+main()
+    var k = 0 - 3
+    let r = retry(2)
+        fact(k)
+    else
+        error
+    print(r)
+#==== a793011ba0a8 tests/test_v3.py::TestVerifier::test_declared_effects_are_an_upper_bound
+#[effects: io]
+f()
+    print("x")
+main()
+    f()
+#==== d096ebbb462b tests/test_v3.py::TestVerifier::test_declared_effects_are_an_upper_bound
+#[effects: fs]
+f()
+    print("x")
+main()
+    f()
+#==== c4e3ad4a0118 tests/test_v3.py::TestVerifier::test_effects_propagate_through_calls
+log(m: str)
+    print(m)
+#[pure]
+sq(x: int) -> int
+    log("sq")
+    return x * x
+main()
+    print(sq(2))
+#==== 14cbdd9a12d4 tests/test_v3.py::TestVerifier::test_pure_function_cannot_print
+#[pure]
+f(x: int) -> int
+    print(x)
+    return x
+main()
+    print(f(1))

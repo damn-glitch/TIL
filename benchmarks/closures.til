@@ -1,0 +1,32 @@
+# closures.til - closures, captured variables, higher-order functions (TIL 3.1 VM benchmark)
+
+make_adder(k: int)
+    return |x: int| x + k
+
+call2(f, g, x: int) -> int
+    return f(g(x))
+
+compose(f, g)
+    return |x: int| call2(f, g, x)
+
+apply_n(f, n: int, x: int) -> int
+    var v = x
+    for i in 0..n
+        v = f(v)
+    return v
+
+main()
+    let add3 = make_adder(3)
+    let twice = compose(add3, add3)
+    var total = 0
+    for i in 0..1000
+        total += apply_n(twice, 200, i) % 1000
+    var base = 0
+    let shifted = |x: int| x + base
+    for i in 0..100000
+        base = i % 13
+        total += shifted(i) % 5
+    let xs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    for r in 0..2000
+        total += xs.map(|x| x * r).filter(|x| x % 3 == 0).reduce(|a, b| a + b, 0) % 100
+    print(total)

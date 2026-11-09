@@ -1,0 +1,16 @@
+# loops.til - nested loops and integer arithmetic (TIL 3.1 VM benchmark)
+
+main()
+    var total = 0
+    for i in 0..700
+        for j in 0..700
+            total = (total + i * j + (i ^ j)) % 1000003
+    var k = 0
+    var acc = 0
+    while k < 600000
+        acc += k & 255
+        if k % 3 == 0
+            acc -= 1
+        k += 1
+    print(total)
+    print(acc)

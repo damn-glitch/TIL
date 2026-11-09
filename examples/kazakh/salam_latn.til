@@ -1,0 +1,20 @@
+#[lang: kk-latn]
+# TIL - qazaqsha latyn arpimen (Kazakh in Latin script)
+
+funktsiya qosu(a: int, b: int) -> int
+    qaitaru a + b
+
+negizgi()
+    turaqty aty = "Alem"
+    turaqty zhasy = 25
+    eger zhasy > 18 zhane aqiqat
+        basyp_shygaru("Salam, " + aty + "!")
+    aitpese eger zhasy > 10
+        basyp_shygaru("Salem!")
+    aitpese
+        basyp_shygaru("Salemetsiz be!")
+    aynymaly qosyndy = 0
+    ushin i ishinde 1..=5
+        qosyndy += i
+    basyp_shygaru(qosyndy)
+    basyp_shygaru(qosu(3, 4))
