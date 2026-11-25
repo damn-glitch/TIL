@@ -1,0 +1,216 @@
+/* TIL Studio design tokens: dark (default) and light themes, WCAG AA contrast.
+   Brand palette: accent #00d4ff, green #4ade80, yellow #fbbf24, red #f87171,
+   purple #a78bfa, orange #fb923c. */
+:root,
+:root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg-app: #0b0d12;          /* editor, the deepest surface */
+    --bg-chrome: #11141b;       /* title bar, activity bar, side and bottom panels, status bar */
+    --bg-raised: #171b24;       /* inputs, hovered rows, cards */
+    --bg-raised-2: #1e2330;     /* hovered controls on raised surfaces, selected rows */
+    --bg-overlay: #141821;      /* menus, palette, dialogs, tooltips */
+    --bg-inset: #0e1117;
+    --border: #232836;
+    --border-strong: #303747;
+    --border-soft: #1b2029;
+    --text: #e6e9f0;
+    --text-2: #aeb6c6;
+    --text-3: #8790a3;
+    --text-4: #626b7d;
+    --accent: #00d4ff;
+    --focus: #00d4ff;
+    --accent-hover: #4ee2ff;
+    --accent-text: #3fdcff;     /* accent used for text on dark surfaces */
+    --accent-fg: #04131a;       /* text on an accent background */
+    --accent-bg: rgba(0, 212, 255, 0.11);
+    --accent-bg-strong: rgba(0, 212, 255, 0.2);
+    --accent-border: rgba(0, 212, 255, 0.42);
+    --green: #4ade80;
+    --yellow: #fbbf24;
+    --red: #f87171;
+    --purple: #a78bfa;
+    --orange: #fb923c;
+    --pink: #f472b6;
+    --green-bg: rgba(74, 222, 128, 0.12);
+    --yellow-bg: rgba(251, 191, 36, 0.12);
+    --red-bg: rgba(248, 113, 113, 0.12);
+    --purple-bg: rgba(167, 139, 250, 0.13);
+    --orange-bg: rgba(251, 146, 60, 0.12);
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.35);
+    --shadow-2: 0 10px 30px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.35);
+    --scrim: rgba(4, 6, 10, 0.55);
+    --scrollbar: rgba(140, 152, 176, 0.22);
+    --scrollbar-hover: rgba(140, 152, 176, 0.38);
+
+    /* editor */
+    --ed-selection: rgba(0, 212, 255, 0.2);
+    --ed-selection-blur: rgba(140, 160, 200, 0.16);
+    --ed-active-line: rgba(255, 255, 255, 0.028);
+    --ed-gutter-text: #626b7e;
+    --ed-gutter-active: #aeb6c6;
+    --ed-cursor: #00d4ff;
+    --ed-match: rgba(251, 191, 36, 0.22);
+    --ed-match-border: rgba(251, 191, 36, 0.5);
+    --ed-bracket: rgba(0, 212, 255, 0.24);
+    --ed-debug-line: rgba(251, 191, 36, 0.13);
+    --ed-debug-line-border: rgba(251, 191, 36, 0.7);
+    --ed-highlight: rgba(167, 139, 250, 0.18);
+    --ed-indent-guide: rgba(255, 255, 255, 0.05);
+
+    /* syntax */
+    --syn-kw: #a78bfa;
+    --syn-fn: #00d4ff;
+    --syn-builtin: #67e3ff;
+    --syn-str: #4ade80;
+    --syn-esc: #9cf0c0;
+    --syn-num: #fb923c;
+    --syn-type: #fbbf24;
+    --syn-comment: #7683a0;
+    --syn-attr: #e879f9;
+    --syn-prop: #9cc4ff;
+    --syn-var: #dde2ea;
+    --syn-op: #8fa1c0;
+    --syn-punc: #8a93a7;
+    --syn-const: #fdba74;
+    --syn-self: #f472b6;
+    --syn-interp: #c4b5fd;
+    --syn-fmt: #fbbf24;
+
+    /* terminal */
+    --term-bg: #0b0d12;
+    --term-fg: #d6dbe5;
+    --ansi-black: #3a4150;
+    --ansi-red: #f87171;
+    --ansi-green: #4ade80;
+    --ansi-yellow: #fbbf24;
+    --ansi-blue: #60a5fa;
+    --ansi-magenta: #c084fc;
+    --ansi-cyan: #22d3ee;
+    --ansi-white: #d6dbe5;
+    --ansi-bright-black: #6b7385;
+    --ansi-bright-red: #fca5a5;
+    --ansi-bright-green: #86efac;
+    --ansi-bright-yellow: #fde68a;
+    --ansi-bright-blue: #93c5fd;
+    --ansi-bright-magenta: #e9d5ff;
+    --ansi-bright-cyan: #67e8f9;
+    --ansi-bright-white: #ffffff;
+}
+
+:root[data-theme="light"] {
+    color-scheme: light;
+    --bg-app: #ffffff;
+    --bg-chrome: #f6f7f9;
+    --bg-raised: #eef0f4;
+    --bg-raised-2: #e4e8ee;
+    --bg-overlay: #ffffff;
+    --bg-inset: #f9fafb;
+    --border: #dde1e8;
+    --border-strong: #c7cdd8;
+    --border-soft: #e8ebf0;
+    --text: #1b1f2a;
+    --text-2: #444c5c;
+    --text-3: #5e6678;
+    --text-4: #8a92a2;
+    --accent: #00b8e0;
+    --focus: #0081a6;
+    --accent-hover: #00a8cf;
+    --accent-text: #00708f;
+    --accent-fg: #03161d;
+    --accent-bg: rgba(0, 150, 190, 0.09);
+    --accent-bg-strong: rgba(0, 150, 190, 0.17);
+    --accent-border: rgba(0, 130, 170, 0.45);
+    --green: #15803d;
+    --yellow: #a16207;
+    --red: #c62828;
+    --purple: #7c3aed;
+    --orange: #c2410c;
+    --pink: #be185d;
+    --green-bg: rgba(22, 163, 74, 0.1);
+    --yellow-bg: rgba(202, 138, 4, 0.12);
+    --red-bg: rgba(220, 38, 38, 0.08);
+    --purple-bg: rgba(124, 58, 237, 0.08);
+    --orange-bg: rgba(234, 88, 12, 0.09);
+    --shadow-1: 0 1px 2px rgba(20, 30, 50, 0.08);
+    --shadow-2: 0 12px 32px rgba(20, 30, 50, 0.16), 0 2px 6px rgba(20, 30, 50, 0.08);
+    --scrim: rgba(20, 26, 38, 0.32);
+    --scrollbar: rgba(80, 92, 116, 0.22);
+    --scrollbar-hover: rgba(80, 92, 116, 0.38);
+
+    --ed-selection: rgba(0, 150, 200, 0.18);
+    --ed-selection-blur: rgba(100, 116, 139, 0.16);
+    --ed-active-line: rgba(20, 40, 80, 0.035);
+    --ed-gutter-text: #8e95a3;
+    --ed-gutter-active: #444c5c;
+    --ed-cursor: #0090b8;
+    --ed-match: rgba(234, 179, 8, 0.25);
+    --ed-match-border: rgba(202, 138, 4, 0.55);
+    --ed-bracket: rgba(0, 150, 200, 0.2);
+    --ed-debug-line: rgba(250, 204, 21, 0.22);
+    --ed-debug-line-border: rgba(202, 138, 4, 0.85);
+    --ed-highlight: rgba(124, 58, 237, 0.1);
+    --ed-indent-guide: rgba(20, 30, 50, 0.07);
+
+    --syn-kw: #7c3aed;
+    --syn-fn: #00759e;
+    --syn-builtin: #0e7490;
+    --syn-str: #15803d;
+    --syn-esc: #047857;
+    --syn-num: #c2410c;
+    --syn-type: #a15c07;
+    --syn-comment: #6b7280;
+    --syn-attr: #b4239e;
+    --syn-prop: #1d4ed8;
+    --syn-var: #1b1f2a;
+    --syn-op: #4b5568;
+    --syn-punc: #667085;
+    --syn-const: #b45309;
+    --syn-self: #be185d;
+    --syn-interp: #6d28d9;
+    --syn-fmt: #a15c07;
+
+    --term-bg: #ffffff;
+    --term-fg: #1f2430;
+    --ansi-black: #1f2430;
+    --ansi-red: #c62828;
+    --ansi-green: #15803d;
+    --ansi-yellow: #a15c07;
+    --ansi-blue: #1d4ed8;
+    --ansi-magenta: #9333ea;
+    --ansi-cyan: #0e7490;
+    --ansi-white: #6b7280;
+    --ansi-bright-black: #6b7280;
+    --ansi-bright-red: #dc2626;
+    --ansi-bright-green: #16a34a;
+    --ansi-bright-yellow: #ca8a04;
+    --ansi-bright-blue: #2563eb;
+    --ansi-bright-magenta: #a855f7;
+    --ansi-bright-cyan: #0891b2;
+    --ansi-bright-white: #111827;
+}
+
+:root {
+    --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", Inter, Roboto, "Noto Sans", "Helvetica Neue", Arial, sans-serif;
+    --font-code: "JetBrains Mono", "Cascadia Code", "Fira Code", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    --fs-ui: 13px;
+    --fs-sm: 12px;
+    --fs-xs: 11px;
+    --fs-code: 14px;
+    --radius-sm: 4px;
+    --radius: 6px;
+    --radius-lg: 10px;
+    --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+    --t-fast: 120ms;
+    --titlebar-h: 42px;
+    --activity-w: 48px;
+    --statusbar-h: 24px;
+    --tabs-h: 36px;
+    --crumbs-h: 26px;
+    --panel-head-h: 34px;
+    --row-h: 24px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    :root { --t-fast: 0ms; }
+    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

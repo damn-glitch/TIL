@@ -1,0 +1,26 @@
+{
+  "name": "til-studio",
+  "version": "3.1.0",
+  "private": true,
+  "description": "TIL Studio frontend: sources of ide/studio.html (built with esbuild, CodeMirror 6)",
+  "license": "SEE LICENSE IN ../../LICENSE",
+  "type": "module",
+  "scripts": {
+    "tables": "python3 gen_tables.py",
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "mock": "node test/mock_server.mjs",
+    "test": "node --test test/studio.spec.mjs"
+  },
+  "devDependencies": {
+    "@codemirror/autocomplete": "^6.18.0",
+    "@codemirror/commands": "^6.7.0",
+    "@codemirror/language": "^6.10.0",
+    "@codemirror/lint": "^6.8.0",
+    "@codemirror/search": "^6.5.0",
+    "@codemirror/state": "^6.4.0",
+    "@codemirror/view": "^6.34.0",
+    "@lezer/highlight": "^1.2.0",
+    "esbuild": "^0.28.0"
+  }
+}
