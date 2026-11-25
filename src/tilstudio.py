@@ -1368,12 +1368,17 @@ class _DapBridge:
             self.studio.log_exception("debug adapter close")
 
     def close_all(self):
+        """Close every session at once (tildap's close() may wait up to 5 s each)."""
         with self.lock:
             sessions = list(self.sessions.values())
             self.sessions.clear()
             self.used.clear()
-        for s in sessions:
-            self._close(s)
+        threads = [threading.Thread(target=self._close, args=(s,), name='til-studio-dap-close', daemon=True)
+                   for s in sessions]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(6.0)
 
 
 # ── file watching ───────────────────────────────────────────────────────────

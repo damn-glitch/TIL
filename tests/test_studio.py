@@ -1461,6 +1461,35 @@ def test_shutdown_cleans_up(project, standins):
         socket.create_connection(('127.0.0.1', api.port), timeout=2).close()
 
 
+@pytest.mark.skipif(not HAS_TILDAP, reason="src/tildap.py is not installed")
+def test_shutdown_with_debug_sessions(project):
+    """Programs paused in the real debugger end with the studio (no threads left)."""
+    before = set(threading.enumerate())
+    server = tilstudio.StudioServer(project, frontend=False, log=open(os.devnull, 'w')).start()
+    api = Api(server)
+    ev = api.events()
+    for _ in range(3):
+        sid = api.ok('POST', '/api/dap/start')['sessionId']
+        for seq, command, arguments in ((1, 'initialize', {'adapterID': 'til'}),
+                                        (2, 'launch', {'program': 'loop.til', 'stopOnEntry': True}),
+                                        (3, 'configurationDone', {})):
+            api.ok('POST', f'/api/dap/{sid}', {'seq': seq, 'type': 'request', 'command': command,
+                                               'arguments': arguments})
+        ev.wait(lambda n, d, sid=sid: n == 'dap' and d['sessionId'] == sid and
+                d['message'].get('event') == 'stopped', 20)
+    t0 = time.monotonic()
+    server.stop()
+    assert time.monotonic() - t0 < 10
+    ev.thread.join(5)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        left = [t for t in threading.enumerate() if t not in before and t.is_alive() and t is not ev.thread]
+        if not left:
+            break
+        time.sleep(0.05)
+    assert left == [], [t.name for t in left]
+
+
 def test_command_line(project, tmp_path):
     env = dict(os.environ)
     env.pop('TIL_LANG', None)
