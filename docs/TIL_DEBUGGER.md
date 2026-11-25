@@ -11,11 +11,17 @@ first time, and nothing it printed is printed twice.
 til debug prog.til                                    # interactive, prompt "(til) "
 til debug prog.til --commands "b 5; c; p x; back; p x; q"
 til debug game.til --keys "UP,UP,ENTER" -- level1     # scripted keys, args() for the program
+til dap                                               # the same debugger for editors (DAP)
 ```
+
+The same engine drives editors and TIL Studio: `til dap` is a [Debug Adapter
+Protocol](#debug-adapter-dap) server, so VS Code, Neovim, Helix and the studio
+get breakpoints, Step Back and Reverse Continue.
 
 Contents: [example](#an-example-session) · [commands](#commands) ·
 [options](#options) · [line events](#line-events) · [time travel](#time-travel) ·
-[variables](#variables) · [debug info in the bytecode](#the-debug-info-section) ·
+[variables](#variables) · [expressions](#expressions) ·
+[debug adapter (DAP)](#debug-adapter-dap) · [debug info in the bytecode](#the-debug-info-section) ·
 [performance](#performance) · [messages](#messages) · [limitations](#limitations) ·
 [implementation notes](#implementation-notes)
 
@@ -112,7 +118,7 @@ printing `4` or `15` a second time.
 | `out` | run until the current function returns: stops in the caller, in the middle of the line of the call, and shows the returned value |
 | `back` | step back one line event |
 | `rc` | reverse-continue: back to the previous breakpoint hit (none: back to the start) |
-| `p NAME` | print a local, an upvalue (a captured variable of a closure or effect clause) or a global; also `NAME.field`, `NAME[3]`, `NAME["key"]`, `NAME[i]` and chains of them |
+| `p NAME` | print a local, an upvalue (a captured variable of a closure or effect clause) or a global; also `NAME.field`, `NAME[3]`, `NAME["key"]`, `NAME[i]` and chains of them, and any [expression](#expressions) (`p total / len(xs)`) |
 | `locals` | the local variables live at this point (innermost declaration of each name), then the upvalues |
 | `bt` | the call stack, innermost first, with the parameters of every frame |
 | `q` | quit |
@@ -238,8 +244,193 @@ of its block; a later `let x` in the same or an inner block hides the outer one.
 Parameters are visible in the whole function. Captured variables (cells) are
 shown by value. In a lambda or effect clause the upvalues (captured variables of
 the enclosing function) are visible by name. Globals are visible everywhere;
-constants that the compiler inlines (`let X = 5` at the top level) have no slot
-and cannot be printed.
+constants that the compiler inlines (`let X = 5` at the top level) have no slot,
+but `p X` and expressions still know their value (the compiler's table).
+
+## Expressions
+
+`p`, the editors' hover and watch expressions, the debug console and breakpoint
+conditions evaluate the same expressions, with the VM's own operations (so `7 /
+2` is `3`, `"a" + 1` is `"a1"` and `"a" - 1` fails, as in the program):
+
+| | examples |
+|---|---|
+| variables | locals, upvalues, globals, inlined constants, `$3` (slot 3 without debug info) |
+| fields and indexes | `p.x`, `xs[i]`, `m["key"]`, `m.key` (a map key), `opt.value` (Some / Ok), `res.error` (Err), `shape[0]` (an enum value's fields), `Color.Red`, `Shape.Empty` |
+| literals | `42`, `1.5`, `"text"`, `'c'`, `true`, `false`, `None`, `[1, 2]`, `{"a": 1}`, `f"{x}-{y}"`, `Some(x)`, `Ok(x)`, `Err(x)` |
+| operators | `+ - * / % **`, comparisons (also chained: `0 <= i < n`), `and or not`, `& \| ^ ~ << >>`, `x if c else y`, `x as float` |
+| calls | builtins without side effects: `len str int float bool abs sqrt pow sin cos tan log exp floor ceil round min max sum chr ord range type_of format str_bytes bytes_to_str args screen_width screen_height get_pixel`; builtin methods that do not change their receiver: `len contains starts_with ends_with trim to_upper to_lower replace slice find index_of count eq split repeat to_int to_float is_empty get join first last sum min max has keys values get_or unwrap expect unwrap_or is_some is_none is_ok is_err error to_string copy` |
+
+Nothing an expression does can change the program or the world: calls of the
+program's own functions and methods, methods that change their receiver (`push`,
+`sort`, ...), `print`, `input`, `random`, files and keys, assignments, lambdas
+and list comprehensions are refused (`Cannot evaluate '...': only variables,
+fields, ...`); `xs * n` and `range()` may not build more than a million elements.
+Keywords of the program's languages work (`и`/`және` for `and` in a `#[lang:
+ru]` / Kazakh program).
+
+## Debug adapter (DAP)
+
+`til dap` speaks the [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/)
+over standard input and output (`Content-Length` framing; `--log FILE` writes
+every message to FILE). It is this debugger: the program runs on the reference
+VM with line events, snapshots and the recorded inputs, so the editor's **Step
+Back** and **Reverse Continue** buttons work (`supportsStepBack`), and output is
+printed once however often you go back.
+
+**VS Code** (`.vscode/launch.json`; the debug type `til` comes with the TIL
+extension in `editors/vscode/`, which starts `til dap`):
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "til",
+      "request": "launch",
+      "name": "Debug the current TIL file",
+      "program": "${file}",
+      "cwd": "${workspaceFolder}",
+      "args": [],
+      "stopOnEntry": false
+    },
+    {
+      "type": "til",
+      "request": "launch",
+      "name": "Debug the game with scripted keys and input",
+      "program": "${workspaceFolder}/game.til",
+      "keys": "RIGHT,RIGHT,ENTER,ESC",
+      "stdin": "Aigerim\n42\n",
+      "stopAtEnd": true,
+      "lang": "kk"
+    }
+  ]
+}
+```
+
+**Neovim** ([nvim-dap](https://github.com/mfussenegger/nvim-dap)):
+
+```lua
+local dap = require('dap')
+dap.adapters.til = { type = 'executable', command = 'til', args = { 'dap' } }
+dap.configurations.til = {
+  {
+    type = 'til', request = 'launch', name = 'Debug TIL file',
+    program = '${file}', cwd = '${workspaceFolder}', stopOnEntry = false,
+  },
+}
+-- reverse debugging: dap.step_back(), dap.reverse_continue()
+```
+
+(`vim.filetype.add({ extension = { til = 'til' } })` if Neovim does not know
+`.til` files yet.) **Helix** (`languages.toml`):
+
+```toml
+[[language]]
+name = "til"
+scope = "source.til"
+file-types = ["til"]
+
+[language.debugger]
+name = "til"
+transport = "stdio"
+command = "til"
+args = ["dap"]
+
+[[language.debugger.templates]]
+name = "launch"
+request = "launch"
+completion = [ { name = "program", completion = "filename" } ]
+args = { program = "{0}" }
+```
+
+**Launch arguments**
+
+| argument | |
+|---|---|
+| `program` | the `.til` (compiled with debug info) or `.tbc` file; relative paths start at the session's root (TIL Studio's project) or the adapter's working directory |
+| `args` | arguments for `args()` (a list of strings) |
+| `cwd` | where the program's relative file paths start (`read_file`, `write_file`, `file_exists`); default: the root / the adapter's working directory |
+| `stdin` | the program's whole input (text); without it input is interactive: see `til/stdin` |
+| `keys` | scripted key presses, as `--keys` (`"UP,UP,ENTER"`) or a list of key codes |
+| `stopOnEntry` | stop at the first line event (reason `entry`) |
+| `noDebug` | just run (no stops; output, input and screen as when debugging) |
+| `stopAtEnd` | stop at the end of the program (reason `exit`) instead of ending the session, so you can still go back in time |
+| `lang` | `en`, `ru` or `kk`: the language of the adapter's messages (default: the client's `locale`) |
+| `source` | the program's text instead of the file (an unsaved editor buffer; `program` names it) |
+| `noFuse`, `snapshotEvery` | as `--no-fuse` and `--snapshot-every` |
+
+**Requests.** `initialize`, `launch`, `setBreakpoints` (conditions and hit
+conditions), `setExceptionBreakpoints`, `breakpointLocations`,
+`configurationDone`, `threads` (one thread, `main`), `stackTrace` (paged),
+`scopes`, `variables` (paged), `evaluate`, `exceptionInfo`, `continue`, `next`,
+`stepIn`, `stepOut`, `stepBack`, `reverseContinue`, `pause`, `terminate`,
+`disconnect`, `loadedSources`; `attach`, `setVariable`, `restart` and function
+breakpoints are not supported. Events: `initialized` (after the launch
+response), `stopped` (`entry`, `breakpoint` with `hitBreakpointIds`, `step`,
+`pause`, `goto`, `exception`, `exit`; `allThreadsStopped: true`), `continued`,
+`output` (`stdout`, `stderr` for the error report, `console` for the adapter's
+notes), `breakpoint`, `exited` (`exitCode`) followed by `terminated`.
+
+* **Breakpoints** on a line without code move to the next line with code
+  (`verified: true` and the actual `line` in the response; no code at or after
+  it: `verified: false` with a message). A breakpoint belongs to its file: code
+  imported from another module stops only at that module's breakpoints, and its
+  stack frames name that file. A **condition** is an [expression](#expressions)
+  (a condition that cannot be evaluated stops, and the console says why); a **hit
+  condition** counts the line events of that line from the start of the program
+  (also after going back in time): `N` (the Nth time), `== N`, `>= N`, `> N`,
+  `<= N`, `< N`, `% N` (every Nth time).
+* **Stepping.** `next` / `stepIn` / `stepOut` are `n` / `s` / `out`. `stepBack`
+  is the reverse of `next`: back to the previous line event of this function or
+  of a caller, stepping over the calls made in between (at a function's first
+  line: back to the line that called it); from the end of the program it goes to
+  the last line that ran. `reverseContinue` goes back to the previous breakpoint
+  hit, with conditions and hit counts (none: to the start of the program). After
+  `stepOut` the Locals scope shows the returned value (`f() returned`).
+* **Variables.** Scopes `Locals` (the frame's live locals and upvalues) and
+  `Globals`; arrays (`indexedVariables`, paged), maps, structs, closures (their
+  captured variables), Some/Ok/Err and enum values with fields expand;
+  `evaluateName` gives the path of each part (`m["nested"]["a"][1]`). Strings are
+  shown quoted with escapes. `variablesReference` and frame ids are valid while
+  the program is stopped.
+* **Runtime errors.** The exception filter `runtime-error` (on by default) stops
+  where an uncaught error ends the program (reason `exception`, `exceptionInfo`
+  has the message and the traceback); the state is the one where it happened, so
+  you can inspect it and step back. Continuing ends the session (`exited` with
+  code 1). Without the filter the program just ends. The error report is an
+  `output` event (`stderr`), once.
+* **Input.** With launch `stdin` the program reads that text. Otherwise, when it
+  calls `input()`, the adapter sends the event `til/inputRequested` and waits for
+  the request `til/stdin {text, eof?}` (several lines at once are fine; `eof: true`
+  ends the input); in VS Code type the line in the debug console (an `evaluate`
+  with context `repl` while the program waits for input is its next line).
+  Going back in time replays what was read: the program is not asked again.
+* **Custom requests and events** (for TIL Studio's timeline): `til/timeline` →
+  `{index, total, complete}` (line events before the current point, line events
+  recorded, whether the history reaches the end of the program); `til/goto
+  {index}` jumps to any recorded line event (`continued`, then `stopped` with
+  reason `goto`; `index = total` once `complete`: to the end, reason `exit` or
+  `exception`); event `til/screen {w,
+  h, rgb_b64}` (the framebuffer as base64 RGB24) on `screen_show()` - at most 30
+  frames a second while the program runs - and at every stop and at the end when
+  the framebuffer changed, so after going back the screen shows that moment.
+
+**In-process API** (TIL Studio, `src/tilstudio.py`):
+
+```python
+from tildap import DapSession
+session = DapSession(emit, root)        # emit(event: dict): called from any thread, one at a time
+responses = session.handle(message)    # one DAP message -> the response(s) to send now
+with session.hold_events():            # optional: events caused by the request come after
+    send(session.handle(message))      #   what you send inside the block
+session.close()
+```
+
+The program runs on a worker thread; `handle()` does not wait for it (only
+`disconnect` and `close()` wait up to 5 seconds for it to end), and may be
+called from several threads (requests are processed one at a time). `seq`
+numbers of responses and events come from one counter.
 
 ## The debug-info section
 
@@ -332,9 +523,17 @@ Values, source lines and command names are not translated; `bt` uses the same
 ## Limitations
 
 * Runs on the reference (Python) VM only; the C VM is not instrumented.
-* Line numbers have no file: code imported from another module reports that
-  module's line numbers like the main file's (a breakpoint at line 5 also stops
-  at line 5 of an imported module). This is a property of the line table.
+* Line numbers have no file in the bytecode: `til debug`'s `b 5` stops at line 5
+  of every file of the program, and its stops show the main file's source line.
+  The debug adapter knows the file of each function (from the compiler: named
+  functions and methods by the file that defines them, lambdas and effect
+  clauses by the function they are written in), so its breakpoints and stack
+  frames are per file; a `.tbc` program is one file. A hit condition counts the
+  line events of its line number in all files.
+* The debug adapter runs one program per session (one thread, `main`); keys come
+  from `keys` only (no live keyboard), `setVariable` is not offered (changing a
+  value would break the recorded history), and `pause` while the program waits
+  in `input()` takes effect once the line has arrived.
 * A function name with a space (`<clause Ask:7>`) keeps the location message
   English in `ru`/`kk`.
 * Keys come from `--keys` only (no terminal keys: the terminal is the debugger's
@@ -353,8 +552,31 @@ Values, source lines and command names are not translated; `bt` uses the same
 * `src/tildebug.py`: `debug_execute_code()` (the instrumented copy of
   `execute()`), `DebugVM` (a `TILVM`: line-event hook, `resume(stop)`,
   snapshots, `restore`/`travel`, `nd()` record/replay, overrides of
-  `call_native` and `check_budget`), `copy_state`, `Session` (the commands),
+  `call_native`, `gfx_native`, `path_arg` and `check_budget`; `request_pause()`
+  and `kill()` from other threads), `copy_state`, `DebugSession` (the engine,
+  below), `Session` (the commands of `til debug`, on a DebugSession),
+  `compile_program` / `load_program` (the program with the compiler's
+  `ProgramInfo`: the file of every function, inlined constants, enum values),
   `main(argv)` (routed as `til debug` through `EXTRA_COMMANDS`).
+* `DebugSession(module, source, path, args=, stdin=, keys=, screen=, out=, err=,
+  on_screen=, every=, cwd=, lang=, info=)` or `DebugSession.load(path, source=None)`:
+  breakpoints (`resolve_line`, `add_breakpoint(line, file, condition,
+  hit_condition)`, `set_file_breakpoints`, `remove_breakpoint`), run methods that
+  return a `Stop` (`start`, `cont`, `step_in`, `step_over`, `step_out`,
+  `step_back` = `back`, `step_back_over` = DAP's `stepBack`, `reverse_continue`,
+  `goto(index)`, `run_to_end`; `interrupt()`, `kill()` from any thread), queries
+  (`stack()`, `locals(depth)`, `params(depth)`, `globals()`, `lookup`,
+  `evaluate(expr, depth)`, `timeline()`, `output`, `finished`), values
+  (`preview`, `children`, `describe`; module functions `preview`, `value_type`,
+  `value_kind`, `value_children`, `child_counts`).
+* Reverse "step over" needs the depth of every line event: `DebugVM.ev_meta`
+  (2 × depth + 1 for a frame's first line event) grows with the history, like
+  `ev_lines`. Reverse-continue checks breakpoints without conditions on the
+  history alone; with conditions it replays the history backwards one snapshot
+  interval at a time and evaluates them there.
+* `src/tildap.py`: `DapSession` (requests -> engine calls; the program on a
+  worker thread; variables references and frame ids per stop; output sent in
+  chunks of at most 30 ms), `StdioServer` and `main(argv)` (`til dap`).
 * The `# @line-event` comment in `TILVM.execute()` must stay at the top of the
   dispatch loop, after `op_pc = pc` and before the opcode is read; everything
   the loop keeps in local variables must be derivable from `self.frames[-1]` at
