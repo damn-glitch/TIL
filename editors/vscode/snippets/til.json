@@ -5,21 +5,68 @@
       "main()",
       "    $0"
     ],
-    "description": "Main entry point"
+    "description": "Program entry point"
   },
   "Function": {
     "prefix": "fn",
     "body": [
-      "${1:name}(${2:params}) -> ${3:type}",
-      "    $0"
+      "${1:name}(${2:x: int}) -> ${3:int}",
+      "    ${0:return x}"
     ],
     "description": "Function definition"
+  },
+  "Function with Contracts": {
+    "prefix": "fnc",
+    "body": [
+      "#[requires: ${1:n >= 0}]",
+      "#[ensures: ${2:result >= 0}]",
+      "${3:name}(${4:n: int}) -> ${5:int}",
+      "    ${0:return n}"
+    ],
+    "description": "Function with #[requires] / #[ensures] contracts (checked at run time, proved by til prove)"
+  },
+  "Requires": {
+    "prefix": "requires",
+    "body": "#[requires: ${1:condition}]$0",
+    "description": "Precondition, checked on entry (and proved by til prove)"
+  },
+  "Ensures": {
+    "prefix": "ensures",
+    "body": "#[ensures: ${1:result >= 0}]$0",
+    "description": "Postcondition on result, checked on return"
+  },
+  "Pure Function": {
+    "prefix": "pure",
+    "body": [
+      "#[pure]",
+      "${1:name}(${2:x: int}) -> ${3:int}",
+      "    ${0:return x}"
+    ],
+    "description": "A function without effects (checked: E-EFFECT)"
+  },
+  "Effects": {
+    "prefix": "effects",
+    "body": "#[effects: ${1:io}]$0",
+    "description": "The effects a function may perform (an upper bound, checked)"
+  },
+  "Capability": {
+    "prefix": "cap",
+    "body": [
+      "cap ${1:Storage} { ${2:read}, ${3:write} }",
+      "",
+      "#[cap: ${1:Storage}]",
+      "#[effects: io]",
+      "${4:save}(${5:name: str})",
+      "    $0"
+    ],
+    "description": "A capability and a function that needs it (checked: E-CAP)"
   },
   "Struct": {
     "prefix": "struct",
     "body": [
-      "struct ${1:Name}",
-      "    ${2:field}: ${3:type}",
+      "struct ${1:Point}",
+      "    ${2:x}: ${3:float}",
+      "    ${4:y}: ${5:float}",
       "$0"
     ],
     "description": "Struct definition"
@@ -27,19 +74,71 @@
   "Impl": {
     "prefix": "impl",
     "body": [
-      "impl ${1:Type}",
-      "    $0"
+      "impl ${1:Point}",
+      "    ${2:length}(self) -> ${3:float}",
+      "        ${0:return sqrt(self.x * self.x + self.y * self.y)}"
     ],
-    "description": "Impl block"
+    "description": "Methods of a struct"
+  },
+  "Struct with Impl": {
+    "prefix": "structimpl",
+    "body": [
+      "struct ${1:Point}",
+      "    ${2:x}: ${3:float}",
+      "",
+      "impl ${1:Point}",
+      "    ${4:show}(self) -> str",
+      "        return f\"${1:Point}({self.${2:x}})\"$0"
+    ],
+    "description": "A struct and its methods"
+  },
+  "Trait": {
+    "prefix": "trait",
+    "body": [
+      "trait ${1:Greeter}",
+      "    ${2:name}(self) -> str",
+      "    ${3:greet}(self) -> str",
+      "        ${0:return \"Hello, \" + self.${2:name}() + \"!\"}"
+    ],
+    "description": "Trait with a default method"
+  },
+  "Impl Trait": {
+    "prefix": "impltrait",
+    "body": [
+      "impl ${1:Greeter} for ${2:Student}",
+      "    ${3:name}(self) -> str",
+      "        $0"
+    ],
+    "description": "Implement a trait for a struct"
   },
   "Enum": {
     "prefix": "enum",
     "body": [
-      "enum ${1:Name}",
-      "    ${2:Variant}",
+      "enum ${1:Shape}",
+      "    ${2:Circle}(${3:float})",
+      "    ${4:Rect}(${5:float}, ${6:float})",
+      "    ${7:Dot}",
       "$0"
     ],
-    "description": "Enum definition"
+    "description": "Enum (variants may carry data)"
+  },
+  "Match": {
+    "prefix": "match",
+    "body": [
+      "match ${1:value}",
+      "    ${2:pattern} => ${3:result}",
+      "    _ => ${0:other}"
+    ],
+    "description": "Match expression"
+  },
+  "Match Result": {
+    "prefix": "matchres",
+    "body": [
+      "match ${1:result}",
+      "    Ok(${2:v}) => print(f\"ok: {${2:v}}\")",
+      "    Err(${3:e}) => print(f\"error: {${3:e}}\")$0"
+    ],
+    "description": "Match on Ok / Err"
   },
   "If": {
     "prefix": "if",
@@ -47,7 +146,7 @@
       "if ${1:condition}",
       "    $0"
     ],
-    "description": "If statement"
+    "description": "If block"
   },
   "If-Else": {
     "prefix": "ife",
@@ -57,7 +156,7 @@
       "else",
       "    $0"
     ],
-    "description": "If-else statement"
+    "description": "If / else"
   },
   "For Loop": {
     "prefix": "for",
@@ -65,7 +164,7 @@
       "for ${1:i} in ${2:0..10}",
       "    $0"
     ],
-    "description": "For loop"
+    "description": "For loop over a range or a collection"
   },
   "While Loop": {
     "prefix": "while",
@@ -81,7 +180,7 @@
       "loop",
       "    $0"
     ],
-    "description": "Infinite loop"
+    "description": "Endless loop (leave it with break)"
   },
   "Let": {
     "prefix": "let",
@@ -93,44 +192,172 @@
     "body": "var ${1:name} = ${2:value}$0",
     "description": "Mutable variable"
   },
+  "Const": {
+    "prefix": "const",
+    "body": "const ${1:NAME} = ${2:value}$0",
+    "description": "Constant"
+  },
   "Print": {
     "prefix": "print",
     "body": "print(${1:value})$0",
-    "description": "Print statement"
+    "description": "Print a value"
   },
-  "Level 0": {
-    "prefix": "level0",
+  "Print F-String": {
+    "prefix": "printf",
+    "body": "print(f\"${1:x} = {${2:x}}\")$0",
+    "description": "Print an f-string with interpolation"
+  },
+  "Closure": {
+    "prefix": "lambda",
+    "body": "|${1:x}| ${0:x * 2}",
+    "description": "Closure (anonymous function)"
+  },
+  "Retry": {
+    "prefix": "retry",
     "body": [
-      "#[level: 0]",
-      "${1:name}(${2:params}) -> ${3:type}",
+      "let ${1:value} = retry(${2:3})",
+      "    ${3:flaky()}",
+      "else",
+      "    ${0:-1}"
+    ],
+    "description": "Run the body again after a runtime error, up to n times; else: the fallback (error holds the message)"
+  },
+  "Timeout": {
+    "prefix": "timeout",
+    "body": [
+      "let ${1:value} = timeout(${2:100})",
+      "    ${3:slow()}",
+      "else",
+      "    ${0:\"stopped: \" + error}"
+    ],
+    "description": "Stop the body after n milliseconds; else: the fallback"
+  },
+  "Handle Effects": {
+    "prefix": "handle",
+    "body": [
+      "let ${1:result} = handle",
+      "    ${2:greet()}",
+      "with",
+      "    ${3:Ask}(${4:key}) => resume(${0:\"Aigerim\"})"
+    ],
+    "description": "Effect handler: resume(v) continues after the perform"
+  },
+  "Handle with Block Clause": {
+    "prefix": "handleblock",
+    "body": [
+      "handle",
+      "    ${1:countdown(5)}",
+      "with",
+      "    ${2:Yield}(${3:v}) =>",
+      "        ${0:print(${3:v})}",
+      "        resume()"
+    ],
+    "description": "Effect handler whose clause has a block body (a generator consumer)"
+  },
+  "Perform": {
+    "prefix": "perform",
+    "body": "perform ${1:Ask}(${2:\"name\"})$0",
+    "description": "Perform an effect: the nearest handle decides what it means"
+  },
+  "Assert": {
+    "prefix": "assert",
+    "body": "assert ${1:condition}, \"${2:message}\"$0",
+    "description": "Assertion (a runtime error when false, proved by til prove)"
+  },
+  "Intent": {
+    "prefix": "intent",
+    "body": [
+      "intent \"${1:what this block does}\"",
       "    $0"
     ],
-    "description": "Level 0 function (Hardware)"
+    "description": "Intent block: its description is added to error messages"
   },
-  "Level 1": {
-    "prefix": "level1",
+  "Import": {
+    "prefix": "import",
+    "body": "import ${1:module}$0",
+    "description": "Import a module"
+  },
+  "From Import": {
+    "prefix": "from",
+    "body": "from ${1:module} import ${2:name}$0",
+    "description": "Import names from a module"
+  },
+  "Graphics Loop": {
+    "prefix": "screen",
     "body": [
-      "#[level: 1]",
-      "${1:name}(${2:params}) -> ${3:type}",
+      "main()",
+      "    screen_init(${1:96}, ${2:64})",
+      "    var x = ${3:10}",
+      "    var running = true",
+      "    while running",
+      "        let key = key_pressed()",
+      "        if key == 27",
+      "            running = false",
+      "        elif key == 3",
+      "            x -= 1",
+      "        elif key == 4",
+      "            x += 1",
+      "        screen_clear(${4:0x1E3A5F})",
+      "        fill_rect(x, ${5:28}, 8, 8, ${6:0xFFD23F})",
+      "        draw_text(2, 2, \"${7:TIL}\", 0xFFFFFF)",
+      "        $0",
+      "        screen_show()",
+      "        sleep_ms(${8:16})"
+    ],
+    "description": "Graphics main loop: keys (ESC=27, LEFT=3, RIGHT=4), draw, show, wait (run with til run --vm --screen-ansi)"
+  },
+  "Energy Mode": {
+    "prefix": "energy",
+    "body": [
+      "#[energy: ${1|balanced,low,performance|}]",
+      "",
+      "$0"
+    ],
+    "description": "The program's energy mode (a pragma before every definition, followed by an empty line)"
+  },
+  "Low-Energy Function": {
+    "prefix": "energylow",
+    "body": [
+      "#[energy: low]",
+      "${1:background}(${2:n: int}) -> ${3:int}",
       "    $0"
     ],
-    "description": "Level 1 function (Systems)"
+    "description": "A background function: while it runs the VM behaves as in energy mode low"
   },
-  "Level 3": {
-    "prefix": "level3",
+  "Energy Burst": {
+    "prefix": "energyburst",
     "body": [
-      "#[level: 3]",
-      "${1:name}(${2:params})",
+      "let saved = energy_mode(0)",
+      "$0",
+      "energy_mode(saved)"
+    ],
+    "description": "Run a short burst at full speed, then restore the previous energy mode"
+  },
+  "Level": {
+    "prefix": "level",
+    "body": [
+      "#[level: ${1|0,1,2,3,4|}]",
+      "${2:name}(${3:x: int}) -> ${4:int}",
       "    $0"
     ],
-    "description": "Level 3 function (Script)"
+    "description": "Function level: 0 hardware, 1 systems, 2 safe, 3 script, 4 formal"
   },
-  "Constructor": {
-    "prefix": "new",
+  "Kazakh Main": {
+    "prefix": "негізгі",
     "body": [
-      "new(${1:params}) -> ${2:Self}",
-      "    return ${2:Self} { $0 }"
+      "негізгі()",
+      "    басып_шығару(${1:\"Сәлем!\"})$0"
     ],
-    "description": "Constructor method"
+    "description": "Бағдарламаның кіру нүктесі (Kazakh keywords)"
+  },
+  "Russian Main": {
+    "prefix": "главная",
+    "body": [
+      "#[lang: ru]",
+      "",
+      "главная()",
+      "    печать(${1:\"Привет!\"})$0"
+    ],
+    "description": "Точка входа программы (Russian keywords: #[lang: ru])"
   }
 }

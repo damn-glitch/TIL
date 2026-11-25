@@ -1,0 +1,7 @@
+# TIL for VS Code
+node_modules/
+*.vsix
+# copied from the repository root by `node scripts/build.mjs --release` (for vsce)
+/LICENSE
+# the bundle is committed (the repository .gitignore ignores dist/ folders)
+!dist/
