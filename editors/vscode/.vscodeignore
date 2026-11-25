@@ -1,3 +1,11 @@
+# Files left out of the .vsix (vsce package): sources, build scripts, tests.
+# The extension runs from dist/extension.js (bundled, with its dependencies).
 .gitignore
+src/**
+scripts/**
+test/**
 node_modules/**
+jsconfig.json
+package-lock.json
 *.vsix
+**/*.map

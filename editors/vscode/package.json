@@ -1,47 +1,78 @@
 {
   "name": "til-lang",
   "displayName": "TIL Language",
-  "description": "TIL Programming Language - syntax highlighting, run, build, and check support. Simpler than Python. Faster than C.",
-  "version": "1.1.0",
+  "description": "TIL (The Intelligent Language): language server (diagnostics, completion, hover, rename, formatting), time-travel debugger with Step Back, run on native / TIL VM / C VM, prover, device fit, keyword translation (English, Kazakh, Russian).",
+  "version": "3.1.0",
   "publisher": "alisher-beisembekov",
+  "author": "Alisher Beisembekov",
+  "license": "SEE LICENSE IN LICENSE",
   "icon": "images/til-logo.png",
   "galleryBanner": {
-    "color": "#1a1a2e",
+    "color": "#0b0d12",
     "theme": "dark"
   },
   "homepage": "https://til-dev.vercel.app",
   "repository": {
     "type": "git",
-    "url": "https://github.com/damn-glitch/TIL"
+    "url": "https://github.com/damn-glitch/TIL",
+    "directory": "editors/vscode"
   },
   "bugs": {
     "url": "https://github.com/damn-glitch/TIL/issues"
   },
   "engines": {
-    "vscode": "^1.74.0"
+    "vscode": "^1.82.0"
   },
   "categories": [
     "Programming Languages",
-    "Snippets",
-    "Other"
+    "Debuggers",
+    "Formatters",
+    "Snippets"
   ],
   "keywords": [
     "til",
-    "programming language",
-    "compiler",
-    "multi-level",
-    "systems programming"
+    "kazakh",
+    "russian",
+    "language server",
+    "time-travel debugging",
+    "step back",
+    "bytecode",
+    "microcontrollers",
+    "calculators"
   ],
+  "main": "./dist/extension.js",
   "activationEvents": [
-    "onLanguage:til"
+    "onLanguage:til",
+    "onDebugResolve:til",
+    "onDebugDynamicConfigurations:til",
+    "onView:til.timeline"
   ],
-  "main": "./src/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "In Restricted Mode the TIL command is not taken from workspace settings (til.path, til.python) or from a TIL checkout in the workspace.",
+      "restrictedConfigurations": [
+        "til.path",
+        "til.python",
+        "til.compilerPath"
+      ]
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "The TIL tools work on files on disk."
+    }
+  },
   "contributes": {
     "languages": [
       {
         "id": "til",
-        "aliases": ["TIL", "til"],
-        "extensions": [".til"],
+        "aliases": [
+          "TIL",
+          "til"
+        ],
+        "extensions": [
+          ".til"
+        ],
         "configuration": "./language-configuration.json",
         "icon": {
           "light": "./images/til-logo.png",
@@ -62,104 +93,585 @@
         "path": "./snippets/til.json"
       }
     ],
+    "configurationDefaults": {
+      "[til]": {
+        "editor.insertSpaces": true,
+        "editor.tabSize": 4
+      }
+    },
+    "breakpoints": [
+      {
+        "language": "til"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "til",
+        "label": "TIL",
+        "languages": [
+          "til"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "The .til file (or .tbc bytecode) to debug. Relative paths start at the workspace folder.",
+                "default": "${file}"
+              },
+              "args": {
+                "type": [
+                  "array",
+                  "string"
+                ],
+                "items": {
+                  "type": "string"
+                },
+                "description": "Arguments for the program's args() (a list of strings, or one string split like a shell does).",
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Where the program's relative file paths start (read_file, write_file, file_exists).",
+                "default": "${workspaceFolder}"
+              },
+              "stdin": {
+                "type": "string",
+                "description": "The program's whole input. Without it input is interactive: an input box (and the Debug Console) asks for each line.",
+                "default": ""
+              },
+              "keys": {
+                "type": [
+                  "string",
+                  "array"
+                ],
+                "items": {
+                  "type": [
+                    "string",
+                    "integer"
+                  ]
+                },
+                "description": "Scripted key presses for key_pressed() / wait_key(), as in `til run --keys`: \"UP,UP,ENTER,a,ESC\" or a list of key codes.",
+                "default": "UP,UP,ENTER"
+              },
+              "lang": {
+                "type": "string",
+                "enum": [
+                  "en",
+                  "ru",
+                  "kk"
+                ],
+                "description": "Language of the debugger's messages (default: til.locale, else the VS Code display language)."
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Stop at the first line of the program.",
+                "default": false
+              },
+              "stopAtEnd": {
+                "type": "boolean",
+                "description": "Stop at the end of the program instead of ending the session, so you can still step back in time.",
+                "default": true
+              },
+              "noFuse": {
+                "type": "boolean",
+                "description": "Compile without superinstructions (as `til build --no-fuse`).",
+                "default": false
+              },
+              "snapshotEvery": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "How many line events between two time-travel snapshots (as `til debug --snapshot-every`)."
+              },
+              "source": {
+                "type": "string",
+                "description": "The program's text instead of the file (set by the extension for unsaved editors)."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "til",
+            "request": "launch",
+            "name": "Debug the current TIL file",
+            "program": "${file}",
+            "cwd": "${workspaceFolder}",
+            "args": [],
+            "stopOnEntry": false
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "TIL: Debug the current file",
+            "description": "Debug the file in the active editor (time travel: Step Back, Reverse Continue).",
+            "body": {
+              "type": "til",
+              "request": "launch",
+              "name": "Debug the current TIL file",
+              "program": "^\"\\${file}\"",
+              "cwd": "^\"\\${workspaceFolder}\"",
+              "args": [],
+              "stopOnEntry": false
+            }
+          },
+          {
+            "label": "TIL: Debug a program with arguments",
+            "description": "Debug a fixed program with arguments for args().",
+            "body": {
+              "type": "til",
+              "request": "launch",
+              "name": "Debug ${1:main.til}",
+              "program": "^\"\\${workspaceFolder}/${1:main.til}\"",
+              "cwd": "^\"\\${workspaceFolder}\"",
+              "args": [
+                "${2:first}",
+                "${3:second}"
+              ]
+            }
+          },
+          {
+            "label": "TIL: Debug with input and scripted keys",
+            "description": "Pre-recorded input() lines and key presses (games, graphics); stops at the end so you can go back in time.",
+            "body": {
+              "type": "til",
+              "request": "launch",
+              "name": "Debug ${1:game.til} with input and keys",
+              "program": "^\"\\${workspaceFolder}/${1:game.til}\"",
+              "stdin": "${2:Aigerim\\n42\\n}",
+              "keys": "${3:RIGHT,RIGHT,ENTER,ESC}",
+              "stopAtEnd": true
+            }
+          },
+          {
+            "label": "TIL: Debug with messages in Kazakh or Russian",
+            "description": "The debugger's messages in another language.",
+            "body": {
+              "type": "til",
+              "request": "launch",
+              "name": "Debug the current TIL file (${1|kk,ru,en|})",
+              "program": "^\"\\${file}\"",
+              "lang": "${1|kk,ru,en|}"
+            }
+          }
+        ]
+      }
+    ],
+    "views": {
+      "debug": [
+        {
+          "type": "webview",
+          "id": "til.timeline",
+          "name": "TIL Time Travel",
+          "when": "debugType == 'til'"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "til.run",
-        "title": "TIL: Run File",
+        "title": "Run File",
+        "category": "TIL",
         "icon": "$(play)"
       },
       {
+        "command": "til.runVM",
+        "title": "Run on the TIL VM",
+        "category": "TIL",
+        "icon": "$(vm)"
+      },
+      {
+        "command": "til.runCVM",
+        "title": "Run on the C VM",
+        "category": "TIL",
+        "icon": "$(circuit-board)"
+      },
+      {
+        "command": "til.debug",
+        "title": "Debug File",
+        "category": "TIL",
+        "icon": "$(debug-alt)"
+      },
+      {
+        "command": "til.prove",
+        "title": "Prove Contracts in File",
+        "category": "TIL",
+        "icon": "$(verified)"
+      },
+      {
+        "command": "til.proveFunction",
+        "title": "Prove Function at Cursor",
+        "category": "TIL"
+      },
+      {
+        "command": "til.fit",
+        "title": "Fit for Device...",
+        "category": "TIL",
+        "icon": "$(device-mobile)"
+      },
+      {
+        "command": "til.translate",
+        "title": "Translate Keywords...",
+        "category": "TIL"
+      },
+      {
+        "command": "til.openStudio",
+        "title": "Open in TIL Studio",
+        "category": "TIL",
+        "icon": "$(browser)"
+      },
+      {
+        "command": "til.buildBytecode",
+        "title": "Build Bytecode (.tbc)",
+        "category": "TIL"
+      },
+      {
+        "command": "til.buildCVM",
+        "title": "Build C VM File (_vm.c)",
+        "category": "TIL"
+      },
+      {
         "command": "til.build",
-        "title": "TIL: Build File",
+        "title": "Build Native Executable",
+        "category": "TIL",
         "icon": "$(tools)"
       },
       {
         "command": "til.check",
-        "title": "TIL: Check Syntax",
+        "title": "Check File",
+        "category": "TIL",
         "icon": "$(check)"
       },
       {
-        "command": "til.runInTerminal",
-        "title": "TIL: Run in Terminal",
-        "icon": "$(terminal)"
+        "command": "til.restartServer",
+        "title": "Restart Language Server",
+        "category": "TIL"
+      },
+      {
+        "command": "til.showOutput",
+        "title": "Show Output",
+        "category": "TIL"
+      },
+      {
+        "command": "til.statusMenu",
+        "title": "Language Server Status",
+        "category": "TIL"
+      },
+      {
+        "command": "til.gotoTime",
+        "title": "Go to Point in Time...",
+        "category": "TIL",
+        "icon": "$(history)"
+      },
+      {
+        "command": "til.sendInput",
+        "title": "Send Input to the Program...",
+        "category": "TIL",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "til.showScreen",
+        "title": "Show Program Screen",
+        "category": "TIL",
+        "icon": "$(device-desktop)"
       }
     ],
-    "keybindings": [
+    "submenus": [
       {
-        "command": "til.run",
-        "key": "f5",
-        "when": "editorLangId == til && !inDebugMode"
-      },
-      {
-        "command": "til.build",
-        "key": "f6",
-        "when": "editorLangId == til"
-      },
-      {
-        "command": "til.check",
-        "key": "f7",
-        "when": "editorLangId == til"
-      },
-      {
-        "command": "til.runInTerminal",
-        "key": "ctrl+f5",
-        "when": "editorLangId == til"
+        "id": "til.editorContext",
+        "label": "TIL"
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "til.run",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.runVM",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.runCVM",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.debug",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.prove",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.proveFunction",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.fit",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.translate",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.buildBytecode",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.buildCVM",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.build",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.check",
+          "when": "editorLangId == til"
+        },
+        {
+          "command": "til.gotoTime",
+          "when": "inDebugMode && debugType == 'til'"
+        },
+        {
+          "command": "til.sendInput",
+          "when": "inDebugMode && debugType == 'til'"
+        }
+      ],
       "editor/title/run": [
         {
           "command": "til.run",
-          "when": "editorLangId == til",
+          "when": "resourceLangId == til",
           "group": "navigation@1"
         },
         {
-          "command": "til.runInTerminal",
-          "when": "editorLangId == til",
+          "command": "til.runVM",
+          "when": "resourceLangId == til",
           "group": "navigation@2"
+        },
+        {
+          "command": "til.runCVM",
+          "when": "resourceLangId == til",
+          "group": "navigation@3"
+        },
+        {
+          "command": "til.debug",
+          "when": "resourceLangId == til",
+          "group": "navigation@4"
         }
       ],
       "editor/context": [
         {
-          "command": "til.run",
+          "submenu": "til.editorContext",
           "when": "editorLangId == til",
           "group": "til@1"
+        }
+      ],
+      "til.editorContext": [
+        {
+          "command": "til.run",
+          "group": "1_run@1"
         },
         {
-          "command": "til.build",
-          "when": "editorLangId == til",
-          "group": "til@2"
+          "command": "til.runVM",
+          "group": "1_run@2"
+        },
+        {
+          "command": "til.runCVM",
+          "group": "1_run@3"
+        },
+        {
+          "command": "til.debug",
+          "group": "1_run@4"
+        },
+        {
+          "command": "til.prove",
+          "group": "2_verify@1"
+        },
+        {
+          "command": "til.proveFunction",
+          "group": "2_verify@2"
+        },
+        {
+          "command": "til.fit",
+          "group": "2_verify@3"
         },
         {
           "command": "til.check",
-          "when": "editorLangId == til",
+          "group": "2_verify@4"
+        },
+        {
+          "command": "til.translate",
+          "group": "3_translate@1"
+        },
+        {
+          "command": "til.buildBytecode",
+          "group": "4_build@1"
+        },
+        {
+          "command": "til.buildCVM",
+          "group": "4_build@2"
+        },
+        {
+          "command": "til.build",
+          "group": "4_build@3"
+        },
+        {
+          "command": "til.openStudio",
+          "group": "5_studio@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "til.run",
+          "when": "resourceExtname == .til",
+          "group": "til@1"
+        },
+        {
+          "command": "til.debug",
+          "when": "resourceExtname == .til",
+          "group": "til@2"
+        },
+        {
+          "command": "til.openStudio",
+          "when": "explorerResourceIsFolder",
           "group": "til@3"
+        }
+      ],
+      "debug/toolBar": [
+        {
+          "command": "til.gotoTime",
+          "when": "debugType == 'til' && debugState == 'stopped'",
+          "group": "navigation@90"
         }
       ]
     },
+    "keybindings": [
+      {
+        "command": "til.build",
+        "key": "f6",
+        "when": "editorTextFocus && editorLangId == til && !inDebugMode"
+      },
+      {
+        "command": "til.check",
+        "key": "f7",
+        "when": "editorTextFocus && editorLangId == til && !inDebugMode"
+      },
+      {
+        "command": "til.gotoTime",
+        "key": "ctrl+alt+g",
+        "mac": "cmd+alt+g",
+        "when": "inDebugMode && debugType == 'til' && debugState == 'stopped'"
+      }
+    ],
     "configuration": {
       "title": "TIL",
       "properties": {
-        "til.compilerPath": {
+        "til.path": {
           "type": "string",
-          "default": "til",
-          "description": "Path to the TIL compiler"
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Path to the `til` launcher or to `src/til.py` of a TIL checkout (a folder with `src/til.py` works too). Empty: `til` on `PATH`, else the checkout this extension runs from, else `~/.til/bin/til.py`."
+        },
+        "til.python": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "Python 3.9+ that runs `til.py` (when `#til.path#` is a `.py` file or no `til` launcher is found). Empty: `python3` (`python` or `py -3` on Windows)."
+        },
+        "til.lsp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Start the TIL language server (`til lsp`): diagnostics, completion, hover, go to definition, rename, formatting, code lenses."
+        },
+        "til.locale": {
+          "type": "string",
+          "default": "auto",
+          "enum": [
+            "auto",
+            "en",
+            "ru",
+            "kk"
+          ],
+          "enumDescriptions": [
+            "The VS Code display language",
+            "English",
+            "Русский",
+            "Қазақша"
+          ],
+          "markdownDescription": "Language of diagnostics, hovers and debugger messages (sent to the server as `initializationOptions.locale`)."
+        },
+        "til.trace.server": {
+          "type": "string",
+          "default": "off",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "scope": "window",
+          "description": "Trace the messages between VS Code and the TIL language server (in the output channel 'TIL Language Server')."
         },
         "til.optimization": {
           "type": "string",
           "default": "-O2",
-          "enum": ["-O0", "-O1", "-O2", "-O3"],
-          "description": "Optimization level for builds"
+          "enum": [
+            "-O0",
+            "-O1",
+            "-O2",
+            "-O3"
+          ],
+          "description": "Optimization level of 'TIL: Build Native Executable'."
         },
-        "til.runInTerminal": {
+        "til.run.screenAnsi": {
           "type": "boolean",
-          "default": false,
-          "description": "Run TIL files in integrated terminal instead of output panel"
+          "default": true,
+          "markdownDescription": "Run commands: draw the screen of graphics programs (those that call `screen_init`) in the terminal (`--screen-ansi`)."
+        },
+        "til.prove.timeout": {
+          "type": "integer",
+          "default": 10000,
+          "minimum": 1,
+          "markdownDescription": "Solver time limit per proof condition in milliseconds (`til prove --timeout`)."
+        },
+        "til.debug.showScreen": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "While debugging, show the framebuffer of graphics programs in a 'TIL Screen' panel (event `til/screen`)."
+        },
+        "til.compilerPath": {
+          "type": "string",
+          "default": "til",
+          "scope": "machine-overridable",
+          "description": "Path to the TIL compiler.",
+          "deprecationMessage": "Use til.path instead."
         }
       }
     }
   },
   "scripts": {
-    "package": "vsce package"
+    "build": "node scripts/build.mjs",
+    "check-bundle": "node scripts/build.mjs --check",
+    "grammar": "python3 scripts/gen_grammar.py",
+    "vscode:prepublish": "node scripts/build.mjs --release",
+    "package": "npx --yes @vscode/vsce@4.1.1 package --no-dependencies",
+    "typecheck": "tsc -p jsconfig.json"
+  },
+  "dependencies": {
+    "vscode-languageclient": "9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "18.19.130",
+    "@types/vscode": "1.82.0",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3",
+    "vscode-oniguruma": "2.0.1",
+    "vscode-textmate": "9.3.2"
   }
 }
