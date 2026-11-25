@@ -1,23 +1,14 @@
-#!/bin/bash
-# TIL IDE Launcher for Linux/macOS
-# Author: Alisher Beisembekov
-
-echo "Starting TIL IDE..."
-
-# Get script directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Check if Python is installed
-if ! command -v python3 &> /dev/null; then
-    echo "Python 3 is not installed. Please install Python 3.8+"
+#!/bin/sh
+# TIL Studio launcher for Linux/macOS: opens the IDE in your browser.
+#   ./til-ide.sh [FOLDER]        (default: the current folder)
+# Same as `til ide [FOLDER]`. Needs only Python 3.9+.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+if command -v til >/dev/null 2>&1; then
+    exec til ide "$@"
+fi
+PY="$(command -v python3 || command -v python)"
+if [ -z "$PY" ]; then
+    echo "TIL Studio needs Python 3.9+: https://www.python.org/downloads/" >&2
     exit 1
 fi
-
-# Check if PyQt6 is installed
-if ! python3 -c "import PyQt6" &> /dev/null; then
-    echo "Installing PyQt6..."
-    pip3 install PyQt6
-fi
-
-# Run the IDE
-python3 "$SCRIPT_DIR/til_ide.py"
+exec "$PY" "$DIR/../src/til.py" ide "$@"

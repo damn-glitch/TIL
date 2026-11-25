@@ -121,6 +121,27 @@ jobs:
       - name: Playground (WebAssembly VM + self-hosted compiler in the browser)
         run: TIL_SLOW_TESTS=1 NODE_PATH="$RUNNER_TEMP/pw/node_modules" python3 -m pytest tests/test_playground.py -v
 
+  studio:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Node dependencies and Playwright
+        run: |
+          pip install pytest
+          npm ci --prefix ide/studio
+          npm ci --prefix editors/vscode
+          npm install --prefix "$RUNNER_TEMP/pw" playwright
+          npx --prefix "$RUNNER_TEMP/pw" playwright install --with-deps chromium
+      - name: TIL Studio (server, language server, debug adapter, UI end to end) and the VS Code extension
+        run: NODE_PATH="$RUNNER_TEMP/pw/node_modules" python -m pytest tests/test_tills.py tests/test_lsp.py tests/test_dap.py tests/test_studio.py tests/test_studio_ui.py tests/test_vscode_ext.py -v
+
   test-macos:
     runs-on: macos-latest
     needs: lint

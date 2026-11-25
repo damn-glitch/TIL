@@ -56,7 +56,7 @@ Write-Host "Downloading TIL compiler..." -ForegroundColor Blue
 $TIL_RAW = "https://raw.githubusercontent.com/damn-glitch/TIL/main"
 Invoke-WebRequest -Uri "$TIL_RAW/src/til.py" -OutFile "$TIL_BIN\til.py"
 # TIL 3.1 tools next to the compiler (packages, proofs, device fit, debugger, messages, types)
-foreach ($m in @("tilpkg", "tilprove", "tilfit", "tildebug", "tilmsg", "tiltypes")) {
+foreach ($m in @("tilpkg", "tilprove", "tilfit", "tildebug", "tilmsg", "tiltypes", "tills", "tillsp", "tildap", "tilstudio")) {
     Invoke-WebRequest -Uri "$TIL_RAW/src/$m.py" -OutFile "$TIL_BIN\$m.py"
 }
 
@@ -70,6 +70,9 @@ foreach ($f in @("math.til", "strings.til")) {
 foreach ($f in @("tilvm.c", "tilvm.h", "main.c", "Makefile", "README.md")) {
     Invoke-WebRequest -Uri "$TIL_RAW/vm/$f" -OutFile "$TIL_HOME\vm\$f"
 }
+# TIL Studio (til ide): the IDE is one self-contained page
+New-Item -ItemType Directory -Force -Path "$TIL_HOME\ide" | Out-Null
+Invoke-WebRequest -Uri "$TIL_RAW/ide/studio.html" -OutFile "$TIL_HOME\ide\studio.html"
 # The self-hosted compiler (TIL written in TIL)
 New-Item -ItemType Directory -Force -Path "$TIL_HOME\selfhost" | Out-Null
 Invoke-WebRequest -Uri "$TIL_RAW/selfhost/tilc.til" -OutFile "$TIL_HOME\selfhost\tilc.til"

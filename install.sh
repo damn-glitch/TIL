@@ -63,8 +63,14 @@ fetch() {
 }
 fetch src/til.py "$TIL_BIN/til.py"
 # TIL 3.1 tools next to the compiler: packages, proofs, device fit, debugger,
-# Kazakh/Russian messages, type inference (each is optional; til.py works without them)
-for m in tilpkg tilprove tilfit tildebug tilmsg tiltypes; do fetch "src/$m.py" "$TIL_BIN/$m.py"; done
+# Kazakh/Russian messages, type inference, language server, debug adapter and
+# TIL Studio (each is optional; til.py works without them)
+for m in tilpkg tilprove tilfit tildebug tilmsg tiltypes tills tillsp tildap tilstudio; do
+    fetch "src/$m.py" "$TIL_BIN/$m.py"
+done
+# TIL Studio (til ide): the IDE is one self-contained page
+mkdir -p "$TIL_HOME/ide"
+fetch ide/studio.html "$TIL_HOME/ide/studio.html"
 
 # Standard library and the portable TIL VM (for `til build --target c-vm` / `til run --cvm`)
 echo -e "${BLUE}Downloading standard library and TIL VM...${NC}"
