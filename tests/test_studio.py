@@ -317,9 +317,10 @@ class Events:
 
     def _read(self):
         name, data = None, []
+        fp = self.response.fp                   # (close() clears response.fp)
         try:
-            while True:
-                line = self.response.fp.readline()
+            while fp is not None:
+                line = fp.readline()
                 if not line:
                     break
                 line = line.decode('utf-8').rstrip('\n')
@@ -333,7 +334,7 @@ class Events:
                             self.items.append((time.monotonic(), name, json.loads('\n'.join(data))))
                             self.cond.notify_all()
                     name, data = None, []
-        except (OSError, ValueError):
+        except (OSError, ValueError, AttributeError):
             pass
         finally:
             with self.cond:
@@ -919,18 +920,20 @@ class TestRuns:
         assert exit_of(evs)['code'] == 3
         assert studio.post(f'/api/run/{rid}/stdin', {'text': 'late'}).status == 409
 
-    def test_vm_input_event_and_prerecorded_stdin(self, studio, events):
-        r = studio.post('/api/run', {'path': 'greet.til', 'backend': 'vm', 'stdin': 'Bob\n'})
+    def test_vm_input_event(self, studio, events):
+        r = studio.post('/api/run', {'path': 'greet.til', 'backend': 'vm'})
         rid = r.json()['runId']
-        # the first line came with the run; the program waits for the second
         events.wait(lambda n, d: n == 'run' and d.get('runId') == rid and d['kind'] == 'input', 30)
         before = events.run_events(rid)
-        assert text_of(before) == "start\nName? Hello Bob\n"
+        assert text_of(before) == "start\nName? "
         kinds = [e['kind'] for e in before]
-        assert kinds.index('input') > max(i for i, k in enumerate(kinds) if k == 'stdout')
-        studio.ok('POST', f'/api/run/{rid}/stdin', {'text': 'more'})
+        assert kinds.index('input') > max(i for i, k in enumerate(kinds) if k == 'stdout')   # after the prompt
+        mark = events.mark()
+        studio.ok('POST', f'/api/run/{rid}/stdin', {'text': 'Bob'})
+        events.wait(lambda n, d: n == 'run' and d.get('runId') == rid and d['kind'] == 'input', 30, mark)
+        studio.ok('POST', f'/api/run/{rid}/stdin', {'text': 'more\n'})
         evs = events.until_exit(rid, 30)
-        assert text_of(evs).endswith("then more\n") and exit_of(evs)['code'] == 0
+        assert text_of(evs) == "start\nName? Hello Bob\nthen more\n" and exit_of(evs)['code'] == 0
         # end of input: input() returns ""
         r = studio.post('/api/run', {'path': 'greet.til', 'backend': 'vm'})
         rid = r.json()['runId']
@@ -938,6 +941,21 @@ class TestRuns:
         studio.ok('POST', f'/api/run/{rid}/stdin', {'text': '', 'eof': True})
         evs = events.until_exit(rid, 30)
         assert text_of(evs) == "start\nName? Hello \nthen \n"
+
+    @pytest.mark.parametrize('backend', BACKENDS)
+    def test_given_stdin_is_the_whole_input(self, studio, events, backend):
+        """As `til run < FILE` and the debugger's launch `stdin`: then the end of input."""
+        rid, evs = studio.run(events, path='greet.til', backend=backend, stdin='Bob\n')
+        assert text_of(evs) == "start\nName? Hello Bob\nthen \n" and exit_of(evs)['code'] == 0
+        assert not [e for e in evs if e['kind'] == 'input']
+        src = 'main()\n    print(input())\n    sleep_ms(100000)\n'
+        r = studio.post('/api/run', {'source': src, 'backend': backend, 'stdin': 'x'})
+        rid = r.json()['runId']
+        events.wait(lambda n, d: n == 'run' and d.get('runId') == rid and d.get('text') == 'x\n', 60)
+        r = studio.post(f'/api/run/{rid}/stdin', {'text': 'more'})
+        assert r.status == 409 and 'whole input' in r.json()['error']
+        studio.ok('POST', f'/api/run/{rid}/stop')
+        events.until_exit(rid, 10)
 
     @pytest.mark.parametrize('backend', BACKENDS)
     def test_stop_infinite_loop(self, studio, events, backend):
@@ -1055,6 +1073,18 @@ class TestRuns:
         rid, evs = studio.run(events, path='poll.til', backend='vm', keys='NONE,x,NONE,y,DOWN')
         assert text_of(evs) == "120\n121\n2\n"
         assert studio.post('/api/run', {'path': 'poll.til', 'keys': 'NOPE,LEFTISH'}).status == 400
+        # a key script is the run's keys (as `til run --keys`): wait_key() gets ESC when it ends
+        rid, evs = studio.run(events, path='gfx.til', backend='vm', keys='NONE')
+        assert text_of(evs) == "key 27\n"
+        rid, evs = studio.run(events, path='gfx.til', backend='vm', keys=[ord('q')])
+        assert text_of(evs) == "key 113\n"
+        r = studio.post('/api/run', {'path': 'poll.til', 'backend': 'vm', 'keys': 'NONE'})
+        rid = r.json()['runId']
+        events.wait(lambda n, d: n == 'run' and d.get('runId') == rid and d.get('state') == 'running', 30)
+        r = studio.post(f'/api/run/{rid}/key', {'code': 'a'})
+        assert r.status == 409 and 'key script' in r.json()['error']
+        studio.ok('POST', f'/api/run/{rid}/stop')
+        events.until_exit(rid, 10)
 
     def test_frames_are_coalesced(self, studio, events, monkeypatch):
         sent = []                         # when the server sends frames (receiving can bunch up)
@@ -1318,21 +1348,61 @@ def test_real_language_server(real_studio, project):
 
 
 @pytest.mark.skipif(not HAS_TILDAP, reason="src/tildap.py is not installed")
-def test_real_debug_adapter(real_studio, project):
+def test_real_debug_adapter(real_studio, project, monkeypatch):
     events = real_studio.events()
+    api = real_studio
     try:
-        sid = real_studio.ok('POST', '/api/dap/start')['sessionId']
-        out = real_studio.ok('POST', f'/api/dap/{sid}', {'seq': 1, 'type': 'request', 'command': 'initialize',
-                                                         'arguments': {'adapterID': 'til'}})['messages']
-        assert out[0]['success'] is True
-        real_studio.ok('POST', f'/api/dap/{sid}', {
-            'seq': 2, 'type': 'request', 'command': 'launch',
-            'arguments': {'program': os.path.join(os.path.realpath(project), 'hello.til')}})
-        real_studio.ok('POST', f'/api/dap/{sid}', {'seq': 3, 'type': 'request', 'command': 'configurationDone'})
-        ev = events.wait(lambda n, d: n == 'dap' and d['sessionId'] == sid and
-                         d['message'].get('event') in ('output', 'terminated', 'exited'), 30)
-        assert ev['message']['type'] == 'event'
-        real_studio.ok('POST', f'/api/dap/{sid}', {'seq': 4, 'type': 'request', 'command': 'disconnect'})
+        sid = api.ok('POST', '/api/dap/start')['sessionId']
+
+        def dap(seq, command, arguments=None):
+            msg = {'seq': seq, 'type': 'request', 'command': command, 'arguments': arguments or {}}
+            out = api.ok('POST', f'/api/dap/{sid}', msg)['messages']
+            assert out and out[0]['type'] == 'response' and out[0]['command'] == command, out
+            return out[0]
+
+        def event(name, mark, timeout=20):
+            return events.wait(lambda n, d: n == 'dap' and d['sessionId'] == sid
+                               and d['message'].get('event') == name, timeout, mark)['message']
+        r = dap(1, 'initialize', {'adapterID': 'til', 'linesStartAt1': True, 'columnsStartAt1': True})
+        assert r['success'] and r['body']['supportsStepBack'] is True
+        # the events a request causes go out after its reply (hold_events)
+        published = []
+        publish = api.server.hub.publish
+
+        def recording(name, data, key=None):
+            published.append((name, data))
+            publish(name, data, key)
+        monkeypatch.setattr(api.server.hub, 'publish', recording)
+        seen = []
+        mark = events.mark()
+        launch = {'seq': 2, 'type': 'request', 'command': 'launch',
+                  'arguments': {'program': 'greet.til', 'stopOnEntry': True}}
+        api.server.dap.handle(sid, launch, 'en', lambda out: seen.append(
+            (out[0]['success'], [d['message'].get('event') for n, d in published if n == 'dap'])))
+        assert seen == [(True, [])]
+        assert 'initialized' in [d['message'].get('event') for n, d in published if n == 'dap']
+        monkeypatch.undo()
+        event('initialized', mark)
+        dap(3, 'configurationDone')
+        stopped = event('stopped', mark)
+        assert stopped['body']['reason'] == 'entry' and stopped['body']['threadId'] == 1
+        assert dap(4, 'threads')['body']['threads'][0]['id'] == 1
+        frames = dap(5, 'stackTrace', {'threadId': 1})['body']['stackFrames']
+        assert frames[0]['source']['name'] == 'greet.til' and frames[0]['line'] >= 1
+        mark = events.mark()
+        dap(6, 'continue', {'threadId': 1})
+        event('til/inputRequested', mark)                 # without launch `stdin`: interactive input
+        mark = events.mark()
+        dap(7, 'til/stdin', {'text': 'Zoe\n'})
+        event('til/inputRequested', mark)
+        dap(8, 'til/stdin', {'text': 'more\n'})
+        event('terminated', mark)
+        with events.cond:
+            out = "".join(d['message']['body'].get('output', '') for _t, n, d in events.items
+                          if n == 'dap' and d['sessionId'] == sid and d['message'].get('event') == 'output')
+        assert 'Hello Zoe' in out and 'then more' in out
+        dap(9, 'disconnect')
+        assert api.post(f'/api/dap/{sid}', {'seq': 10, 'type': 'request', 'command': 'threads'}).status == 404
     finally:
         events.close()
 

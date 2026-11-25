@@ -737,8 +737,15 @@ class _Run:
         self.proc: Optional[subprocess.Popen] = None
         self.writer: Optional[_StdinWriter] = None
         self.pause_req: Optional[_PauseRequest] = None
-        self.input = _RunInput(self, spec['stdin'])
-        self.keys = _RunKeys(self, spec['keys'])
+        # given `stdin`: the program's whole input (end of input after it, as `til run < FILE`
+        # and the debugger's launch); else lines from /stdin. Given `keys`: a key script, as
+        # `til run --keys` (wait_key() returns ESC when it ends); else keys from /key.
+        self.whole_input = spec['stdin'] is not None
+        self.input = _RunInput(self, spec['stdin'] or b"")
+        if self.whole_input:
+            self.input.eof = True
+        self.scripted_keys = spec['keys'] is not None
+        self.keys = til.KeyScript(spec['keys']) if self.scripted_keys else _RunKeys(self, [])
         self.started = time.monotonic()
         self.finished_at = 0.0
         self.helpers: List[threading.Thread] = []
@@ -843,6 +850,8 @@ class _Run:
         with self.lock:
             if self.done.is_set():
                 raise _ApiError(409, _t("the run has ended", lang))
+            if self.whole_input:
+                raise _ApiError(409, _t("this run was given its whole input (stdin)", lang))
             if self.writer is not None:
                 self.writer.put(data)
                 if eof:
@@ -856,6 +865,8 @@ class _Run:
                 raise _ApiError(409, _t("the run has ended", lang))
             if self.proc is not None:
                 raise _ApiError(409, _t("keys go to programs that run on the VM backend", lang))
+            if self.scripted_keys:
+                raise _ApiError(409, _t("this run plays a key script (keys)", lang))
             self.keys.push(code)
 
     def stop(self):
@@ -866,7 +877,8 @@ class _Run:
             vm, proc = self.vm, self.proc
         self.stop_event.set()
         self.input.wake()
-        self.keys.wake()
+        if isinstance(self.keys, _RunKeys):
+            self.keys.wake()
         if vm is not None:
             vm.max_steps = 1           # the next step ends the program (report() stays quiet)
         if proc is not None:
@@ -1324,25 +1336,30 @@ class _DapBridge:
             self._close(s)
         return sid
 
-    def handle(self, sid: str, message: Dict[str, Any], lang: Optional[str]) -> List[Any]:
+    def handle(self, sid: str, message: Dict[str, Any], lang: Optional[str],
+               reply: Callable[[List[Any]], None]):
+        """One DAP message: `reply` gets the responses. With tildap's hold_events(),
+        the events the message causes go out after the reply (as over stdio)."""
         with self.lock:
             session = self.sessions.get(sid)
             if session is not None:
                 self.used[sid] = time.monotonic()
         if session is None:
             raise _ApiError(404, _t(f"no such debug session: {sid}", lang))
-        try:
-            out = list(session.handle(message) or [])
-        except Exception as e:
-            self.studio.log_exception("debug adapter")
-            out = [{'type': 'response', 'request_seq': message.get('seq', 0), 'success': False,
-                    'command': message.get('command', ''), 'message': f"{type(e).__name__}: {e}"}]
+        hold = getattr(session, 'hold_events', None)
+        with (hold() if callable(hold) else contextlib.nullcontext()):
+            try:
+                out = list(session.handle(message) or [])
+            except Exception as e:
+                self.studio.log_exception("debug adapter")
+                out = [{'type': 'response', 'request_seq': message.get('seq', 0), 'success': False,
+                        'command': message.get('command', ''), 'message': f"{type(e).__name__}: {e}"}]
+            reply(out)
         if message.get('type') == 'request' and message.get('command') == 'disconnect':
             with self.lock:
                 self.sessions.pop(sid, None)
                 self.used.pop(sid, None)
             self._close(session)
-        return out
 
     def _close(self, session):
         try:
@@ -2133,14 +2150,14 @@ class StudioServer:
         args = body.get('args') or []
         if not isinstance(args, list) or not all(isinstance(a, str) for a in args):
             raise _ApiError(400, _t("missing or invalid field 'args'", lang))
-        stdin = body.get('stdin') or ''
-        if not isinstance(stdin, str):
+        stdin = body.get('stdin')
+        if stdin is not None and not isinstance(stdin, str):
             raise _ApiError(400, _t("missing or invalid field 'stdin'", lang))
         max_steps = body.get('maxSteps') or 0
         if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 0:
             raise _ApiError(400, _t("missing or invalid field 'maxSteps'", lang))
         keys = body.get('keys')
-        codes: List[int] = []
+        codes: Optional[List[int]] = None
         if keys is not None:
             try:
                 if isinstance(keys, str):
@@ -2159,7 +2176,8 @@ class StudioServer:
         run_lang = (til.message_language_code(body.get('lang')) if isinstance(body.get('lang'), str) else None) \
             or self.lang or til.pragma_message_language(source) or lang or 'en'
         spec = {'backend': backend, 'path': abs_path, 'rel': rel, 'virtual': virtual, 'source': source,
-                'filename': filename, 'args': args, 'stdin': stdin.encode('utf-8', 'replace'),
+                'filename': filename, 'args': args,
+                'stdin': None if stdin is None else stdin.encode('utf-8', 'replace'),
                 'lang': run_lang, 'max_steps': max_steps, 'keys': codes, 'cwd': cwd}
         with self.runs_lock:
             if self.stopping.is_set():
@@ -2511,6 +2529,7 @@ def structured_disassembly(module, text: str) -> Dict[str, Any]:
 # ── HTTP ────────────────────────────────────────────────────────────────────
 
 _ROUTES: List[Tuple[str, Any, str]] = []
+_SENT = object()                # a route that sent its reply itself
 
 
 def _route(method: str, pattern: str):
@@ -2708,7 +2727,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                     continue
                 body = self._body(lang) if method in ('POST', 'PUT') else {}
                 result = getattr(self, name)(studio, body, query, lang, *match.groups())
-                return self._send_json(200, result)
+                if result is not _SENT:
+                    self._send_json(200, result)
+                return
             if known:
                 raise _ApiError(405, _t(f"method {method} is not allowed here", lang))
             raise _ApiError(404, _t(f"unknown address: {route}", lang))
@@ -2852,7 +2873,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     @_route('POST', r'/api/dap/([A-Za-z0-9_-]+)')
     def r_dap(self, studio, body, query, lang, sid):
-        return {'messages': studio.dap.handle(sid, body, lang)}
+        studio.dap.handle(sid, body, lang, lambda out: self._send_json(200, {'messages': out}))
+        return _SENT
 
     @_route('POST', '/api/tools/prove')
     def r_prove(self, studio, body, query, lang):
