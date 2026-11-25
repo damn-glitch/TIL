@@ -1,0 +1,667 @@
+{
+ "version": "3.1.0",
+ "languages": [
+  "en",
+  "kk",
+  "kk-latn",
+  "ru"
+ ],
+ "default_languages": [
+  "en",
+  "kk"
+ ],
+ "keywords": {
+  "en": {
+   "if": "IF",
+   "else": "ELSE",
+   "elif": "ELIF",
+   "for": "FOR",
+   "while": "WHILE",
+   "loop": "LOOP",
+   "in": "IN",
+   "return": "RETURN",
+   "break": "BREAK",
+   "continue": "CONTINUE",
+   "fn": "FN",
+   "let": "LET",
+   "var": "VAR",
+   "const": "CONST",
+   "mut": "MUT",
+   "pub": "PUB",
+   "struct": "STRUCT",
+   "enum": "ENUM",
+   "impl": "IMPL",
+   "trait": "TRAIT",
+   "match": "MATCH",
+   "import": "IMPORT",
+   "from": "FROM",
+   "as": "AS",
+   "type": "TYPE",
+   "self": "SELF",
+   "and": "AND",
+   "or": "OR",
+   "not": "NOT",
+   "true": "BOOL",
+   "false": "BOOL",
+   "True": "BOOL",
+   "False": "BOOL",
+   "assert": "ASSERT",
+   "invariant": "INVARIANT",
+   "intent": "INTENT",
+   "retry": "RETRY",
+   "fallback": "FALLBACK",
+   "timeout": "TIMEOUT",
+   "cap": "CAP",
+   "perform": "PERFORM",
+   "handle": "HANDLE"
+  },
+  "kk": {
+   "егер": "IF",
+   "әйтпесе": "ELSE",
+   "немесе": "OR",
+   "үшін": "FOR",
+   "кезінде": "WHILE",
+   "цикл": "LOOP",
+   "ішінде": "IN",
+   "қайтару": "RETURN",
+   "тоқтату": "BREAK",
+   "жалғастыру": "CONTINUE",
+   "функция": "FN",
+   "тұрақты": "LET",
+   "айнымалы": "VAR",
+   "тұрақтама": "CONST",
+   "өзгермелі": "MUT",
+   "ашық": "PUB",
+   "құрылым": "STRUCT",
+   "санақ": "ENUM",
+   "іске": "IMPL",
+   "қасиет": "TRAIT",
+   "сәйкестік": "MATCH",
+   "импорт": "IMPORT",
+   "бастап": "FROM",
+   "ретінде": "AS",
+   "тип": "TYPE",
+   "өзін": "SELF",
+   "және": "AND",
+   "емес": "NOT",
+   "ақиқат": "BOOL",
+   "жалған": "BOOL",
+   "тексеру": "ASSERT",
+   "қайталау": "RETRY",
+   "ниет": "INTENT"
+  },
+  "kk-latn": {
+   "eger": "IF",
+   "aitpese": "ELSE",
+   "ushin": "FOR",
+   "kezinde": "WHILE",
+   "tsikl": "LOOP",
+   "ishinde": "IN",
+   "qaitaru": "RETURN",
+   "toqtatu": "BREAK",
+   "zhalgastyru": "CONTINUE",
+   "funktsiya": "FN",
+   "turaqty": "LET",
+   "aynymaly": "VAR",
+   "turaqtama": "CONST",
+   "ozgermeli": "MUT",
+   "ashyq": "PUB",
+   "qurylym": "STRUCT",
+   "sanaq": "ENUM",
+   "iske": "IMPL",
+   "qasiet": "TRAIT",
+   "saikestik": "MATCH",
+   "bastap": "FROM",
+   "retinde": "AS",
+   "ozin": "SELF",
+   "zhane": "AND",
+   "nemese": "OR",
+   "emes": "NOT",
+   "aqiqat": "BOOL",
+   "zhalgan": "BOOL",
+   "tekseru": "ASSERT",
+   "qaitalau": "RETRY",
+   "niet": "INTENT"
+  },
+  "ru": {
+   "если": "IF",
+   "иначе": "ELSE",
+   "для": "FOR",
+   "пока": "WHILE",
+   "цикл": "LOOP",
+   "в": "IN",
+   "вернуть": "RETURN",
+   "прервать": "BREAK",
+   "продолжить": "CONTINUE",
+   "функция": "FN",
+   "пусть": "LET",
+   "перем": "VAR",
+   "конст": "CONST",
+   "изм": "MUT",
+   "публ": "PUB",
+   "структура": "STRUCT",
+   "перечисление": "ENUM",
+   "реализация": "IMPL",
+   "типаж": "TRAIT",
+   "выбор": "MATCH",
+   "импорт": "IMPORT",
+   "из": "FROM",
+   "как": "AS",
+   "тип": "TYPE",
+   "сам": "SELF",
+   "и": "AND",
+   "или": "OR",
+   "не": "NOT",
+   "истина": "BOOL",
+   "ложь": "BOOL",
+   "проверить": "ASSERT",
+   "инвариант": "INVARIANT",
+   "повторить": "RETRY",
+   "таймаут": "TIMEOUT",
+   "намерение": "INTENT"
+  }
+ },
+ "contextual": {
+  "en": {
+   "with": "WITH",
+   "resume": "RESUME"
+  },
+  "kk": {
+   "орындау": "PERFORM",
+   "өңдеу": "HANDLE",
+   "арқылы": "WITH",
+   "жалғау": "RESUME"
+  },
+  "kk-latn": {
+   "oryndau": "PERFORM",
+   "ondeu": "HANDLE",
+   "arqyly": "WITH",
+   "zhalgau": "RESUME"
+  },
+  "ru": {
+   "выполнить": "PERFORM",
+   "обработать": "HANDLE",
+   "с": "WITH",
+   "возобновить": "RESUME"
+  }
+ },
+ "aliases": {
+  "kk": {
+   "басып_шығару": "print",
+   "шығару": "print",
+   "негізгі": "main",
+   "ұзындық": "len",
+   "енгізу": "input"
+  },
+  "kk-latn": {
+   "basyp_shygaru": "print",
+   "shygaru": "print",
+   "negizgi": "main",
+   "uzyndyq": "len",
+   "engizu": "input"
+  },
+  "ru": {
+   "печать": "print",
+   "вывод": "print",
+   "главная": "main",
+   "длина": "len",
+   "ввод": "input"
+  }
+ },
+ "true_words": [
+  "True",
+  "aqiqat",
+  "true",
+  "ақиқат",
+  "истина"
+ ],
+ "natives": [
+  "print",
+  "len",
+  "str",
+  "int",
+  "float",
+  "abs",
+  "sqrt",
+  "pow",
+  "sin",
+  "cos",
+  "tan",
+  "log",
+  "exp",
+  "floor",
+  "ceil",
+  "round",
+  "min",
+  "max",
+  "input",
+  "chr",
+  "ord",
+  "range",
+  "type_of",
+  "format",
+  "clock_ms",
+  "random",
+  "seed",
+  "sleep_ms",
+  "exit",
+  "bool",
+  "sum",
+  "panic",
+  "iter",
+  "println",
+  "read_file",
+  "write_file",
+  "file_exists",
+  "args",
+  "bytes_to_str",
+  "str_bytes",
+  "screen_init",
+  "screen_clear",
+  "draw_pixel",
+  "draw_line",
+  "draw_rect",
+  "fill_rect",
+  "draw_circle",
+  "draw_text",
+  "get_pixel",
+  "screen_show",
+  "key_pressed",
+  "wait_key",
+  "screen_width",
+  "screen_height",
+  "energy_mode"
+ ],
+ "native_arity": {
+  "print": [
+   0,
+   null
+  ],
+  "len": [
+   1,
+   1
+  ],
+  "str": [
+   1,
+   1
+  ],
+  "int": [
+   1,
+   1
+  ],
+  "float": [
+   1,
+   1
+  ],
+  "abs": [
+   1,
+   1
+  ],
+  "sqrt": [
+   1,
+   1
+  ],
+  "pow": [
+   2,
+   2
+  ],
+  "sin": [
+   1,
+   1
+  ],
+  "cos": [
+   1,
+   1
+  ],
+  "tan": [
+   1,
+   1
+  ],
+  "log": [
+   1,
+   1
+  ],
+  "exp": [
+   1,
+   1
+  ],
+  "floor": [
+   1,
+   1
+  ],
+  "ceil": [
+   1,
+   1
+  ],
+  "round": [
+   1,
+   1
+  ],
+  "min": [
+   1,
+   null
+  ],
+  "max": [
+   1,
+   null
+  ],
+  "input": [
+   0,
+   1
+  ],
+  "chr": [
+   1,
+   1
+  ],
+  "ord": [
+   1,
+   1
+  ],
+  "range": [
+   1,
+   3
+  ],
+  "type_of": [
+   1,
+   1
+  ],
+  "format": [
+   2,
+   2
+  ],
+  "clock_ms": [
+   0,
+   0
+  ],
+  "random": [
+   0,
+   2
+  ],
+  "seed": [
+   1,
+   1
+  ],
+  "sleep_ms": [
+   1,
+   1
+  ],
+  "exit": [
+   0,
+   1
+  ],
+  "bool": [
+   1,
+   1
+  ],
+  "sum": [
+   1,
+   null
+  ],
+  "panic": [
+   0,
+   1
+  ],
+  "iter": [
+   1,
+   1
+  ],
+  "println": [
+   0,
+   null
+  ],
+  "read_file": [
+   1,
+   1
+  ],
+  "write_file": [
+   2,
+   2
+  ],
+  "file_exists": [
+   1,
+   1
+  ],
+  "args": [
+   0,
+   0
+  ],
+  "bytes_to_str": [
+   1,
+   1
+  ],
+  "str_bytes": [
+   1,
+   1
+  ],
+  "screen_init": [
+   2,
+   2
+  ],
+  "screen_clear": [
+   0,
+   1
+  ],
+  "draw_pixel": [
+   3,
+   3
+  ],
+  "draw_line": [
+   5,
+   5
+  ],
+  "draw_rect": [
+   5,
+   5
+  ],
+  "fill_rect": [
+   5,
+   5
+  ],
+  "draw_circle": [
+   4,
+   4
+  ],
+  "draw_text": [
+   4,
+   4
+  ],
+  "get_pixel": [
+   2,
+   2
+  ],
+  "screen_show": [
+   0,
+   0
+  ],
+  "key_pressed": [
+   0,
+   0
+  ],
+  "wait_key": [
+   0,
+   0
+  ],
+  "screen_width": [
+   0,
+   0
+  ],
+  "screen_height": [
+   0,
+   0
+  ],
+  "energy_mode": [
+   0,
+   1
+  ]
+ },
+ "methods": [
+  "len",
+  "push",
+  "pop",
+  "get",
+  "set",
+  "contains",
+  "starts_with",
+  "ends_with",
+  "trim",
+  "to_upper",
+  "to_lower",
+  "replace",
+  "slice",
+  "find",
+  "eq",
+  "split",
+  "repeat",
+  "to_int",
+  "to_float",
+  "is_empty",
+  "insert",
+  "remove",
+  "index_of",
+  "reverse",
+  "sort",
+  "join",
+  "first",
+  "last",
+  "clear",
+  "sum",
+  "min",
+  "max",
+  "has",
+  "delete",
+  "keys",
+  "values",
+  "get_or",
+  "unwrap",
+  "expect",
+  "unwrap_or",
+  "is_some",
+  "is_none",
+  "is_ok",
+  "is_err",
+  "error",
+  "to_string",
+  "copy",
+  "count",
+  "map",
+  "filter",
+  "reduce",
+  "each",
+  "any",
+  "all"
+ ],
+ "types": [
+  "int",
+  "i8",
+  "i16",
+  "i32",
+  "i64",
+  "uint",
+  "u8",
+  "u16",
+  "u32",
+  "u64",
+  "float",
+  "f32",
+  "f64",
+  "bool",
+  "str",
+  "char",
+  "void",
+  "Option",
+  "Result",
+  "Some",
+  "None",
+  "Ok",
+  "Err",
+  "Self"
+ ],
+ "attributes": [
+  "pure",
+  "effects",
+  "requires",
+  "ensures",
+  "cap",
+  "level",
+  "energy",
+  "lang",
+  "inline",
+  "noinline",
+  "hot",
+  "cold",
+  "cross_level"
+ ],
+ "energy_modes": [
+  "performance",
+  "balanced",
+  "low"
+ ],
+ "energy_levels": [
+  "low",
+  "medium",
+  "high"
+ ],
+ "key_names": {
+  "UP": 1,
+  "DOWN": 2,
+  "LEFT": 3,
+  "RIGHT": 4,
+  "ENTER": 13,
+  "ESC": 27,
+  "SPACE": 32,
+  "TAB": 9,
+  "BACKSPACE": 8,
+  "COMMA": 44,
+  "NONE": 0
+ },
+ "superinstructions": [
+  "LOAD_LOCAL2",
+  "LOAD_LOCAL_FIELD",
+  "INC_LOCAL",
+  "CAST_LOCAL",
+  "CAST_RETURN",
+  "ADD_STORE_LOCAL",
+  "NATIVE_POP",
+  "INDEX_L",
+  "INDEX_LL",
+  "RETURN_LOCAL",
+  "FOR_ITER_STORE",
+  "JUMP_IF_NOT",
+  "JUMP_IF_NOT_L",
+  "JUMP_IF_NOT_I",
+  "JUMP_IF_NOT_LL",
+  "JUMP_IF_NOT_LI",
+  "ADD_I",
+  "SUB_I",
+  "MUL_I",
+  "DIV_I",
+  "MOD_I",
+  "BAND_I",
+  "BOR_I",
+  "BXOR_I",
+  "SHL_I",
+  "SHR_I",
+  "EQ_I",
+  "NE_I",
+  "LT_I",
+  "LE_I",
+  "GT_I",
+  "GE_I",
+  "ADD_L",
+  "SUB_L",
+  "MUL_L",
+  "DIV_L",
+  "MOD_L",
+  "BAND_L",
+  "BOR_L",
+  "BXOR_L",
+  "SHL_L",
+  "SHR_L",
+  "EQ_L",
+  "NE_L",
+  "LT_L",
+  "LE_L",
+  "GT_L",
+  "GE_L"
+ ]
+}
