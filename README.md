@@ -76,6 +76,8 @@ Commands:
   prove <file.til>        Prove #[requires]/#[ensures] for ALL inputs (Z3)
   fit <file.til>          Will it fit a device?  --device ti84ce|numworks|z80-16|... [--run]
   pkg <cmd>               Packages: init | add NAME SPEC | install | remove | list | verify
+  ide [FOLDER]            TIL Studio: the IDE in your browser (time-travel debugger, proofs, devices)
+  lsp / dap               Language server / debug adapter for VS Code, Neovim, Helix, Sublime
 
 Options:
   --vm / --cvm            run on the Python VM / on the C VM
@@ -99,6 +101,27 @@ Options:
   -v, --verbose           Verbose output
   --version               Show version
 ```
+
+---
+
+## TIL Studio — the IDE
+
+```bash
+til ide            # opens the IDE for the current folder in your browser
+```
+
+![TIL Studio](docs/images/studio-editor-dark.png)
+
+TIL Studio needs only Python (no pip packages, works offline) and uses the
+real compiler for every error, completion and rename. It runs programs
+natively, on the TIL VM and on the C VM (with a live calculator screen), and
+debugs them with **step back** and a **timeline** you can drag through the
+whole run. Contracts are proved with Z3 right in the editor, the Devices
+panel shows whether a program fits a TI-84 Plus CE, NumWorks or a Z80 calculator,
+and the whole interface speaks English, Russian and Kazakh. The same app runs
+on the website without installing anything, and `til lsp` / `til dap` bring
+its intelligence and debugger to VS Code, Neovim, Helix and Sublime.
+Guide: [docs/TIL_STUDIO.md](docs/TIL_STUDIO.md).
 
 ---
 
