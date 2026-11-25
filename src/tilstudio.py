@@ -11,10 +11,12 @@ frontend (ide/studio.html) and a JSON API over the project folder:
   escapes, no absolute paths, no `..`); the TIL examples are readable as
   `@examples/...`;
 * the language server (src/tillsp.py, in-process `LspServer(root)`): one per
-  studio, requests answered in the POST reply, notifications also pushed on
-  the event stream, debounced diagnostics by a ticker calling poll();
+  client tab (at most 16), requests answered in the POST reply, what it sends
+  later (debounced diagnostics, by a ticker calling poll()) on that tab's
+  event stream; `@examples/...` URIs are translated both ways;
 * the debug adapter (src/tildap.py, `DapSession(emit, root)`): sessions by id,
-  events on the event stream;
+  events on the event stream of the tab that started them; an example is
+  debugged where it is (`program: "@examples/..."`);
 * runs: `vm` in-process on the reference VM (live output, input(), screen
   frames, keys, portable snapshots), `cvm` and `native` as subprocesses
   (`til exec --cvm` / the program built by the native backend) with streamed
