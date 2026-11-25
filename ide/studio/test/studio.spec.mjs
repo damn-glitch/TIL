@@ -113,6 +113,26 @@ async function placeCursor(page, line, text, offset = 0) {
 
 const lineOf = (src, needle) => src.split('\n').findIndex((l) => l.includes(needle)) + 1;
 
+/* hover `target` until an LSP hover tooltip shows. Code lenses (a row above
+   main() and functions with contracts) arrive after the text and move the lines
+   below them: the pointer can end up on a lens row, so hover again then. */
+async function hoverTooltip(page, target, timeout = 10000) {
+    if (await page.evaluate(() => window.tilStudio.lsp.has('codeLensProvider'))) {
+        await page.waitForSelector('.cm-codeLens', { timeout: 5000 }).catch(() => {});
+    }
+    const deadline = Date.now() + timeout;
+    for (;;) {
+        await page.mouse.move(0, 0);
+        await target().hover();
+        try {
+            await page.waitForFunction(() => document.querySelectorAll('.cm-lsp-hover').length > 0, null, { timeout: 1500 });
+            return;
+        } catch (e) {
+            if (Date.now() > deadline) throw e;
+        }
+    }
+}
+
 async function shot(page, name) {
     if (process.env.SKIP_SHOTS) return;
     await page.waitForTimeout(250);
@@ -182,14 +202,11 @@ describe('desktop face', () => {
         const src = await docText(page);
         const callLine = lineOf(src, 'print(greet(');
         await placeCursor(page, callLine, 'greet', 2);
-        await page.locator('.cm-line').nth(callLine - 1).locator('.t-fn:has-text("greet")').hover();
-        await page.waitForSelector('.cm-lsp-hover', { timeout: 5000 });
+        await hoverTooltip(page, () => page.locator('.cm-line').nth(callLine - 1).locator('.t-fn:has-text("greet")'));
         assert.match(await page.locator('.cm-lsp-hover').textContent(), /greet/);
         // hovers with **bold** and *italic* text (keywords, locals) render and the page stays responsive
         const retLine = lineOf(src, 'return f"Hello');
-        await page.mouse.move(0, 0);
-        await page.locator('.cm-line').nth(retLine - 1).locator('.t-kw').first().hover();
-        await page.waitForFunction(() => document.querySelectorAll('.cm-lsp-hover').length > 0, null, { timeout: 5000 });
+        await hoverTooltip(page, () => page.locator('.cm-line').nth(retLine - 1).locator('.t-kw').first());
         assert.ok((await page.locator('.cm-lsp-hover strong, .cm-lsp-hover em, .cm-lsp-hover code').count()) > 0);
         await page.mouse.move(0, 0);
         await page.keyboard.press('F12');
@@ -755,6 +772,34 @@ describe('web face (static hosting)', { skip: Boolean(process.env.SKIP_WEB) || !
         await page.waitForFunction(() => document.querySelector('.term-out').textContent.includes('50'), null, { timeout: 10000 });
         await page.click('.tb-stop');
         await page.context().close();
+    });
+
+    it('never loads the runtime of another site from a link (?runtime=)', async () => {
+        // a reflected-XSS attempt: /.//HOST/ looks same-origin, then resolves to //HOST/tilvm.js
+        const hits = [];
+        const evil = http.createServer((req, res) => {
+            hits.push(req.url);
+            res.writeHead(200, { 'Content-Type': 'text/javascript' });
+            res.end('window.__pwned = true; window.TILWasm = { Runtime: { create() { window.__pwned = true; } } };');
+        });
+        await new Promise((resolve) => evil.listen(0, '127.0.0.1', resolve));
+        const port = evil.address().port;
+        try {
+            for (const q of [`/.//127.0.0.1:${port}/`, `//127.0.0.1:${port}/`, `http://127.0.0.1:${port}/`, `/\\127.0.0.1:${port}/`]) {
+                const page = await open({ url: `${WEB}index.html?runtime=${encodeURIComponent(q)}` });
+                await openFile(page, 'main.til');
+                await page.keyboard.press(`${MOD}+F5`);
+                await page.waitForSelector('.term-foot', { timeout: 30000 });
+                assert.match(await page.locator('.term-out').textContent(), /Hello, TIL!/, 'the runtime of this site ran');
+                assert.equal(await page.evaluate(() => window.__pwned), undefined, q);
+                const foreign = await page.evaluate((p) => performance.getEntriesByType('resource').map((e) => e.name).filter((n) => n.includes(`:${p}`)), port);
+                assert.deepEqual(foreign, [], q);
+                await page.context().close();
+            }
+            assert.deepEqual(hits, [], 'no request reached the other site');
+        } finally {
+            await new Promise((resolve) => evil.close(resolve));
+        }
     });
 
     it('shows the desktop card for desktop-only features', async () => {

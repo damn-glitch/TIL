@@ -88,6 +88,7 @@ export class DesktopBackend extends Emitter {
 
     async request(method, path, body, query) {
         const headers = this.headers();
+        if (body === undefined && (method === 'POST' || method === 'PUT')) body = {};      // the server takes JSON only
         const init = { method, headers, credentials: 'same-origin', cache: 'no-store' };
         if (body !== undefined) {
             headers['Content-Type'] = 'application/json';

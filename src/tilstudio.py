@@ -23,9 +23,18 @@ frontend (ide/studio.html) and a JSON API over the project folder:
   disassembly, translate, build, packages (tilpkg).
 
 Security: a random token per launch (`?token=` in the printed URL, then an
-HttpOnly SameSite=Strict cookie; API clients may send `X-TIL-Token`), the
-`Host` header must name 127.0.0.1:PORT or localhost:PORT, a request with a
-foreign `Origin` (or a cross-site `Sec-Fetch-Site`) is refused, no CORS.
+HttpOnly SameSite=Strict cookie; API clients may send `X-TIL-Token`); the
+browser is started on a private redirect file (0600 in a 0700 folder), so the
+token is never on a command line other users can read; the `Host` header must
+name 127.0.0.1:PORT or localhost:PORT, a request with a foreign `Origin` (or a
+cross-site `Sec-Fetch-Site`) is refused, POST/PUT bodies must be
+application/json (415), no CORS; tool outputs (build) are paths of the project
+that are replaced, never written through a link.
+
+Clients: each browser tab sends a random id (X-TIL-Client; ?client= on the
+event stream) and gets its own language server; the events of its language
+server, debug sessions and runs go to its streams only, and what a tab leaves
+is closed a minute after its last stream is gone.
 
 Server-sent events (`GET /api/events`, one stream per client tab):
     lsp   one LSP message (notification or request from the server)
@@ -38,6 +47,7 @@ Server-sent events (`GET /api/events`, one stream per client tab):
     ping  {time}              at connect and every 15 s
 """
 
+import atexit
 import base64
 import bisect
 import codecs
@@ -66,6 +76,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+import weakref
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import til
@@ -1791,6 +1802,25 @@ class _HTTPServer(http.server.ThreadingHTTPServer):
                 studio.connections.pop(threading.current_thread(), None)
 
 
+_LIVE_SERVERS: 'weakref.WeakSet' = weakref.WeakSet()
+
+
+def _kill_leftover_processes():
+    """At interpreter exit: the processes of runs and tools of servers nobody
+    stopped (they have process groups of their own and would outlive us)."""
+    for studio in list(_LIVE_SERVERS):
+        with studio.runs_lock:
+            procs = [r.proc for r in studio.runs.values()]
+        with studio.workers_lock:
+            procs += list(studio.workers)
+        for proc in procs:
+            if proc is not None and proc.poll() is None:
+                _kill_process(proc)
+
+
+atexit.register(_kill_leftover_processes)
+
+
 class _ClientState:
     """What the studio knows of a client tab: its open event streams, when the
     last one closed, its last request."""
@@ -1850,6 +1880,7 @@ class StudioServer:
         self.httpd = _HTTPServer(('127.0.0.1', port), _Handler)
         self.httpd.studio = self
         self.port = self.httpd.server_address[1]
+        _LIVE_SERVERS.add(self)
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     @property
@@ -2604,11 +2635,21 @@ class StudioServer:
         stem = os.path.splitext(os.path.basename(abs_path))[0]
         name = {'vm': stem + '.tbc', 'c-vm': stem + '_vm.c'}.get(
             target, stem + ('.exe' if sys.platform == 'win32' else ''))
-        folder = self.root if virtual else os.path.dirname(abs_path)
-        out_path = os.path.join(folder, name)
-        if os.path.normcase(out_path) == os.path.normcase(abs_path):
-            out_path = os.path.join(folder, stem + '.out')
-        cmd = [sys.executable, _til_script(), 'build', abs_path, '--target', target, '-o', out_path,
+        folder_rel = '' if virtual else posix_dirname(rel)
+        if not virtual and name == rel.rsplit('/', 1)[-1]:
+            name = stem + '.out'
+        # the output is a path of the project like any other (its folder's real
+        # location inside the root), its last component not followed: the tool
+        # writes a new file next to it, which then replaces it (a symbolic link
+        # there is replaced, never written through)
+        out_path, out_rel, _v = self.project.resolve(f"{folder_rel}/{name}" if folder_rel else name, lang,
+                                                     write=True, follow=False, allow_root=False)
+        if os.path.lexists(out_path) and not os.path.islink(out_path) and not os.path.isfile(out_path):
+            raise _ApiError(409, _t(f"the build output is not a regular file: {out_rel}", lang))
+        tmp = os.path.join(os.path.dirname(out_path), f".{name}.{secrets.token_hex(6)}{TEMP_SUFFIX}")
+        if sys.platform == 'win32' and target == 'native':
+            tmp += '.exe'                        # (til build adds .exe to a native output)
+        cmd = [sys.executable, _til_script(), 'build', abs_path, '--target', target, '-o', tmp,
                '--lang', lang or 'en']
         device = body.get('device')
         if device:
@@ -2631,10 +2672,21 @@ class StudioServer:
         finally:
             with self.workers_lock:
                 self.workers.discard(proc)
-        ok = proc.returncode == 0 and os.path.exists(out_path)
-        artifact = self.project.rel(out_path) if ok else None
-        return {'ok': ok, 'rc': proc.returncode, 'output': _plain(out.decode('utf-8', 'replace')),
-                'artifact': artifact}
+        output = _plain(out.decode('utf-8', 'replace')).replace(tmp, out_path)
+        ok = proc.returncode == 0 and os.path.isfile(tmp) and not os.path.islink(tmp)
+        try:
+            if ok:
+                os.replace(tmp, out_path)        # replaces what is there (a link: the link itself)
+        except OSError as e:
+            ok = False
+            output += _t(f"cannot write {out_rel}: {e.strerror or e}", lang) + "\n"
+        finally:
+            if os.path.lexists(tmp):
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        return {'ok': ok, 'rc': proc.returncode, 'output': output, 'artifact': out_rel if ok else None}
 
     def api_pkg(self, body: Dict[str, Any], lang: Optional[str]) -> Dict[str, Any]:
         argv = body.get('argv')
@@ -2982,6 +3034,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if not self._token_ok(query):
                 raise _ApiError(403, _t("missing or wrong token: open the address that `til ide` printed",
                                         lang))
+            if method in ('POST', 'PUT') and not _is_json_type(self.headers.get('Content-Type')):
+                # (a cross-site form can only send text/plain, urlencoded or multipart bodies)
+                self.close_connection = True
+                raise _ApiError(415, _t("the request must be JSON (Content-Type: application/json)", lang))
             self.client_id = self._client_id(query)
             if self.client_id is not None and route != '/api/events':
                 studio.touch_client(self.client_id)
@@ -3180,6 +3236,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return studio.api_pkg(body, lang)
 
 
+def _is_json_type(value: Optional[str]) -> bool:
+    """Content-Type application/json (with parameters such as charset=utf-8)."""
+    return bool(value) and value.split(';', 1)[0].strip().lower() == 'application/json'
+
+
 def _ping_frame() -> bytes:
     return ("event: ping\ndata: %s\n\n" % json.dumps({'time': int(time.time() * 1000)})).encode('utf-8')
 
@@ -3234,12 +3295,46 @@ def _chromium_browsers() -> List[str]:
     return found
 
 
-def open_browser(url: str) -> bool:
-    """An app window of Chrome / Edge / Chromium (`--app=URL`), else the default
-    browser. False when nothing could be opened (no display)."""
+_REDIRECT_PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="referrer" content="no-referrer">
+<meta http-equiv="refresh" content="0;url=%(attr)s"><title>TIL Studio</title>
+<script>location.replace(%(js)s);</script></head>
+<body><p><a href="%(attr)s">TIL Studio</a></p></body></html>
+"""
+
+
+def redirect_file(url: str) -> Tuple[str, str]:
+    """A file that sends the browser on to `url` (with its token): (its private
+    folder, its file:// URL). The browser is started with this file's URL: a
+    command line can be read by every user of the machine (/proc/PID/cmdline),
+    the file only by this user (0600 in a 0700 folder, as Jupyter does)."""
+    folder = tempfile.mkdtemp(prefix='til-studio-')        # 0700
+    path = os.path.join(folder, 'open.html')
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0), 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(_REDIRECT_PAGE % {'attr': _html(url), 'js': json.dumps(url).replace('</', '<\\/')})
+    import pathlib
+    return folder, pathlib.Path(path).as_uri()
+
+
+def browser_commands(target: str) -> List[List[str]]:
+    """How Chrome / Edge / Chromium are started on `target` (an app window)."""
+    return [[exe, f"--app={target}", '--new-window'] for exe in _chromium_browsers()]
+
+
+def open_browser(url: str, popen: Optional[Callable[..., Any]] = None) -> Tuple[bool, Callable[[], None]]:
+    """An app window of Chrome / Edge / Chromium, else the default browser, on a
+    private redirect file to `url` (the token is never on a command line).
+    Returns (opened, cleanup): cleanup() deletes the redirect file. Nothing is
+    opened without a display (Linux)."""
     if sys.platform.startswith('linux') and not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')):
-        return False
-    for exe in _chromium_browsers():
+        return False, lambda: None
+    folder, target = redirect_file(url)
+
+    def cleanup():
+        shutil.rmtree(folder, ignore_errors=True)
+    popen = popen or subprocess.Popen
+    for cmd in browser_commands(target):
         try:
             kwargs: Dict[str, Any] = {'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL,
                                       'stderr': subprocess.DEVNULL}
@@ -3247,7 +3342,7 @@ def open_browser(url: str) -> bool:
                 kwargs['start_new_session'] = True
             else:
                 kwargs['creationflags'] = getattr(subprocess, 'DETACHED_PROCESS', 0)
-            proc = subprocess.Popen([exe, f"--app={url}", '--new-window'], **kwargs)
+            proc = popen(cmd, **kwargs)
         except OSError:
             continue
 
@@ -3257,10 +3352,10 @@ def open_browser(url: str) -> bool:
             except subprocess.TimeoutExpired:
                 return                       # still running: the window is open
             if rc != 0:
-                _default_browser(url)
+                _default_browser(target)
         threading.Thread(target=check, name='til-studio-browser', daemon=True).start()
-        return True
-    return _default_browser(url)
+        return True, cleanup
+    return _default_browser(target), cleanup
 
 
 def _default_browser(url: str) -> bool:
@@ -3362,8 +3457,15 @@ def main(argv: List[str]) -> int:
     _say(_t(f"TIL Studio {til.TIL_VERSION}: project {studio.root}", say_lang))
     _say("  " + studio.url)
     _say(_t("press Ctrl+C to stop", say_lang))
-    if browser and not open_browser(studio.url):
-        _say(_t("open the address above in a browser", say_lang))
+    cleanup = None
+    if browser:
+        opened, cleanup = open_browser(studio.url)
+        if opened:
+            timer = threading.Timer(120.0, cleanup)          # the redirect file is not needed for long
+            timer.daemon = True
+            timer.start()
+        else:
+            _say(_t("open the address above in a browser", say_lang))
     signals = _StopSignals()
     try:
         studio.serve_forever()
@@ -3373,6 +3475,8 @@ def main(argv: List[str]) -> int:
         signals.during_cleanup()            # a second Ctrl+C does not cut the cleanup short
         try:
             studio.stop()
+            if cleanup is not None:
+                cleanup()
         finally:
             signals.restore()
     return 0

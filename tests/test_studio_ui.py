@@ -169,6 +169,13 @@ def run_spec(env, cwd=ROOT, timeout=900):
     return r
 
 
+def failures(r) -> str:
+    """The reporter's 'failing tests' section (the errors), else the end of the output."""
+    out = r.stdout
+    i = out.find('failing tests:')
+    return (out[i:i + 8000] if i >= 0 else out[-6000:]) + "\n" + r.stderr[-3000:]
+
+
 @needs_node
 def test_browser_studio(tmp_path):
     """The desktop face against test/mock_server.mjs, the web face against website/."""
@@ -183,8 +190,8 @@ def test_browser_studio(tmp_path):
         env['SKIP_SHOTS'] = '1'
         env['SCREENSHOTS'] = str(tmp_path / 'screenshots')
     r = run_spec(env)
-    assert r.returncode == 0, f"browser tests failed:\n{r.stdout[-6000:]}\n{r.stderr[-3000:]}"
-    assert '✖' not in r.stdout, r.stdout[-6000:]
+    assert r.returncode == 0, f"browser tests failed:\n{failures(r)}"
+    assert '✖' not in r.stdout, failures(r)
 
 
 @needs_node
@@ -209,7 +216,7 @@ def test_browser_studio_real_server(tmp_path):
         finally:
             server.stop()
     server_log = log_path.read_text(encoding='utf-8')
-    assert r.returncode == 0, (f"browser tests against the real server failed:\n{r.stdout[-6000:]}\n"
-                               f"{r.stderr[-3000:]}\nserver log:\n{server_log[-3000:]}")
-    assert '✖' not in r.stdout, r.stdout[-6000:]
+    assert r.returncode == 0, (f"browser tests against the real server failed:\n{failures(r)}\n"
+                               f"server log:\n{server_log[-3000:]}")
+    assert '✖' not in r.stdout, failures(r)
     assert 'Traceback' not in server_log, server_log[-3000:]

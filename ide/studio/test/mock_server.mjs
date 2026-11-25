@@ -591,6 +591,7 @@ const KEY_NAMES = { UP: 1, DOWN: 2, LEFT: 3, RIGHT: 4, ENTER: 13, ESC: 27, ESCAP
 
 /* ── the server ─────────────────────────────────────────────────────── */
 export async function startMockServer({ root, port = 0, token = crypto.randomBytes(12).toString('hex'), html = DEFAULT_HTML, seed = true, latency = 0 } = {}) {
+    const ownRoot = !root;           // a temporary project of its own: removed by close()
     if (!root) root = await fsp.mkdtemp(path.join(os.tmpdir(), 'til-studio-mock-'));
     root = path.resolve(root);
     if (seed) {
@@ -829,6 +830,12 @@ export async function startMockServer({ root, port = 0, token = crypto.randomByt
             const origin = req.headers.origin;
             const host = req.headers.host;
             if (origin && origin !== `http://${host}`) { json(res, 403, { error: 'bad Origin' }); return; }
+        }
+        // state-changing requests are JSON, as the real server requires (a cross-site
+        // form can only send text/plain, urlencoded or multipart bodies)
+        if ((method === 'POST' || method === 'PUT') && !/^application\/json\s*(;|$)/i.test(req.headers['content-type'] || '')) {
+            json(res, 415, { error: 'the request must be JSON (Content-Type: application/json)' });
+            return;
         }
         const body = method === 'GET' ? {} : await readBody(req);
         if (p === '/api/file' && method === 'PUT') {
@@ -1136,7 +1143,13 @@ export async function startMockServer({ root, port = 0, token = crypto.randomByt
             await fsp.writeFile(path.join(root, rel), text);
             S.broadcast('fs', { paths: [rel] });
         },
-        close: () => new Promise((resolve) => { for (const c of clients) c.end(); server.close(() => resolve()); }),
+        close: () => new Promise((resolve) => {
+            for (const c of clients) c.end();
+            server.close(() => {
+                if (ownRoot) fs.rmSync(root, { recursive: true, force: true });
+                resolve();
+            });
+        }),
     };
 }
 

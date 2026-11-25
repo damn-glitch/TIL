@@ -93,15 +93,9 @@ export class BrowserBackend extends Emitter {
         super();
         this.kind = 'web';
         this.rootUri = ROOT_URI;
-        const q = new URLSearchParams(location.search).get('runtime');
-        let base = runtimeBase || '../playground/';
-        if (q) {
-            try {
-                const u = new URL(q, location.href);
-                if (u.origin === location.origin) base = u.pathname.endsWith('/') ? u.pathname : u.pathname + '/';
-            } catch (e) { /* keep the default */ }
-        }
-        this.runtime = new WebRuntime(new URL(base, location.href).href);
+        // the runtime next to the page (website/playground/). Never taken from the
+        // page's URL: a link could make the page run another site's script.
+        this.runtime = new WebRuntime(new URL(runtimeBase || '../playground/', location.href).href);
         this.cache = new Map();       // path -> {path, type, text, mtime}
         this.runs = new Map();
         this.runSeq = 0;
