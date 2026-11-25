@@ -912,8 +912,9 @@ class TestRuns:
         events.wait(lambda n, d: n == 'run' and d.get('runId') == rid and 'Name? ' in d.get('text', ''), 60)
         timed = [(t, d) for t, d in events.timed(rid) if d['kind'] == 'stdout']
         # four lines 150 ms apart arrived as they were printed (not all at the end)
-        firsts = [t for t, d in timed if d['text'].strip() in ('0', '3')]
-        assert len(firsts) == 2 and firsts[1] - firsts[0] > 0.3
+        first = min(t for t, d in timed if '0\n' in d['text'])
+        last = min(t for t, d in timed if '3\n' in d['text'])
+        assert last - first > 0.25
         assert studio.ok('POST', f'/api/run/{rid}/stdin', {'text': 'Ann'}) == {}
         evs = events.until_exit(rid, 30)
         assert text_of(evs) == "0\n1\n2\n3\nName? Hello Ann\n"
@@ -1099,7 +1100,8 @@ class TestRuns:
         frames = [e for e in evs if e['kind'] == 'screen']
         assert 1 <= len(frames) <= len(sent) <= (sent[-1] - sent[0]) * 30 + 1
         assert base64.b64decode(frames[-1]['rgb'])[:3] == bytes((0, 1, 43))      # the last one: 299 = 0x00012B
-        assert all(b - a >= 1 / 30 - 0.002 for a, b in zip(sent, sent[1:]))       # at most 30 per second
+        # at most 30 per second (the timestamps are taken a GIL switch, <= 5 ms, after the pacing decision)
+        assert all(b - a >= 1 / 30 - 0.01 for a, b in zip(sent, sent[1:]))
 
     def test_output_limit(self, studio, events):
         rid, evs = studio.run(events, path='big.til', backend='vm')

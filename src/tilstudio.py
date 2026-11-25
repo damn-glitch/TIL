@@ -1412,14 +1412,18 @@ class _Watcher:
             while len(self.read) > 256:
                 self.read.popitem(last=False)
 
-    def wrote(self, rel: str):
-        """The studio wrote this file: the next poll does not report it."""
-        try:
-            st = os.stat(os.path.join(self.studio.project.root, *rel.split('/')))
-        except OSError:
-            return
+    def write(self, rel: str, abs_path: str, write: Callable[[], None]) -> os.stat_result:
+        """The studio writes a file: no `fs` event comes back for it, under its API
+        path or its real one. (Under the lock: a poll that saw the new file
+        compares it after `expected` is set.)"""
         with self.lock:
-            self.expected[rel] = ('f', st.st_mtime_ns, st.st_size)
+            write()
+            st = os.stat(abs_path)
+            sig = ('f', st.st_mtime_ns, st.st_size)
+            for name in {rel, self.studio.project.rel(abs_path)}:
+                if name:
+                    self.expected[name] = sig
+            return st
 
     def scan(self) -> Dict[str, tuple]:
         root = self.studio.project.root
@@ -1974,12 +1978,10 @@ class StudioServer:
             raise _ApiError(404, _t(f"no such file or folder: {rel}", lang))
         data = text.encode('utf-8', 'replace')
         try:
-            _atomic_write(abs_path, data, mode)
-            mtime = os.stat(abs_path).st_mtime
+            st = self.watcher.write(rel, abs_path, lambda: _atomic_write(abs_path, data, mode))
         except OSError as e:
             raise _ApiError(403, _t(f"cannot write {rel}: {e.strerror or e}", lang))
-        self.watcher.wrote(rel)
-        return {'path': rel, 'mtime': mtime, 'size': len(data)}
+        return {'path': rel, 'mtime': st.st_mtime, 'size': len(data)}
 
     def api_file_create(self, body: Dict[str, Any], lang: Optional[str]) -> Dict[str, Any]:
         abs_path, rel, _v = self.project.resolve(body.get('path'), lang, write=True, follow=False,
