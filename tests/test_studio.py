@@ -1299,6 +1299,20 @@ def test_real_language_server(real_studio, project):
         diag = events.wait(lambda n, d: n == 'lsp' and d.get('method') == 'textDocument/publishDiagnostics'
                            and d['params']['uri'] == uri and d['params']['diagnostics'], 15)
         assert any('oops' in d['message'] for d in diag['params']['diagnostics'])
+        # a change: its diagnostics are debounced, poll() (the ticker) sends them on the stream
+        mark = events.mark()
+        out = lsp(real_studio, 'textDocument/didChange', {
+            'textDocument': {'uri': uri, 'version': 2},
+            'contentChanges': [{'text': 'main()\n    print("fixed")\n    print(nope)\n'}]})
+        assert not [m for m in out if m.get('method') == 'textDocument/publishDiagnostics']
+        diag = events.wait(lambda n, d: n == 'lsp' and d.get('method') == 'textDocument/publishDiagnostics'
+                           and d['params']['uri'] == uri, 10, mark)
+        assert [d['range']['start']['line'] for d in diag['params']['diagnostics']] == [2]
+        assert 'nope' in diag['params']['diagnostics'][0]['message']
+        out = lsp(real_studio, 'textDocument/hover', {'textDocument': {'uri': uri},
+                                                      'position': {'line': 1, 'character': 5}}, 2)
+        assert out[0]['id'] == 2 and 'result' in out[0]
+        lsp(real_studio, 'textDocument/didClose', {'textDocument': {'uri': uri}})
     finally:
         events.close()
 

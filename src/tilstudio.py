@@ -1206,6 +1206,7 @@ class _LspBridge:
         self.init_locale: Any = None
         self.initialized = False
         self.failed_polls = 0
+        self.wake = threading.Event()           # a message arrived: the ticker looks again
 
     def _instance(self, lang: Optional[str]):
         if self.server is None:
@@ -1260,8 +1261,24 @@ class _LspBridge:
                                 self.init_result, self.init_locale = m['result'], params.get('locale')
                         elif self.init_result is not None:    # it refuses a second initialize
                             out[i] = {'jsonrpc': '2.0', 'id': mid, 'result': self.init_result}
+        self.wake.set()
         self._publish(out)
         return out
+
+    def delay(self) -> Optional[float]:
+        """Seconds until poll() is due: the server's next_due() (tillsp), else
+        LSP_TICK_SECONDS; None = nothing pending (wait for the next message)."""
+        server = self.server
+        if server is None:
+            return None
+        next_due = getattr(server, 'next_due', None)
+        if next_due is None:
+            return LSP_TICK_SECONDS
+        try:
+            due = next_due()
+        except Exception:
+            return LSP_TICK_SECONDS
+        return None if due is None else max(0.005, float(due))
 
     def poll(self):
         with self.lock:
@@ -1658,6 +1675,7 @@ class StudioServer:
             self.stopping.set()
             served = self.served.is_set()
         self.pump_wake.set()
+        self.lsp.wake.set()
         with self.runs_lock:
             runs = list(self.runs.values())
         for r in runs:
@@ -1755,8 +1773,15 @@ class StudioServer:
             self.stopping.wait(PUMP_SECONDS)
 
     def _lsp_loop(self):
-        while not self.stopping.wait(LSP_TICK_SECONDS):
-            self.lsp.poll()
+        """Debounced diagnostics: poll() when the language server says they are due."""
+        lsp = self.lsp
+        while not self.stopping.is_set():
+            delay = lsp.delay()
+            lsp.wake.wait(1.0 if delay is None else min(delay, 1.0))
+            lsp.wake.clear()
+            if self.stopping.is_set():
+                break
+            lsp.poll()
 
     # ── runs ────────────────────────────────────────────────────────────────
     def run_finished(self, run: _Run):
