@@ -407,7 +407,8 @@ class FakeDap {
             const rel = this.server.rel(program);
             let text = typeof a.source === 'string' ? a.source : '';
             if (typeof a.source !== 'string') {
-                try { text = await fsp.readFile(this.server.abs(rel), 'utf8'); } catch (e) {
+                // a TIL example by its "@examples/..." path (the real server hands the adapter the file)
+                try { text = this.server.virtual(rel) ? await this.server.read(rel) : await fsp.readFile(this.server.abs(rel), 'utf8'); } catch (e) {
                     out.push(this.respond(req, undefined, false, `cannot read ${program}`));
                     break;
                 }
@@ -604,7 +605,7 @@ export async function startMockServer({ root, port = 0, token = crypto.randomByt
     const runs = new Map();
     const daps = new Map();
     let runSeq = 0, dapSeq = 0;
-    const stats = { requests: [], lsp: [], dap: [], runs: [], lang: '' };
+    const stats = { requests: [], lsp: [], dap: [], runs: [], lang: '', clients: { requests: [], events: [] } };
     const state = { root, token, stats, clients, runs, daps };
 
     const S = {
@@ -783,8 +784,12 @@ export async function startMockServer({ root, port = 0, token = crypto.randomByt
         const method = req.method;
         stats.requests.push(`${method} ${p}`);
         if (req.headers['x-til-lang']) stats.lang = req.headers['x-til-lang'];      // the language of error messages
+        // the page's id (X-TIL-Client; ?client= on the event stream): the real server keeps
+        // a language server, debug sessions and runs per page
+        if (req.headers['x-til-client']) stats.clients.requests.push(req.headers['x-til-client']);
         if (latency) await sleep(latency);
         if (p === '/api/events' && method === 'GET') {
+            stats.clients.events.push(url.searchParams.get('client') || '');
             res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
             // ping {time} at connect and every 15 s
             const pingMsg = () => `event: ping\ndata: ${JSON.stringify({ time: Date.now() / 1000 })}\n\n`;

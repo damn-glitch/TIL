@@ -13,10 +13,12 @@ docs/dev/TIL_STUDIO_DESIGN.md §6).
     makes from the sources (checked when ide/studio/node_modules is installed:
     cd ide/studio && npm ci);
   * the page itself: Node + Playwright + Chromium run
-    ide/studio/test/studio.spec.mjs (the desktop face against
-    test/mock_server.mjs, the web face against a static server of website/).
-    The screenshot tour is skipped here; TIL_STUDIO_SHOTS=DIR keeps it and
-    writes the screenshots to DIR.
+    ide/studio/test/studio.spec.mjs twice: the desktop face against
+    test/mock_server.mjs and the web face against a static server of
+    website/; then the desktop face against the real server (src/tilstudio.py,
+    StudioServer over a temporary project, STUDIO_URL). The screenshot tour is
+    skipped here; TIL_STUDIO_SHOTS=DIR keeps it (mock run) and writes the
+    screenshots to DIR.
 
 Needs node (+ the npm packages for the build check, + Playwright and Chromium
 for the browser tests); the tests skip what is not installed.
@@ -35,7 +37,7 @@ import tempfile
 
 import pytest
 
-from tilhelpers import ROOT
+from tilhelpers import ROOT, SRC
 
 STUDIO = os.path.join(ROOT, 'ide', 'studio')
 BUILT = os.path.join(ROOT, 'ide', 'studio.html')
@@ -159,20 +161,55 @@ def has_playwright() -> bool:
         return False
 
 
+def run_spec(env, cwd=ROOT, timeout=900):
+    r = subprocess.run([NODE, '--test', '--test-reporter=spec', SPEC], capture_output=True, text=True,
+                       env=env, timeout=timeout, cwd=cwd)
+    if r.returncode != 0 and "Executable doesn't exist" in (r.stdout + r.stderr):
+        pytest.skip("Playwright's Chromium is not installed (npx playwright install chromium)")
+    return r
+
+
 @needs_node
 def test_browser_studio(tmp_path):
+    """The desktop face against test/mock_server.mjs, the web face against website/."""
     if not has_playwright():
         pytest.skip("Playwright is not installed (npm install playwright; npx playwright install chromium)")
     env = dict(os.environ)
+    env.pop('STUDIO_URL', None)
     shots = os.environ.get('TIL_STUDIO_SHOTS')
     if shots:
         env['SCREENSHOTS'] = os.path.abspath(shots)
     else:
         env['SKIP_SHOTS'] = '1'
         env['SCREENSHOTS'] = str(tmp_path / 'screenshots')
-    r = subprocess.run([NODE, '--test', '--test-reporter=spec', SPEC], capture_output=True, text=True,
-                       env=env, timeout=900, cwd=ROOT)
-    if r.returncode != 0 and "Executable doesn't exist" in (r.stdout + r.stderr):
-        pytest.skip("Playwright's Chromium is not installed (npx playwright install chromium)")
+    r = run_spec(env)
     assert r.returncode == 0, f"browser tests failed:\n{r.stdout[-6000:]}\n{r.stderr[-3000:]}"
     assert '✖' not in r.stdout, r.stdout[-6000:]
+
+
+@needs_node
+def test_browser_studio_real_server(tmp_path):
+    """The desktop face against the real server: src/tilstudio.py serving the
+    built ide/studio.html over a temporary project (the spec writes its files
+    through the API), with the real language server, debugger, VMs and tools."""
+    if not has_playwright():
+        pytest.skip("Playwright is not installed (npm install playwright; npx playwright install chromium)")
+    if SRC not in sys.path:
+        sys.path.insert(0, SRC)
+    import tilstudio
+    project = tmp_path / 'project'
+    project.mkdir()
+    log_path = tmp_path / 'server.log'
+    with open(log_path, 'w', encoding='utf-8') as log:
+        server = tilstudio.StudioServer(str(project), frontend=BUILT, log=log).start()
+        try:
+            env = dict(os.environ, STUDIO_URL=server.url, SKIP_WEB='1', SKIP_SHOTS='1',
+                       SCREENSHOTS=str(tmp_path / 'screenshots'))
+            r = run_spec(env)
+        finally:
+            server.stop()
+    server_log = log_path.read_text(encoding='utf-8')
+    assert r.returncode == 0, (f"browser tests against the real server failed:\n{r.stdout[-6000:]}\n"
+                               f"{r.stderr[-3000:]}\nserver log:\n{server_log[-3000:]}")
+    assert '✖' not in r.stdout, r.stdout[-6000:]
+    assert 'Traceback' not in server_log, server_log[-3000:]

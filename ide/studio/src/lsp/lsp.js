@@ -22,6 +22,7 @@ export class LspClient extends Emitter {
         this.ready = false;
         this.docs = new Map();      // uri -> {version, text, timer, open}
         this.failed = false;
+        this.restarting = null;
         backend.on('lsp', (msg) => this.dispatch(msg));
     }
 
@@ -80,6 +81,14 @@ export class LspClient extends Emitter {
         for (const [uri, d] of this.docs) if (d.open) this.sendOpen(uri, d);
         this.emit('ready', this.capabilities);
         return this.capabilities;
+    }
+
+    /* initialize again and open the documents again */
+    reinitialize() {
+        if (this.restarting) return this.restarting;
+        this.ready = false;
+        this.restarting = this.start().catch(() => {}).finally(() => { this.restarting = null; });
+        return this.restarting;
     }
 
     has(name) {
@@ -142,6 +151,9 @@ export class LspClient extends Emitter {
                 const err = new Error(msg.error.message || 'language server error');
                 err.code = msg.error.code;
                 err.data = msg.error.data;
+                // ServerNotInitialized after we were ready: the server let this page's
+                // language server go (the page was away); start a new one with our documents
+                if (err.code === -32002 && this.ready && p.method !== 'initialize') this.reinitialize();
                 p.reject(err);
             } else p.resolve(msg.result === undefined ? null : msg.result);
             return;

@@ -93,6 +93,12 @@ PROVE_SECONDS = 600                   # the prover worker's time limit
 FIT_RUN_SECONDS = 60                  # fit --run's time limit
 BUILD_SECONDS = 600
 MAX_DAP_SESSIONS = 8
+MAX_LSP_CLIENTS = 16                  # language servers (one per client tab; the least recently used goes)
+CLIENT_GRACE_SECONDS = 60.0           # a tab's servers, sessions and runs outlive its last event stream this long
+DAP_IDLE_SECONDS = 30 * 60            # a debug session without a request for this long is closed
+JANITOR_SECONDS = 5.0
+MAX_CLIENTS = 256                     # client ids remembered
+_CLIENT_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 FINISHED_RUNS_KEPT = 16
 MTIME_TOLERANCE = 0.001               # PUT /api/file: mtime compared to the millisecond
 
@@ -307,8 +313,9 @@ class _Client:
     """One event stream (a browser tab): undelivered frames, newest screen
     frame per run only (a slow client skips frames, never output)."""
 
-    def __init__(self, sock):
+    def __init__(self, sock, client_id: Optional[str] = None):
         self.sock = sock
+        self.client_id = client_id          # X-TIL-Client / ?client= of the tab (None: anonymous)
         self.cond = threading.Condition()
         self.items: collections.deque = collections.deque()   # [key, frame bytes]
         self.keyed: Dict[Any, list] = {}
@@ -321,8 +328,8 @@ class EventHub:
         self.lock = threading.Lock()
         self.clients: List[_Client] = []
 
-    def subscribe(self, sock=None) -> _Client:
-        client = _Client(sock)
+    def subscribe(self, sock=None, client_id: Optional[str] = None) -> _Client:
+        client = _Client(sock, client_id)
         with self.lock:
             self.clients.append(client)
         return client
@@ -337,12 +344,13 @@ class EventHub:
             client.keyed.clear()
             client.cond.notify_all()
 
-    def publish(self, event: str, data: Any, key: Any = None):
-        """Send an event to every stream. With `key`, an undelivered event of
-        the same key is replaced (screen frames)."""
+    def publish(self, event: str, data: Any, key: Any = None, client: Optional[str] = None):
+        """Send an event to every stream, or with `client` to the streams of that
+        client only. With `key`, an undelivered event of the same key is replaced
+        (screen frames)."""
         frame = ("event: %s\ndata: %s\n\n" % (event, _dumps(data))).encode('utf-8')
         with self.lock:
-            clients = list(self.clients)
+            clients = [c for c in self.clients if client is None or c.client_id == client]
         for c in clients:
             with c.cond:
                 if c.closed:
@@ -749,13 +757,15 @@ class _Run:
         self.started = time.monotonic()
         self.finished_at = 0.0
         self.helpers: List[threading.Thread] = []
+        self.owner: Optional[str] = spec.get('owner')     # the client that started it: its events go there
         self.thread = threading.Thread(target=self._main, name=f"til-run-{run_id}", daemon=True)
 
     # ── events and output ───────────────────────────────────────────────────
     def _publish(self, kind: str, **fields):
         data = {'runId': self.id, 'kind': kind}
         data.update(fields)
-        self.studio.hub.publish('run', data, key=('screen', self.id) if kind == 'screen' else None)
+        self.studio.hub.publish('run', data, key=('screen', self.id) if kind == 'screen' else None,
+                                client=self.owner)
 
     def emit(self, kind: str, **fields):
         """A run event, after the output written before it."""
@@ -1207,51 +1217,184 @@ def _file_uri_path(uri: Any) -> Optional[str]:
         return None
 
 
-class _LspBridge:
-    """One in-process LspServer (src/tillsp.py) shared by every tab."""
+def _file_uri(path: str) -> str:
+    """file:// URI of a path, as tills.path_to_uri writes it (quote(path, safe='/:'))."""
+    p = os.path.abspath(path)
+    if os.name == 'nt':
+        p = p.replace('\\', '/')
+        if re.match(r'^[A-Za-z]:', p):
+            p = '/' + p
+    return 'file://' + urllib.parse.quote(p, safe='/:')
 
-    def __init__(self, studio: 'StudioServer'):
-        self.studio = studio
+
+class _ExamplePaths:
+    """The read-only `@examples/...` of the API <-> the TIL distribution's example
+    files, for the language server (file URIs) and the debug adapter (file
+    paths): an example is analysed and debugged where it is, so its imports
+    resolve in the examples folder, as when it runs. Inactive when the examples
+    are inside the project (then they are ordinary project files)."""
+
+    def __init__(self, project: _Project):
+        ex = project.examples
+        self.project = project
+        self.active = ex is not None and project.rel(ex) is None
+        self.dir = ex or ''
+        root_uri = _path_uri(project.root).rstrip('/')
+        self.view_uri = root_uri + '/%40examples/'          # what the frontend writes (encodeURIComponent)
+        self.view_uris = (self.view_uri, root_uri + '/@examples/')
+        self.real_uri = _file_uri(ex) + '/' if ex else ''
+        self.real_uris = tuple({self.real_uri, _path_uri(ex) + '/'}) if ex else ()
+
+    # LSP: URIs (keys named *uri*, the keys of WorkspaceEdit.changes)
+    def _uri_in(self, uri: str) -> str:
+        for v in self.view_uris:
+            if uri.startswith(v):
+                return self.real_uri + uri[len(v):]
+        return uri
+
+    def _uri_out(self, uri: str) -> str:
+        for r in self.real_uris:
+            if uri.startswith(r):
+                return self.view_uri + uri[len(r):]
+        return uri
+
+    def _uris(self, value: Any, fn: Callable[[str], str]) -> Any:
+        if isinstance(value, list):
+            return [self._uris(v, fn) for v in value]
+        if not isinstance(value, dict):
+            return value
+        out = {}
+        for k, v in value.items():
+            if isinstance(v, str) and isinstance(k, str) and k.lower().endswith('uri'):
+                out[k] = fn(v)
+            elif k == 'changes' and isinstance(v, dict):
+                out[k] = {fn(u) if isinstance(u, str) else u: self._uris(edits, fn) for u, edits in v.items()}
+            else:
+                out[k] = self._uris(v, fn)
+        return out
+
+    def lsp_in(self, message: Any) -> Any:
+        return self._uris(message, self._uri_in) if self.active else message
+
+    def lsp_out(self, message: Any) -> Any:
+        return self._uris(message, self._uri_out) if self.active else message
+
+    # DAP: paths (launch program / cwd, Source.path)
+    def _path_in(self, value: Any, lang: Optional[str]) -> Any:
+        if isinstance(value, str) and (value == EXAMPLES or value.startswith(EXAMPLES + '/')):
+            return self.project.resolve(value, lang)[0]
+        return value
+
+    def dap_in(self, message: Any, lang: Optional[str]) -> Any:
+        if not isinstance(message, dict) or not isinstance(message.get('arguments'), dict):
+            return message
+        args = dict(message['arguments'])
+        for key in ('program', 'cwd'):
+            if key in args:
+                args[key] = self._path_in(args[key], lang)
+        src = args.get('source')
+        if isinstance(src, dict) and 'path' in src:
+            args['source'] = dict(src, path=self._path_in(src['path'], lang))
+        return dict(message, arguments=args)
+
+    def _view_path(self, path: str) -> Optional[str]:
+        if not os.path.isabs(path):
+            return None
+        real = os.path.realpath(path)
+        if not _inside(real, self.dir):
+            return None
+        rel = os.path.relpath(real, self.dir).replace(os.sep, '/')
+        return EXAMPLES if rel == '.' else f"{EXAMPLES}/{rel}"
+
+    def dap_out(self, value: Any) -> Any:
+        if not self.active:
+            return value
+        if isinstance(value, list):
+            return [self.dap_out(v) for v in value]
+        if not isinstance(value, dict):
+            return value
+        out = {k: self.dap_out(v) for k, v in value.items()}
+        if isinstance(out.get('path'), str) and 'name' in out:          # a DAP Source
+            view = self._view_path(out['path'])
+            if view is not None:
+                out['path'] = out['name'] = view
+        return out
+
+
+class _LspSession:
+    """The language server of one client (a browser tab)."""
+
+    def __init__(self, server):
+        self.server = server
         self.lock = threading.Lock()
-        self.server = None
         self.init_result: Optional[Any] = None
         self.init_locale: Any = None
         self.initialized = False
         self.failed_polls = 0
+        self.last_used = time.monotonic()
+
+
+class _LspBridge:
+    """In-process language servers (src/tillsp.py LspServer): one per client tab
+    (X-TIL-Client), created on first use and closed when the tab is gone (see
+    StudioServer.janitor); at most MAX_LSP_CLIENTS (the least recently used one
+    goes). Answers come in the POST reply; what poll() sends later (debounced
+    diagnostics) goes to the event streams of that client only. Requests
+    without a client id share one server whose notifications every stream
+    gets (the API of TIL Studio 3.1.0)."""
+
+    def __init__(self, studio: 'StudioServer'):
+        self.studio = studio
+        self.lock = threading.Lock()
+        self.sessions: 'collections.OrderedDict[Optional[str], _LspSession]' = collections.OrderedDict()
         self.wake = threading.Event()           # a message arrived: the ticker looks again
 
-    def _instance(self, lang: Optional[str]):
-        if self.server is None:
-            module = self.studio.module('tillsp', lang)
-            self.server = module.LspServer(self.studio.root)
-        return self.server
+    def _session(self, client: Optional[str], lang: Optional[str]) -> _LspSession:
+        evicted = []
+        with self.lock:
+            session = self.sessions.get(client)
+            if session is None:
+                module = self.studio.module('tillsp', lang)
+                session = self.sessions[client] = _LspSession(module.LspServer(self.studio.root))
+                while len(self.sessions) > MAX_LSP_CLIENTS:
+                    oldest = next(iter(self.sessions))
+                    evicted.append(self.sessions.pop(oldest))
+            self.sessions.move_to_end(client)
+            session.last_used = time.monotonic()
+        for old in evicted:
+            self._close(old)
+        return session
 
-    def _publish(self, messages: List[Any]):
+    def _publish(self, client: Optional[str], messages: List[Any]):
         for m in messages:
             if isinstance(m, dict) and 'method' in m:
-                self.studio.hub.publish('lsp', m)
+                self.studio.hub.publish('lsp', m, client=client)
 
-    def handle(self, message: Dict[str, Any], lang: Optional[str]) -> List[Any]:
+    def handle(self, message: Dict[str, Any], lang: Optional[str], client: Optional[str] = None) -> List[Any]:
         method = message.get('method')
         mid = message.get('id')
-        if method == 'shutdown' and mid is not None:     # the server is shared: a tab cannot end it
+        if method == 'shutdown' and mid is not None and client is None:   # the shared server outlives a tab
             return [{'jsonrpc': '2.0', 'id': mid, 'result': None}]
         if method == 'exit':
+            if client is not None:
+                self.close_client(client)
             return []
+        message = self.studio.example_paths.lsp_in(message)
         if method in ('textDocument/didOpen', 'textDocument/didClose'):
             params = message.get('params') if isinstance(message.get('params'), dict) else {}
             doc = params.get('textDocument') if isinstance(params.get('textDocument'), dict) else {}
             path = _file_uri_path(doc.get('uri'))
             if path is not None:
                 self.studio.watcher.document(path, method.endswith('didOpen'))
-        with self.lock:
-            server = self._instance(lang)
-            if method == 'initialized' and self.initialized:
+        session = self._session(client, lang)
+        with session.lock:
+            server = session.server
+            if method == 'initialized' and session.initialized:
                 return []
-            if method == 'initialize' and self.init_result is not None and mid is not None:
-                params = message.get('params') if isinstance(message.get('params'), dict) else {}
-                if params.get('locale') == self.init_locale:
-                    return [{'jsonrpc': '2.0', 'id': mid, 'result': self.init_result}]
+            params = message.get('params') if isinstance(message.get('params'), dict) else {}
+            if method == 'initialize' and session.init_result is not None and mid is not None \
+                    and params.get('locale') == session.init_locale:
+                return [{'jsonrpc': '2.0', 'id': mid, 'result': session.init_result}]
             try:
                 out = list(server.handle(message) or [])
             except Exception as e:
@@ -1263,77 +1406,110 @@ class _LspBridge:
                     out = [{'jsonrpc': '2.0', 'id': mid,
                             'error': {'code': -32603, 'message': f"{type(e).__name__}: {e}"}}]
             if method == 'initialized':
-                self.initialized = True
+                session.initialized = True
             if method == 'initialize' and mid is not None:
-                params = message.get('params') if isinstance(message.get('params'), dict) else {}
                 for i, m in enumerate(out):
                     if isinstance(m, dict) and m.get('id') == mid and 'method' not in m:
                         if 'result' in m and m.get('error') is None:
-                            if self.init_result is None or params.get('locale') != self.init_locale:
-                                self.init_result, self.init_locale = m['result'], params.get('locale')
-                        elif self.init_result is not None:    # it refuses a second initialize
-                            out[i] = {'jsonrpc': '2.0', 'id': mid, 'result': self.init_result}
+                            session.init_result, session.init_locale = m['result'], params.get('locale')
+                        elif session.init_result is not None:    # it refuses a second initialize
+                            out[i] = {'jsonrpc': '2.0', 'id': mid, 'result': session.init_result}
         self.wake.set()
-        self._publish(out)
+        out = self.studio.example_paths.lsp_out(out)
+        if client is None:
+            self._publish(None, out)        # the shared server: other tabs see its notifications too
         return out
 
     def delay(self) -> Optional[float]:
-        """Seconds until poll() is due: the server's next_due() (tillsp), else
-        LSP_TICK_SECONDS; None = nothing pending (wait for the next message)."""
-        server = self.server
-        if server is None:
-            return None
-        next_due = getattr(server, 'next_due', None)
-        if next_due is None:
-            return LSP_TICK_SECONDS
-        try:
-            due = next_due()
-        except Exception:
-            return LSP_TICK_SECONDS
-        return None if due is None else max(0.005, float(due))
+        """Seconds until some poll() is due: the servers' next_due() (tillsp),
+        else LSP_TICK_SECONDS; None = nothing pending (wait for a message)."""
+        with self.lock:
+            servers = [s.server for s in self.sessions.values()]
+        best: Optional[float] = None
+        for server in servers:
+            next_due = getattr(server, 'next_due', None)
+            if next_due is None:
+                due: Optional[float] = LSP_TICK_SECONDS
+            else:
+                try:
+                    due = next_due()
+                except Exception:
+                    due = LSP_TICK_SECONDS
+            if due is not None and (best is None or due < best):
+                best = max(0.005, float(due))
+        return best
 
     def poll(self):
         with self.lock:
-            if self.server is None:
-                return
+            sessions = list(self.sessions.items())
+        for client, session in sessions:
+            with session.lock:
+                try:
+                    out = list(session.server.poll() or [])
+                    session.failed_polls = 0
+                except Exception:
+                    session.failed_polls += 1
+                    if session.failed_polls == 1:
+                        self.studio.log_exception("language server poll")
+                    continue
+            if out:
+                self._publish(client, self.studio.example_paths.lsp_out(out))
+
+    def clients(self) -> List[Optional[str]]:
+        with self.lock:
+            return list(self.sessions)
+
+    def close_client(self, client: Optional[str]):
+        with self.lock:
+            session = self.sessions.pop(client, None)
+        if session is not None:
+            self._close(session)
+
+    def _close(self, session: _LspSession):
+        close = getattr(session.server, 'close', None)
+        if callable(close):
             try:
-                out = list(self.server.poll() or [])
-                self.failed_polls = 0
+                close()
             except Exception:
-                self.failed_polls += 1
-                if self.failed_polls == 1:
-                    self.studio.log_exception("language server poll")
-                return
-        self._publish(out)
+                self.studio.log_exception("language server close")
+
+
+class _DapEntry:
+    def __init__(self, session, owner: Optional[str]):
+        self.session = session
+        self.owner = owner
+        self.last_used = time.monotonic()
 
 
 class _DapBridge:
-    """Debug sessions (src/tildap.py DapSession) by id; events -> `dap` events."""
+    """Debug sessions (src/tildap.py DapSession) by id. Events go to the event
+    streams of the client that started the session (all streams without a
+    client id). A session is closed on `disconnect`, when its client is gone
+    (StudioServer.janitor), after DAP_IDLE_SECONDS without a request, and
+    beyond MAX_DAP_SESSIONS (the least recently used)."""
 
     def __init__(self, studio: 'StudioServer'):
         self.studio = studio
         self.lock = threading.Lock()
-        self.sessions: Dict[str, Any] = {}
-        self.used: Dict[str, float] = {}
+        self.sessions: Dict[str, _DapEntry] = {}
 
-    def start(self, lang: Optional[str]) -> str:
+    def start(self, lang: Optional[str], client: Optional[str] = None) -> str:
         module = self.studio.module('tildap', lang)
         sid = secrets.token_hex(4)
         hub = self.studio.hub
+        paths = self.studio.example_paths
 
         def emit(payload):
-            hub.publish('dap', {'sessionId': sid, 'message': payload})
-        session = module.DapSession(emit, self.studio.root)
+            hub.publish('dap', {'sessionId': sid, 'message': paths.dap_out(payload)}, client=client)
+        entry = _DapEntry(module.DapSession(emit, self.studio.root), client)
         evicted = []
         with self.lock:
-            self.sessions[sid] = session
-            self.used[sid] = time.monotonic()
+            self.sessions[sid] = entry
             while len(self.sessions) > MAX_DAP_SESSIONS:
-                oldest = min(self.used, key=self.used.get)
+                oldest = min(self.sessions, key=lambda k: self.sessions[k].last_used)
                 evicted.append(self.sessions.pop(oldest))
-                del self.used[oldest]
-        for s in evicted:
-            self._close(s)
+        for e in evicted:
+            self._close(e.session)
         return sid
 
     def handle(self, sid: str, message: Dict[str, Any], lang: Optional[str],
@@ -1341,25 +1517,44 @@ class _DapBridge:
         """One DAP message: `reply` gets the responses. With tildap's hold_events(),
         the events the message causes go out after the reply (as over stdio)."""
         with self.lock:
-            session = self.sessions.get(sid)
-            if session is not None:
-                self.used[sid] = time.monotonic()
-        if session is None:
+            entry = self.sessions.get(sid)
+            if entry is not None:
+                entry.last_used = time.monotonic()
+        if entry is None:
             raise _ApiError(404, _t(f"no such debug session: {sid}", lang))
+        session = entry.session
+        paths = self.studio.example_paths
+        real = paths.dap_in(message, lang)
         hold = getattr(session, 'hold_events', None)
         with (hold() if callable(hold) else contextlib.nullcontext()):
             try:
-                out = list(session.handle(message) or [])
+                out = list(session.handle(real) or [])
             except Exception as e:
                 self.studio.log_exception("debug adapter")
                 out = [{'type': 'response', 'request_seq': message.get('seq', 0), 'success': False,
                         'command': message.get('command', ''), 'message': f"{type(e).__name__}: {e}"}]
-            reply(out)
+            reply(paths.dap_out(out))
         if message.get('type') == 'request' and message.get('command') == 'disconnect':
             with self.lock:
                 self.sessions.pop(sid, None)
-                self.used.pop(sid, None)
             self._close(session)
+
+    def owners(self) -> Dict[str, Optional[str]]:
+        with self.lock:
+            return {sid: e.owner for sid, e in self.sessions.items()}
+
+    def close_where(self, test: Callable[[_DapEntry], bool]) -> int:
+        """Close the sessions `test` picks (in parallel: tildap's close() may wait up to 5 s)."""
+        with self.lock:
+            picked = [sid for sid, e in self.sessions.items() if test(e)]
+            entries = [self.sessions.pop(sid) for sid in picked]
+        threads = [threading.Thread(target=self._close, args=(e.session,), name='til-studio-dap-close',
+                                    daemon=True) for e in entries]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(6.0)
+        return len(entries)
 
     def _close(self, session):
         try:
@@ -1368,17 +1563,7 @@ class _DapBridge:
             self.studio.log_exception("debug adapter close")
 
     def close_all(self):
-        """Close every session at once (tildap's close() may wait up to 5 s each)."""
-        with self.lock:
-            sessions = list(self.sessions.values())
-            self.sessions.clear()
-            self.used.clear()
-        threads = [threading.Thread(target=self._close, args=(s,), name='til-studio-dap-close', daemon=True)
-                   for s in sessions]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(6.0)
+        self.close_where(lambda e: True)
 
 
 # ── file watching ───────────────────────────────────────────────────────────
@@ -1606,6 +1791,17 @@ class _HTTPServer(http.server.ThreadingHTTPServer):
                 studio.connections.pop(threading.current_thread(), None)
 
 
+class _ClientState:
+    """What the studio knows of a client tab: its open event streams, when the
+    last one closed, its last request."""
+    __slots__ = ('streams', 'gone_since', 'last_seen')
+
+    def __init__(self, now: float):
+        self.streams = 0
+        self.gone_since = now
+        self.last_seen = now
+
+
 class StudioServer:
     """The TIL Studio server for one project folder.
 
@@ -1634,6 +1830,9 @@ class StudioServer:
         self.runs: Dict[str, _Run] = {}
         self.runs_lock = threading.Lock()
         self.pump_wake = threading.Event()
+        self.example_paths = _ExamplePaths(self.project)
+        self.clients: Dict[str, '_ClientState'] = {}
+        self.clients_lock = threading.Lock()
         self.lsp = _LspBridge(self)
         self.dap = _DapBridge(self)
         self.watcher = _Watcher(self)
@@ -1667,7 +1866,8 @@ class StudioServer:
 
     def _start_background(self):
         for name, target in (('til-studio-pump', self._pump_loop), ('til-studio-lsp', self._lsp_loop),
-                             ('til-studio-watch', lambda: self.watcher.loop(self.stopping))):
+                             ('til-studio-watch', lambda: self.watcher.loop(self.stopping)),
+                             ('til-studio-janitor', self._janitor_loop)):
             t = threading.Thread(target=target, name=name, daemon=True)
             t.start()
             self.threads.append(t)
@@ -1808,6 +2008,64 @@ class StudioServer:
             if self.stopping.is_set():
                 break
             lsp.poll()
+
+    def _janitor_loop(self):
+        while not self.stopping.wait(JANITOR_SECONDS):
+            try:
+                self.janitor()
+            except Exception:
+                self.log_exception("janitor")
+
+    # ── clients (browser tabs: X-TIL-Client, ?client= of /api/events) ──────
+    def touch_client(self, client: str, streams: int = 0):
+        """A request (streams=0) or an event stream opening (+1) / closing (-1)."""
+        now = time.monotonic()
+        with self.clients_lock:
+            state = self.clients.get(client)
+            if state is None:
+                if len(self.clients) >= MAX_CLIENTS:        # forget the oldest tabs without a stream
+                    idle = sorted((st.last_seen, cid) for cid, st in self.clients.items() if not st.streams)
+                    for _seen, cid in idle[:max(1, len(self.clients) - MAX_CLIENTS + 1)]:
+                        del self.clients[cid]
+                state = self.clients[client] = _ClientState(now)
+            state.last_seen = now
+            state.streams = max(0, state.streams + streams)
+            if streams < 0 and not state.streams:
+                state.gone_since = now
+
+    def client_gone(self, client: Optional[str], now: Optional[float] = None) -> bool:
+        """True once a tab has had no event stream (and sent nothing) for
+        CLIENT_GRACE_SECONDS; never for anonymous requests (client None)."""
+        if client is None:
+            return False
+        now = time.monotonic() if now is None else now
+        with self.clients_lock:
+            state = self.clients.get(client)
+            if state is None:
+                return True
+            return not state.streams and now - max(state.gone_since, state.last_seen) > CLIENT_GRACE_SECONDS
+
+    def janitor(self, now: Optional[float] = None) -> Dict[str, int]:
+        """Close what gone tabs left: their language servers, debug sessions and
+        runs; debug sessions idle for DAP_IDLE_SECONDS. Returns the counts."""
+        now = time.monotonic() if now is None else now
+        lsp = [c for c in self.lsp.clients() if c is not None and self.client_gone(c, now)]
+        for client in lsp:
+            self.lsp.close_client(client)
+        dap = self.dap.close_where(lambda e: (e.owner is not None and self.client_gone(e.owner, now))
+                                   or now - e.last_used > DAP_IDLE_SECONDS)
+        runs = [r for r in self.active_runs() if r.owner is not None and self.client_gone(r.owner, now)]
+        for r in runs:
+            r.stop()
+        with self.clients_lock:
+            for client in [c for c, st in self.clients.items()
+                           if not st.streams and now - max(st.gone_since, st.last_seen) > CLIENT_GRACE_SECONDS]:
+                del self.clients[client]
+        return {'lsp': len(lsp), 'dap': dap, 'runs': len(runs)}
+
+    def active_runs(self) -> List[_Run]:
+        with self.runs_lock:
+            return [r for r in self.runs.values() if not r.done.is_set()]
 
     # ── runs ────────────────────────────────────────────────────────────────
     def run_finished(self, run: _Run):
@@ -2149,7 +2407,7 @@ class StudioServer:
         filename = abs_path or os.path.join(self.root, 'untitled.til')
         return abs_path, rel, virtual, source, filename
 
-    def api_run(self, body: Dict[str, Any], lang: Optional[str]) -> Dict[str, Any]:
+    def api_run(self, body: Dict[str, Any], lang: Optional[str], client: Optional[str] = None) -> Dict[str, Any]:
         backend = body.get('backend') or 'vm'
         if backend not in BACKENDS:
             raise _ApiError(400, _t(f"unknown backend '{backend}' (use native, vm or cvm)", lang))
@@ -2185,7 +2443,7 @@ class StudioServer:
         spec = {'backend': backend, 'path': abs_path, 'rel': rel, 'virtual': virtual, 'source': source,
                 'filename': filename, 'args': args,
                 'stdin': None if stdin is None else stdin.encode('utf-8', 'replace'),
-                'lang': run_lang, 'max_steps': max_steps, 'keys': codes, 'cwd': cwd}
+                'lang': run_lang, 'max_steps': max_steps, 'keys': codes, 'cwd': cwd, 'owner': client}
         with self.runs_lock:
             if self.stopping.is_set():
                 raise _ApiError(503, _t("TIL Studio is stopping", lang))
@@ -2551,6 +2809,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     server_version = 'TILStudio/' + til.TIL_VERSION
     sys_version = ''
     timeout = 60                            # seconds a socket read or write may block
+    client_id: Optional[str] = None         # the tab that sends the request (X-TIL-Client)
 
     def log_message(self, format, *args):  # noqa: A002 (the base class's signature)
         pass
@@ -2664,6 +2923,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _same(a: Optional[str], b: str) -> bool:
         return bool(a) and hmac.compare_digest(a.encode('utf-8', 'replace'), b.encode('utf-8'))
 
+    def _client_id(self, query: Dict[str, List[str]]) -> Optional[str]:
+        """The tab's id: X-TIL-Client, or ?client= (EventSource cannot send headers)."""
+        cid = self.headers.get('X-TIL-Client') or (query.get('client') or [None])[0]
+        return cid if cid and _CLIENT_ID_RE.match(cid) else None
+
     def _token_ok(self, query: Dict[str, List[str]]) -> bool:
         token = self.server.studio.token
         return (self._same(self.headers.get('X-TIL-Token'), token)
@@ -2718,6 +2982,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if not self._token_ok(query):
                 raise _ApiError(403, _t("missing or wrong token: open the address that `til ide` printed",
                                         lang))
+            self.client_id = self._client_id(query)
+            if self.client_id is not None and route != '/api/events':
+                studio.touch_client(self.client_id)
             if route == '/favicon.ico' and method == 'GET':
                 return self._send(204, b"", None)
             if route == '/api/events':
@@ -2771,7 +3038,10 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         """GET /api/events: the event stream of one tab (until it disconnects)."""
         studio = self.server.studio
         self.close_connection = True
-        client = studio.hub.subscribe(self.connection)
+        cid = self.client_id
+        client = studio.hub.subscribe(self.connection, cid)
+        if cid is not None:
+            studio.touch_client(cid, +1)
         try:
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream; charset=utf-8')
@@ -2804,6 +3074,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             pass
         finally:
             studio.hub.unsubscribe(client)
+            if cid is not None:
+                studio.touch_client(cid, -1)
 
     # ── API routes: (self, studio, body, query, lang, *groups) -> JSON ──────
     @_route('GET', '/api/info')
@@ -2840,11 +3112,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     @_route('POST', '/api/lsp')
     def r_lsp(self, studio, body, query, lang):
-        return {'messages': studio.lsp.handle(body, lang)}
+        return {'messages': studio.lsp.handle(body, lang, self.client_id)}
 
     @_route('POST', '/api/run')
     def r_run(self, studio, body, query, lang):
-        return studio.api_run(body, lang)
+        return studio.api_run(body, lang, self.client_id)
 
     @_route('POST', r'/api/run/([A-Za-z0-9_-]+)/stdin')
     def r_run_stdin(self, studio, body, query, lang, run_id):
@@ -2876,7 +3148,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     @_route('POST', '/api/dap/start')
     def r_dap_start(self, studio, body, query, lang):
-        return {'sessionId': studio.dap.start(lang)}
+        return {'sessionId': studio.dap.start(lang, self.client_id)}
 
     @_route('POST', r'/api/dap/([A-Za-z0-9_-]+)')
     def r_dap(self, studio, body, query, lang, sid):

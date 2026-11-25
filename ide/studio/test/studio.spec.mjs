@@ -339,6 +339,73 @@ describe('desktop face', () => {
         await page.context().close();
     });
 
+    it('debugs a TIL example where it is (its imports resolve)', async () => {
+        const page = await open();
+        const ex = await page.evaluate(() => {
+            const list = window.tilStudio.info.examples;
+            return (list.find((e) => /08_imports/.test(e.path)) || list.find((e) => /hello/.test(e.name)) || list[0]).path;
+        });
+        await page.evaluate((p) => window.tilStudio.openFile(p), ex);
+        await page.waitForFunction((p) => window.tilStudio.editors.activeDoc() && window.tilStudio.editors.activeDoc().path === p, ex);
+        await page.keyboard.press('F5');
+        await page.waitForFunction(() => window.tilStudio.debugger.active, null, { timeout: 10000 });
+        await page.waitForFunction(() => !window.tilStudio.debugger.active, null, { timeout: 20000 });
+        const out = await page.locator('.term-out').textContent();
+        if (!mock && /08_imports/.test(ex)) assert.match(out, /25\s*27\s*10/, out);      // square, cube, clamp from math_utils
+        assert.doesNotMatch(out, /Could not find module|cannot read/, out);
+        assert.deepEqual(page.errors, []);
+        await page.context().close();
+    });
+
+    it('ends its debug session when the page goes away', async () => {
+        const page = await open();
+        await openFile(page, 'main.til');
+        const src = await docText(page);
+        await placeCursor(page, lineOf(src, 'print(f"total'), 'print');
+        await page.keyboard.press('F9');
+        await page.keyboard.press('F5');
+        await page.waitForSelector('.cm-debugLine', { timeout: 15000 });
+        const sid = await page.evaluate(() => window.tilStudio.debugger.client.sessionId);
+        await page.goto('about:blank');                        // pagehide: a keepalive disconnect
+        const deadline = Date.now() + 10000;
+        let gone = false;
+        while (!gone && Date.now() < deadline) {
+            if (mock) gone = mock.state.stats.dap.includes('disconnect');
+            else gone = await api('POST', `/api/dap/${sid}`, { seq: 99, type: 'request', command: 'threads' }).then(() => false, (e) => /404/.test(e.message));
+            if (!gone) await new Promise((r) => setTimeout(r, 100));
+        }
+        assert.ok(gone, 'the debug session was ended');
+        await page.context().close();
+    });
+
+    it('names each page to the server: its own language server and language', async () => {
+        const kk = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+        await kk.addInitScript(() => localStorage.setItem('til-studio:settings', JSON.stringify({ uiLang: 'kk' })));
+        const a = await open({ ctx: kk });
+        const b = await open();
+        const ids = await Promise.all([a, b].map((p) => p.evaluate(() => window.tilStudio.backend.clientId)));
+        assert.ok(ids[0] && ids[1] && ids[0] !== ids[1], JSON.stringify(ids));
+        if (mock) {
+            assert.ok(mock.state.stats.clients.events.includes(ids[0]) && mock.state.stats.clients.events.includes(ids[1]), 'the event streams name their page');
+            assert.ok(mock.state.stats.clients.requests.includes(ids[0]), 'the requests name their page');
+        } else {
+            // the diagnostics of each page come from its own language server, in its own language
+            await api('PUT', '/api/file', { path: 'tabs.til', text: 'main()\n    print(nope)\n' });
+            const messages = async (page) => {
+                await openFile(page, 'tabs.til');
+                await page.waitForFunction(() => [...window.tilStudio.diagnostics.values()].some((l) => l.length), null, { timeout: 10000 });
+                return page.evaluate(() => [...window.tilStudio.diagnostics.values()].flat().map((d) => d.message).join('\n'));
+            };
+            const inKazakh = await messages(a);
+            const inEnglish = await messages(b);
+            assert.match(inEnglish, /unknown name 'nope'/);
+            assert.ok(inKazakh.includes('nope') && !/unknown name/.test(inKazakh), inKazakh);
+            await api('POST', '/api/file/delete', { path: 'tabs.til' });
+        }
+        await a.context().close();
+        await b.context().close();
+    });
+
     it('proves contracts and offers to debug a counterexample', async () => {
         const page = await open();
         await openFile(page, 'proofs.til');

@@ -3,6 +3,10 @@
 //
 // fetch wrappers for every endpoint plus ONE EventSource on /api/events,
 // whose events (lsp, run, dap, fs, ping) are re-emitted by this object.
+// Every request names this page (X-TIL-Client, ?client= on the event stream):
+// the server keeps a language server, debug sessions and runs per page and
+// sends their events to this page only; what a page leaves behind is closed
+// a minute after its event stream is gone.
 // Paths are POSIX paths relative to the project root (the TIL examples are
 // the read-only "@examples/..."). Unknown fields in responses are ignored;
 // missing ones get defaults. Every request says the UI language
@@ -28,6 +32,17 @@ export class NotAvailable extends Error {
 
 const TOKEN_KEY = 'til-studio-token';
 
+/* a random id for this page (a reload is another client: a fresh language server) */
+export function newClientId() {
+    try {
+        const b = new Uint8Array(12);
+        crypto.getRandomValues(b);
+        return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
+    } catch (e) {
+        return Math.random().toString(36).slice(2) + Date.now().toString(36);
+    }
+}
+
 /* the per-launch token: ?token= of the opened URL (then kept for this tab) */
 export function takeToken() {
     let token = null;
@@ -48,10 +63,11 @@ export function takeToken() {
 }
 
 export class DesktopBackend extends Emitter {
-    constructor({ token = null, base = '' } = {}) {
+    constructor({ token = null, base = '', clientId = null } = {}) {
         super();
         this.kind = 'desktop';
         this.token = token;
+        this.clientId = clientId || newClientId();
         this.base = base;
         this.info = null;
         this.source = null;
@@ -64,9 +80,14 @@ export class DesktopBackend extends Emitter {
         return u.href;
     }
 
-    async request(method, path, body, query) {
-        const headers = { Accept: 'application/json', 'X-TIL-Lang': getLocale() };
+    headers(extra) {
+        const headers = Object.assign({ Accept: 'application/json', 'X-TIL-Lang': getLocale(), 'X-TIL-Client': this.clientId }, extra || {});
         if (this.token) headers['X-TIL-Token'] = this.token;
+        return headers;
+    }
+
+    async request(method, path, body, query) {
+        const headers = this.headers();
         const init = { method, headers, credentials: 'same-origin', cache: 'no-store' };
         if (body !== undefined) {
             headers['Content-Type'] = 'application/json';
@@ -97,9 +118,7 @@ export class DesktopBackend extends Emitter {
     /* GET /api/info; resolves null when this is not the desktop server */
     async probe() {
         try {
-            const headers = { Accept: 'application/json', 'X-TIL-Lang': getLocale() };
-            if (this.token) headers['X-TIL-Token'] = this.token;
-            const resp = await fetch(this.url('api/info'), { headers, credentials: 'same-origin', cache: 'no-store' });
+            const resp = await fetch(this.url('api/info'), { headers: this.headers(), credentials: 'same-origin', cache: 'no-store' });
             const type = resp.headers.get('content-type') || '';
             if (resp.status === 403) return { forbidden: true };
             if (!resp.ok || !type.includes('json')) return null;
@@ -127,7 +146,7 @@ export class DesktopBackend extends Emitter {
 
     openEvents() {
         if (typeof EventSource !== 'function') return;
-        const es = new EventSource(this.url('api/events', this.token ? { token: this.token } : null), { withCredentials: true });
+        const es = new EventSource(this.url('api/events', { token: this.token || undefined, client: this.clientId }), { withCredentials: true });
         this.source = es;
         es.onopen = () => this.setConnected(true);
         es.onerror = () => this.setConnected(false);
@@ -200,14 +219,15 @@ export class DesktopBackend extends Emitter {
 
     runStop(id) { return this.request('POST', `api/run/${encodeURIComponent(id)}/stop`, {}); }
 
-    /* Stop while the page unloads: a keepalive request outlives the page */
-    runStopOnUnload(id) {
-        const headers = { 'Content-Type': 'application/json', 'X-TIL-Lang': getLocale() };
-        if (this.token) headers['X-TIL-Token'] = this.token;
+    /* a request while the page unloads: keepalive outlives the page */
+    sendOnUnload(path, body) {
         try {
-            fetch(this.url(`api/run/${encodeURIComponent(id)}/stop`), { method: 'POST', headers, body: '{}', credentials: 'same-origin', keepalive: true }).catch(() => {});
+            fetch(this.url(path), { method: 'POST', headers: this.headers({ 'Content-Type': 'application/json' }), body: JSON.stringify(body), credentials: 'same-origin', keepalive: true }).catch(() => {});
         } catch (e) { /* the page is going away anyway */ }
     }
+
+    /* Stop while the page unloads */
+    runStopOnUnload(id) { this.sendOnUnload(`api/run/${encodeURIComponent(id)}/stop`, {}); }
 
     /* {path, size, steps}; stop: end the run after saving */
     runSnapshot(id, stop = false) { return this.request('POST', `api/run/${encodeURIComponent(id)}/snapshot`, stop ? { stop: true } : {}); }
@@ -221,6 +241,11 @@ export class DesktopBackend extends Emitter {
     async dap(id, message) {
         const r = await this.request('POST', `api/dap/${encodeURIComponent(id)}`, message);
         return Array.isArray(r.messages) ? r.messages : [];
+    }
+
+    /* end a debug session while the page unloads (its program stops) */
+    dapDisconnectOnUnload(id, seq) {
+        this.sendOnUnload(`api/dap/${encodeURIComponent(id)}`, { seq, type: 'request', command: 'disconnect', arguments: { terminateDebuggee: true } });
     }
 
     /* ── tools ── */

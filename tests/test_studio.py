@@ -301,9 +301,10 @@ class Api:
 class Events:
     """One event stream (GET /api/events) read by a thread."""
 
-    def __init__(self, api: Api, token=True):
+    def __init__(self, api: Api, token=True, client=None):
         self.conn = http.client.HTTPConnection('127.0.0.1', api.port, timeout=300)
-        self.conn.request('GET', '/api/events', headers={'X-TIL-Token': api.token} if token else {})
+        self.conn.request('GET', '/api/events' + (f'?client={client}' if client else ''),
+                          headers={'X-TIL-Token': api.token} if token else {})
         self.sock = self.conn.sock              # (the response takes the socket over)
         self.response = self.conn.getresponse()
         self.status = self.response.status
@@ -605,14 +606,16 @@ class TestFiles:
         tables = studio.ok('GET', '/api/info')['tables']
         gen = os.path.join(ROOT, 'ide', 'studio', 'gen_tables.py')
         built = os.path.join(ROOT, 'ide', 'studio', 'tables.json')
-        if os.path.isfile(gen):
+        if not os.path.isfile(gen) and not os.path.isfile(built):
+            pytest.skip("the frontend sources (ide/studio/) are not installed")
+        if os.path.isfile(gen):                   # what the server serves: build_tables() ...
             spec = importlib.util.spec_from_file_location('gen_tables_for_test', gen)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             assert tables == json.loads(json.dumps(module.build_tables()))
-        elif os.path.isfile(built):
+        if os.path.isfile(built):                 # ... is what the frontend embeds
             with open(built, encoding='utf-8') as f:
-                assert tables == json.load(f)
+                assert tables == json.load(f), "ide/studio/tables.json is stale: python3 ide/studio/gen_tables.py"
         assert tables['native_arity']['print'] == [0, None]
         assert tables['keywords']['ru']['если'] == 'IF' and tables['key_names']['ENTER'] == 13
 
@@ -845,6 +848,104 @@ class TestLsp:
             server.stop()
 
 
+class TestClients:
+    """One language server per client tab (X-TIL-Client / ?client=), events routed
+    to the tab's own streams, what a gone tab left closed by the janitor."""
+
+    def test_one_language_server_per_tab(self, studio, standins, project):
+        lsp_cls = standins['tillsp'].LspServer
+        uri = tilstudio._path_uri(os.path.join(os.path.realpath(project), 'tab.til'))
+        a, b, anon = Events(studio, client='tabA'), Events(studio, client='tabB'), studio.events()
+        try:
+            before = len(lsp_cls.instances)
+            for tab, locale in (('tabA', 'kk'), ('tabB', 'en')):
+                r = studio.post('/api/lsp', {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+                                             'params': {'locale': locale}}, headers={'X-TIL-Client': tab})
+                assert r.status == 200 and r.json()['messages'][0]['result']['serverInfo']['name'] == 'til-lsp'
+            assert len(lsp_cls.instances) == before + 2          # two servers: each tab its own language
+            mine = studio.server.lsp.sessions['tabA'].server
+            assert mine.methods == ['initialize'] and mine is not studio.server.lsp.sessions['tabB'].server
+            marks = [e.mark() for e in (a, b, anon)]
+            out = studio.post('/api/lsp', {'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {
+                'textDocument': {'uri': uri, 'languageId': 'til', 'version': 1, 'text': 'x = oops\n'}}},
+                headers={'X-TIL-Client': 'tabA'}).json()['messages']
+            assert out[0]['method'] == 'window/logMessage'         # in the reply ...
+            diag = a.wait(lambda n, d: n == 'lsp' and d.get('method') == 'textDocument/publishDiagnostics',
+                          5, marks[0])
+            assert diag['params']['uri'] == uri and diag['params']['diagnostics']
+            time.sleep(0.5)
+            for ev, mark in ((b, marks[1]), (anon, marks[2]), (a, marks[0])):
+                with ev.cond:
+                    seen = [d.get('method') for _t, n, d in ev.items[mark:] if n == 'lsp']
+                if ev is a:
+                    assert seen == ['textDocument/publishDiagnostics']   # ... not on the stream again
+                else:
+                    assert seen == [], seen                           # the other tabs see nothing
+            # a tab's exit ends its own server only
+            studio.post('/api/lsp', {'jsonrpc': '2.0', 'method': 'exit'}, headers={'X-TIL-Client': 'tabB'})
+            assert 'tabB' not in studio.server.lsp.sessions and 'tabA' in studio.server.lsp.sessions
+        finally:
+            for ev in (a, b, anon):
+                ev.close()
+            studio.server.lsp.close_client('tabA')
+
+    def test_language_servers_are_capped(self, studio, standins):
+        lsp = studio.server.lsp
+        for i in range(tilstudio.MAX_LSP_CLIENTS + 3):
+            studio.post('/api/lsp', {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}},
+                        headers={'X-TIL-Client': f'many{i}'})
+        assert len(lsp.sessions) == tilstudio.MAX_LSP_CLIENTS
+        assert 'many0' not in lsp.sessions and f'many{tilstudio.MAX_LSP_CLIENTS + 2}' in lsp.sessions
+        for i in range(tilstudio.MAX_LSP_CLIENTS + 3):
+            lsp.close_client(f'many{i}')
+
+    def test_gone_tabs_are_cleaned_up(self, studio, standins, events):
+        server = studio.server
+        h = {'X-TIL-Client': 'leaver'}
+        ev = Events(studio, client='leaver')
+        studio.post('/api/lsp', {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {}}, headers=h)
+        sid = studio.request('POST', '/api/dap/start', {}, headers=h).json()['sessionId']
+        session = standins['tildap'].DapSession.instances[-1]
+        rid = studio.request('POST', '/api/run', {'path': 'loop.til', 'backend': 'vm'}, headers=h).json()['runId']
+        ev.wait(lambda n, d: n == 'run' and d.get('runId') == rid and d.get('state') == 'running', 30)
+        # the run's events go to the tab that started it only
+        time.sleep(0.2)
+        assert events.run_events(rid) == []
+        # while the tab is connected, or within the grace period after it left, nothing is closed
+        late = time.monotonic() + tilstudio.CLIENT_GRACE_SECONDS + 1
+        assert server.janitor(late) == {'lsp': 0, 'dap': 0, 'runs': 0}
+        ev.close()
+        deadline = time.monotonic() + 5
+        while server.clients['leaver'].streams and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert server.janitor() == {'lsp': 0, 'dap': 0, 'runs': 0}
+        # 60 s after its last stream closed: its language server, debug session and run end
+        assert server.janitor(time.monotonic() + tilstudio.CLIENT_GRACE_SECONDS + 1) == \
+            {'lsp': 1, 'dap': 1, 'runs': 1}
+        assert 'leaver' not in server.lsp.sessions and session.closed
+        assert studio.post(f'/api/dap/{sid}', {'seq': 2, 'type': 'request', 'command': 'threads'}).status == 404
+        deadline = time.monotonic() + 5
+        while not server.runs[rid].done.is_set() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert server.runs[rid].exit_code == 130
+
+    def test_idle_debug_sessions_are_closed(self, studio, standins):
+        sid = studio.ok('POST', '/api/dap/start')['sessionId']          # no client id: never "gone"
+        session = standins['tildap'].DapSession.instances[-1]
+        server = studio.server
+        assert server.janitor(time.monotonic() + 60)['dap'] == 0
+        assert server.janitor(time.monotonic() + tilstudio.DAP_IDLE_SECONDS + 1)['dap'] == 1
+        assert session.closed
+        assert studio.post(f'/api/dap/{sid}', {'seq': 1, 'type': 'request', 'command': 'threads'}).status == 404
+
+    def test_bad_client_ids_are_anonymous(self, studio, events):
+        for bad in ('', 'a b', 'x' * 65, 'é'):
+            r = studio.post('/api/run', {'path': 'hello.til', 'backend': 'vm'}, headers={'X-TIL-Client': bad})
+            rid = r.json()['runId']
+            evs = events.until_exit(rid, 30)                   # anonymous: every stream sees it
+            assert text_of(evs) == "Hello, Studio!\n"
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # the DAP bridge
 # ═══════════════════════════════════════════════════════════════════════════
@@ -872,6 +973,9 @@ class TestDap:
         assert out[0]['success'] is False and 'dap boom' in out[0]['message']
         out = studio.ok('POST', f'/api/dap/{sid}', {'seq': 4, 'type': 'request', 'command': 'disconnect'})
         assert out['messages'][0]['command'] == 'disconnect'
+        deadline = time.monotonic() + 5              # closed right after the reply went out
+        while not session.closed and time.monotonic() < deadline:
+            time.sleep(0.01)
         assert session.closed is True
         assert studio.post(f'/api/dap/{sid}', {'seq': 5, 'type': 'request', 'command': 'threads'}).status == 404
 
@@ -1091,10 +1195,10 @@ class TestRuns:
         sent = []                         # when the server sends frames (receiving can bunch up)
         publish = studio.server.hub.publish
 
-        def recording(event, data, key=None):
+        def recording(event, data, key=None, **kw):
             if event == 'run' and data.get('kind') == 'screen':
                 sent.append(time.monotonic())
-            publish(event, data, key)
+            publish(event, data, key, **kw)
         monkeypatch.setattr(studio.server.hub, 'publish', recording)
         rid, evs = studio.run(events, path='frames.til', backend='vm')
         frames = [e for e in evs if e['kind'] == 'screen']
@@ -1349,6 +1453,103 @@ def test_real_language_server(real_studio, project):
         events.close()
 
 
+@pytest.mark.skipif(not HAS_TILLSP, reason="src/tillsp.py is not installed")
+def test_real_language_server_per_tab(real_studio, project):
+    """Each tab has its own server: a Kazakh tab and an English tab see their own languages."""
+    uri = tilstudio._path_uri(os.path.join(os.path.realpath(project), 'broken.til'))
+    got = {}
+    for tab, locale in (('kkTab', 'kk'), ('enTab', 'en')):
+        h = {'X-TIL-Client': tab}
+        msg = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize',
+               'params': {'processId': None, 'rootUri': tilstudio._path_uri(project), 'capabilities': {},
+                          'locale': locale}}
+        assert real_studio.request('POST', '/api/lsp', msg, headers=h).status == 200
+        real_studio.request('POST', '/api/lsp', {'jsonrpc': '2.0', 'method': 'initialized', 'params': {}}, headers=h)
+        out = real_studio.request('POST', '/api/lsp', {'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {
+            'textDocument': {'uri': uri, 'languageId': 'til', 'version': 1, 'text': PROGRAMS['broken.til']}}},
+            headers=h).json()['messages']
+        diag = [m for m in out if m.get('method') == 'textDocument/publishDiagnostics']
+        got[tab] = diag[0]['params']['diagnostics'][0]['message']
+    assert 'oops' in got['enTab'] and got['enTab'].startswith('unknown name')
+    assert 'oops' in got['kkTab'] and got['kkTab'] != got['enTab']
+    for tab in got:
+        real_studio.server.lsp.close_client(tab)
+
+
+@pytest.mark.skipif(not HAS_TILLSP, reason="src/tillsp.py is not installed")
+def test_real_language_server_on_examples(real_studio, project):
+    """An example (@examples/...) is analysed where it is: its imports resolve."""
+    if real_studio.server.project.rel(real_studio.server.project.examples) is not None:
+        pytest.skip("the examples are inside the project")
+    h = {'X-TIL-Client': 'exTab'}
+    root_uri = tilstudio._path_uri(os.path.realpath(project))
+    real_studio.request('POST', '/api/lsp', {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+        'rootUri': root_uri, 'capabilities': {}, 'locale': 'en'}}, headers=h)
+    real_studio.request('POST', '/api/lsp', {'jsonrpc': '2.0', 'method': 'initialized', 'params': {}}, headers=h)
+    uri = root_uri + '/%40examples/08_imports.til'            # what the frontend writes for @examples/08_imports.til
+    text = real_studio.ok('GET', '/api/file?path=@examples/08_imports.til')['text']
+    out = real_studio.request('POST', '/api/lsp', {'jsonrpc': '2.0', 'method': 'textDocument/didOpen', 'params': {
+        'textDocument': {'uri': uri, 'languageId': 'til', 'version': 1, 'text': text}}}, headers=h).json()['messages']
+    diag = [m for m in out if m.get('method') == 'textDocument/publishDiagnostics']
+    assert diag and diag[0]['params']['uri'] == uri
+    assert diag[0]['params']['diagnostics'] == []                  # math_utils was found next to it
+    out = real_studio.request('POST', '/api/lsp', {'jsonrpc': '2.0', 'id': 2, 'method': 'textDocument/definition',
+                              'params': {'textDocument': {'uri': uri}, 'position': {'line': 6, 'character': 11}}},
+                              headers=h).json()['messages']
+    locs = out[0]['result']
+    assert locs and locs[0]['uri'] == root_uri + '/%40examples/math_utils.til'    # back as @examples/...
+    real_studio.server.lsp.close_client('exTab')
+
+
+@pytest.mark.skipif(not HAS_TILDAP, reason="src/tildap.py is not installed")
+def test_real_debug_adapter_on_examples(real_studio, project):
+    """Debugging an example works like running it: the adapter gets the real
+    file (imports resolve next to it), the client sees @examples/... paths."""
+    if real_studio.server.project.rel(real_studio.server.project.examples) is not None:
+        pytest.skip("the examples are inside the project")
+    events = real_studio.events()
+    api = real_studio
+    try:
+        sid = api.ok('POST', '/api/dap/start')['sessionId']
+        seq = [0]
+
+        def dap(command, arguments=None):
+            seq[0] += 1
+            out = api.ok('POST', f'/api/dap/{sid}', {'seq': seq[0], 'type': 'request', 'command': command,
+                                                     'arguments': arguments or {}})['messages']
+            assert out[0]['success'] is True, out
+            return out[0]
+        dap('initialize', {'adapterID': 'til'})
+        mark = events.mark()
+        dap('launch', {'program': '@examples/08_imports.til'})
+        bp = dap('setBreakpoints', {'source': {'path': '@examples/math_utils.til', 'name': 'math_utils.til'},
+                                    'breakpoints': [{'line': 5}]})
+        assert bp['body']['breakpoints'][0]['verified'] is True
+        assert bp['body']['breakpoints'][0]['source']['path'] == '@examples/math_utils.til'
+        dap('configurationDone')
+        stopped = events.wait(lambda n, d: n == 'dap' and d['sessionId'] == sid
+                              and d['message'].get('event') == 'stopped', 20, mark)['message']
+        assert stopped['body']['reason'] == 'breakpoint'
+        frames = dap('stackTrace', {'threadId': 1})['body']['stackFrames']
+        assert frames[0]['source'] == {'name': '@examples/math_utils.til', 'path': '@examples/math_utils.til'}
+        assert frames[0]['line'] == 5
+        assert frames[1]['source']['path'] == '@examples/08_imports.til'
+        dap('continue', {'threadId': 1})
+        events.wait(lambda n, d: n == 'dap' and d['sessionId'] == sid
+                    and d['message'].get('event') == 'terminated', 20, mark)
+        with events.cond:
+            out = "".join(d['message']['body'].get('output', '') for _t, n, d in events.items
+                          if n == 'dap' and d['sessionId'] == sid and d['message'].get('event') == 'output')
+        assert out == "25\n27\n10\n"
+        # outside the examples: refused like every API path
+        r = api.post(f'/api/dap/{sid}', {'seq': 99, 'type': 'request', 'command': 'launch',
+                                         'arguments': {'program': '@examples/../../x.til'}})
+        assert r.status == 403
+        dap('disconnect')
+    finally:
+        events.close()
+
+
 @pytest.mark.skipif(not HAS_TILDAP, reason="src/tildap.py is not installed")
 def test_real_debug_adapter(real_studio, project, monkeypatch):
     events = real_studio.events()
@@ -1371,9 +1572,9 @@ def test_real_debug_adapter(real_studio, project, monkeypatch):
         published = []
         publish = api.server.hub.publish
 
-        def recording(name, data, key=None):
+        def recording(name, data, key=None, **kw):
             published.append((name, data))
-            publish(name, data, key)
+            publish(name, data, key, **kw)
         monkeypatch.setattr(api.server.hub, 'publish', recording)
         seen = []
         mark = events.mark()
