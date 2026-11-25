@@ -407,7 +407,8 @@ class FakeDap {
             const rel = this.server.rel(program);
             let text = typeof a.source === 'string' ? a.source : '';
             if (typeof a.source !== 'string') {
-                try { text = await fsp.readFile(this.server.abs(rel), 'utf8'); } catch (e) {
+                // a TIL example by its "@examples/..." path (the real server hands the adapter the file)
+                try { text = this.server.virtual(rel) ? await this.server.read(rel) : await fsp.readFile(this.server.abs(rel), 'utf8'); } catch (e) {
                     out.push(this.respond(req, undefined, false, `cannot read ${program}`));
                     break;
                 }
@@ -590,6 +591,7 @@ const KEY_NAMES = { UP: 1, DOWN: 2, LEFT: 3, RIGHT: 4, ENTER: 13, ESC: 27, ESCAP
 
 /* ── the server ─────────────────────────────────────────────────────── */
 export async function startMockServer({ root, port = 0, token = crypto.randomBytes(12).toString('hex'), html = DEFAULT_HTML, seed = true, latency = 0 } = {}) {
+    const ownRoot = !root;           // a temporary project of its own: removed by close()
     if (!root) root = await fsp.mkdtemp(path.join(os.tmpdir(), 'til-studio-mock-'));
     root = path.resolve(root);
     if (seed) {
@@ -604,7 +606,7 @@ export async function startMockServer({ root, port = 0, token = crypto.randomByt
     const runs = new Map();
     const daps = new Map();
     let runSeq = 0, dapSeq = 0;
-    const stats = { requests: [], lsp: [], dap: [], runs: [], lang: '' };
+    const stats = { requests: [], lsp: [], dap: [], runs: [], lang: '', clients: { requests: [], events: [] } };
     const state = { root, token, stats, clients, runs, daps };
 
     const S = {
@@ -783,8 +785,12 @@ export async function startMockServer({ root, port = 0, token = crypto.randomByt
         const method = req.method;
         stats.requests.push(`${method} ${p}`);
         if (req.headers['x-til-lang']) stats.lang = req.headers['x-til-lang'];      // the language of error messages
+        // the page's id (X-TIL-Client; ?client= on the event stream): the real server keeps
+        // a language server, debug sessions and runs per page
+        if (req.headers['x-til-client']) stats.clients.requests.push(req.headers['x-til-client']);
         if (latency) await sleep(latency);
         if (p === '/api/events' && method === 'GET') {
+            stats.clients.events.push(url.searchParams.get('client') || '');
             res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
             // ping {time} at connect and every 15 s
             const pingMsg = () => `event: ping\ndata: ${JSON.stringify({ time: Date.now() / 1000 })}\n\n`;
@@ -824,6 +830,12 @@ export async function startMockServer({ root, port = 0, token = crypto.randomByt
             const origin = req.headers.origin;
             const host = req.headers.host;
             if (origin && origin !== `http://${host}`) { json(res, 403, { error: 'bad Origin' }); return; }
+        }
+        // state-changing requests are JSON, as the real server requires (a cross-site
+        // form can only send text/plain, urlencoded or multipart bodies)
+        if ((method === 'POST' || method === 'PUT') && !/^application\/json\s*(;|$)/i.test(req.headers['content-type'] || '')) {
+            json(res, 415, { error: 'the request must be JSON (Content-Type: application/json)' });
+            return;
         }
         const body = method === 'GET' ? {} : await readBody(req);
         if (p === '/api/file' && method === 'PUT') {
@@ -1131,7 +1143,13 @@ export async function startMockServer({ root, port = 0, token = crypto.randomByt
             await fsp.writeFile(path.join(root, rel), text);
             S.broadcast('fs', { paths: [rel] });
         },
-        close: () => new Promise((resolve) => { for (const c of clients) c.end(); server.close(() => resolve()); }),
+        close: () => new Promise((resolve) => {
+            for (const c of clients) c.end();
+            server.close(() => {
+                if (ownRoot) fs.rmSync(root, { recursive: true, force: true });
+                resolve();
+            });
+        }),
     };
 }
 

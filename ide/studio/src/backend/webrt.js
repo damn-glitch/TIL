@@ -21,6 +21,10 @@ function postTask(fn) {
 function loadScript(src) {
     return new Promise((resolve, reject) => {
         if (window.TILWasm) { resolve(window.TILWasm); return; }
+        // scripts of this site only (defense in depth: the base is never user input)
+        let url;
+        try { url = new URL(src, location.href); } catch (e) { reject(new Error(`bad script address ${src}`)); return; }
+        if (url.origin !== location.origin) { reject(new Error(`refusing a script of another site: ${url.origin}`)); return; }
         const s = document.createElement('script');
         s.src = src;
         s.async = true;
@@ -32,6 +36,8 @@ function loadScript(src) {
 
 export class WebRuntime {
     constructor(base) {
+        // tilvm.js, tilvm.wasm and tilc.tbc come from this site only
+        if (new URL(base, location.href).origin !== location.origin) throw new Error(`the TIL runtime must come from this site, not ${base}`);
         this.base = base;
         this.rt = null;
         this.api = null;

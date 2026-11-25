@@ -41,13 +41,15 @@ export class Debugger {
             if (!ok) return;
         }
         const cfg = app.views.debug.config();
-        // the program the adapter runs: the file, or its text through `source`
-        // (documents that are not files yet, and "Debug with these inputs")
-        // a file of the project is debugged by its path; anything else (a new
-        // buffer, a read-only TIL example "@examples/...") by its text
+        // the program the adapter runs: a file of the project by its path; a TIL
+        // example by its "@examples/..." path (the server gives the adapter the
+        // real file, so its imports resolve next to it, as when it runs); anything
+        // else (a new buffer) by its text through `source` ("Debug with these
+        // inputs" too: its text, under the program's path)
         const inProject = doc.kind === 'file' && !doc.path.startsWith('@');
-        const target = { docPath: doc.path, program: app.absPath(inProject ? doc.path : doc.name), source: undefined };
-        if (!inProject) target.source = doc.current().doc.toString();
+        const example = doc.kind === 'file' && doc.path.startsWith('@examples/');
+        const target = { docPath: doc.path, program: example ? doc.path : app.absPath(inProject ? doc.path : doc.name), source: undefined };
+        if (!inProject && !example) target.source = doc.current().doc.toString();
         if (opts.call) {
             target.source = harnessText(doc.current().doc.toString(), opts.call);
             this.breakAtFunction(doc, opts.call.function);
@@ -177,7 +179,8 @@ export class Debugger {
 
     /* ── breakpoints ── */
     sourceFor(path) {
-        if (this.target && path === this.target.docPath) return { path: this.target.program, name: basename(this.target.program) };
+        if (this.target && path === this.target.docPath) return { path: this.target.program, name: path.startsWith('@') ? path : basename(this.target.program) };
+        if (path.startsWith('@')) return { path, name: path };          // a TIL example: the server maps it
         return { path: this.app.absPath(path), name: path };
     }
 

@@ -113,6 +113,26 @@ async function placeCursor(page, line, text, offset = 0) {
 
 const lineOf = (src, needle) => src.split('\n').findIndex((l) => l.includes(needle)) + 1;
 
+/* hover `target` until an LSP hover tooltip shows. Code lenses (a row above
+   main() and functions with contracts) arrive after the text and move the lines
+   below them: the pointer can end up on a lens row, so hover again then. */
+async function hoverTooltip(page, target, timeout = 10000) {
+    if (await page.evaluate(() => window.tilStudio.lsp.has('codeLensProvider'))) {
+        await page.waitForSelector('.cm-codeLens', { timeout: 5000 }).catch(() => {});
+    }
+    const deadline = Date.now() + timeout;
+    for (;;) {
+        await page.mouse.move(0, 0);
+        await target().hover();
+        try {
+            await page.waitForFunction(() => document.querySelectorAll('.cm-lsp-hover').length > 0, null, { timeout: 1500 });
+            return;
+        } catch (e) {
+            if (Date.now() > deadline) throw e;
+        }
+    }
+}
+
 async function shot(page, name) {
     if (process.env.SKIP_SHOTS) return;
     await page.waitForTimeout(250);
@@ -182,14 +202,11 @@ describe('desktop face', () => {
         const src = await docText(page);
         const callLine = lineOf(src, 'print(greet(');
         await placeCursor(page, callLine, 'greet', 2);
-        await page.locator('.cm-line').nth(callLine - 1).locator('.t-fn:has-text("greet")').hover();
-        await page.waitForSelector('.cm-lsp-hover', { timeout: 5000 });
+        await hoverTooltip(page, () => page.locator('.cm-line').nth(callLine - 1).locator('.t-fn:has-text("greet")'));
         assert.match(await page.locator('.cm-lsp-hover').textContent(), /greet/);
         // hovers with **bold** and *italic* text (keywords, locals) render and the page stays responsive
         const retLine = lineOf(src, 'return f"Hello');
-        await page.mouse.move(0, 0);
-        await page.locator('.cm-line').nth(retLine - 1).locator('.t-kw').first().hover();
-        await page.waitForFunction(() => document.querySelectorAll('.cm-lsp-hover').length > 0, null, { timeout: 5000 });
+        await hoverTooltip(page, () => page.locator('.cm-line').nth(retLine - 1).locator('.t-kw').first());
         assert.ok((await page.locator('.cm-lsp-hover strong, .cm-lsp-hover em, .cm-lsp-hover code').count()) > 0);
         await page.mouse.move(0, 0);
         await page.keyboard.press('F12');
@@ -337,6 +354,73 @@ describe('desktop face', () => {
         await page.waitForFunction(() => !window.tilStudio.debugger.active, null, { timeout: 10000 });
         assert.equal(await page.locator('.cm-debugLine').count(), 0);
         await page.context().close();
+    });
+
+    it('debugs a TIL example where it is (its imports resolve)', async () => {
+        const page = await open();
+        const ex = await page.evaluate(() => {
+            const list = window.tilStudio.info.examples;
+            return (list.find((e) => /08_imports/.test(e.path)) || list.find((e) => /hello/.test(e.name)) || list[0]).path;
+        });
+        await page.evaluate((p) => window.tilStudio.openFile(p), ex);
+        await page.waitForFunction((p) => window.tilStudio.editors.activeDoc() && window.tilStudio.editors.activeDoc().path === p, ex);
+        await page.keyboard.press('F5');
+        await page.waitForFunction(() => window.tilStudio.debugger.active, null, { timeout: 10000 });
+        await page.waitForFunction(() => !window.tilStudio.debugger.active, null, { timeout: 20000 });
+        const out = await page.locator('.term-out').textContent();
+        if (!mock && /08_imports/.test(ex)) assert.match(out, /25\s*27\s*10/, out);      // square, cube, clamp from math_utils
+        assert.doesNotMatch(out, /Could not find module|cannot read/, out);
+        assert.deepEqual(page.errors, []);
+        await page.context().close();
+    });
+
+    it('ends its debug session when the page goes away', async () => {
+        const page = await open();
+        await openFile(page, 'main.til');
+        const src = await docText(page);
+        await placeCursor(page, lineOf(src, 'print(f"total'), 'print');
+        await page.keyboard.press('F9');
+        await page.keyboard.press('F5');
+        await page.waitForSelector('.cm-debugLine', { timeout: 15000 });
+        const sid = await page.evaluate(() => window.tilStudio.debugger.client.sessionId);
+        await page.goto('about:blank');                        // pagehide: a keepalive disconnect
+        const deadline = Date.now() + 10000;
+        let gone = false;
+        while (!gone && Date.now() < deadline) {
+            if (mock) gone = mock.state.stats.dap.includes('disconnect');
+            else gone = await api('POST', `/api/dap/${sid}`, { seq: 99, type: 'request', command: 'threads' }).then(() => false, (e) => /404/.test(e.message));
+            if (!gone) await new Promise((r) => setTimeout(r, 100));
+        }
+        assert.ok(gone, 'the debug session was ended');
+        await page.context().close();
+    });
+
+    it('names each page to the server: its own language server and language', async () => {
+        const kk = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+        await kk.addInitScript(() => localStorage.setItem('til-studio:settings', JSON.stringify({ uiLang: 'kk' })));
+        const a = await open({ ctx: kk });
+        const b = await open();
+        const ids = await Promise.all([a, b].map((p) => p.evaluate(() => window.tilStudio.backend.clientId)));
+        assert.ok(ids[0] && ids[1] && ids[0] !== ids[1], JSON.stringify(ids));
+        if (mock) {
+            assert.ok(mock.state.stats.clients.events.includes(ids[0]) && mock.state.stats.clients.events.includes(ids[1]), 'the event streams name their page');
+            assert.ok(mock.state.stats.clients.requests.includes(ids[0]), 'the requests name their page');
+        } else {
+            // the diagnostics of each page come from its own language server, in its own language
+            await api('PUT', '/api/file', { path: 'tabs.til', text: 'main()\n    print(nope)\n' });
+            const messages = async (page) => {
+                await openFile(page, 'tabs.til');
+                await page.waitForFunction(() => [...window.tilStudio.diagnostics.values()].some((l) => l.length), null, { timeout: 10000 });
+                return page.evaluate(() => [...window.tilStudio.diagnostics.values()].flat().map((d) => d.message).join('\n'));
+            };
+            const inKazakh = await messages(a);
+            const inEnglish = await messages(b);
+            assert.match(inEnglish, /unknown name 'nope'/);
+            assert.ok(inKazakh.includes('nope') && !/unknown name/.test(inKazakh), inKazakh);
+            await api('POST', '/api/file/delete', { path: 'tabs.til' });
+        }
+        await a.context().close();
+        await b.context().close();
     });
 
     it('proves contracts and offers to debug a counterexample', async () => {
@@ -688,6 +772,34 @@ describe('web face (static hosting)', { skip: Boolean(process.env.SKIP_WEB) || !
         await page.waitForFunction(() => document.querySelector('.term-out').textContent.includes('50'), null, { timeout: 10000 });
         await page.click('.tb-stop');
         await page.context().close();
+    });
+
+    it('never loads the runtime of another site from a link (?runtime=)', async () => {
+        // a reflected-XSS attempt: /.//HOST/ looks same-origin, then resolves to //HOST/tilvm.js
+        const hits = [];
+        const evil = http.createServer((req, res) => {
+            hits.push(req.url);
+            res.writeHead(200, { 'Content-Type': 'text/javascript' });
+            res.end('window.__pwned = true; window.TILWasm = { Runtime: { create() { window.__pwned = true; } } };');
+        });
+        await new Promise((resolve) => evil.listen(0, '127.0.0.1', resolve));
+        const port = evil.address().port;
+        try {
+            for (const q of [`/.//127.0.0.1:${port}/`, `//127.0.0.1:${port}/`, `http://127.0.0.1:${port}/`, `/\\127.0.0.1:${port}/`]) {
+                const page = await open({ url: `${WEB}index.html?runtime=${encodeURIComponent(q)}` });
+                await openFile(page, 'main.til');
+                await page.keyboard.press(`${MOD}+F5`);
+                await page.waitForSelector('.term-foot', { timeout: 30000 });
+                assert.match(await page.locator('.term-out').textContent(), /Hello, TIL!/, 'the runtime of this site ran');
+                assert.equal(await page.evaluate(() => window.__pwned), undefined, q);
+                const foreign = await page.evaluate((p) => performance.getEntriesByType('resource').map((e) => e.name).filter((n) => n.includes(`:${p}`)), port);
+                assert.deepEqual(foreign, [], q);
+                await page.context().close();
+            }
+            assert.deepEqual(hits, [], 'no request reached the other site');
+        } finally {
+            await new Promise((resolve) => evil.close(resolve));
+        }
     });
 
     it('shows the desktop card for desktop-only features', async () => {

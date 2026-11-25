@@ -165,6 +165,9 @@ export class App {
         window.addEventListener('pagehide', () => {
             const run = this.runner.current;
             if (run && !run.done && run.id !== null && this.backend.runStopOnUnload) this.backend.runStopOnUnload(run.id);
+            // and its debug session (else the server closes it a minute after the page is gone)
+            const dap = this.debugger && this.debugger.active ? this.debugger.client : null;
+            if (dap && dap.sessionId && !dap.closed && this.backend.dapDisconnectOnUnload) this.backend.dapDisconnectOnUnload(dap.sessionId, dap.seq++);
         });
         window.addEventListener('resize', () => this.editorsResized());
         this.ready = true;
