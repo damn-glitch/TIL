@@ -13289,6 +13289,9 @@ EXTRA_COMMANDS: Dict[str, Tuple[str, str]] = {
     'prove': ('tilprove', "Prove #[requires]/#[ensures] for all inputs (needs z3-solver)"),
     'fit': ('tilfit', "Will the program fit a device?  --device NAME [--run]"),
     'debug': ('tildebug', "Time-travel debugger: breakpoints, step, step back, reverse-continue"),
+    'ide': ('tilstudio', "TIL Studio: the IDE in your browser (til ide [FOLDER])"),
+    'lsp': ('tillsp', "Language server for editors (VS Code, Neovim, Helix, ...): stdio LSP"),
+    'dap': ('tildap', "Debug adapter for editors: stdio DAP with step back"),
 }
 
 # Options of run/exec/build that take a value (stored in opts[key]) or are flags.
